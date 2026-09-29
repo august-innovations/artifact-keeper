@@ -51,7 +51,9 @@ fn publish_workflow_builds_only_the_backend_and_does_not_deploy() {
         "the build runner is at least 16 vCPU"
     );
     assert!(
-        labels.iter().any(|l| l.contains("c9g.") && l.contains("m9g.")),
+        labels
+            .iter()
+            .any(|l| l.contains("c9g.") && l.contains("m9g.")),
         "the build runner is latest-generation Graviton"
     );
     assert!(
