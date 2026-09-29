@@ -8,8 +8,10 @@ name: Publish backend image
 # runs on GitHub-hosted runners: it does not have the infra-tools RunsOn pool.
 # linux/amd64 matches the infra NodePools, which are not dual-arch.
 #
-# The `github-actions` role in each account must trust
-# `repo:august-innovations/artifact-keeper:*`.
+# The `github-actions` role in each account must trust this repository's
+# immutable OIDC subject. Repositories created after 2026-07-15 cannot use
+# the name-based `repo:august-innovations/*` pattern:
+# `repo:august-innovations@179184203/artifact-keeper@1395633388:*`.
 
 on: # yamllint disable-line rule:truthy
   push:
