@@ -5,9 +5,13 @@ name: Publish backend image
 # workflow does not Helm-deploy; infra-tools pins the digest.
 #
 # The AWS role and login match nexus-cooldown in infra-tools. The image
-# build runs on RunsOn (`artifact_keeper_build`): on-demand Graviton, at
-# least 16 vCPU, latest generation only. The image is linux/arm64 so cargo
-# compiles natively on that runner.
+# build runs on RunsOn: on-demand Graviton (c9g/m9g, 16 or 32 vCPU). The
+# image is linux/arm64 so cargo compiles natively on that runner.
+#
+# This repository is public, so RunsOn ignores `.github/runs-on.yml` until
+# it is on the default branch and launches a small spot fallback when a
+# `runner=` spec is missing. The shape is therefore inline job labels.
+# `spot=false` is required: a spot reclaim throws away the rust compile.
 #
 # The `github-actions` role in each account must trust this repository's
 # immutable OIDC subject. Repositories created after 2026-07-15 cannot use
@@ -42,8 +46,11 @@ jobs:
       id-token: write
     runs-on:
       - runs-on=${{ github.run_id }}
-      - runner=artifact_keeper_build
-      - image=august_ci_ubuntu22_arm64
+      - cpu=16+32
+      - ram=32+64
+      - family=c9g.*+m9g.*
+      - image=ubuntu22-full-arm64
+      - volume=160gb
       - env=infra-prod
       - spot=false
     timeout-minutes: 90

@@ -40,6 +40,32 @@ fn publish_workflow_builds_only_the_backend_and_does_not_deploy() {
         .expect("jobs");
     assert_eq!(jobs.len(), 1, "the publish workflow has one job");
     assert!(jobs.contains_key(Value::String("publish".to_string())));
+    let runs_on = jobs
+        .get(Value::String("publish".to_string()))
+        .and_then(|job| job.get("runs-on"))
+        .and_then(Value::as_sequence)
+        .expect("publish runs-on labels");
+    let labels: Vec<&str> = runs_on.iter().filter_map(Value::as_str).collect();
+    assert!(
+        labels.iter().any(|l| l.starts_with("cpu=16")),
+        "the build runner is at least 16 vCPU"
+    );
+    assert!(
+        labels.iter().any(|l| l.contains("c9g.") && l.contains("m9g.")),
+        "the build runner is latest-generation Graviton"
+    );
+    assert!(
+        labels.iter().any(|l| *l == "image=ubuntu22-full-arm64"),
+        "arm64 is selected with a built-in image, not a repo runner spec"
+    );
+    assert!(
+        labels.iter().any(|l| *l == "spot=false"),
+        "publish must not run on spot"
+    );
+    assert!(
+        labels.iter().all(|l| !l.starts_with("runner=")),
+        "a named runner spec is not visible on a public repo until it is on the default branch"
+    );
 
     assert!(
         raw.contains("file: docker/Dockerfile.backend"),
@@ -49,8 +75,6 @@ fn publish_workflow_builds_only_the_backend_and_does_not_deploy() {
         raw.contains("platforms: linux/arm64"),
         "the image is built natively for arm64"
     );
-    assert!(raw.contains("runner=artifact_keeper_build"));
-    assert!(raw.contains("spot=false"));
     assert!(
         !raw.contains("ubuntu-24.04"),
         "the image build does not use a GitHub-hosted runner"
