@@ -51,14 +51,14 @@ fn publish_workflow_builds_only_the_backend_and_does_not_deploy() {
         "the build runner is at least 16 vCPU"
     );
     assert!(
-        labels
-            .iter()
-            .any(|l| l.contains("c9g.") && l.contains("m9g.")),
-        "the build runner is latest-generation Graviton"
+        labels.iter().any(|l| {
+            l.contains("c8i.") && l.contains("c8a.") && l.contains("m8i.") && l.contains("m8a.")
+        }),
+        "the build runner is latest-generation x64"
     );
     assert!(
-        labels.contains(&"image=ubuntu22-full-arm64"),
-        "arm64 is selected with a built-in image, not a repo runner spec"
+        labels.contains(&"image=ubuntu22-full-x64"),
+        "amd64 is selected with a built-in image, not a repo runner spec"
     );
     assert!(
         labels.contains(&"spot=false"),
@@ -74,8 +74,8 @@ fn publish_workflow_builds_only_the_backend_and_does_not_deploy() {
         "the build must use the backend Dockerfile"
     );
     assert!(
-        raw.contains("platforms: linux/arm64"),
-        "the image is built natively for arm64"
+        raw.contains("platforms: linux/amd64"),
+        "the image is linux/amd64 for the deploy node pool"
     );
     assert!(
         !raw.contains("ubuntu-24.04"),

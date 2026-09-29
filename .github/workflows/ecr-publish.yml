@@ -4,9 +4,10 @@ name: Publish backend image
 # pushes go to infra-dev only. Pushes to main go to infra-prod only. This
 # workflow does not Helm-deploy; infra-tools pins the digest.
 #
-# The AWS role and login match nexus-cooldown in infra-tools. The image
-# build runs on RunsOn: on-demand Graviton (c9g/m9g, 16 or 32 vCPU). The
-# image is linux/arm64 so cargo compiles natively on that runner.
+# The AWS role and login match nexus-cooldown in infra-tools. The deploy
+# node pool is amd64, so the image is linux/amd64. The build runs on RunsOn
+# on-demand 8th-gen x64 (c8i/c8a/m8i/m8a, 16 or 32 vCPU) so cargo compiles
+# natively for that image.
 #
 # This repository is public, so RunsOn ignores `.github/runs-on.yml` until
 # it is on the default branch and launches a small spot fallback when a
@@ -48,8 +49,8 @@ jobs:
       - runs-on=${{ github.run_id }}
       - cpu=16+32
       - ram=32+64
-      - family=c9g.*+m9g.*
-      - image=ubuntu22-full-arm64
+      - family=c8i.*+c8a.*+m8i.*+m8a.*+c8i-flex.*+m8i-flex.*
+      - image=ubuntu22-full-x64
       - volume=160gb
       - env=infra-prod
       - spot=false
@@ -154,7 +155,7 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.backend
-          platforms: linux/arm64
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.registry.outputs.image }}
           build-args: |
