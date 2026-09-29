@@ -57,11 +57,11 @@ fn publish_workflow_builds_only_the_backend_and_does_not_deploy() {
         "the build runner is latest-generation Graviton"
     );
     assert!(
-        labels.iter().any(|l| *l == "image=ubuntu22-full-arm64"),
+        labels.contains(&"image=ubuntu22-full-arm64"),
         "arm64 is selected with a built-in image, not a repo runner spec"
     );
     assert!(
-        labels.iter().any(|l| *l == "spot=false"),
+        labels.contains(&"spot=false"),
         "publish must not run on spot"
     );
     assert!(
