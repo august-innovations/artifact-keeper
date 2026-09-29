@@ -482,6 +482,14 @@ pub async fn require_auth_with_bearer_fallback(
             .unwrap()
     })?;
     let auth_service = AuthService::new(db.clone(), std::sync::Arc::new(config.clone()));
+    // The decoded password is often an API token (`npm`/`cargo`/`goproxy`).
+    // Check the token cache before bcrypt; a miss verifies and caches.
+    // A capacity shed stays 503 and does not fall through to password bcrypt.
+    match auth_service.validate_api_token(&password).await {
+        Ok(validation) => return Ok(validation.user.id),
+        Err(e) if auth_capacity_failure(&e) => return Err(service_unavailable_response()),
+        Err(_) => {}
+    }
     let (user, _) = auth_service
         .authenticate(&username, &password)
         .await
@@ -490,7 +498,7 @@ pub async fn require_auth_with_bearer_fallback(
             // transient capacity problem (POOL_EXHAUSTED), not a bad password:
             // surface a retryable 503 rather than flattening it to a spurious
             // 401 (#2125). Any genuine failure keeps the existing 401.
-            if e.is_pool_timeout() {
+            if auth_capacity_failure(&e) {
                 return service_unavailable_response();
             }
             Response::builder()
@@ -500,6 +508,52 @@ pub async fn require_auth_with_bearer_fallback(
                 .unwrap()
         })?;
     Ok(user.id)
+}
+
+/// bcrypt semaphore shed or a pool-acquire timeout: retryable, not a bad password.
+fn auth_capacity_failure(err: &AppError) -> bool {
+    matches!(err, AppError::ServiceUnavailable(_)) || err.is_pool_timeout()
+}
+
+/// Username/password credential shared by Basic auth and Bearer-encoded basic.
+///
+/// When `allow_basic_api_token` is set (format and registry routes), the
+/// password is tried as an API token first. `validate_api_token` checks the
+/// in-memory cache, then bcrypt, then inserts a hit. A cache hit never takes
+/// a bcrypt permit. A capacity shed is [`AuthOutcome::Overloaded`] and does
+/// not fall through into `authenticate`, which would turn it into a 401.
+/// A real password still takes the bcrypt path. When the flag is false the
+/// token probe is skipped, so the management API still refuses an API token
+/// presented as a Basic password.
+async fn resolve_username_password(
+    auth_service: &AuthService,
+    username: &str,
+    password: &str,
+    allow_basic_api_token: bool,
+) -> AuthOutcome {
+    if allow_basic_api_token {
+        match validate_api_token_with_scopes(auth_service, password).await {
+            Ok(ext) => return AuthOutcome::Resolved(ext),
+            Err(TokenAuthError::Overloaded) => return AuthOutcome::Overloaded,
+            Err(TokenAuthError::Invalid) => {}
+        }
+    }
+    match auth_service.authenticate(username, password).await {
+        Ok((user, _)) => return AuthOutcome::Resolved(AuthExtension::from(user)),
+        // A transient bcrypt-capacity shed must surface as 503, not a 401.
+        // Without this, twine (which sends standard Basic auth) gets a
+        // spurious 401 under parallel-suite load and aborts, while a single
+        // curl -u upload with the same credentials succeeds.
+        Err(e) if auth_capacity_failure(&e) => return AuthOutcome::Overloaded,
+        Err(_) => {}
+    }
+    // Short-lived JWT access token as the password. CI/CD keyless flows
+    // (OIDC token exchange) send the AK access token as the Basic password
+    // for Maven, pip/twine, and Helm.
+    if let Ok(claims) = auth_service.validate_access_token_async(password).await {
+        return AuthOutcome::Resolved(AuthExtension::from(claims));
+    }
+    AuthOutcome::InvalidCredential
 }
 
 /// Token extraction result
@@ -1162,10 +1216,18 @@ pub(crate) enum AuthOutcome {
 ///   * `ExtractedToken::Bearer` / `ApiKey` / `Basic` ->
 ///     - `Resolved(ext)` on any successful path
 ///     - `InvalidCredential` if every validation attempt failed
+///     - `Overloaded` if a bcrypt-capacity shed or a pool timeout stops
+///       validation before a credential verdict
 ///
 /// `allow_basic_api_token` controls the ONE difference between the format/registry
 /// callers and the management-API (/api/v1) callers: whether an API token is
-/// accepted as the HTTP Basic *password*.
+/// accepted as the HTTP Basic *password*, and — when it is — that the token
+/// (including a cache hit) is resolved *before* `authenticate()`. Pip sends
+/// `username:<api_token>`. Trying bcrypt first never matches that secret, and
+/// the five-minute token cache is only reached after the cost-12 verify fails.
+/// Under load that fills the process-wide auth semaphore, waiters hit
+/// `AUTH_PERMIT_WAIT`, and the request is shed as 503 before the cache is
+/// consulted.
 ///   * `true`  — `repo_visibility_middleware` (npm/maven/pypi/v2/… format
 ///     endpoints): pip-netrc / Artifactory-style `username:<api_token>` Basic
 ///     auth resolves to the token owner (the #2786 customer need).
@@ -1200,15 +1262,16 @@ pub(crate) async fn try_resolve_auth_outcome(
             }
             // Some package managers (npm, cargo, goproxy) send Bearer tokens
             // that are base64-encoded `username:password` rather than JWTs or
-            // API keys. Try decoding as credentials before giving up.
+            // API keys. The password may itself be an API token; resolve that
+            // (cache, then bcrypt) before a password verify.
             if let Some((username, password)) = decode_basic_credentials(token) {
-                match auth_service.authenticate(&username, &password).await {
-                    Ok((user, _)) => return AuthOutcome::Resolved(AuthExtension::from(user)),
-                    // A transient bcrypt-capacity shed must surface as 503, not
-                    // 401. See `AuthOutcome::Overloaded`.
-                    Err(AppError::ServiceUnavailable(_)) => return AuthOutcome::Overloaded,
-                    Err(_) => {}
-                }
+                return resolve_username_password(
+                    auth_service,
+                    &username,
+                    &password,
+                    allow_basic_api_token,
+                )
+                .await;
             }
             AuthOutcome::InvalidCredential
         }
@@ -1225,52 +1288,8 @@ pub(crate) async fn try_resolve_auth_outcome(
             let Some((username, password)) = decode_basic_credentials(encoded) else {
                 return AuthOutcome::InvalidCredential;
             };
-            // Try bcrypt username/password auth first
-            match auth_service.authenticate(&username, &password).await {
-                Ok((user, _)) => return AuthOutcome::Resolved(AuthExtension::from(user)),
-                // A transient bcrypt-capacity shed must surface as 503, not a
-                // 401. Without this, twine (which sends standard Basic auth)
-                // gets a spurious 401 under parallel-suite load and aborts,
-                // while a single curl -u upload with the same credentials
-                // succeeds. See `AuthOutcome::Overloaded`.
-                Err(AppError::ServiceUnavailable(_)) => return AuthOutcome::Overloaded,
-                // A pool-acquire timeout is a retryable 503, never a 401.
-                // Short-circuit here so a saturated pool does not pay a second
-                // acquire-timeout on the API-token fallback below before the
-                // classifier reaches the same conclusion (#2125). See
-                // `AuthOutcome::Overloaded`.
-                Err(ref e) if e.is_pool_timeout() => return AuthOutcome::Overloaded,
-                Err(_) => {}
-            }
-            // Try treating the password as a short-lived JWT access token.
-            // This enables CI/CD keyless flows (e.g. OIDC token exchange) where
-            // package managers like Maven, pip/twine, and Helm send the AK access
-            // token as the Basic auth password.
-            if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
-                return AuthOutcome::Resolved(AuthExtension::from(claims));
-            }
-            // Fall back to treating the password as an API token — compatible with
-            // pip netrc / Artifactory-style `token:<api_token>` credential format.
-            //
-            // Only the format/registry endpoints (`repo_visibility_middleware`)
-            // opt into this via `allow_basic_api_token=true`. The /api/v1
-            // management callers (`optional_auth_middleware`, `admin_middleware`)
-            // pass `false`, so an API token presented as a Basic password there is
-            // refused (falls through to `InvalidCredential`), honouring the
-            // openapi.rs contract (#2806). Bearer/X-Api-Key token auth and
-            // bcrypt/JWT Basic auth above are unaffected.
-            if !allow_basic_api_token {
-                return AuthOutcome::InvalidCredential;
-            }
-            match validate_api_token_with_scopes(auth_service, &password).await {
-                Ok(ext) => AuthOutcome::Resolved(ext),
-                // The token fallback also burns a bcrypt verify under the
-                // same process-wide cap; preserve the shed as Overloaded so
-                // pip-netrc-style `token:<api_token>` clients get the
-                // retryable 503, not a spurious 401.
-                Err(TokenAuthError::Overloaded) => AuthOutcome::Overloaded,
-                Err(TokenAuthError::Invalid) => AuthOutcome::InvalidCredential,
-            }
+            resolve_username_password(auth_service, &username, &password, allow_basic_api_token)
+                .await
         }
         ExtractedToken::None => AuthOutcome::NoCredential,
         ExtractedToken::Invalid => AuthOutcome::InvalidCredential,
@@ -6501,6 +6520,98 @@ mod tests {
                 "format path must resolve the api-token-as-Basic-password to the token owner"
             ),
             other => panic!("expected Resolved(is_api_token) on the format path, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_format_basic_api_token_cache_hit_skips_bcrypt() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::auth_service::bcrypt_verify_counter;
+        use std::sync::atomic::Ordering;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = insert_oidc_service_account(&pool).await;
+        let auth_service =
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()));
+        let (token, _tid) = auth_service
+            .generate_api_token(user_id, "ci", vec!["read:artifacts".into()], None)
+            .await
+            .expect("generate api token");
+        // Warm the five-minute cache. This verify is the one bcrypt the
+        // token should ever pay.
+        auth_service
+            .validate_api_token(&token)
+            .await
+            .expect("prime token cache");
+        let before = bcrypt_verify_counter().load(Ordering::Relaxed);
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("pip:{token}"));
+
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), true).await;
+        let after = bcrypt_verify_counter().load(Ordering::Relaxed);
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        match outcome {
+            AuthOutcome::Resolved(ext) => assert!(ext.is_api_token),
+            other => panic!("expected a cached token to resolve, got {other:?}"),
+        }
+        assert_eq!(
+            after, before,
+            "a cache hit on the format path must not run bcrypt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_format_basic_password_still_uses_bcrypt() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let user_id = Uuid::new_v4();
+        let username = format!("ph-fmt-{user_id}");
+        let password = "correct horse battery staple";
+        let hash = AuthService::hash_password(password)
+            .await
+            .expect("hash password");
+        sqlx::query(
+            r#"INSERT INTO users
+               (id, username, email, password_hash, auth_provider,
+                is_admin, is_active, is_service_account)
+               VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("insert local user");
+
+        let auth_service =
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()));
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), true).await;
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        match outcome {
+            AuthOutcome::Resolved(ext) => assert!(
+                !ext.is_api_token,
+                "a real password on the format path must resolve through bcrypt, not as an API token"
+            ),
+            other => panic!("expected a password login to resolve, got {other:?}"),
         }
     }
 

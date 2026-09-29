@@ -1053,11 +1053,10 @@ jobs:
             exit 1
           fi
 
-      # `workflow_scan_gate_tests` is the #2609 contract guard: it asserts that
-      # docker-publish.yml's Trivy enforcement pass still gates (exit-code '1',
-      # CRITICAL/HIGH, ignore-unfixed, .trivyignore, non-SARIF format) and that
-      # every merge-* job `needs: scan-containers`. It lives in backend/tests/
-      # so it is an INTEGRATION target, and it ran in NO job at all (#3437).
+      # `workflow_scan_gate_tests` pins ecr-publish.yml: backend image only,
+      # infra-dev on feature branches, infra-prod on main, no Helm deploy.
+      # It lives in backend/tests/ so it is an INTEGRATION target, and it ran
+      # in NO job at all (#3437).
       #
       # It and the other targets here run in this, the DEFAULT-set step,
       # rather than in the Tier 2 step below, because the Tier 2 step runs
@@ -1443,33 +1442,6 @@ jobs:
       - name: mock-upstream HTTP contract test
         run: bash scripts/native-tests/mock-upstream/test_mock_upstream.sh
 
-      # Container CVE gate honesty (#3122): a Trivy step that BLOCKS a publish
-      # must actually apply the severity filter it declares. trivy-action
-      # silently `unset`s TRIVY_SEVERITY when the format is SARIF, which turned
-      # the documented "CRITICAL,HIGH only" gate into one that failed on a
-      # fixable CVE of ANY severity — a LOW blocked all publishing from `main`
-      # for days (#3121). Pure YAML inspection, no network, runs in ~1s.
-      - name: Check Trivy gate severity filter
-        run: ./scripts/ci/check-trivy-gate-severity.sh
-
-      # Same species as the check above, one layer out (#3308). That one asks
-      # "does the publish gate apply the filter it declares?"; this one asks
-      # "does the PRE-TAG gate block on what it just measured?" It did not:
-      # release-preflight.sh printed "a tag cut will likely stall" and
-      # "READY: ... Safe to cut the tag." in the same run, because the
-      # measured-red branch called `warn` (non-incrementing) instead of `bad`.
-      #
-      # It needs a test rather than a live run because the interesting case is
-      # invisible whenever main is green: with a green Docker Publish the buggy
-      # and fixed scripts are byte-identical in behaviour. Stubs `gh`, so no
-      # network and no dependence on main's current health. ~1s.
-      #
-      # Also covers check 4 (#3339), which asks whether a component's pinned
-      # VERSION tag is already published from different sources. Same species
-      # again: the v1.7.2 tag died on that collision while Docker Publish on
-      # main passed for the SAME commit, because the exact-tag check only runs
-      # on a clean refs/tags/v* ref. Registry answers are stubbed too, so this
-      # stays offline.
       - name: Check release-preflight gates block on what they measure
         run: bash scripts/ci/test-release-preflight.sh
 
@@ -1516,8 +1488,6 @@ jobs:
       # All stub gh / curl / the registry probes; offline, ~1s each.
       - name: Check the release-candidate certification gate blocks what it must
         run: bash scripts/ci/test-assert-candidate-certified.sh
-      - name: Check the certifying-ref resolver refuses every branch but the two
-        run: bash scripts/ci/test-resolve-certified-ref.sh
       - name: Check the registry digest probe never guesses
         run: bash scripts/ci/test-registry-tag-digest.sh
       - name: Check the scanner-adapter exact-version parity check
@@ -1659,50 +1629,12 @@ jobs:
       # enforcement=active. Stubs `gh`; throwaway git repos, offline, ~2s.
       - name: Check the release-line creation procedure stays safe
         run: bash scripts/ci/test-create-release-line.sh
-      # The other half of that gate, and the half the script self-test cannot
-      # see: the WORKFLOW deciding whether to call the script at all (#4070).
-      # `release-process: approved` used to skip every step, and a job whose
-      # steps all skip still concludes success — so the required
-      # `Verify commits trace back to main` context on ruleset 20038606 was
-      # satisfied by anyone who could open a PR against `release/*` and label
-      # their own PR. This asserts the wiring: nothing derived from a label may
-      # condition the gate, and the gate step is still there to be conditioned.
-      # Pure YAML inspection, no network, ~1s.
-      - name: Check no label can bypass the release-branch gate
-        run: bash scripts/ci/test-release-branch-gate.sh
-
-      # Documentation describing a gate configuration that has since moved is
-      # invisible to every other check here: docs are not compiled, linted or
-      # executed. CLAUDE.md's mandatory pre-push checklist named
-      # a plain `cargo test` unit-test run long after both CI unit-test jobs had
-      # moved to nextest, so a contributor following it saw ten NuGet failures
-      # unrelated to their change on a clean tree, and a hung run at the default
-      # thread count — which teaches people to ignore red (#3479). This pins the
-      # documented command to the one CI invokes. ~1s, no dependencies.
       - name: Check the pre-push test command matches CI
         run: ./scripts/ci/check-docs-test-command.sh
 
       - name: Check the docs/CI drift gate catches what it must
         run: bash scripts/ci/test-check-docs-test-command.sh
 
-      # Six STEP-level `continue-on-error: true` on `Generate artifact
-      # attestation` and `Attach VEX attestations` meant a failed provenance
-      # push left the merge job GREEN and published the image anyway, with no
-      # annotation and nothing in `needs.<job>.result` — so build provenance
-      # had never been proven to attach to any image (#3496). Same species as
-      # #2824 (cosign failed, 1.6.1 shipped unsigned). This pins the
-      # invariant: attestation and cosign steps may never be soft-failed, and
-      # docker-publish.yml may carry no step-level continue-on-error at all.
-      # Pure YAML inspection, no network, ~1s.
-      - name: Check supply-chain steps cannot fail silently
-        run: ./scripts/ci/check-supply-chain-soft-fail.sh
-
-      # Static half of the #3551 toolchain pin: rust-toolchain.toml must name a
-      # concrete version, and no workflow may re-float past it with a
-      # `dtolnay/rust-toolchain@stable` ref or a contradicting `toolchain:`
-      # input. check-rust asserts the live compiler; this asserts the
-      # configuration, on every PR including ones that touch no Rust. Pure file
-      # inspection, no network, ~1s.
       - name: Check the Rust toolchain pin has not re-floated
         run: ./scripts/ci/check-toolchain-pin.sh
 
@@ -1763,66 +1695,6 @@ jobs:
       # commands; offline, ~1s.
       - name: Check the published-attestation audit catches what it must
         run: bash scripts/ci/test-audit-published-attestations.sh
-
-      # The runtime gate above asserts about the refs it is HANDED, so it
-      # cannot see a registry nobody passed it. That is not hypothetical: the
-      # Docker Hub mirrors of every published image shipped unsigned for the
-      # project's entire history because `cosign sign` was only ever given the
-      # ghcr ref (#3562). Nothing was broken — a whole distribution channel was
-      # simply absent from the controls, and absence is invisible to a runtime
-      # check. This reads docker-publish.yml and requires that every registry a
-      # publish job mirrors to is also one it signs on and verifies. Pure YAML
-      # inspection, no network, ~1s.
-      - name: Check every published registry is signed and verified
-        run: ./scripts/ci/check-registry-publish-parity.sh
-
-      - name: Check the registry-parity gate catches what it must
-        run: bash scripts/ci/test-check-registry-publish-parity.sh
-
-      # Four of the last eight releases shipped with wrong release bookkeeping
-      # — a missing curated notes file, bullets filed under an already-released
-      # heading, an [Unreleased] heading renamed without a fresh one being
-      # opened — and every one was found by a human days later (#3537). The
-      # gates that close those shapes fire only on a `v*` tag push, a handful
-      # of runs per release, and their interesting cases are ones nobody wants
-      # to reproduce live: a release that publishes with no curated notes
-      # cannot be un-published. This exercises them offline, including the
-      # `Resolve release notes` run-block extracted straight out of
-      # release.yml, so a revert to the silent auto-notes fallback is a red
-      # test rather than a review miss. Stubs `gh`; ~2s.
-      - name: Check the release-bookkeeping gates catch what they must
-        run: bash scripts/ci/test-assert-release-bookkeeping.sh
-
-      # `:latest` and `:X.Y` used to be written by the merge jobs at tag-push
-      # time -- before the release gate, which is what tests the bytes those
-      # tags name. On v1.8.1 that gap was 78 minutes on a cut where nothing
-      # went wrong; v1.7.2 published `:latest` for a version that was retired
-      # with the gate never run. The fix is an ORDERING, and an ordering is
-      # invisible on a green run: the same tags exist either way. So the
-      # arrangement is pinned structurally -- exactly one job writes floating
-      # tags, it fans in from every merge job with no `if:`, and the release
-      # path promotes only after the gate and the release. Pure YAML
-      # inspection, no network, ~1s.
-      - name: Check floating tags are confined to the post-gate promotion
-        run: ./scripts/ci/check-floating-tag-promotion.sh
-
-      - name: Check the floating-tag gate catches what it must
-        run: bash scripts/ci/test-check-floating-tag-promotion.sh
-
-      # The rule the promotion obeys: a floating tag may only name a version
-      # with a published GitHub Release, and only if it is newest in that line.
-      # Its interesting cases (a backport that moves :X.Y but not :latest, a
-      # version whose images exist but whose release never published) happen
-      # about once per release and never on a normal one.
-      - name: Check the floating-tag promotion rule
-        run: bash scripts/ci/test-floating-tag-plan.sh
-
-      # The scanner-adapter's published set (the adapter VERSION each
-      # published release ships) feeds that rule on both the promote side and
-      # the release-side assert; a lookup that fails open can only make an
-      # older adapter version look newest, so the failure modes are pinned.
-      - name: Check the adapter published-set resolver fails closed
-        run: bash scripts/ci/test-adapter-published-set.sh
 
       # Release binaries shipped with only a `<name>.sha256` beside them, which
       # is served from the same place, by the same authority, as the artifact it

@@ -19,6 +19,7 @@ use crate::services::opensearch_service::OpenSearchService;
 use crate::services::permission_service::PermissionService;
 use crate::services::plugin_registry::PluginRegistry;
 use crate::services::proxy_service::ProxyService;
+use crate::services::pypi_simple_cache::PypiSimpleCache;
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
 use crate::services::rpm_repodata_cache::RpmRepodataCache;
@@ -221,6 +222,9 @@ pub struct AppState {
     /// invalidation: npm forbids republishing a version, so entries are
     /// immutable facts that age out.
     pub npm_attestation_cache: Option<Arc<NpmAttestationCache>>,
+    /// In-process cache of finished PyPI simple-project pages. Always
+    /// present; a TTL of `0` makes the handler skip it.
+    pub pypi_simple_cache: Arc<PypiSimpleCache>,
     /// In-process cache of signed APT `InRelease` / `Release.gpg` payloads,
     /// keyed by `SHA-256(unsigned Release || key fingerprint)`. Avoids
     /// re-signing on every `apt update` poll (#1236).
@@ -279,6 +283,10 @@ impl AppState {
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
+        let pypi_simple_cache = Arc::new(PypiSimpleCache::with_capacity(
+            std::time::Duration::from_secs(config.pypi_simple_cache_ttl_secs),
+            config.pypi_simple_cache_max_bytes,
+        ));
         Self {
             config,
             db,
@@ -302,6 +310,7 @@ impl AppState {
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
             npm_attestation_cache,
+            pypi_simple_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
@@ -328,6 +337,10 @@ impl AppState {
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
+        let pypi_simple_cache = Arc::new(PypiSimpleCache::with_capacity(
+            std::time::Duration::from_secs(config.pypi_simple_cache_ttl_secs),
+            config.pypi_simple_cache_max_bytes,
+        ));
         Self {
             config,
             db,
@@ -351,6 +364,7 @@ impl AppState {
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
             npm_attestation_cache,
+            pypi_simple_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),

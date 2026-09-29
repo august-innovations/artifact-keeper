@@ -1385,9 +1385,10 @@ impl AuthService {
 
     /// Authenticate user with username and password.
     ///
-    /// This is the shared credential primitive: the API middleware tries it
-    /// before the API-token path on every Basic-auth package-manager request,
-    /// and the OCI and conda handlers reach it too. It does **not** pay the
+    /// This is the shared credential primitive: the management-API Basic
+    /// path tries it before anything else, and a format/registry request
+    /// that accepts an API token as the Basic password tries that token
+    /// first. The OCI and conda handlers reach it too. It does **not** pay the
     /// bcrypt timing pad — see [`TimingPad`]. Use
     /// [`Self::authenticate_for_login`] for the unauthenticated login
     /// endpoint.
@@ -4365,6 +4366,8 @@ mod tests {
             npm_packument_cache_redis_url: None,
             npm_attestation_negative_cache_enabled: true,
             npm_attestation_negative_cache_ttl_secs: 86_400,
+            pypi_simple_cache_ttl_secs: 60,
+            pypi_simple_cache_max_bytes: 64 * 1024 * 1024,
             npm_upstream_feed_enabled: false,
             npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
                 .into(),
