@@ -1,0 +1,20 @@
+# Image builds only. Other CI stays on GitHub-hosted runners.
+runners:
+  # On-demand latest-generation Graviton. 16 or 32 vCPU (c9g/m9g .4xlarge
+  # and .8xlarge). A spot reclaim would throw away the rust compile, so
+  # this pool does not bid.
+  artifact_keeper_build:
+    cpu: [16, 32]
+    ram: [32, 64]
+    family: ["c9g.*", "m9g.*"]
+    volume: 160gb
+    spot: false
+    image: august_ci_ubuntu22_arm64
+
+images:
+  # Shared with august — baked by august's ci-image-build (infra-prod account).
+  august_ci_ubuntu22_arm64:
+    platform: "linux"
+    arch: "arm64"
+    owner: "756418066679"
+    name: "august-ci-ubuntu22-arm64-full-*"

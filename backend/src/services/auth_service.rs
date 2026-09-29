@@ -1385,9 +1385,10 @@ impl AuthService {
 
     /// Authenticate user with username and password.
     ///
-    /// This is the shared credential primitive: the API middleware tries it
-    /// before the API-token path on every Basic-auth package-manager request,
-    /// and the OCI and conda handlers reach it too. It does **not** pay the
+    /// This is the shared credential primitive: the management-API Basic
+    /// path tries it before anything else, and a format/registry request
+    /// that accepts an API token as the Basic password tries that token
+    /// first. The OCI and conda handlers reach it too. It does **not** pay the
     /// bcrypt timing pad — see [`TimingPad`]. Use
     /// [`Self::authenticate_for_login`] for the unauthenticated login
     /// endpoint.

@@ -337,11 +337,11 @@ async fn ping(
 /// forever. That is exactly the escape `/v2/token` closes with
 /// `cap_access_expiry` (#3460); this is the fourth arm of it.
 ///
-/// `AuthExtension` carries no expiry, so re-derive it from the same header, in
-/// the same order `try_resolve_auth_outcome` tries the credential: a bcrypt
-/// password (which never expires) first, then JWT, then API token. Both
-/// re-validations hit the token caches the middleware populated moments
-/// earlier, so this costs no extra bcrypt work.
+/// `AuthExtension` carries no expiry, so re-derive it from the same header.
+/// A password never expires. A JWT and an API token do: try the access-token
+/// cache, then `validate_api_token` (in-memory cache, then bcrypt, then
+/// insert). Both re-validations hit the caches the middleware populated
+/// moments earlier, so this costs no extra bcrypt work.
 async fn presented_credential_expiry(
     headers: &HeaderMap,
     auth_service: &AuthService,

@@ -46,6 +46,7 @@ use crate::api::handlers::cache_headers::{check_conditional_request, compute_eta
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
+use crate::error::AppError;
 use crate::formats::conda_native::CondaNativeHandler;
 use crate::models::repository::RepositoryType;
 use crate::services::auth_service::AuthService;
@@ -990,26 +991,36 @@ async fn check_read_access(
 
 /// Authenticate using a URL path token.
 ///
-/// The token is treated as an API token/access token. It's passed as the
-/// password in a pseudo-Basic auth flow (the username is "token").
+/// The path segment is an API token or an access JWT. `validate_api_token`
+/// checks the in-memory cache first, then bcrypt, then inserts the result.
+/// A capacity shed is a retryable 503.
 async fn authenticate_with_token(
     db: &sqlx::PgPool,
     config: &crate::config::Config,
     token: &str,
 ) -> Result<uuid::Uuid, Response> {
     let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
-    let (user, _tokens) = auth_service
-        .authenticate("token", token)
-        .await
-        .map_err(|_| {
-            Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header("WWW-Authenticate", "Basic realm=\"conda\"")
-                .body(Body::from("Invalid token"))
-                .unwrap()
-        })?;
-
-    Ok(user.id)
+    match auth_service.validate_api_token(token).await {
+        Ok(validation) => return Ok(validation.user.id),
+        Err(e) if matches!(e, AppError::ServiceUnavailable(_)) || e.is_pool_timeout() => {
+            return Err(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(axum::http::header::RETRY_AFTER, "1")
+                .body(Body::from(
+                    "Authentication service is at capacity, retry shortly",
+                ))
+                .unwrap());
+        }
+        Err(_) => {}
+    }
+    if let Ok(claims) = auth_service.validate_access_token_async(token).await {
+        return Ok(claims.sub);
+    }
+    Err(Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("WWW-Authenticate", "Basic realm=\"conda\"")
+        .body(Body::from("Invalid token"))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------

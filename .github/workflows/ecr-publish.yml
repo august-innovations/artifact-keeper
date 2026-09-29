@@ -4,9 +4,10 @@ name: Publish backend image
 # pushes go to infra-dev only. Pushes to main go to infra-prod only. This
 # workflow does not Helm-deploy; infra-tools pins the digest.
 #
-# The AWS role and login match nexus-cooldown in infra-tools. This repository
-# runs on GitHub-hosted runners: it does not have the infra-tools RunsOn pool.
-# linux/amd64 matches the infra NodePools, which are not dual-arch.
+# The AWS role and login match nexus-cooldown in infra-tools. The image
+# build runs on RunsOn (`artifact_keeper_build`): on-demand Graviton, at
+# least 16 vCPU, latest generation only. The image is linux/arm64 so cargo
+# compiles natively on that runner.
 #
 # The `github-actions` role in each account must trust this repository's
 # immutable OIDC subject. Repositories created after 2026-07-15 cannot use
@@ -39,7 +40,12 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    runs-on: ubuntu-24.04
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - runner=artifact_keeper_build
+      - image=august_ci_ubuntu22_arm64
+      - env=infra-prod
+      - spot=false
     timeout-minutes: 90
     outputs:
       image: ${{ steps.record.outputs.image }}
@@ -141,12 +147,12 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.backend
-          platforms: linux/amd64
+          platforms: linux/arm64
           push: true
           tags: ${{ steps.registry.outputs.image }}
           build-args: |
             GIT_SHA=${{ github.sha }}
-            CARGO_BUILD_JOBS=4
+            CARGO_BUILD_JOBS=16
             CARGO_PROFILE=release
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}

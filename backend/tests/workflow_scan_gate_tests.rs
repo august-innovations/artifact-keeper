@@ -46,6 +46,16 @@ fn publish_workflow_builds_only_the_backend_and_does_not_deploy() {
         "the build must use the backend Dockerfile"
     );
     assert!(
+        raw.contains("platforms: linux/arm64"),
+        "the image is built natively for arm64"
+    );
+    assert!(raw.contains("runner=artifact_keeper_build"));
+    assert!(raw.contains("spot=false"));
+    assert!(
+        !raw.contains("ubuntu-24.04"),
+        "the image build does not use a GitHub-hosted runner"
+    );
+    assert!(
         raw.contains("ECR_REPOSITORY: artifact-keeper-fork"),
         "the image repository is artifact-keeper-fork"
     );
