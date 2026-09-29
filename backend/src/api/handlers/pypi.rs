@@ -30,6 +30,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use sqlx::PgPool;
 use std::future::Future;
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::api::extractors::RequestBaseUrl;
@@ -45,8 +46,13 @@ use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::pypi::{is_wheel_core_metadata_entry, PkgInfo, PypiHandler};
 use crate::formats::pypi_name::{NormalizedProjectName, PEP508_NAME_PATTERN};
-use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::age_gate_service::AgeGateService;
+use crate::services::metrics_service::{record_pypi_simple_cache_lookup, PYPI_SIMPLE_CACHE_ROUTE};
+use crate::services::pypi_simple_cache::{
+    simple_cache_decision, CacheMode, CachedSimplePage, LookupOutcome, PypiSimpleCacheKey,
+    SimpleRepresentation,
+};
 use crate::services::upstream_metadata::metadata_http_client;
 use chrono::Utc;
 
@@ -782,6 +788,80 @@ async fn pypi_project_tracks_for(
     .unwrap_or_default()
 }
 
+/// A finished simple-project menu, or a response that must not be cached.
+enum SimpleIndexBuild {
+    /// Body after URL rewrite, the age gate, and the virtual merge.
+    Page { body: Vec<u8>, content_type: String },
+    /// `Ok` channel response that is not a menu (a bad upstream index).
+    Raw(Response),
+}
+
+fn simple_page(body: impl Into<Vec<u8>>, content_type: impl AsRef<str>) -> SimpleIndexBuild {
+    SimpleIndexBuild::Page {
+        body: body.into(),
+        content_type: content_type.as_ref().to_string(),
+    }
+}
+
+fn wants_pypi_simple_json(headers: &HeaderMap) -> bool {
+    headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .contains(PEP691_JSON_CONTENT_TYPE)
+}
+
+/// An HTTP response captured so waiters of one in-flight build can replay it.
+///
+/// Failed builds are not stored. The leader and its waiters still share the
+/// response that was produced, including whether it was the `Ok` or `Err`
+/// channel of the handler.
+#[derive(Clone)]
+struct ReplayedResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+    is_ok: bool,
+}
+
+impl ReplayedResponse {
+    /// An error page or a bad-upstream index, not an artifact. 1 MiB is far
+    /// above either; a body past the cap is replaced with a short 502 so the
+    /// replay cannot grow without a bound.
+    const REPLAY_CAP: usize = 1024 * 1024;
+
+    #[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped; the exempt call is marked inline below (#1608)
+    async fn capture(response: Response, is_ok: bool) -> Self {
+        let status = response.status();
+        let headers = response.headers().clone();
+        // STREAMING-EXEMPT: capped replay of an error or bad-upstream simple-index response (not an artifact blob) so one in-flight build's waiters share it; bounded to 1 MiB; over-cap becomes a short 502 and is not cached; tracked under #1608
+        let (status, headers, body) =
+            match axum::body::to_bytes(response.into_body(), Self::REPLAY_CAP).await {
+                Ok(body) => (status, headers, body),
+                Err(_) => (
+                    StatusCode::BAD_GATEWAY,
+                    HeaderMap::new(),
+                    Bytes::from_static(b"simple index response exceeded the replay cap"),
+                ),
+            };
+        Self {
+            status,
+            headers,
+            body,
+            is_ok,
+        }
+    }
+
+    fn into_response(self) -> Response {
+        let mut response = Response::builder()
+            .status(self.status)
+            .body(Body::from(self.body))
+            .unwrap();
+        *response.headers_mut() = self.headers;
+        response
+    }
+}
+
 async fn simple_project(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -794,21 +874,102 @@ async fn simple_project(
     // so there is nothing to gate and nothing to fetch.
     let normalized = parse_project_segment(&project)?;
 
-    // Curation gate (#2912): block a curation-ruled package
-    // before doing any local lookup or upstream fetch for it. The index request
-    // names only a project, so version-constrained rules do not apply here — they
-    // are enforced on the download path, which knows the version.
+    // Curation gate (#2912): block a curation-ruled package before the cache
+    // and before any local lookup or upstream fetch. A block is not cached,
+    // and a package ruled out after a page was stored stops being served on
+    // the next request. Version-constrained rules do not apply here — the
+    // index request names only a project — and are enforced on the download
+    // path, which knows the version.
     enforce_pypi_curation(&state, &repo, normalized.as_str(), None).await?;
 
     // PEP 691 content negotiation also governs the proxy path: a JSON client
     // must get the upstream's JSON representation (which carries PEP 700
-    // `upload-time`), not its HTML index (which never does).
-    let wants_json = headers
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .contains(PEP691_JSON_CONTENT_TYPE);
+    // `upload-time`), not its HTML index (which never does). HTML and JSON
+    // are separate cache entries.
+    let wants_json = wants_pypi_simple_json(&headers);
+    let mode = simple_cache_decision(state.config.pypi_simple_cache_ttl_secs, &repo.format);
 
+    // The caller-scope part of the key is the authorized member set. Hosted
+    // and remote repositories have one fixed (empty) scope. Fetching members
+    // is not the artifacts query: a hit still has to know which menu this
+    // caller is allowed to see, and then returns without touching `artifacts`
+    // or the age gate.
+    let (caller_scope, authorized_members) = if mode == CacheMode::Enabled
+        && repo.repo_type == RepositoryType::Virtual
+    {
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
+        let scope = members.iter().map(|member| member.id).collect();
+        (scope, Some(members))
+    } else {
+        (Vec::new(), None)
+    };
+    let representation = if wants_json {
+        SimpleRepresentation::Json
+    } else {
+        SimpleRepresentation::Html
+    };
+    let key = PypiSimpleCacheKey::new(repo.id, normalized.as_str(), representation, caller_scope);
+
+    let state_for_build = Arc::clone(&state);
+    let auth_for_build = auth.clone();
+    let repo_for_build = repo.clone();
+    let repo_key_for_build = repo_key.clone();
+    let normalized_for_build = normalized.clone();
+    let lookup = state
+        .pypi_simple_cache
+        .lookup(mode, key, || async move {
+            match assemble_simple_project(
+                state_for_build,
+                auth_for_build,
+                repo_for_build,
+                &repo_key_for_build,
+                &normalized_for_build,
+                wants_json,
+                authorized_members,
+            )
+            .await
+            {
+                Ok(SimpleIndexBuild::Page { body, content_type }) => Ok(CachedSimplePage {
+                    body: Bytes::from(body),
+                    content_type,
+                }),
+                Ok(SimpleIndexBuild::Raw(response)) => {
+                    Err(ReplayedResponse::capture(response, true).await)
+                }
+                Err(response) => Err(ReplayedResponse::capture(response, false).await),
+            }
+        })
+        .await;
+
+    record_pypi_simple_cache_lookup(&repo_key, lookup.kind.as_label(), PYPI_SIMPLE_CACHE_ROUTE);
+    match lookup.outcome {
+        LookupOutcome::Ready(page) => Ok(negotiated_cacheable_response(
+            page.body.to_vec(),
+            &page.content_type,
+            &headers,
+        )),
+        LookupOutcome::Failed(replay) => {
+            let is_ok = replay.is_ok;
+            let response = replay.into_response();
+            if is_ok {
+                Ok(response)
+            } else {
+                Err(response)
+            }
+        }
+    }
+}
+
+async fn assemble_simple_project(
+    state: SharedState,
+    auth: Option<AuthExtension>,
+    repo: RepoInfo,
+    repo_key: &str,
+    normalized: &NormalizedProjectName,
+    wants_json: bool,
+    authorized_members: Option<Vec<Repository>>,
+) -> Result<SimpleIndexBuild, Response> {
     // Find all artifacts that belong to this package.
     // We normalize the name for matching: replace [_.-]+ with - then lowercase.
     let artifacts = sqlx::query!(
@@ -861,7 +1022,7 @@ async fn simple_project(
                     proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
                         proxy,
                         repo.id,
-                        &repo_key,
+                        repo_key,
                         &effective_upstream,
                         &upstream_path,
                         &format!("{}{}", upstream_path, PEP691_JSON_CACHE_SUFFIX),
@@ -873,7 +1034,7 @@ async fn simple_project(
                     proxy_helpers::proxy_fetch_capped_budgeted(
                         proxy,
                         repo.id,
-                        &repo_key,
+                        repo_key,
                         &effective_upstream,
                         &upstream_path,
                         proxy_helpers::LARGE_METADATA_MAX_BYTES,
@@ -890,7 +1051,7 @@ async fn simple_project(
                 // HTML and fall through to the HTML rewrite below.
                 if wants_json && ct.contains("json") {
                     if let Some(json) =
-                        rewrite_upstream_simple_json(&content, &repo_key, normalized.as_str())
+                        rewrite_upstream_simple_json(&content, repo_key, normalized.as_str())
                     {
                         let json = filter_pypi_simple_json_response(
                             &state,
@@ -901,18 +1062,14 @@ async fn simple_project(
                         )
                         .await;
                         // HTTP caching (#2773): ETag + Cache-Control + 304.
-                        return Ok(negotiated_cacheable_response(
-                            json.into_bytes(),
-                            PEP691_JSON_CONTENT_TYPE,
-                            &headers,
-                        ));
+                        return Ok(simple_page(json.into_bytes(), PEP691_JSON_CONTENT_TYPE));
                     }
                 }
 
                 // Rewrite absolute download URLs to route through our proxy.
                 if ct.contains("text/html") {
                     let html = String::from_utf8_lossy(&content);
-                    let rewritten = rewrite_upstream_urls(&html, &repo_key, normalized.as_str());
+                    let rewritten = rewrite_upstream_urls(&html, repo_key, normalized.as_str());
                     let rewritten = filter_pypi_simple_html_response(
                         &state,
                         &repo,
@@ -922,11 +1079,7 @@ async fn simple_project(
                     )
                     .await;
                     // HTTP caching (#2773): ETag + Cache-Control + 304.
-                    return Ok(negotiated_cacheable_response(
-                        rewritten.into_bytes(),
-                        &ct,
-                        &headers,
-                    ));
+                    return Ok(simple_page(rewritten.into_bytes(), &ct));
                 }
 
                 // #2801: the upstream Content-Type is neither JSON (handled
@@ -937,7 +1090,7 @@ async fn simple_project(
                 // bytes, which carry un-rewritten offsite download URLs.
                 return match sniff_simple_index(&content) {
                     SniffedSimpleIndex::Json => {
-                        match rewrite_upstream_simple_json(&content, &repo_key, normalized.as_str())
+                        match rewrite_upstream_simple_json(&content, repo_key, normalized.as_str())
                         {
                             Some(json) => {
                                 let json = filter_pypi_simple_json_response(
@@ -948,19 +1101,14 @@ async fn simple_project(
                                     json,
                                 )
                                 .await;
-                                Ok(negotiated_cacheable_response(
-                                    json.into_bytes(),
-                                    PEP691_JSON_CONTENT_TYPE,
-                                    &headers,
-                                ))
+                                Ok(simple_page(json.into_bytes(), PEP691_JSON_CONTENT_TYPE))
                             }
-                            None => Ok(bad_upstream_simple_index()),
+                            None => Ok(SimpleIndexBuild::Raw(bad_upstream_simple_index())),
                         }
                     }
                     SniffedSimpleIndex::Html => {
                         let html = String::from_utf8_lossy(&content);
-                        let rewritten =
-                            rewrite_upstream_urls(&html, &repo_key, normalized.as_str());
+                        let rewritten = rewrite_upstream_urls(&html, repo_key, normalized.as_str());
                         let rewritten = filter_pypi_simple_html_response(
                             &state,
                             &repo,
@@ -969,13 +1117,14 @@ async fn simple_project(
                             rewritten,
                         )
                         .await;
-                        Ok(negotiated_cacheable_response(
+                        Ok(simple_page(
                             rewritten.into_bytes(),
                             "text/html; charset=utf-8",
-                            &headers,
                         ))
                     }
-                    SniffedSimpleIndex::Binary => Ok(bad_upstream_simple_index()),
+                    SniffedSimpleIndex::Binary => {
+                        Ok(SimpleIndexBuild::Raw(bad_upstream_simple_index()))
+                    }
                 };
             }
         }
@@ -991,9 +1140,16 @@ async fn simple_project(
             // isolation/shadowing decision by caller visibility would drop the
             // isolation a member the caller cannot see asserts and re-expose
             // the upstream name — dependency confusion.
-            let members =
-                proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
-                    .await?;
+            // The cache key was built from this same set. Re-reading it here
+            // would let a grant change between the key and the walk, so a hit
+            // for one caller could be stored under another's scope.
+            let members = match authorized_members {
+                Some(members) => members,
+                None => {
+                    proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+                        .await?
+                }
+            };
 
             if members.is_empty() {
                 return Err(proxy_helpers::no_accessible_members_response());
@@ -1224,7 +1380,7 @@ async fn simple_project(
                             case_a_filter_remote_body(
                                 &content,
                                 &owned_profile,
-                                &repo_key,
+                                repo_key,
                                 normalized.as_str(),
                             )
                         } else {
@@ -1260,13 +1416,13 @@ async fn simple_project(
                     .into_response());
                 }
                 (false, None) => {
-                    return build_simple_project_response(
-                        &headers,
-                        &repo_key,
+                    return Ok(render_simple_project_page(
+                        wants_json,
+                        repo_key,
                         normalized.as_str(),
                         &local_artifacts,
                         &tracks,
-                    );
+                    ));
                 }
                 (_, Some((content, content_type))) => {
                     let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
@@ -1286,50 +1442,38 @@ async fn simple_project(
                             SniffedSimpleIndex::Json => {
                                 let merged = merge_local_into_remote_simple_json(
                                     &content,
-                                    &repo_key,
+                                    repo_key,
                                     normalized.as_str(),
                                     &local_artifacts,
                                     &tracks,
                                 )
                                 .unwrap_or_else(|| empty_pep691_listing(normalized.as_str()));
-                                Ok(negotiated_cacheable_response(
-                                    merged.into_bytes(),
-                                    PEP691_JSON_CONTENT_TYPE,
-                                    &headers,
-                                ))
+                                Ok(simple_page(merged.into_bytes(), PEP691_JSON_CONTENT_TYPE))
                             }
                             SniffedSimpleIndex::Html => {
                                 // The rebuild is already AK-pathed; splice locals
                                 // WITHOUT rewrite_upstream_urls.
                                 let merged = merge_local_into_remote_simple_html(
                                     &String::from_utf8_lossy(&content),
-                                    &repo_key,
+                                    repo_key,
                                     normalized.as_str(),
                                     &local_artifacts,
                                     &tracks,
                                 );
-                                Ok(negotiated_cacheable_response(
-                                    merged.into_bytes(),
-                                    "text/html; charset=utf-8",
-                                    &headers,
-                                ))
+                                Ok(simple_page(merged.into_bytes(), "text/html; charset=utf-8"))
                             }
                             // Fail closed: filter emitted nothing usable → empty
                             // listing, never raw upstream bytes.
                             SniffedSimpleIndex::Binary => {
                                 let merged = merge_local_into_remote_simple_json(
                                     empty_pep691_listing(normalized.as_str()).as_bytes(),
-                                    &repo_key,
+                                    repo_key,
                                     normalized.as_str(),
                                     &local_artifacts,
                                     &tracks,
                                 )
                                 .unwrap_or_else(|| empty_pep691_listing(normalized.as_str()));
-                                Ok(negotiated_cacheable_response(
-                                    merged.into_bytes(),
-                                    PEP691_JSON_CONTENT_TYPE,
-                                    &headers,
-                                ))
+                                Ok(simple_page(merged.into_bytes(), PEP691_JSON_CONTENT_TYPE))
                             }
                         };
                     }
@@ -1341,37 +1485,28 @@ async fn simple_project(
                     if wants_json && ct.contains("json") {
                         if let Some(json) = merge_local_into_remote_simple_json(
                             &content,
-                            &repo_key,
+                            repo_key,
                             normalized.as_str(),
                             &local_artifacts,
                             &tracks,
                         ) {
                             // HTTP caching (#2773): ETag + Cache-Control + 304.
-                            return Ok(negotiated_cacheable_response(
-                                json.into_bytes(),
-                                PEP691_JSON_CONTENT_TYPE,
-                                &headers,
-                            ));
+                            return Ok(simple_page(json.into_bytes(), PEP691_JSON_CONTENT_TYPE));
                         }
                     }
 
                     if ct.contains("text/html") {
                         let html = String::from_utf8_lossy(&content);
-                        let rewritten =
-                            rewrite_upstream_urls(&html, &repo_key, normalized.as_str());
+                        let rewritten = rewrite_upstream_urls(&html, repo_key, normalized.as_str());
                         let merged = merge_local_into_remote_simple_html(
                             &rewritten,
-                            &repo_key,
+                            repo_key,
                             normalized.as_str(),
                             &local_artifacts,
                             &tracks,
                         );
                         // HTTP caching (#2773): ETag + Cache-Control + 304.
-                        return Ok(negotiated_cacheable_response(
-                            merged.into_bytes(),
-                            &ct,
-                            &headers,
-                        ));
+                        return Ok(simple_page(merged.into_bytes(), &ct));
                     }
 
                     // #2801: the upstream Content-Type is neither JSON (handled
@@ -1384,37 +1519,33 @@ async fn simple_project(
                         SniffedSimpleIndex::Json => {
                             match merge_local_into_remote_simple_json(
                                 &content,
-                                &repo_key,
+                                repo_key,
                                 normalized.as_str(),
                                 &local_artifacts,
                                 &tracks,
                             ) {
-                                Some(json) => Ok(negotiated_cacheable_response(
-                                    json.into_bytes(),
-                                    PEP691_JSON_CONTENT_TYPE,
-                                    &headers,
-                                )),
-                                None => Ok(bad_upstream_simple_index()),
+                                Some(json) => {
+                                    Ok(simple_page(json.into_bytes(), PEP691_JSON_CONTENT_TYPE))
+                                }
+                                None => Ok(SimpleIndexBuild::Raw(bad_upstream_simple_index())),
                             }
                         }
                         SniffedSimpleIndex::Html => {
                             let html = String::from_utf8_lossy(&content);
                             let rewritten =
-                                rewrite_upstream_urls(&html, &repo_key, normalized.as_str());
+                                rewrite_upstream_urls(&html, repo_key, normalized.as_str());
                             let merged = merge_local_into_remote_simple_html(
                                 &rewritten,
-                                &repo_key,
+                                repo_key,
                                 normalized.as_str(),
                                 &local_artifacts,
                                 &tracks,
                             );
-                            Ok(negotiated_cacheable_response(
-                                merged.into_bytes(),
-                                "text/html; charset=utf-8",
-                                &headers,
-                            ))
+                            Ok(simple_page(merged.into_bytes(), "text/html; charset=utf-8"))
                         }
-                        SniffedSimpleIndex::Binary => Ok(bad_upstream_simple_index()),
+                        SniffedSimpleIndex::Binary => {
+                            Ok(SimpleIndexBuild::Raw(bad_upstream_simple_index()))
+                        }
                     };
                 }
             }
@@ -1424,13 +1555,13 @@ async fn simple_project(
     }
 
     let tracks = pypi_project_tracks_for(&state.db, &[repo.id], normalized.as_str()).await;
-    build_simple_project_response(
-        &headers,
-        &repo_key,
+    Ok(render_simple_project_page(
+        wants_json,
+        repo_key,
         normalized.as_str(),
         &simple_artifacts,
         &tracks,
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,6 +1624,7 @@ fn local_simple_file_json(
     file
 }
 
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
 fn build_simple_project_response(
     headers: &HeaderMap,
@@ -1501,12 +1633,33 @@ fn build_simple_project_response(
     artifacts: &[SimpleProjectArtifact],
     tracks: &[String],
 ) -> Result<Response, Response> {
-    let accept = headers
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    match render_simple_project_page(
+        wants_pypi_simple_json(headers),
+        repo_key,
+        normalized,
+        artifacts,
+        tracks,
+    ) {
+        SimpleIndexBuild::Page { body, content_type } => {
+            Ok(negotiated_cacheable_response(body, &content_type, headers))
+        }
+        SimpleIndexBuild::Raw(response) => Ok(response),
+    }
+}
 
-    if accept.contains("application/vnd.pypi.simple.v1+json") {
+/// The simple-project menu, before HTTP caching headers are applied.
+///
+/// Callers that cache the page store this body and run
+/// [`negotiated_cacheable_response`] per request, so a conditional `304` is
+/// never what gets stored.
+fn render_simple_project_page(
+    wants_json: bool,
+    repo_key: &str,
+    normalized: &str,
+    artifacts: &[SimpleProjectArtifact],
+    tracks: &[String],
+) -> SimpleIndexBuild {
+    if wants_json {
         // PEP 691 JSON response
         let files: Vec<serde_json::Value> = artifacts
             .iter()
@@ -1535,13 +1688,10 @@ fn build_simple_project_response(
             "files": files,
         });
 
-        // HTTP caching (#2773): ETag + Cache-Control + 304, via the shared
-        // helper used by conda/maven.
-        return Ok(negotiated_cacheable_response(
+        return simple_page(
             serde_json::to_vec(&json).unwrap(),
             "application/vnd.pypi.simple.v1+json",
-            headers,
-        ));
+        );
     }
 
     // HTML response
@@ -1607,13 +1757,7 @@ fn build_simple_project_response(
 
     html.push_str("</body>\n</html>\n");
 
-    // HTTP caching (#2773): ETag + Cache-Control + 304. This HTML variant
-    // carries no extra security headers, so the shared helper suffices.
-    Ok(negotiated_cacheable_response(
-        html.into_bytes(),
-        "text/html; charset=utf-8",
-        headers,
-    ))
+    simple_page(html.into_bytes(), "text/html; charset=utf-8")
 }
 
 /// Splice local-member entries into a remote-member PEP 503 HTML response so

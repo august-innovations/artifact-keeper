@@ -20,7 +20,8 @@
 //!   - `json` -- one JSON object per line, for structured stdout collection by a SIEM / log shipper (#2413 item 1)
 
 use opentelemetry::KeyValue;
-use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::Resource;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
@@ -131,6 +132,24 @@ fn build_span_exporter(protocol: OtlpProtocol, endpoint: &str) -> SpanExporter {
             .with_endpoint(endpoint)
             .build()
             .expect("Failed to create OTLP HTTP/protobuf span exporter"),
+    }
+}
+
+/// Build an OTLP metric exporter for the same protocol and endpoint the span
+/// exporter uses. The chart injects one `OTEL_EXPORTER_OTLP_ENDPOINT` and one
+/// `OTEL_EXPORTER_OTLP_PROTOCOL`; both signals follow them.
+fn build_metric_exporter(protocol: OtlpProtocol, endpoint: &str) -> MetricExporter {
+    match protocol {
+        OtlpProtocol::Grpc => MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()
+            .expect("Failed to create OTLP gRPC metric exporter"),
+        OtlpProtocol::HttpProtobuf => MetricExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .build()
+            .expect("Failed to create OTLP HTTP/protobuf metric exporter"),
     }
 }
 
@@ -282,7 +301,7 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
                     .uses_ratio()
                     .then(sampler_ratio_from_env)
                     .map(tracing::field::display),
-                "OpenTelemetry tracing enabled"
+                "OpenTelemetry tracing and metrics enabled"
             );
             Some(guard)
         }
@@ -296,15 +315,19 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
     }
 }
 
-/// Guard that shuts down the OTel tracer provider on drop,
-/// flushing any pending spans.
+/// Guard that shuts down the OTel tracer and meter providers on drop,
+/// flushing any pending spans and metrics.
 pub struct OtelGuard {
-    provider: opentelemetry_sdk::trace::SdkTracerProvider,
+    tracer: opentelemetry_sdk::trace::SdkTracerProvider,
+    meter: SdkMeterProvider,
 }
 
 impl Drop for OtelGuard {
     fn drop(&mut self) {
-        if let Err(e) = self.provider.shutdown() {
+        if let Err(e) = self.meter.shutdown() {
+            eprintln!("Failed to shutdown OTel meter provider: {e:?}");
+        }
+        if let Err(e) = self.tracer.shutdown() {
             eprintln!("Failed to shutdown OTel tracer provider: {e:?}");
         }
     }
@@ -326,13 +349,23 @@ fn init_with_otel(
     let sampler_choice = SamplerChoice::from_env();
     let sampler_ratio = sampler_ratio_from_env();
 
-    let provider = SdkTracerProvider::builder()
-        .with_resource(resource)
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_resource(resource.clone())
         .with_sampler(build_sampler(sampler_choice, sampler_ratio))
         .with_span_processor(BatchSpanProcessor::builder(exporter).build())
         .build();
 
-    let tracer = provider.tracer("artifact-keeper");
+    // Same endpoint and protocol as traces. When the endpoint is unset,
+    // `init_tracing` never reaches here, so the Prometheus recorder is the
+    // only meter and this exporter is not installed.
+    let meter_exporter = build_metric_exporter(protocol, endpoint);
+    let meter_provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_periodic_exporter(meter_exporter)
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+
+    let tracer = tracer_provider.tracer("artifact-keeper");
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
     // Install the W3C Trace Context propagator globally.
@@ -354,7 +387,10 @@ fn init_with_otel(
         .with(otel_layer)
         .init();
 
-    OtelGuard { provider }
+    OtelGuard {
+        tracer: tracer_provider,
+        meter: meter_provider,
+    }
 }
 
 #[cfg(ak_test_shard = "services-2")]

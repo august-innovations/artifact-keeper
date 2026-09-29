@@ -172,6 +172,8 @@ fn test_config(storage_path: &str) -> Config {
         npm_packument_cache_redis_url: None,
         npm_attestation_negative_cache_enabled: true,
         npm_attestation_negative_cache_ttl_secs: 86_400,
+        pypi_simple_cache_ttl_secs: 60,
+        pypi_simple_cache_max_bytes: 64 * 1024 * 1024,
         npm_upstream_feed_enabled: false,
         npm_upstream_feed_url:
             artifact_keeper_backend::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL

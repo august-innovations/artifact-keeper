@@ -1069,6 +1069,20 @@ pub struct Config {
     /// Raise it if you proxy npm directly; `0` disables the cache entirely.
     pub npm_attestation_negative_cache_ttl_secs: u64,
 
+    // -- PyPI simple-project page cache --
+    /// How long a finished PyPI simple-project page stays in the in-process
+    /// cache, in seconds. Env `PYPI_SIMPLE_CACHE_TTL_SECS`, default 300
+    /// (5 minutes). `0` disables the cache. An unset variable uses the
+    /// default. An empty, negative, or non-integer value refuses to start:
+    /// a typo must not silently cache forever or turn the cache off.
+    pub pypi_simple_cache_ttl_secs: u64,
+
+    /// Cap on stored PyPI simple-project page bodies, in bytes. Env
+    /// `PYPI_SIMPLE_CACHE_MAX_BYTES`, default 67108864 (64 MiB). `0` stores
+    /// nothing. An unset variable uses the default. An empty, negative, or
+    /// non-integer value refuses to start.
+    pub pypi_simple_cache_max_bytes: u64,
+
     // -- npm upstream replication feed (#2249) --
     /// Opt-in: subscribe to npm's public replication feed and proactively
     /// invalidate cached computed packuments when packages change upstream,
@@ -1206,6 +1220,8 @@ redacted_debug!(Config {
     redact_option npm_packument_cache_redis_url,
     show npm_attestation_negative_cache_enabled,
     show npm_attestation_negative_cache_ttl_secs,
+    show pypi_simple_cache_ttl_secs,
+    show pypi_simple_cache_max_bytes,
     show npm_upstream_feed_enabled,
     redact npm_upstream_feed_url,
 });
@@ -1343,6 +1359,10 @@ impl Default for Config {
             npm_attestation_negative_cache_enabled: true,
             npm_attestation_negative_cache_ttl_secs:
                 crate::services::npm_attestation_cache::NPM_ATTESTATION_NEGATIVE_TTL_DEFAULT_SECS,
+            pypi_simple_cache_ttl_secs:
+                crate::services::pypi_simple_cache::PYPI_SIMPLE_CACHE_TTL_DEFAULT_SECS,
+            pypi_simple_cache_max_bytes:
+                crate::services::pypi_simple_cache::PYPI_SIMPLE_CACHE_MAX_BYTES,
             npm_upstream_feed_enabled: false,
             npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
                 .into(),
@@ -1775,6 +1795,19 @@ impl Config {
                 "NPM_ATTESTATION_NEGATIVE_CACHE_TTL_SECS",
                 crate::services::npm_attestation_cache::NPM_ATTESTATION_NEGATIVE_TTL_DEFAULT_SECS,
             ),
+            // Strict: unset is 300 seconds, `0` disables, anything else refuses
+            // startup. `env_parse` would swallow a typo and keep the default.
+            pypi_simple_cache_ttl_secs:
+                crate::services::pypi_simple_cache::parse_pypi_simple_cache_ttl(
+                    env::var("PYPI_SIMPLE_CACHE_TTL_SECS").ok().as_deref(),
+                )
+                .map_err(AppError::Config)?,
+            // Same strictness as the TTL. Unset is 64 MiB. `0` stores nothing.
+            pypi_simple_cache_max_bytes:
+                crate::services::pypi_simple_cache::parse_pypi_simple_cache_max_bytes(
+                    env::var("PYPI_SIMPLE_CACHE_MAX_BYTES").ok().as_deref(),
+                )
+                .map_err(AppError::Config)?,
             // Off by default; only an explicit, recognized positive enables
             // the npm replication-feed consumer (#2249).
             npm_upstream_feed_enabled: parse_opt_in_flag(
@@ -5354,8 +5387,8 @@ mod tests {
 
         let workflows = discover_workflow_files(repo_root);
         assert!(
-            workflows.iter().any(|f| f == "docker-publish.yml"),
-            "expected to discover docker-publish.yml among the repo's \
+            workflows.iter().any(|f| f == "ecr-publish.yml"),
+            "expected to discover ecr-publish.yml among the repo's \
              workflows, found: {workflows:?}"
         );
 
@@ -5383,8 +5416,8 @@ mod tests {
         }
 
         assert!(
-            publishers.iter().any(|f| f == "docker-publish.yml"),
-            "docker-publish.yml must be classified as an image publisher, \
+            publishers.iter().any(|f| f == "ecr-publish.yml"),
+            "ecr-publish.yml must be classified as an image publisher, \
              otherwise this guard silently checks nothing. Classified: \
              {publishers:?}"
         );

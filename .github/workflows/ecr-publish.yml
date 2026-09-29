@@ -1,0 +1,182 @@
+name: Publish backend image
+
+# Builds the backend image and pushes it to Adaptive ECR. Feature-branch
+# pushes go to infra-dev only. Pushes to main go to infra-prod only. This
+# workflow does not Helm-deploy; infra-tools pins the digest.
+#
+# The AWS role and login match nexus-cooldown in infra-tools. This repository
+# runs on GitHub-hosted runners: it does not have the infra-tools RunsOn pool.
+# linux/amd64 matches the infra NodePools, which are not dual-arch.
+#
+# The `github-actions` role in each account must trust
+# `repo:august-innovations/artifact-keeper:*`.
+
+on: # yamllint disable-line rule:truthy
+  push:
+    branches:
+      - main
+      - "feature/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: none
+
+concurrency:
+  group: ecr-publish-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  INFRA_DEV_AWS_ACCOUNT_ID: "091974775961"
+  INFRA_PROD_AWS_ACCOUNT_ID: "756418066679"
+  ECR_REPOSITORY: artifact-keeper-fork
+
+jobs:
+  publish:
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      image: ${{ steps.record.outputs.image }}
+      digest: ${{ steps.record.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select registry
+        id: registry
+        shell: bash
+        env:
+          GIT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          # A manual re-run follows the same rule as a push: main is
+          # infra-prod, every other ref is infra-dev.
+          if [ "$GIT_REF" = "refs/heads/main" ]; then
+            target="prod"
+          else
+            target="dev"
+          fi
+          case "$target" in
+            prod)
+              account="$INFRA_PROD_AWS_ACCOUNT_ID"
+              name="infra-prod"
+              ;;
+            dev)
+              account="$INFRA_DEV_AWS_ACCOUNT_ID"
+              name="infra-dev"
+              ;;
+            *)
+              echo "Unknown deploy target: $target" >&2
+              exit 1
+              ;;
+          esac
+          image="${account}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          {
+            echo "account=${account}"
+            echo "name=${name}"
+            echo "image=${image}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Pushing ${image} to ${name}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::${{ steps.registry.outputs.account }}:role/github-actions
+
+      - name: Login to ECR
+        shell: bash
+        env:
+          ACCOUNT: ${{ steps.registry.outputs.account }}
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            if aws ecr get-login-password --region "$AWS_REGION" \
+              | docker login --username AWS --password-stdin "${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"; then
+              exit 0
+            fi
+            if [ "$i" -ne 3 ]; then
+              echo "ECR login failed. Retrying in $((i * 5)) seconds..."
+              sleep $((i * 5))
+            fi
+          done
+          echo "ECR login failed after retries" >&2
+          exit 1
+
+      - name: Check whether this commit is already published
+        id: existing
+        shell: bash
+        env:
+          ACCOUNT: ${{ steps.registry.outputs.account }}
+        run: |
+          set -euo pipefail
+          digest="$(aws ecr describe-images \
+            --region "$AWS_REGION" \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=${GITHUB_SHA}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text 2>/dev/null || true)"
+          if [ -n "$digest" ] && [ "$digest" != "None" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+            echo "Image already published: ${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}@${digest}"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.existing.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and push
+        id: build
+        if: steps.existing.outputs.exists != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.backend
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.registry.outputs.image }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            CARGO_BUILD_JOBS=4
+            CARGO_PROFILE=release
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Record the published digest
+        id: record
+        shell: bash
+        env:
+          IMAGE: ${{ steps.registry.outputs.image }}
+          ALREADY: ${{ steps.existing.outputs.digest }}
+          BUILT: ${{ steps.build.outputs.digest }}
+          REGISTRY_NAME: ${{ steps.registry.outputs.name }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BUILT" ]; then
+            digest="$BUILT"
+          else
+            digest="$ALREADY"
+          fi
+          if [ -z "$digest" ]; then
+            echo "No digest recorded for ${IMAGE}" >&2
+            exit 1
+          fi
+          {
+            echo "image=${IMAGE}"
+            echo "digest=${digest}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Backend image"
+            echo ""
+            echo "- Registry: \`${REGISTRY_NAME}\`"
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Digest: \`${digest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

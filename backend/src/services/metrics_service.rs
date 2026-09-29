@@ -6,6 +6,11 @@
 
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use opentelemetry::KeyValue;
+
+/// `route` label for the PyPI simple-project page cache. Later routes can
+/// reuse the same counter without a new series.
+pub const PYPI_SIMPLE_CACHE_ROUTE: &str = "simple_project";
 
 /// Initialize the Prometheus metrics recorder and return the handle for rendering.
 pub fn init_metrics() -> PrometheusHandle {
@@ -55,6 +60,60 @@ pub fn record_proxy_cache_lookup(repo_key: &str, result: &str) {
         "result" => result.to_string()
     )
     .increment(1);
+}
+
+/// Record one lookup against the in-process PyPI simple-project page cache.
+///
+/// `result` is `hit`, `miss`, `bypass`, or `disabled`. `route` is
+/// [`PYPI_SIMPLE_CACHE_ROUTE`] for the simple-project page. The project name
+/// is not a label: its cardinality is unbounded. The repository label is
+/// bounded by the operator's repo count, matching
+/// [`record_proxy_cache_lookup`].
+///
+/// The same lookup is counted twice, on purpose, on two meters:
+///
+///   * Prometheus `ak_pypi_simple_cache_lookups_total`, which the existing
+///     scrape already collects
+///   * OpenTelemetry `ak.pypi.simple_cache.lookups`, exported on
+///     `OTEL_EXPORTER_OTLP_ENDPOINT` when that variable is set
+///
+/// This is a separate series from [`record_proxy_cache_lookup`]. That counter
+/// is the S3 proxy cache's hit rate for raw upstream bodies. Folding rebuilt
+/// menu lookups into it would change every dashboard that already charts it.
+pub fn record_pypi_simple_cache_lookup(repo_key: &str, result: &str, route: &str) {
+    counter!(
+        "ak_pypi_simple_cache_lookups_total",
+        "repository" => repo_key.to_string(),
+        "result" => result.to_string(),
+        "route" => route.to_string()
+    )
+    .increment(1);
+
+    // One instrument for the process. Created on the first lookup, which is
+    // after `telemetry` has installed the meter provider when
+    // `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Before that the global meter is a
+    // no-op, and this counter stays a no-op for the rest of the process.
+    pypi_simple_cache_lookups().add(
+        1,
+        &[
+            KeyValue::new("repository", repo_key.to_owned()),
+            KeyValue::new("result", result.to_owned()),
+            KeyValue::new("route", route.to_owned()),
+        ],
+    );
+}
+
+fn pypi_simple_cache_lookups() -> opentelemetry::metrics::Counter<u64> {
+    static COUNTER: std::sync::OnceLock<opentelemetry::metrics::Counter<u64>> =
+        std::sync::OnceLock::new();
+    COUNTER
+        .get_or_init(|| {
+            opentelemetry::global::meter("artifact-keeper")
+                .u64_counter("ak.pypi.simple_cache.lookups")
+                .with_description("Lookups against the in-process PyPI simple-project page cache")
+                .build()
+        })
+        .clone()
 }
 
 /// Record a lookup against the npm attestation negative cache (#3764),
@@ -390,6 +449,14 @@ mod tests {
     #[test]
     fn test_record_artifact_download_does_not_panic() {
         record_artifact_download("my-repo", "npm");
+    }
+
+    #[test]
+    fn test_record_pypi_simple_cache_lookup_does_not_panic() {
+        record_pypi_simple_cache_lookup("python", "hit", PYPI_SIMPLE_CACHE_ROUTE);
+        record_pypi_simple_cache_lookup("python", "miss", PYPI_SIMPLE_CACHE_ROUTE);
+        record_pypi_simple_cache_lookup("python", "bypass", PYPI_SIMPLE_CACHE_ROUTE);
+        record_pypi_simple_cache_lookup("python", "disabled", PYPI_SIMPLE_CACHE_ROUTE);
     }
 
     #[test]
