@@ -11949,7 +11949,11 @@ mod tests {
         let mut saw_gzip = false;
         for entry in walkdir::WalkDir::new(&fx.storage_dir) {
             let entry = entry.expect("walk cache dir");
-            if entry.file_name() == "__cache_meta__.json" {
+            // The packument is cached beside the tarball and keeps the
+            // upstream JSON type. Only the `.tgz` sidecar is forced to gzip.
+            if entry.file_name() == "__cache_meta__.json"
+                && entry.path().to_string_lossy().contains(".tgz")
+            {
                 let raw = std::fs::read(entry.path()).expect("read sidecar");
                 let meta: serde_json::Value = serde_json::from_slice(&raw).expect("sidecar json");
                 assert_eq!(meta["content_type"], "application/gzip");
@@ -17271,18 +17275,19 @@ mod content_encoding_forwarding_tests {
             .unwrap_or(src);
 
         let call_sites = body.matches("build_tarball_response_stream(").count();
-        // 5 serves + the `fn` definition itself.
+        // 6 serves (warm remote hit, cold remote miss, virtual, virtual-LKG,
+        // hosted, scan-pending) + the `fn` definition itself.
         assert_eq!(
-            call_sites, 6,
+            call_sites, 7,
             "npm tarball call-site count changed; re-check each new arm \
              forwards content_encoding (#3149)",
         );
         let forwarding = body.matches(".content_encoding,").count();
         assert_eq!(
-            forwarding, 4,
-            "every proxied npm tarball arm (remote, virtual, virtual-LKG, \
-             scan-pending) must pass the fetch result's content_encoding; \
-             only the hosted arm passes None (#3149)",
+            forwarding, 5,
+            "every proxied npm tarball arm (warm remote hit, cold remote \
+             miss, virtual, virtual-LKG, scan-pending) must pass the fetch \
+             result's content_encoding; only the hosted arm passes None (#3149)",
         );
     }
 }
