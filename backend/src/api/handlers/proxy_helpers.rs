@@ -250,6 +250,60 @@ pub async fn resolve_repo_by_key(
     })
 }
 
+/// Resolve a repository from the in-process [`crate::api::RepoCache`] when the
+/// entry is fresh, otherwise from [`resolve_repo_by_key`].
+///
+/// `repo_visibility_middleware` fills the cache before handlers run, so a warm
+/// request spends no database round-trip on repository identity. A miss or an
+/// entry older than [`crate::api::REPO_CACHE_TTL_SECS`] falls through to the
+/// database lookup and deliberately does not write the cache: a handler-built
+/// entry would omit visibility and could lie to the middleware. A fresh entry
+/// whose format is outside `expected_formats` is a 400 and also does not touch
+/// the database.
+#[allow(clippy::result_large_err)]
+pub async fn resolve_repo_from_cache(
+    db: &PgPool,
+    repo_key: &str,
+    repo_cache: &crate::api::RepoCache,
+    expected_formats: &[&str],
+    format_label: &str,
+) -> Result<RepoInfo, Response> {
+    {
+        let cache = repo_cache.read().await;
+        if let Some((entry, at)) = cache.get(repo_key) {
+            if at.elapsed().as_secs() < crate::api::REPO_CACHE_TTL_SECS {
+                let fmt_lower = entry.format.to_lowercase();
+                if !expected_formats.iter().any(|f| *f == fmt_lower) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Repository '{}' is not {} repository (format: {})",
+                            repo_key, format_label, entry.format
+                        ),
+                    )
+                        .into_response());
+                }
+                return Ok(RepoInfo {
+                    id: entry.id,
+                    key: repo_key.to_string(),
+                    storage_path: entry.storage_path.clone(),
+                    storage_backend: entry.storage_backend.clone(),
+                    repo_type: entry.repo_type.clone(),
+                    format: entry.format.clone(),
+                    upstream_url: entry.upstream_url.clone(),
+                    promotion_only: entry.promotion_only,
+                    age_gate_enabled: entry.age_gate_enabled,
+                    age_gate_min_age_days: entry.age_gate_min_age_days,
+                    age_gate_mode: entry.age_gate_mode.clone(),
+                    curation_enabled: entry.curation_enabled,
+                    curation_default_action: entry.curation_default_action.clone(),
+                });
+            }
+        }
+    }
+    resolve_repo_by_key(db, repo_key, expected_formats, format_label).await
+}
+
 /// Map an error to a 500 Internal Server Error plain-text response.
 ///
 /// The `label` is prepended to the error message (e.g. "Storage", "Database").

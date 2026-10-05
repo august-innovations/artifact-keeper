@@ -284,10 +284,15 @@ struct SimpleProjectArtifact {
 // Repository resolution
 // ---------------------------------------------------------------------------
 
-async fn resolve_pypi_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    proxy_helpers::resolve_repo_by_key(
+async fn resolve_pypi_repo(
+    db: &PgPool,
+    repo_key: &str,
+    repo_cache: &crate::api::RepoCache,
+) -> Result<RepoInfo, Response> {
+    proxy_helpers::resolve_repo_from_cache(
         db,
         repo_key,
+        repo_cache,
         &["pypi", "poetry", "conda", "jupyter"],
         "a PyPI",
     )
@@ -381,7 +386,7 @@ async fn simple_root(
     Path(repo_key): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
-    let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
+    let repo = resolve_pypi_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
     // Get all distinct package names in this repository, then normalize
     // them in Rust per PEP 503 (the SQL REPLACE chain is only approximate).
@@ -868,7 +873,7 @@ async fn simple_project(
     Path((repo_key, project)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
-    let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
+    let repo = resolve_pypi_repo(&state.db, &repo_key, &state.repo_cache).await?;
     // PEP 508 validation FIRST (#3186), before the curation gate, the local
     // lookup and any upstream fetch. An invalid segment is not a project name,
     // so there is nothing to gate and nothing to fetch.
@@ -1872,7 +1877,7 @@ async fn download_or_metadata(
     Path((repo_key, project, filename)): Path<(String, String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
+    let repo = resolve_pypi_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
     // Curation gate (#2912): a blocked package must never serve any version,
     // whether via PEP 658 metadata or a regular file download, so this runs before
@@ -5347,7 +5352,7 @@ async fn serve_legacy_json(
     version: Option<&str>,
     headers: &HeaderMap,
 ) -> Result<Response, Response> {
-    let repo = resolve_pypi_repo(&state.db, repo_key).await?;
+    let repo = resolve_pypi_repo(&state.db, repo_key, &state.repo_cache).await?;
     // PEP 508 validation first (#3186), then the curation gate, before any
     // lookup or upstream fetch — the same order as `simple_project`.
     let normalized = parse_project_segment(project)?;
@@ -6217,7 +6222,7 @@ async fn xmlrpc(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
+    let repo = resolve_pypi_repo(&state.db, &repo_key, &state.repo_cache).await?;
     let call = match parse_xmlrpc_call(&body) {
         Ok(call) => call,
         Err(fault) => return Ok(xmlrpc_fault_response(&fault)),
@@ -6286,7 +6291,7 @@ async fn upload(
     // Authenticate
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "pypi", "write:artifacts")?.user_id;
-    let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
+    let repo = resolve_pypi_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
     // Reject writes to remote/virtual repos
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -7984,6 +7989,122 @@ mod tests {
     use crate::api::handlers::cache_headers::{DEFAULT_CACHE_CONTROL, PRIVATE_CACHE_CONTROL};
     use crate::api::handlers::proxy_helpers::scan_blocked_response;
     use sha2::{Digest, Sha256};
+
+    fn cached_pypi_repo(repo_id: uuid::Uuid, format: &str) -> crate::api::CachedRepo {
+        crate::api::CachedRepo {
+            id: repo_id,
+            format: format.to_string(),
+            repo_type: "remote".to_string(),
+            upstream_url: Some("https://pypi.org".to_string()),
+            storage_path: "/cache/pypi".to_string(),
+            storage_backend: "filesystem".to_string(),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
+            index_upstream_url: None,
+            promotion_only: true,
+            age_gate_enabled: true,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: true,
+            curation_default_action: "block".to_string(),
+        }
+    }
+
+    async fn seeded_repo_cache(key: &str, entry: crate::api::CachedRepo) -> crate::api::RepoCache {
+        let cache = crate::api::RepoCache::default();
+        cache
+            .write()
+            .await
+            .insert(key.to_string(), (entry, std::time::Instant::now()));
+        cache
+    }
+
+    #[tokio::test]
+    async fn test_resolve_pypi_repo_cache_hit_never_touches_db() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").expect("lazy pool");
+        let cache =
+            seeded_repo_cache("pypi-proxy", cached_pypi_repo(uuid::Uuid::new_v4(), "pypi")).await;
+        let repo_id = cache.read().await.get("pypi-proxy").unwrap().0.id;
+        let repo = resolve_pypi_repo(&pool, "pypi-proxy", &cache)
+            .await
+            .expect("a fresh cache entry must resolve without the DB");
+        assert_eq!(repo.id, repo_id);
+        assert!(repo.age_gate_enabled);
+        assert_eq!(repo.age_gate_min_age_days, 7);
+        assert!(repo.curation_enabled);
+        assert_eq!(repo.curation_default_action, "block");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_pypi_repo_cache_accepts_alias_formats() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").expect("lazy pool");
+        for format in ["poetry", "conda", "jupyter"] {
+            let cache =
+                seeded_repo_cache("alias", cached_pypi_repo(uuid::Uuid::new_v4(), format)).await;
+            let repo = resolve_pypi_repo(&pool, "alias", &cache)
+                .await
+                .unwrap_or_else(|_| panic!("{format} must resolve on the PyPI surface"));
+            assert_eq!(repo.format, format);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_pypi_repo_cache_rejects_wrong_format() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").expect("lazy pool");
+        let cache = seeded_repo_cache("npm", cached_pypi_repo(uuid::Uuid::new_v4(), "npm")).await;
+        let err = resolve_pypi_repo(&pool, "npm", &cache)
+            .await
+            .err()
+            .expect("a non-PyPI entry must be rejected");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_pypi_repo_empty_cache_uses_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let cache = crate::api::RepoCache::default();
+        let repo = resolve_pypi_repo(&pool, &repo_key, &cache)
+            .await
+            .expect("an empty cache falls through to the database");
+        assert_eq!(repo.id, repo_id);
+        assert!(
+            cache.read().await.is_empty(),
+            "the handler must not fill the cache"
+        );
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::nil()).await;
+    }
+
+    #[tokio::test]
+    async fn test_resolve_pypi_repo_stale_entry_falls_back_to_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let cache = crate::api::RepoCache::default();
+        let mut entry = cached_pypi_repo(uuid::Uuid::new_v4(), "pypi");
+        entry.upstream_url = Some("https://stale.example.invalid/".to_string());
+        cache.write().await.insert(
+            repo_key.clone(),
+            (
+                entry,
+                std::time::Instant::now()
+                    - std::time::Duration::from_secs(crate::api::REPO_CACHE_TTL_SECS + 1),
+            ),
+        );
+        let repo = resolve_pypi_repo(&pool, &repo_key, &cache)
+            .await
+            .expect("a stale entry falls through to the database");
+        assert_eq!(repo.id, repo_id);
+        assert_ne!(
+            repo.upstream_url.as_deref(),
+            Some("https://stale.example.invalid/")
+        );
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::nil()).await;
+    }
 
     /// #3290: the sibling mapping between the two content-negotiated cache
     /// paths of a Simple project index, in both directions — and `None` for

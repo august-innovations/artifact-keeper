@@ -1933,6 +1933,7 @@ impl RepositoryService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        self.publish_virtual_layout_change().await;
         Ok(resolved_priority)
     }
 
@@ -2007,6 +2008,7 @@ impl RepositoryService {
             ));
         }
 
+        self.publish_virtual_layout_change().await;
         Ok(())
     }
 
@@ -2076,7 +2078,13 @@ impl RepositoryService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        self.publish_virtual_layout_change().await;
         Ok(updated)
+    }
+
+    async fn publish_virtual_layout_change(&self) {
+        crate::api::handlers::npm::invalidate_npm_virtual_layout_cache().await;
+        crate::services::cache_invalidation::notify_npm_virtual_layout_changed(&self.db).await;
     }
 
     /// Get virtual repository members
@@ -2500,6 +2508,10 @@ impl RepositoryService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // PUT /members replaces the whole set. The other membership writes
+        // already drop the npm virtual-layout cache; this path has to as well
+        // or a warm tarball keeps the previous members for up to 180 seconds.
+        self.publish_virtual_layout_change().await;
         Ok(())
     }
 

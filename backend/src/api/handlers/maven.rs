@@ -244,8 +244,8 @@ pub fn router() -> Router<SharedState> {
 /// The cached entry carries the full enforcement surface (`promotion_only`,
 /// `age_gate_*`, `curation_*`), so a cache-served [`RepoInfo`] is the same
 /// snapshot the DB lookup would have produced; writes to those columns evict
-/// the entry via the migration-239 trigger, with the 60-second TTL as the
-/// fallback bound. A cache miss falls back to the DB lookup. The fallback
+/// the entry via the migration-239 trigger, with [`crate::api::REPO_CACHE_TTL_SECS`]
+/// as the fallback bound. A cache miss falls back to the DB lookup. The fallback
 /// deliberately does NOT populate the cache: it only runs when the
 /// middleware was bypassed (tests), and `resolve_repo_by_key` does not
 /// select `is_public` — a handler-populated entry without it would be a
@@ -255,40 +255,14 @@ async fn resolve_maven_repo(
     repo_key: &str,
     repo_cache: &crate::api::RepoCache,
 ) -> Result<RepoInfo, Response> {
-    {
-        let cache = repo_cache.read().await;
-        if let Some((entry, at)) = cache.get(repo_key) {
-            if at.elapsed().as_secs() < crate::api::REPO_CACHE_TTL_SECS {
-                let fmt_lower = entry.format.to_lowercase();
-                if fmt_lower != "maven" && fmt_lower != "gradle" {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "Repository '{}' is not a Maven repository (format: {})",
-                            repo_key, entry.format
-                        ),
-                    )
-                        .into_response());
-                }
-                return Ok(RepoInfo {
-                    id: entry.id,
-                    key: repo_key.to_string(),
-                    storage_path: entry.storage_path.clone(),
-                    storage_backend: entry.storage_backend.clone(),
-                    repo_type: entry.repo_type.clone(),
-                    format: entry.format.clone(),
-                    upstream_url: entry.upstream_url.clone(),
-                    promotion_only: entry.promotion_only,
-                    age_gate_enabled: entry.age_gate_enabled,
-                    age_gate_min_age_days: entry.age_gate_min_age_days,
-                    age_gate_mode: entry.age_gate_mode.clone(),
-                    curation_enabled: entry.curation_enabled,
-                    curation_default_action: entry.curation_default_action.clone(),
-                });
-            }
-        }
-    }
-    proxy_helpers::resolve_repo_by_key(db, repo_key, &["maven", "gradle"], "a Maven").await
+    proxy_helpers::resolve_repo_from_cache(
+        db,
+        repo_key,
+        repo_cache,
+        &["maven", "gradle"],
+        "a Maven",
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -4117,8 +4091,8 @@ mod tests {
         };
         let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "maven").await;
 
-        // An expired cache entry (inserted 2 minutes ago, TTL is 60s) must
-        // not be served — the resolver falls back to the DB row.
+        // An entry older than the shared TTL must not be served — the
+        // resolver falls back to the DB row.
         let cache = crate::api::RepoCache::default();
         let mut entry = cached_maven_repo_entry(uuid::Uuid::new_v4(), "maven");
         entry.upstream_url = Some("https://stale.example.invalid/".to_string());
@@ -4126,7 +4100,8 @@ mod tests {
             repo_key.clone(),
             (
                 entry,
-                std::time::Instant::now() - std::time::Duration::from_secs(120),
+                std::time::Instant::now()
+                    - std::time::Duration::from_secs(crate::api::REPO_CACHE_TTL_SECS + 1),
             ),
         );
 

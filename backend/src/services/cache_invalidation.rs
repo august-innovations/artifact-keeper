@@ -96,6 +96,12 @@ pub enum InvalidationEvent {
         repo_keys: Vec<String>,
         package: String,
     },
+    /// Virtual membership or an npm scope policy changed. The payload carries
+    /// no ids: both caches are small and the write is rare, so every replica
+    /// drops the whole map. Emitted application-side, not by a SQL trigger.
+    /// A missed notification converges when [`crate::api::handlers::npm`]
+    /// entries pass their TTL.
+    NpmVirtualLayoutChanged,
 }
 
 /// Versioned wrapper matching the exact JSON the triggers emit.
@@ -171,6 +177,9 @@ pub async fn apply_invalidation_event(
                 }
             }
         }
+        InvalidationEvent::NpmVirtualLayoutChanged => {
+            crate::api::handlers::npm::invalidate_npm_virtual_layout_cache().await;
+        }
     }
 }
 
@@ -188,6 +197,7 @@ pub async fn conservative_flush_all(handles: &CacheInvalidationHandles) {
     handles.repo_cache.write().await.clear();
     handles.repo_miss_cache.write().await.clear();
     handles.permission_service.invalidate_cache();
+    crate::api::handlers::npm::invalidate_npm_virtual_layout_cache().await;
     counter!("ak_cache_invalidation_conservative_flushes_total").increment(1);
     tracing::info!(
         flushed_token_entries,
@@ -321,6 +331,30 @@ pub fn npm_packument_invalidation_payloads(repo_keys: &[String], package: &str) 
 /// the local invalidation the caller already performed stands, and other
 /// replicas converge through stale-while-revalidate within their TTL bounds
 /// (the pre-#2490 behavior).
+/// Tell every listening replica to drop its virtual-membership and npm
+/// scope-policy caches. Best-effort: the caller has already cleared its own
+/// copy, and a failed notify still converges through the 180-second TTL.
+pub async fn notify_npm_virtual_layout_changed(pool: &PgPool) {
+    let payload = serde_json::to_string(&InvalidationEnvelope {
+        v: CACHE_INVALIDATION_VERSION,
+        event: InvalidationEvent::NpmVirtualLayoutChanged,
+    })
+    .expect("npm virtual layout invalidation envelope must serialize");
+    if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(CACHE_INVALIDATION_CHANNEL)
+        .bind(&payload)
+        .execute(pool)
+        .await
+    {
+        counter!("ak_cache_invalidation_notify_errors_total").increment(1);
+        tracing::warn!(
+            error = %e,
+            "failed to publish npm virtual layout invalidation; \
+             other replicas converge via TTL"
+        );
+    }
+}
+
 pub async fn notify_npm_packument_invalidated(pool: &PgPool, repo_keys: &[String], package: &str) {
     for payload in npm_packument_invalidation_payloads(repo_keys, package) {
         if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
@@ -559,6 +593,7 @@ mod tests {
                 repo_keys: vec!["npm-local".to_string(), "npm-virtual".to_string()],
                 package: "@acme/webapp".to_string(),
             },
+            InvalidationEvent::NpmVirtualLayoutChanged,
         ];
         for event in events {
             let payload = serde_json::to_string(&InvalidationEnvelope {
