@@ -1871,6 +1871,11 @@ fn merge_local_into_remote_simple_html(
 // GET /pypi/{repo_key}/simple/{project}/{filename} — Download or metadata
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "pypi.download",
+    skip_all,
+    fields(repo = %repo_key, project = %project)
+)]
 async fn download_or_metadata(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,

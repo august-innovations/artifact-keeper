@@ -569,6 +569,7 @@ impl PackumentScope {
 /// serve immediately while one background task refreshes the entry. Misses
 /// compute inline under single-flight, so a burst on one packument costs one
 /// upstream fetch.
+#[tracing::instrument(name = "npm.packument", skip_all, fields(repo = %repo_key, package = %package_name))]
 async fn get_package_metadata_cached(
     state: &SharedState,
     auth: Option<&AuthExtension>,
@@ -2263,6 +2264,7 @@ async fn attestation_cached_meta_fetch(
 /// Without this route, the `/:package/:version` catch-all previously matched
 /// `/-/ping` with `package="-"` and `version="ping"`, producing a confusing
 /// 404 ("Version 'ping' not found for package '-'"). See the linked issue.
+#[tracing::instrument(name = "npm.meta", skip_all, fields(repo = %repo_key, endpoint = %rest))]
 async fn npm_meta_get(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -3083,6 +3085,7 @@ fn layout_cache_fresh(at: Instant) -> bool {
     at.elapsed().as_secs() < NPM_VIRTUAL_LAYOUT_TTL_SECS
 }
 
+#[tracing::instrument(name = "npm.scope_policy", skip_all, fields(repo_id = %repo_id))]
 async fn cached_npm_scope_policy(
     db: &PgPool,
     repo_id: uuid::Uuid,
@@ -3103,6 +3106,7 @@ async fn cached_npm_scope_policy(
     Ok(policy)
 }
 
+#[tracing::instrument(name = "npm.virtual_layout", skip_all, fields(repo_id = %virtual_repo_id))]
 async fn npm_virtual_layout(
     db: &PgPool,
     virtual_repo_id: uuid::Uuid,
@@ -3926,6 +3930,11 @@ fn npm_lkg_redirect(
     (lkg_path, lkg_filename)
 }
 
+#[tracing::instrument(
+    name = "npm.publish_time",
+    skip_all,
+    fields(repo = %repo.key, package = %package_name, version = %version)
+)]
 async fn npm_publish_time_for_version(
     state: &SharedState,
     repo: &RepoInfo,
@@ -3964,6 +3973,11 @@ async fn npm_publish_time_for_version(
     None
 }
 
+#[tracing::instrument(
+    name = "npm.age_gate",
+    skip_all,
+    fields(repo = %repo.key, package = %package_name)
+)]
 async fn apply_npm_download_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
@@ -4111,6 +4125,7 @@ fn rewrite_and_respond_inner(
 // GET tarball download handlers
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(name = "npm.tarball", skip_all, fields(repo = %repo_key, package = %package))]
 async fn download_tarball(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -4122,6 +4137,11 @@ async fn download_tarball(
     serve_tarball(&state, auth.as_ref(), &repo_key, &package, &filename, &ctx).await
 }
 
+#[tracing::instrument(
+    name = "npm.tarball",
+    skip_all,
+    fields(repo = %repo_key, package = %package, scope = %scope)
+)]
 async fn download_scoped_tarball(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -4244,6 +4264,11 @@ enum NpmVirtualOwnership {
 ///   priority-aware (`OwnedAtPriority` / `NotOwned`);
 /// - it does not: the name-only fail-safe (`OwnedNameOnly` / `NotOwned`);
 /// - the name fails `is_valid_npm_name`: the check is skipped (`NotOwned`).
+#[tracing::instrument(
+    name = "npm.virtual_ownership",
+    skip_all,
+    fields(repo_id = %virtual_repo_id, package = %package_name)
+)]
 async fn resolve_npm_virtual_ownership(
     db: &PgPool,
     virtual_repo_id: uuid::Uuid,
@@ -4312,6 +4337,11 @@ fn remote_member_outranked_by_owner(owner_min_priority: i32, remote_priority: Op
     owner_min_priority < remote_priority.unwrap_or(i32::MAX)
 }
 
+#[tracing::instrument(
+    name = "npm.serve_tarball",
+    skip_all,
+    fields(repo = %repo_key, package = %package_name)
+)]
 async fn serve_tarball(
     state: &SharedState,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
