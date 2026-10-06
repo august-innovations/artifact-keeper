@@ -3941,6 +3941,11 @@ async fn npm_publish_time_for_version(
     package_name: &str,
     version: &str,
 ) -> Option<chrono::DateTime<Utc>> {
+    if let Some(cached) = crate::services::upstream_metadata::npm_publish_time_cache()
+        .npm_publish_time(repo.id, package_name, version)
+    {
+        return Some(cached);
+    }
     if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
         let encoded_name = encode_package_name_for_upstream(package_name);
         // Capped like every other buffered packument read (#2181): this runs
@@ -3966,6 +3971,8 @@ async fn npm_publish_time_for_version(
         {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&content) {
                 let times = UpstreamMetadataCache::parse_npm_publish_times(&json);
+                crate::services::upstream_metadata::npm_publish_time_cache()
+                    .store_npm_publish_times(repo.id, package_name, times.clone());
                 return times.get(version).copied();
             }
         }

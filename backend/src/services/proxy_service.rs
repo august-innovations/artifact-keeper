@@ -2757,9 +2757,26 @@ impl UpstreamClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        let content_length = response.content_length();
+        if crate::services::metadata_budget::upstream_length_exceeds_cap(content_length) {
+            tracing::warn!(
+                "Upstream metadata body from {} advertised {} bytes, over the {}-byte ceiling; refusing before buffering",
+                redact_url_for_diagnostics(url),
+                content_length.unwrap_or(0),
+                max
+            );
+            return Err(AppError::BadGateway(format!(
+                "Upstream metadata response exceeded the {}-byte limit",
+                max
+            )));
+        }
+        crate::services::metadata_budget::reserve_upstream_body(content_length).await;
+        let read_cap = crate::services::metadata_budget::active_read_cap().unwrap_or(max);
+
         // Running-bounded accumulation: pull one body frame at a time and
-        // reject the moment the total would exceed `max`. No un-bounded
-        // full-body read (`response.bytes()`) is ever issued.
+        // reject the moment the total would exceed `read_cap`. No un-bounded
+        // full-body read (`response.bytes()`) is ever issued. A budgeted read
+        // sets `read_cap` to the permits it already holds.
         let mut stream = response.bytes_stream();
         let mut buf = bytes::BytesMut::new();
         while let Some(chunk) = stream.next().await {
@@ -2769,11 +2786,11 @@ impl UpstreamClient {
                     e.without_url()
                 ))
             })?;
-            if buf.len().saturating_add(chunk.len()) > max {
+            if buf.len().saturating_add(chunk.len()) > read_cap {
                 tracing::warn!(
                     "Upstream metadata body from {} exceeded the {}-byte ceiling; aborting buffered read",
                     redact_url_for_diagnostics(url),
-                    max
+                    read_cap
                 );
                 return Err(AppError::BadGateway(format!(
                     "Upstream metadata response exceeded the {}-byte limit",
@@ -2783,6 +2800,11 @@ impl UpstreamClient {
             buf.extend_from_slice(&chunk);
         }
         let content = buf.freeze();
+        if !crate::services::metadata_budget::settle(content.len()) {
+            return Err(AppError::ServiceUnavailable(
+                "Buffered metadata budget is saturated; retry shortly".to_string(),
+            ));
+        }
 
         tracing::info!(
             "Fetched {} bytes from upstream (content_type: {:?}, etag: {:?}, link: {:?})",
@@ -6394,7 +6416,7 @@ impl ProxyService {
         metadata_key: &str,
         preloaded_metadata: Option<CacheMetadata>,
     ) -> Result<Option<CachedBody>> {
-        self.get_cached(cache_key, metadata_key, false, preloaded_metadata)
+        self.read_cached_body_under_budget(cache_key, metadata_key, false, preloaded_metadata)
             .await
     }
 
@@ -7146,8 +7168,54 @@ impl ProxyService {
         metadata_key: &str,
         preloaded_metadata: Option<CacheMetadata>,
     ) -> Result<Option<CachedBody>> {
-        self.get_cached(cache_key, metadata_key, true, preloaded_metadata)
+        self.read_cached_body_under_budget(cache_key, metadata_key, true, preloaded_metadata)
             .await
+    }
+
+    /// Buffered cache read that reserves the metadata budget *before* the body
+    /// allocation when this task is inside a budgeted fetch.
+    ///
+    /// A sidecar `size_bytes` is the known length: the reservation is that
+    /// length plus overhead, then the body is read. No sidecar and an inactive
+    /// session keep the historical read. A body that comes back with no prior
+    /// size is reserved after the read, which is the only order possible when
+    /// the length was not known; the hot path always has the sidecar.
+    async fn read_cached_body_under_budget(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+        allow_stale: bool,
+        preloaded_metadata: Option<CacheMetadata>,
+    ) -> Result<Option<CachedBody>> {
+        let metadata =
+            if preloaded_metadata.is_none() && crate::services::metadata_budget::session_active() {
+                self.load_cache_metadata(metadata_key).await.unwrap_or(None)
+            } else {
+                preloaded_metadata
+            };
+        let known = metadata
+            .as_ref()
+            .and_then(|meta| u64::try_from(meta.size_bytes).ok());
+        if let Some(len) = known {
+            crate::services::metadata_budget::reserve_known_body(len).await;
+        }
+        let body = self
+            .get_cached(cache_key, metadata_key, allow_stale, metadata)
+            .await?;
+        if let Some((content, _, _)) = &body {
+            if known.is_none() {
+                crate::services::metadata_budget::reserve_known_body(content.len() as u64).await;
+            }
+            if !crate::services::metadata_budget::settle(content.len()) {
+                crate::services::metadata_budget::release();
+                return Err(AppError::ServiceUnavailable(
+                    "Buffered metadata budget is saturated; retry shortly".to_string(),
+                ));
+            }
+        } else {
+            crate::services::metadata_budget::release();
+        }
+        Ok(body)
     }
 
     /// Check if upstream ETag has changed (returns true if changed/newer).
