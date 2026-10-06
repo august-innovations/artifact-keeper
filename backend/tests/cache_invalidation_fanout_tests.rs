@@ -641,7 +641,7 @@ async fn repo_visibility_flip_on_another_replica_evicts_local_repo_cache() {
         .await
         .expect("visibility flip failed");
 
-    // Well under REPO_CACHE_TTL_SECS (60 s): TTL expiry cannot explain this.
+    // Well under REPO_CACHE_TTL_SECS (180 s): TTL expiry cannot explain this.
     wait_until(
         "repo cache eviction after visibility flip",
         Duration::from_secs(10),
@@ -686,7 +686,7 @@ async fn repository_create_on_another_replica_evicts_a_local_negative_cache_entr
     let repo_id = insert_repo(&pool, &key, false).await;
     notify_repository_created(&pool, &key).await;
 
-    // Well under REPO_CACHE_TTL_SECS (60 s): TTL expiry cannot explain this.
+    // Well under REPO_CACHE_TTL_SECS (180 s): TTL expiry cannot explain this.
     wait_until(
         "negative cache eviction after repository create",
         Duration::from_secs(10),

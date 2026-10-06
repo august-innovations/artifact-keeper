@@ -25,9 +25,13 @@ use axum::Extension;
 use axum::Router;
 use base64::Engine;
 use bytes::Bytes;
+use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::RwLock;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
 use tracing::{debug, info};
@@ -565,6 +569,7 @@ impl PackumentScope {
 /// serve immediately while one background task refreshes the entry. Misses
 /// compute inline under single-flight, so a burst on one packument costs one
 /// upstream fetch.
+#[tracing::instrument(name = "npm.packument", skip_all, fields(repo = %repo_key, package = %package_name))]
 async fn get_package_metadata_cached(
     state: &SharedState,
     auth: Option<&AuthExtension>,
@@ -576,7 +581,7 @@ async fn get_package_metadata_cached(
     let want_abbreviated = wants_abbreviated_metadata(headers);
     // One indexed lookup to classify the repo before consulting the cache;
     // its cost is negligible next to the upstream round-trip a hit saves.
-    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+    let repo = resolve_npm_repo(&state.db, repo_key, &state.repo_cache).await?;
     let cache_eligible = packument_cache_eligible(
         repo.repo_type.as_str(),
         age_gate_bypasses_packument_cache(state, &repo).await,
@@ -1344,9 +1349,19 @@ async fn resolve_npm_tarball_upstream(
 // Repository resolution
 // ---------------------------------------------------------------------------
 
-async fn resolve_npm_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    proxy_helpers::resolve_repo_by_key(db, repo_key, &["npm", "yarn", "pnpm", "bower"], "an npm")
-        .await
+async fn resolve_npm_repo(
+    db: &PgPool,
+    repo_key: &str,
+    repo_cache: &crate::api::RepoCache,
+) -> Result<RepoInfo, Response> {
+    proxy_helpers::resolve_repo_from_cache(
+        db,
+        repo_key,
+        repo_cache,
+        &["npm", "yarn", "pnpm", "bower"],
+        "an npm",
+    )
+    .await
 }
 
 /// Resolve the repository an npm WRITE (publish / dist-tag change) addressed
@@ -1366,7 +1381,7 @@ async fn resolve_npm_write_target(
     auth: Option<&AuthExtension>,
     repo_key: &str,
 ) -> Result<RepoInfo, Response> {
-    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+    let repo = resolve_npm_repo(&state.db, repo_key, &state.repo_cache).await?;
     if repo.repo_type != RepositoryType::Virtual {
         proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
         return Ok(repo);
@@ -2249,13 +2264,14 @@ async fn attestation_cached_meta_fetch(
 /// Without this route, the `/:package/:version` catch-all previously matched
 /// `/-/ping` with `package="-"` and `version="ping"`, producing a confusing
 /// 404 ("Version 'ping' not found for package '-'"). See the linked issue.
+#[tracing::instrument(name = "npm.meta", skip_all, fields(repo = %repo_key, endpoint = %rest))]
 async fn npm_meta_get(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, rest)): Path<(String, String)>,
     raw_query: axum::extract::RawQuery,
 ) -> Result<Response, Response> {
-    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+    let repo = resolve_npm_repo(&state.db, &repo_key, &state.repo_cache).await?;
     let query = raw_query.0;
 
     // Remote: proxy the whole request to upstream, filtered by this repo's own
@@ -2371,7 +2387,7 @@ async fn security_advisories_bulk(
     const PATH: &str = "/-/npm/v1/security/advisories/bulk";
     // npm gzips this POST; decode before anything inspects or forwards it (#3644).
     let body = decode_audit_request_body(&headers, body)?;
-    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+    let repo = resolve_npm_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
@@ -2425,7 +2441,7 @@ async fn security_audits_quick(
     const PATH: &str = "/-/npm/v1/security/audits/quick";
     // npm gzips this POST; decode before anything inspects or forwards it (#3644).
     let body = decode_audit_request_body(&headers, body)?;
-    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+    let repo = resolve_npm_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
@@ -3039,6 +3055,89 @@ pub(crate) async fn fetch_npm_scope_policy(
         .unwrap_or_default())
 }
 
+/// How long a virtual membership map and an npm scope policy stay in memory.
+/// An admin edit drops them immediately; this is the fallback when that
+/// notification is missed.
+const NPM_VIRTUAL_LAYOUT_TTL_SECS: u64 = 180;
+
+#[derive(Clone)]
+struct NpmVirtualLayout {
+    members: Vec<crate::models::repository::Repository>,
+    priorities: HashMap<uuid::Uuid, i32>,
+    policies: HashMap<uuid::Uuid, NpmScopePolicy>,
+}
+
+static NPM_VIRTUAL_LAYOUTS: Lazy<RwLock<HashMap<uuid::Uuid, (NpmVirtualLayout, Instant)>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+static NPM_SCOPE_POLICIES: Lazy<RwLock<HashMap<uuid::Uuid, (NpmScopePolicy, Instant)>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Drop every cached virtual membership map and npm scope policy. Called on
+/// the replica that handled the write, when a notification arrives, and when
+/// the invalidation listener reconnects.
+pub async fn invalidate_npm_virtual_layout_cache() {
+    NPM_VIRTUAL_LAYOUTS.write().await.clear();
+    NPM_SCOPE_POLICIES.write().await.clear();
+}
+
+fn layout_cache_fresh(at: Instant) -> bool {
+    at.elapsed().as_secs() < NPM_VIRTUAL_LAYOUT_TTL_SECS
+}
+
+#[tracing::instrument(name = "npm.scope_policy", skip_all, fields(repo_id = %repo_id))]
+async fn cached_npm_scope_policy(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+) -> Result<NpmScopePolicy, AppError> {
+    {
+        let cache = NPM_SCOPE_POLICIES.read().await;
+        if let Some((policy, at)) = cache.get(&repo_id) {
+            if layout_cache_fresh(*at) {
+                return Ok(policy.clone());
+            }
+        }
+    }
+    let policy = fetch_npm_scope_policy(db, repo_id).await?;
+    NPM_SCOPE_POLICIES
+        .write()
+        .await
+        .insert(repo_id, (policy.clone(), Instant::now()));
+    Ok(policy)
+}
+
+#[tracing::instrument(name = "npm.virtual_layout", skip_all, fields(repo_id = %virtual_repo_id))]
+async fn npm_virtual_layout(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+) -> Result<NpmVirtualLayout, Response> {
+    {
+        let cache = NPM_VIRTUAL_LAYOUTS.read().await;
+        if let Some((layout, at)) = cache.get(&virtual_repo_id) {
+            if layout_cache_fresh(*at) {
+                return Ok(layout.clone());
+            }
+        }
+    }
+    let expansion = proxy_helpers::fetch_virtual_expansion(db, virtual_repo_id).await?;
+    let priorities = proxy_helpers::virtual_member_ranks(&expansion.members);
+    let members: Vec<_> = expansion.members.into_iter().map(|m| m.repo).collect();
+    let member_ids: Vec<_> = members.iter().map(|m| m.id).collect();
+    let policies = fetch_npm_scope_policies(db, &member_ids)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let layout = NpmVirtualLayout {
+        members,
+        priorities,
+        policies,
+    };
+    NPM_VIRTUAL_LAYOUTS
+        .write()
+        .await
+        .insert(virtual_repo_id, (layout.clone(), Instant::now()));
+    Ok(layout)
+}
+
 /// Whether a virtual-repo member may serve as a candidate for
 /// `package_name`. Only Remote members are subject to the scope policy;
 /// Local/Staging members (and members with no stored policy) are always
@@ -3067,7 +3166,7 @@ async fn get_package_metadata(
     base_url: &str,
     want_abbreviated: bool,
 ) -> Result<Response, Response> {
-    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+    let repo = resolve_npm_repo(&state.db, repo_key, &state.repo_cache).await?;
 
     // For remote repos, always proxy metadata from upstream. Cached tarball
     // artifacts do not contain enough information to reconstruct the full
@@ -3168,7 +3267,7 @@ async fn get_package_version_metadata(
     version: &str,
     base_url: &str,
 ) -> Result<Response, Response> {
-    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+    let repo = resolve_npm_repo(&state.db, repo_key, &state.repo_cache).await?;
 
     // Build or fetch the full packument as a JSON value.
     let packument: serde_json::Value = if repo.repo_type == RepositoryType::Remote {
@@ -3831,12 +3930,22 @@ fn npm_lkg_redirect(
     (lkg_path, lkg_filename)
 }
 
+#[tracing::instrument(
+    name = "npm.publish_time",
+    skip_all,
+    fields(repo = %repo.key, package = %package_name, version = %version)
+)]
 async fn npm_publish_time_for_version(
     state: &SharedState,
     repo: &RepoInfo,
     package_name: &str,
     version: &str,
 ) -> Option<chrono::DateTime<Utc>> {
+    if let Some(cached) = crate::services::upstream_metadata::npm_publish_time_cache()
+        .npm_publish_time(repo.id, package_name, version)
+    {
+        return Some(cached);
+    }
     if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
         let encoded_name = encode_package_name_for_upstream(package_name);
         // Capped like every other buffered packument read (#2181): this runs
@@ -3862,6 +3971,8 @@ async fn npm_publish_time_for_version(
         {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&content) {
                 let times = UpstreamMetadataCache::parse_npm_publish_times(&json);
+                crate::services::upstream_metadata::npm_publish_time_cache()
+                    .store_npm_publish_times(repo.id, package_name, times.clone());
                 return times.get(version).copied();
             }
         }
@@ -3869,6 +3980,11 @@ async fn npm_publish_time_for_version(
     None
 }
 
+#[tracing::instrument(
+    name = "npm.age_gate",
+    skip_all,
+    fields(repo = %repo.key, package = %package_name)
+)]
 async fn apply_npm_download_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
@@ -4016,6 +4132,7 @@ fn rewrite_and_respond_inner(
 // GET tarball download handlers
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(name = "npm.tarball", skip_all, fields(repo = %repo_key, package = %package))]
 async fn download_tarball(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -4027,6 +4144,11 @@ async fn download_tarball(
     serve_tarball(&state, auth.as_ref(), &repo_key, &package, &filename, &ctx).await
 }
 
+#[tracing::instrument(
+    name = "npm.tarball",
+    skip_all,
+    fields(repo = %repo_key, package = %package, scope = %scope)
+)]
 async fn download_scoped_tarball(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -4149,6 +4271,11 @@ enum NpmVirtualOwnership {
 ///   priority-aware (`OwnedAtPriority` / `NotOwned`);
 /// - it does not: the name-only fail-safe (`OwnedNameOnly` / `NotOwned`);
 /// - the name fails `is_valid_npm_name`: the check is skipped (`NotOwned`).
+#[tracing::instrument(
+    name = "npm.virtual_ownership",
+    skip_all,
+    fields(repo_id = %virtual_repo_id, package = %package_name)
+)]
 async fn resolve_npm_virtual_ownership(
     db: &PgPool,
     virtual_repo_id: uuid::Uuid,
@@ -4217,6 +4344,11 @@ fn remote_member_outranked_by_owner(owner_min_priority: i32, remote_priority: Op
     owner_min_priority < remote_priority.unwrap_or(i32::MAX)
 }
 
+#[tracing::instrument(
+    name = "npm.serve_tarball",
+    skip_all,
+    fields(repo = %repo_key, package = %package_name)
+)]
 async fn serve_tarball(
     state: &SharedState,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
@@ -4225,7 +4357,7 @@ async fn serve_tarball(
     filename: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+    let repo = resolve_npm_repo(&state.db, repo_key, &state.repo_cache).await?;
 
     // Curation enforcement (#2930): a `block` rule on this remote/virtual repo
     // must block the tarball pull, the same way the pypi seam gates simple-index
@@ -4249,7 +4381,7 @@ async fn serve_tarball(
         // tarball path (#2424). A pinned-lockfile tarball GET for an
         // out-of-scope name would otherwise stream straight through; an
         // out-of-scope name now returns 404.
-        let policy = fetch_npm_scope_policy(&state.db, repo.id)
+        let policy = cached_npm_scope_policy(&state.db, repo.id)
             .await
             .map_err(IntoResponse::into_response)?;
         if !policy.allows(package_name) {
@@ -4267,39 +4399,44 @@ async fn serve_tarball(
                 response_filename = lkg_filename;
             }
 
-            // Packument facts for the tarball actually served (after the age
-            // gate, so a last-known-good substitution resolves its OWN
-            // entry): the integrity the cache commit is gated on, and — for
-            // an upstream outside the registry-standard `/-/` layout (GitHub
-            // Packages, #3785) — the URL the upstream really serves it at.
-            // The proxy cache key stays the canonical `fetch_path` either way.
-            let tarball_upstream = resolve_npm_tarball_upstream(
-                proxy,
+            let gated_repo = proxy_helpers::build_remote_repo_with_format(
                 repo.id,
                 repo_key,
                 upstream_url,
-                package_name,
-                &response_filename,
-            )
-            .await;
-            let source_path = tarball_upstream
-                .source
-                .clone()
-                .unwrap_or_else(|| fetch_path.clone());
+                RepositoryFormat::Npm,
+            );
+            // A warm tarball is already stored under the canonical path (after
+            // any age-gate substitution). Serving it must not read the
+            // packument: the checksum and any nonstandard upstream URL are
+            // only needed when the bytes are not cached yet.
+            let cached_hit = proxy
+                .streaming_cached_artifact_by_path(&gated_repo, &fetch_path)
+                .await
+                .map_err(IntoResponse::into_response)?;
 
             // #3003: when scan-on-proxy is enabled, route through the inline
-            // scan-and-block path (buffered capped fetch + digest-keyed
-            // verdict gate shared with proxy-PyPI, #2954/#2970/#2976). Taken
-            // INSTEAD of the streaming path below, which serves tarball bytes
-            // without consulting a scan verdict. Repos that have not enabled
-            // scan-on-proxy skip this entirely and keep today's untouched
-            // streaming behavior (no regression). Runs after the age gate so
-            // a last-known-good substitution is scanned as what is served.
+            // scan-and-block path. A cache hit still skips the packument; a
+            // miss reads it so a nonstandard upstream URL is honored.
             if crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
                 .is_proxy_scan_enabled(repo.id)
                 .await
                 .unwrap_or(false)
             {
+                let source_path = if cached_hit.is_some() {
+                    fetch_path.clone()
+                } else {
+                    resolve_npm_tarball_upstream(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        package_name,
+                        &response_filename,
+                    )
+                    .await
+                    .source
+                    .unwrap_or_else(|| fetch_path.clone())
+                };
                 let (action, severity_gate) =
                     proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                 return serve_scanned_npm_tarball(
@@ -4319,49 +4456,45 @@ async fn serve_tarball(
                 .await;
             }
 
-            // #2192 / #1608 Phase 4c: an npm tarball is a package BLOB, not
-            // metadata. The buffered fallback (#2181) capped it at
-            // LARGE_METADATA_MAX_BYTES and 502'd a tarball larger than the cap
-            // even though other download paths already stream. Stream it (teed
-            // into the proxy cache under `fetch_path`) so a large tarball
-            // succeeds with 200 and subsequent pulls are served warm.
-            //
-            // GHSA-qxv7-p3mq-88fv: gate the proxy-cache commit on the
-            // packument's `dist.integrity` (SRI) / `dist.shasum` for this
-            // exact tarball filename. Resolved AFTER the age gate so a
-            // last-known-good substitution is gated on its OWN integrity.
-            // npm's digests are SHA-512/SHA-1, which the storage layer never
-            // observes, so the fetch goes through the digest-flexible gated
-            // variant rather than the SHA-256-only proxy_helpers wrapper; a
-            // mismatch is served to the client (npm verifies the SRI itself)
-            // but never cached.
-            let expected_integrity = tarball_upstream.integrity;
-            let gated_repo = proxy_helpers::build_remote_repo_with_format(
+            if let Some(result) = cached_hit {
+                return Ok(build_tarball_response_stream(
+                    result.body,
+                    &response_filename,
+                    npm_virtual_tarball_content_type(result.content_type),
+                    result.content_length,
+                    result.content_encoding,
+                ));
+            }
+
+            // Cold miss. The packument supplies the integrity the cache
+            // commit is gated on and, for an upstream outside the
+            // registry-standard `/-/` layout (GitHub Packages, #3785), the
+            // URL the upstream really serves. The cache key stays
+            // `fetch_path`. A checksum mismatch is served (npm checks the
+            // SRI itself) and is not cached.
+            let tarball_upstream = resolve_npm_tarball_upstream(
+                proxy,
                 repo.id,
                 repo_key,
                 upstream_url,
-                RepositoryFormat::Npm,
-            );
+                package_name,
+                &response_filename,
+            )
+            .await;
+            let source_path = tarball_upstream
+                .source
+                .clone()
+                .unwrap_or_else(|| fetch_path.clone());
             let result = proxy
                 .fetch_artifact_streaming_with_cache_path_gated_digest(
                     &gated_repo,
                     &source_path,
                     &fetch_path,
-                    expected_integrity,
+                    tarball_upstream.integrity,
                 )
                 .await
                 .map_err(IntoResponse::into_response)?;
 
-            // The upstream registry may return application/octet-stream for
-            // npm tarballs, which also gets persisted by the proxy cache.
-            // Correct the cached artifact record so that SBOM generation and
-            // security scanners can identify the file as a gzip archive.
-            correct_cached_tarball_content_type(&state.db, repo.id, &fetch_path).await;
-
-            // Force the outbound Content-Type to application/gzip regardless of
-            // what the upstream advertised — parity with the buffered path
-            // (build_tarball_response(None)) and the virtual path
-            // (npm_virtual_tarball_content_type).
             return Ok(build_tarball_response_stream(
                 result.body,
                 &response_filename,
@@ -4429,43 +4562,41 @@ async fn serve_tarball(
         // no other format (maven/hex/...) is affected. Non-Remote members are
         // always eligible, preserving the `virtual_non_remote_owns_name`
         // shadowing guard and the local-only primitive above.
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Membership, priorities, and scope policy are the same for every
+        // package until an admin edits them. The per-caller authorization
+        // below is not cached.
+        let layout = npm_virtual_layout(&state.db, repo.id).await?;
         // #3178: authorize the member set against the CALLER before any
         // format-specific filtering, so a member this caller could not read
         // directly can never reach the byte resolver.
-        let members =
-            proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members).await;
-        let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
-        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids)
-            .await
-            .map_err(IntoResponse::into_response)?;
+        let members = proxy_helpers::authorize_virtual_members(
+            &state.db,
+            auth,
+            repo.id,
+            layout.members.clone(),
+        )
+        .await;
         let members: Vec<_> = members
             .into_iter()
-            .filter(|m| npm_member_eligible(&m.repo_type, scope_policies.get(&m.id), package_name))
+            .filter(|m| npm_member_eligible(&m.repo_type, layout.policies.get(&m.id), package_name))
             .collect();
 
         // #3955: apply the priority-aware half of the shadowing guard. An
         // owning non-Remote member suppresses only the Remote members it
         // outranks, so the tarball route serves the same member the
         // priority-ordered packument merge drew the version's
-        // `dist.integrity` from. The priorities map is fetched only when an
-        // owner exists — one indexed query on exactly the requests the guard
-        // engages on.
+        // `dist.integrity` from.
         let members: Vec<_> = match ownership {
-            NpmVirtualOwnership::OwnedAtPriority(owner_min_priority) => {
-                let member_priorities =
-                    proxy_helpers::fetch_virtual_member_priorities(&state.db, repo.id).await?;
-                members
-                    .into_iter()
-                    .filter(|m| {
-                        m.repo_type != RepositoryType::Remote
-                            || !remote_member_outranked_by_owner(
-                                owner_min_priority,
-                                member_priorities.get(&m.id).copied(),
-                            )
-                    })
-                    .collect()
-            }
+            NpmVirtualOwnership::OwnedAtPriority(owner_min_priority) => members
+                .into_iter()
+                .filter(|m| {
+                    m.repo_type != RepositoryType::Remote
+                        || !remote_member_outranked_by_owner(
+                            owner_min_priority,
+                            layout.priorities.get(&m.id).copied(),
+                        )
+                })
+                .collect(),
             _ => members,
         };
 
@@ -4520,7 +4651,6 @@ async fn serve_tarball(
                             member.format.clone(),
                         )
                         .await?;
-                        correct_cached_tarball_content_type(&state.db, member.id, &lkg_path).await;
                         return Ok(build_tarball_response_stream(
                             lkg.body,
                             &lkg_filename,
@@ -4712,38 +4842,6 @@ async fn serve_tarball(
     ))
 }
 
-/// Update the content_type of a cached proxy artifact from the incorrect
-/// `application/octet-stream` to `application/gzip`. The upstream npm registry
-/// often serves tarballs with a generic content type, and the proxy cache
-/// stores whatever the upstream returns. This correction ensures that SBOM
-/// generation and security scanners can properly identify and extract the
-/// archive.
-async fn correct_cached_tarball_content_type(db: &PgPool, repository_id: uuid::Uuid, path: &str) {
-    let normalized = path.trim_start_matches('/');
-    let result = sqlx::query!(
-        r#"
-        UPDATE artifacts
-        SET content_type = $1, updated_at = NOW()
-        WHERE repository_id = $2
-          AND path = $3
-          AND content_type != $1
-        "#,
-        NPM_TARBALL_CONTENT_TYPE,
-        repository_id,
-        normalized,
-    )
-    .execute(db)
-    .await;
-
-    if let Err(e) = result {
-        tracing::warn!(
-            "Failed to correct content_type for cached npm tarball {}: {}",
-            path,
-            e
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // #3003: inline scan-and-block on npm proxy tarball download.
 //
@@ -4807,8 +4905,8 @@ fn npm_identity_agrees(
 /// `artifacts` row (proxy-cached bytes are deliberately not persisted as
 /// artifacts, #1278/#1280). The `.tgz` filename plus the `application/gzip`
 /// content type drive scanner applicability and archive extraction exactly as
-/// for a hosted npm tarball (see [`correct_cached_tarball_content_type`] for
-/// why the content type must be gzip).
+/// for a hosted npm tarball. The content type is gzip because that is what
+/// scanners use to decide the file is an archive.
 fn npm_synthetic_artifact(
     repo_id: uuid::Uuid,
     filename: &str,
@@ -5030,7 +5128,6 @@ async fn serve_scanned_npm_tarball(
                         RepositoryFormat::Npm,
                     )
                     .await?;
-                    correct_cached_tarball_content_type(&state.db, repo_id, fetch_path).await;
                     proxy_helpers::record_proxy_download(state, repo_id, repo_key, fetch_path, ctx)
                         .await;
                     let mut resp = build_tarball_response_stream(
@@ -5048,11 +5145,6 @@ async fn serve_scanned_npm_tarball(
         }
         Err(e) => return Err(e.into_response()),
     };
-
-    // The upstream registry may return application/octet-stream; correct the
-    // cached record so SBOM generation / background scanners see gzip (same
-    // as the streaming path).
-    correct_cached_tarball_content_type(&state.db, repo_id, fetch_path).await;
 
     let digest = proxy_helpers::sha256_hex(&bytes);
 
@@ -6013,6 +6105,220 @@ fn build_npm_version_entry(info: &NpmArtifactInfo) -> serde_json::Value {
 mod tests {
     use super::*;
     use axum::http::header::IF_NONE_MATCH;
+
+    fn cached_npm_repo(repo_id: uuid::Uuid, format: &str) -> crate::api::CachedRepo {
+        crate::api::CachedRepo {
+            id: repo_id,
+            format: format.to_string(),
+            repo_type: "remote".to_string(),
+            upstream_url: Some("https://registry.npmjs.org".to_string()),
+            storage_path: "/cache/npm".to_string(),
+            storage_backend: "filesystem".to_string(),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
+            index_upstream_url: None,
+            promotion_only: true,
+            age_gate_enabled: true,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: true,
+            curation_default_action: "block".to_string(),
+        }
+    }
+
+    async fn seeded_repo_cache(key: &str, entry: crate::api::CachedRepo) -> crate::api::RepoCache {
+        let cache = crate::api::RepoCache::default();
+        cache
+            .write()
+            .await
+            .insert(key.to_string(), (entry, std::time::Instant::now()));
+        cache
+    }
+
+    #[tokio::test]
+    async fn test_resolve_npm_repo_cache_hit_never_touches_db() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").expect("lazy pool");
+        let cache =
+            seeded_repo_cache("npm-proxy", cached_npm_repo(uuid::Uuid::new_v4(), "npm")).await;
+        let repo_id = cache.read().await.get("npm-proxy").unwrap().0.id;
+        let repo = resolve_npm_repo(&pool, "npm-proxy", &cache)
+            .await
+            .expect("a fresh cache entry must resolve without the DB");
+        assert_eq!(repo.id, repo_id);
+        assert!(repo.promotion_only);
+        assert!(repo.age_gate_enabled);
+        assert_eq!(repo.age_gate_min_age_days, 7);
+        assert_eq!(repo.age_gate_mode, "upstream_publish_time");
+        assert!(repo.curation_enabled);
+        assert_eq!(repo.curation_default_action, "block");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_npm_repo_cache_accepts_alias_formats() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").expect("lazy pool");
+        for format in ["yarn", "pnpm", "bower"] {
+            let cache =
+                seeded_repo_cache("alias", cached_npm_repo(uuid::Uuid::new_v4(), format)).await;
+            let repo = resolve_npm_repo(&pool, "alias", &cache)
+                .await
+                .unwrap_or_else(|_| panic!("{format} must resolve on the npm surface"));
+            assert_eq!(repo.format, format);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_npm_repo_cache_rejects_wrong_format() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").expect("lazy pool");
+        let cache = seeded_repo_cache("pypi", cached_npm_repo(uuid::Uuid::new_v4(), "pypi")).await;
+        let err = resolve_npm_repo(&pool, "pypi", &cache)
+            .await
+            .err()
+            .expect("a non-npm entry must be rejected");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_npm_repo_empty_cache_uses_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let cache = crate::api::RepoCache::default();
+        let repo = resolve_npm_repo(&pool, &repo_key, &cache)
+            .await
+            .expect("an empty cache falls through to the database");
+        assert_eq!(repo.id, repo_id);
+        assert!(
+            cache.read().await.is_empty(),
+            "the handler must not fill the cache"
+        );
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::nil()).await;
+    }
+
+    #[tokio::test]
+    async fn test_resolve_npm_repo_stale_entry_falls_back_to_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let cache = crate::api::RepoCache::default();
+        let mut entry = cached_npm_repo(uuid::Uuid::new_v4(), "npm");
+        entry.upstream_url = Some("https://stale.example.invalid/".to_string());
+        cache.write().await.insert(
+            repo_key.clone(),
+            (
+                entry,
+                std::time::Instant::now()
+                    - std::time::Duration::from_secs(crate::api::REPO_CACHE_TTL_SECS + 1),
+            ),
+        );
+        let repo = resolve_npm_repo(&pool, &repo_key, &cache)
+            .await
+            .expect("a stale entry falls through to the database");
+        assert_eq!(repo.id, repo_id);
+        assert_ne!(
+            repo.upstream_url.as_deref(),
+            Some("https://stale.example.invalid/")
+        );
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::nil()).await;
+    }
+
+    #[tokio::test]
+    async fn test_fresh_virtual_layout_never_touches_db() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").expect("lazy pool");
+        let virtual_id = uuid::Uuid::new_v4();
+        let member_id = uuid::Uuid::new_v4();
+        let layout = NpmVirtualLayout {
+            members: vec![layout_member(member_id)],
+            priorities: HashMap::from([(member_id, 1)]),
+            policies: HashMap::new(),
+        };
+        NPM_VIRTUAL_LAYOUTS
+            .write()
+            .await
+            .insert(virtual_id, (layout, std::time::Instant::now()));
+        let loaded = npm_virtual_layout(&pool, virtual_id)
+            .await
+            .expect("a fresh layout must be served from memory");
+        assert_eq!(loaded.members[0].id, member_id);
+        assert_eq!(loaded.priorities.get(&member_id), Some(&1));
+        NPM_VIRTUAL_LAYOUTS.write().await.remove(&virtual_id);
+    }
+
+    #[tokio::test]
+    async fn test_stale_virtual_layout_is_not_served() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").expect("lazy pool");
+        let virtual_id = uuid::Uuid::new_v4();
+        NPM_VIRTUAL_LAYOUTS.write().await.insert(
+            virtual_id,
+            (
+                NpmVirtualLayout {
+                    members: vec![layout_member(uuid::Uuid::new_v4())],
+                    priorities: HashMap::new(),
+                    policies: HashMap::new(),
+                },
+                std::time::Instant::now()
+                    - std::time::Duration::from_secs(NPM_VIRTUAL_LAYOUT_TTL_SECS + 1),
+            ),
+        );
+        assert!(
+            npm_virtual_layout(&pool, virtual_id).await.is_err(),
+            "a stale layout must fall through to the database"
+        );
+        NPM_VIRTUAL_LAYOUTS.write().await.remove(&virtual_id);
+    }
+
+    #[tokio::test]
+    async fn test_fresh_scope_policy_never_touches_db() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").expect("lazy pool");
+        let repo_id = uuid::Uuid::new_v4();
+        let policy = policy(&["@acme"], Some(false));
+        NPM_SCOPE_POLICIES
+            .write()
+            .await
+            .insert(repo_id, (policy, std::time::Instant::now()));
+        let loaded = cached_npm_scope_policy(&pool, repo_id)
+            .await
+            .expect("a fresh scope policy must be served from memory");
+        assert!(loaded.allows("@acme/widget"));
+        assert!(!loaded.allows("lodash"));
+        NPM_SCOPE_POLICIES.write().await.remove(&repo_id);
+    }
+
+    fn layout_member(id: uuid::Uuid) -> crate::models::repository::Repository {
+        use crate::models::repository::{
+            ReplicationPriority, Repository, RepositoryFormat, RepositoryVisibility,
+        };
+        Repository {
+            versioning_enabled: false,
+            id,
+            key: "member".to_string(),
+            name: "member".to_string(),
+            description: None,
+            format: RepositoryFormat::Npm,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/cache".to_string(),
+            upstream_url: Some("https://registry.npmjs.org".to_string()),
+            is_public: true,
+            visibility: RepositoryVisibility::Public,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: ReplicationPriority::LocalOnly,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            project_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
 
     // -----------------------------------------------------------------------
     // npm scope policy (#2327)
@@ -7480,6 +7786,7 @@ mod tests {
                 .await
                 .expect("reorder members");
             }
+            super::invalidate_npm_virtual_layout_cache().await;
             for (package, _, _) in packages {
                 let (status, body) =
                     tdh::send(app.clone(), tdh::get(format!("/{}/{package}", fx.repo_key))).await;
@@ -8021,6 +8328,7 @@ mod tests {
                 .await
                 .expect("reorder members");
             }
+            super::invalidate_npm_virtual_layout_cache().await;
 
             let (status, body) =
                 tdh::send(app.clone(), tdh::get(format!("/{}/{package}", fx.repo_key))).await;
@@ -11568,6 +11876,132 @@ mod tests {
         }
 
         // `.expect(1)` on the mock is verified on server drop.
+        drop(mock_server);
+        cleanup().await;
+    }
+
+    /// A second download of a cached tarball must not read the packument or
+    /// the upstream tarball again, and the cache records the body as gzip
+    /// even when upstream labeled it `application/octet-stream`. The HTTP
+    /// response stays `application/gzip`.
+    #[tokio::test]
+    async fn test_warm_tarball_skips_packument_and_stores_gzip() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use base64::Engine as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let tarball_bytes = b"warm-cached-tarball-bytes".to_vec();
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&tarball_bytes))
+        );
+        Mock::given(method("GET"))
+            .and(path("/warmpkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "warmpkg",
+                "dist-tags": {"latest": "1.0.0"},
+                "versions": {"1.0.0": {"dist": {
+                    "tarball": format!("{}/warmpkg/-/warmpkg-1.0.0.tgz", mock_server.uri()),
+                    "integrity": integrity,
+                }}},
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/warmpkg/-/warmpkg-1.0.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(tarball_bytes.clone()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        for i in 0..2 {
+            let result = super::download_tarball(
+                axum::extract::State(state.clone()),
+                axum::Extension(tdh::admin_auth_ext()),
+                axum::extract::Path((
+                    fx.repo_key.clone(),
+                    "warmpkg".to_string(),
+                    "warmpkg-1.0.0.tgz".to_string(),
+                )),
+                Default::default(),
+            )
+            .await;
+            let response = match result {
+                Ok(r) => r,
+                Err(r) => {
+                    let status = r.status();
+                    cleanup().await;
+                    panic!("pull {i} failed with {status}");
+                }
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(NPM_TARBALL_CONTENT_TYPE)
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            assert_eq!(body.as_ref(), tarball_bytes.as_slice());
+            if i == 0 {
+                tdh::wait_for_cache_commit(&fx.storage_dir, 1).await;
+            }
+        }
+
+        let mut saw_gzip = false;
+        for entry in walkdir::WalkDir::new(&fx.storage_dir) {
+            let entry = entry.expect("walk cache dir");
+            // The packument is cached beside the tarball and keeps the
+            // upstream JSON type. Only the `.tgz` sidecar is forced to gzip.
+            if entry.file_name() == "__cache_meta__.json"
+                && entry.path().to_string_lossy().contains(".tgz")
+            {
+                let raw = std::fs::read(entry.path()).expect("read sidecar");
+                let meta: serde_json::Value = serde_json::from_slice(&raw).expect("sidecar json");
+                assert_eq!(meta["content_type"], "application/gzip");
+                saw_gzip = true;
+            }
+        }
+        assert!(
+            saw_gzip,
+            "the committed sidecar must record application/gzip"
+        );
+
         drop(mock_server);
         cleanup().await;
     }
@@ -16878,18 +17312,19 @@ mod content_encoding_forwarding_tests {
             .unwrap_or(src);
 
         let call_sites = body.matches("build_tarball_response_stream(").count();
-        // 5 serves + the `fn` definition itself.
+        // 6 serves (warm remote hit, cold remote miss, virtual, virtual-LKG,
+        // hosted, scan-pending) + the `fn` definition itself.
         assert_eq!(
-            call_sites, 6,
+            call_sites, 7,
             "npm tarball call-site count changed; re-check each new arm \
              forwards content_encoding (#3149)",
         );
         let forwarding = body.matches(".content_encoding,").count();
         assert_eq!(
-            forwarding, 4,
-            "every proxied npm tarball arm (remote, virtual, virtual-LKG, \
-             scan-pending) must pass the fetch result's content_encoding; \
-             only the hosted arm passes None (#3149)",
+            forwarding, 5,
+            "every proxied npm tarball arm (warm remote hit, cold remote \
+             miss, virtual, virtual-LKG, scan-pending) must pass the fetch \
+             result's content_encoding; only the hosted arm passes None (#3149)",
         );
     }
 }

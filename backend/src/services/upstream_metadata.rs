@@ -1,7 +1,7 @@
 //! Upstream publish-time metadata for age-gate decisions.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -12,6 +12,11 @@ use crate::error::{AppError, Result};
 use crate::services::http_client;
 
 const PYPI_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// How long an npm age-gate publish time is reused before the packument is
+/// read again. A version's publish time does not change, so five minutes only
+/// bounds how long a newly published version waits for its first lookup.
+pub const NPM_PUBLISH_TIME_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Hard ceiling on distinct `(repository, project)` publish-time entries held
 /// in process. Each entry is small (one version->timestamp map), but the key
@@ -34,6 +39,7 @@ struct CacheEntry {
 #[derive(Default)]
 pub struct UpstreamMetadataCache {
     pypi: RwLock<HashMap<(Uuid, String), CacheEntry>>,
+    npm: RwLock<HashMap<(Uuid, String), CacheEntry>>,
 }
 
 impl UpstreamMetadataCache {
@@ -56,6 +62,63 @@ impl UpstreamMetadataCache {
             }
         }
         map
+    }
+
+    /// Publish time for one npm version, when this process read that version's
+    /// packument within [`NPM_PUBLISH_TIME_CACHE_TTL`].
+    ///
+    /// A hit is the signal to skip the buffered packument read, and with it
+    /// the metadata-budget reservation. A version that was not in the cached
+    /// document is a miss: the caller reads the packument again rather than
+    /// treating absence as a stored answer.
+    pub fn npm_publish_time(
+        &self,
+        repo_id: Uuid,
+        package_name: &str,
+        version: &str,
+    ) -> Option<DateTime<Utc>> {
+        let key = npm_cache_key(repo_id, package_name);
+        let guard = self.npm.read().ok()?;
+        let entry = guard.get(&key)?;
+        if !is_pypi_cache_fresh(entry.fetched_at.elapsed(), NPM_PUBLISH_TIME_CACHE_TTL) {
+            return None;
+        }
+        entry.times.get(version).copied()
+    }
+
+    /// Remember every version time parsed from one packument.
+    pub fn store_npm_publish_times(
+        &self,
+        repo_id: Uuid,
+        package_name: &str,
+        times: PublishTimeMap,
+    ) {
+        self.store_npm_publish_times_at(repo_id, package_name, times, Instant::now());
+    }
+
+    fn store_npm_publish_times_at(
+        &self,
+        repo_id: Uuid,
+        package_name: &str,
+        times: PublishTimeMap,
+        fetched_at: Instant,
+    ) {
+        if times.is_empty() {
+            return;
+        }
+        let key = npm_cache_key(repo_id, package_name);
+        let Ok(mut guard) = self.npm.write() else {
+            return;
+        };
+        if guard.len() >= PYPI_CACHE_MAX_ENTRIES {
+            guard.retain(|_, entry| {
+                is_pypi_cache_fresh(entry.fetched_at.elapsed(), NPM_PUBLISH_TIME_CACHE_TTL)
+            });
+            if guard.len() >= PYPI_CACHE_MAX_ENTRIES {
+                guard.clear();
+            }
+        }
+        guard.insert(key, CacheEntry { times, fetched_at });
     }
 
     /// Fetch PyPI Warehouse JSON and extract upload times per version.
@@ -139,6 +202,17 @@ fn pypi_cache_key(repo_id: Uuid, project: &str) -> (Uuid, String) {
     (repo_id, project.to_ascii_lowercase())
 }
 
+fn npm_cache_key(repo_id: Uuid, package_name: &str) -> (Uuid, String) {
+    (repo_id, package_name.to_string())
+}
+
+/// Process-wide npm publish-time cache. The age-gate tarball path reads it
+/// before taking a metadata-budget permit.
+pub fn npm_publish_time_cache() -> &'static UpstreamMetadataCache {
+    static CACHE: OnceLock<UpstreamMetadataCache> = OnceLock::new();
+    CACHE.get_or_init(UpstreamMetadataCache::new)
+}
+
 fn is_pypi_cache_fresh(elapsed: Duration, ttl: Duration) -> bool {
     elapsed <= ttl
 }
@@ -219,6 +293,49 @@ mod tests {
         assert_eq!(times.len(), 2);
         assert!(times.contains_key("1.0.0"));
         assert!(times.contains_key("2.0.0"));
+    }
+
+    #[test]
+    fn npm_publish_time_cache_serves_a_stored_version_for_five_minutes() {
+        let cache = UpstreamMetadataCache::new();
+        let repo = Uuid::new_v4();
+        let published = DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut times = PublishTimeMap::new();
+        times.insert("4.17.21".to_string(), published);
+        cache.store_npm_publish_times(repo, "lodash", times);
+
+        assert_eq!(
+            cache.npm_publish_time(repo, "lodash", "4.17.21"),
+            Some(published)
+        );
+        // A version the cached packument did not contain is not a stored answer.
+        assert_eq!(cache.npm_publish_time(repo, "lodash", "0.0.1"), None);
+        assert_eq!(cache.npm_publish_time(repo, "left-pad", "4.17.21"), None);
+        assert_eq!(
+            cache.npm_publish_time(Uuid::new_v4(), "lodash", "4.17.21"),
+            None
+        );
+    }
+
+    #[test]
+    fn npm_publish_time_cache_expires_at_five_minutes() {
+        let cache = UpstreamMetadataCache::new();
+        let repo = Uuid::new_v4();
+        let published = DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut times = PublishTimeMap::new();
+        times.insert("4.17.21".to_string(), published);
+        cache.store_npm_publish_times_at(
+            repo,
+            "lodash",
+            times,
+            Instant::now() - NPM_PUBLISH_TIME_CACHE_TTL - Duration::from_secs(1),
+        );
+        assert_eq!(cache.npm_publish_time(repo, "lodash", "4.17.21"), None);
+        assert_eq!(NPM_PUBLISH_TIME_CACHE_TTL, Duration::from_secs(5 * 60));
     }
 
     #[test]

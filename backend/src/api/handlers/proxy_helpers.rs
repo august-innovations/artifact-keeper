@@ -25,117 +25,14 @@ pub use crate::services::proxy_service::{DEFAULT_METADATA_MAX_BYTES, LARGE_METAD
 use crate::storage::StorageLocation;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-// ---------------------------------------------------------------------------
-// Global buffered-proxy-metadata byte budget (#2665)
-// ---------------------------------------------------------------------------
-
-/// Default ceiling on the TOTAL bytes the buffered proxy-metadata path may hold
-/// resident across ALL in-flight requests (#2665). 1 GiB — eight worst-case
-/// [`LARGE_METADATA_MAX_BYTES`] (128 MiB) buffers, or many more realistically
-/// sized ones — chosen so a legitimate concurrent `dnf` refresh does not block
-/// while a hostile fan-out cannot drive resident memory unbounded.
-pub const DEFAULT_PROXY_METADATA_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
-
-/// Env override for [`DEFAULT_PROXY_METADATA_BUDGET_BYTES`]. A blank,
-/// non-numeric, or zero value falls back to the default.
-pub const PROXY_METADATA_BUDGET_BYTES_ENV: &str = "AK_PROXY_METADATA_BUDGET_BYTES";
-
-/// A process-wide byte budget bounding the TOTAL memory the *buffered*
-/// proxy-metadata path may hold resident at once, independent of request
-/// concurrency (#2665).
-///
-/// The buffered metadata fetch ([`proxy_fetch_capped`], used by the RPM repodata
-/// proxy) reads the whole upstream/cached document into a [`Bytes`] before
-/// responding. A per-request cap ([`LARGE_METADATA_MAX_BYTES`]) bounds ONE
-/// request, but nothing bounded the *sum* over concurrent requests: N anonymous,
-/// un-rate-limited requests each buffering up to the cap put ~N×cap resident (a
-/// realistic ~15 GiB from a cached ~30 MiB `filelists`). Cache hits made this
-/// worse — they return before the single-flight coordinator, so even cached
-/// responses each buffered independently.
-///
-/// This budget caps that sum: each buffered fetch reserves permits (one per
-/// byte, up to the cap) BEFORE it buffers and releases them once the buffered
-/// body has been handed to the response writer, so total concurrent buffering
-/// can never exceed `total_bytes`. Once the budget is exhausted, further
-/// requests await a reservation (bounded queueing) instead of admitting
-/// unbounded buffers. Mirrors the byte-bounded `scan_extraction_semaphore`
-/// pattern (`permits × per-item-cap` resident ceiling) already used by the
-/// scanner.
-pub struct ProxyMetadataBudget {
-    sem: Arc<Semaphore>,
-    total: usize,
-}
-
-impl ProxyMetadataBudget {
-    /// Build a budget of `total_bytes`, clamped to `[1, u32::MAX]` (and to
-    /// [`Semaphore::MAX_PERMITS`]). A single reservation is always `<=` the
-    /// per-request cap, far below `u32::MAX`, so it stays inside the acquirable
-    /// range.
-    pub fn new(total_bytes: usize) -> Self {
-        let ceiling = (u32::MAX as usize).min(Semaphore::MAX_PERMITS);
-        let total = total_bytes.clamp(1, ceiling);
-        Self {
-            sem: Arc::new(Semaphore::new(total)),
-            total,
-        }
-    }
-
-    /// Total budget in bytes.
-    pub fn total_bytes(&self) -> usize {
-        self.total
-    }
-
-    /// Currently unreserved bytes (observability / test helper).
-    pub fn available_bytes(&self) -> usize {
-        self.sem.available_permits()
-    }
-
-    fn permits_for(&self, bytes: usize) -> u32 {
-        // A single request can reserve at most the whole budget, so an oversized
-        // request degrades to "hold the whole budget" rather than deadlocking on
-        // a permit count the semaphore can never satisfy.
-        bytes.clamp(1, self.total) as u32
-    }
-
-    /// Reserve `bytes` of the budget, awaiting when it is exhausted. The
-    /// returned permit releases the reservation on drop — hold it for as long
-    /// as the buffered bytes are resident.
-    pub async fn reserve(&self, bytes: usize) -> OwnedSemaphorePermit {
-        // `acquire_many_owned` only errors when the semaphore is closed; this
-        // one lives for the process lifetime and is never closed.
-        Arc::clone(&self.sem)
-            .acquire_many_owned(self.permits_for(bytes))
-            .await
-            .expect("proxy metadata budget semaphore is never closed")
-    }
-
-    /// Non-blocking reservation: `None` when the budget cannot currently satisfy
-    /// `bytes`. Used to prove the bound rejects once exhausted.
-    pub fn try_reserve(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
-        Arc::clone(&self.sem)
-            .try_acquire_many_owned(self.permits_for(bytes))
-            .ok()
-    }
-}
-
-/// Process-wide buffered-proxy-metadata byte budget (#2665). Sized once from
-/// [`PROXY_METADATA_BUDGET_BYTES_ENV`] (default
-/// [`DEFAULT_PROXY_METADATA_BUDGET_BYTES`]); lives for the process lifetime.
-pub fn proxy_metadata_budget() -> &'static ProxyMetadataBudget {
-    static BUDGET: OnceLock<ProxyMetadataBudget> = OnceLock::new();
-    BUDGET.get_or_init(|| {
-        let total = std::env::var(PROXY_METADATA_BUDGET_BYTES_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_PROXY_METADATA_BUDGET_BYTES);
-        ProxyMetadataBudget::new(total)
-    })
-}
+pub use crate::services::metadata_budget::{
+    proxy_metadata_budget, ProxyMetadataBudget, DEFAULT_PROXY_METADATA_BUDGET_BYTES,
+    METADATA_RESERVATION_OVERHEAD_BYTES, PROXY_METADATA_BUDGET_BYTES_ENV,
+};
 
 // ---------------------------------------------------------------------------
 // Shared RepoInfo
@@ -248,6 +145,60 @@ pub async fn resolve_repo_by_key(
             .try_get("curation_default_action")
             .unwrap_or_else(|_| "allow".to_string()),
     })
+}
+
+/// Resolve a repository from the in-process [`crate::api::RepoCache`] when the
+/// entry is fresh, otherwise from [`resolve_repo_by_key`].
+///
+/// `repo_visibility_middleware` fills the cache before handlers run, so a warm
+/// request spends no database round-trip on repository identity. A miss or an
+/// entry older than [`crate::api::REPO_CACHE_TTL_SECS`] falls through to the
+/// database lookup and deliberately does not write the cache: a handler-built
+/// entry would omit visibility and could lie to the middleware. A fresh entry
+/// whose format is outside `expected_formats` is a 400 and also does not touch
+/// the database.
+#[allow(clippy::result_large_err)]
+pub async fn resolve_repo_from_cache(
+    db: &PgPool,
+    repo_key: &str,
+    repo_cache: &crate::api::RepoCache,
+    expected_formats: &[&str],
+    format_label: &str,
+) -> Result<RepoInfo, Response> {
+    {
+        let cache = repo_cache.read().await;
+        if let Some((entry, at)) = cache.get(repo_key) {
+            if at.elapsed().as_secs() < crate::api::REPO_CACHE_TTL_SECS {
+                let fmt_lower = entry.format.to_lowercase();
+                if !expected_formats.iter().any(|f| *f == fmt_lower) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Repository '{}' is not {} repository (format: {})",
+                            repo_key, format_label, entry.format
+                        ),
+                    )
+                        .into_response());
+                }
+                return Ok(RepoInfo {
+                    id: entry.id,
+                    key: repo_key.to_string(),
+                    storage_path: entry.storage_path.clone(),
+                    storage_backend: entry.storage_backend.clone(),
+                    repo_type: entry.repo_type.clone(),
+                    format: entry.format.clone(),
+                    upstream_url: entry.upstream_url.clone(),
+                    promotion_only: entry.promotion_only,
+                    age_gate_enabled: entry.age_gate_enabled,
+                    age_gate_min_age_days: entry.age_gate_min_age_days,
+                    age_gate_mode: entry.age_gate_mode.clone(),
+                    curation_enabled: entry.curation_enabled,
+                    curation_default_action: entry.curation_default_action.clone(),
+                });
+            }
+        }
+    }
+    resolve_repo_by_key(db, repo_key, expected_formats, format_label).await
 }
 
 /// Map an error to a 500 Internal Server Error plain-text response.
@@ -819,12 +770,12 @@ pub async fn proxy_fetch_capped_budgeted(
     max: usize,
     format: RepositoryFormat,
 ) -> Result<(Bytes, Option<String>, OwnedSemaphorePermit), Response> {
-    let permit = proxy_metadata_budget().reserve(max).await;
     let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
-    let (content, content_type) = proxy_service
-        .fetch_artifact_capped(&repo, path, max)
-        .await
-        .map_err(|e| map_proxy_error(repo_key, path, e))?;
+    let ((content, content_type), permit) = budgeted_metadata_read(max, async {
+        proxy_service.fetch_artifact_capped(&repo, path, max).await
+    })
+    .await
+    .map_err(|e| map_proxy_error(repo_key, path, e))?;
     Ok((content, content_type, permit))
 }
 
@@ -966,18 +917,22 @@ pub async fn proxy_fetch_capped_budgeted_with_encoding(
     path: &str,
     max: usize,
 ) -> Result<CappedMetadataGet, Response> {
-    let budget_permit = proxy_metadata_budget().reserve(max).await;
     let repo = build_remote_repo(repo_id, repo_key, upstream_url);
-    match proxy_service
-        .fetch_artifact_with_cache_path_and_accept_capped(&repo, path, path, None, max)
-        .await
+    match budgeted_metadata_read(max, async {
+        proxy_service
+            .fetch_artifact_with_cache_path_and_accept_capped(&repo, path, path, None, max)
+            .await
+    })
+    .await
     {
-        Ok((content, content_type, content_encoding)) => Ok(CappedMetadataGet::Buffered {
-            content,
-            content_type,
-            content_encoding,
-            budget_permit,
-        }),
+        Ok(((content, content_type, content_encoding), budget_permit)) => {
+            Ok(CappedMetadataGet::Buffered {
+                content,
+                content_type,
+                content_encoding,
+                budget_permit,
+            })
+        }
         Err(error) if is_over_cap_error(&error) => Ok(CappedMetadataGet::OverCap),
         Err(error) => Err(map_proxy_error(repo_key, path, error)),
     }
@@ -998,19 +953,51 @@ pub async fn proxy_fetch_capped_with_cache_key_and_accept_budgeted(
     accept: Option<&str>,
     max: usize,
 ) -> Result<(Bytes, Option<String>, OwnedSemaphorePermit), Response> {
-    let permit = proxy_metadata_budget().reserve(max).await;
-    let (content, content_type) = proxy_fetch_capped_with_cache_key_and_accept(
-        proxy_service,
-        repo_id,
-        repo_key,
-        upstream_url,
-        fetch_path,
-        cache_path,
-        accept,
-        max,
-    )
+    let ((content, content_type), permit) = budgeted_metadata_read(max, async {
+        proxy_fetch_capped_with_cache_key_and_accept(
+            proxy_service,
+            repo_id,
+            repo_key,
+            upstream_url,
+            fetch_path,
+            cache_path,
+            accept,
+            max,
+        )
+        .await
+    })
     .await?;
     Ok((content, content_type, permit))
+}
+
+/// Run a buffered metadata read inside a budget session.
+///
+/// The session is what lets the body reader reserve the known size before it
+/// allocates. The permit is taken after the read and returned to the caller,
+/// which holds it until the buffered bytes are dropped. A read that returns
+/// a body without reserving still accounts for the overhead so the permit
+/// type stays honest; that path is a bug in the reader and is logged.
+async fn budgeted_metadata_read<T, E>(
+    max: usize,
+    fetch: impl Future<Output = Result<T, E>>,
+) -> Result<(T, OwnedSemaphorePermit), E> {
+    use crate::services::metadata_budget::{self, MetadataBudgetSession};
+
+    let session = MetadataBudgetSession::process(max);
+    let kept = Arc::clone(&session);
+    let value = metadata_budget::enter(session, fetch).await?;
+    let permit = match kept.take_permit() {
+        Some(permit) => permit,
+        None => {
+            tracing::warn!(
+                "budgeted metadata read returned without reserving; accounting overhead only"
+            );
+            proxy_metadata_budget()
+                .reserve(METADATA_RESERVATION_OVERHEAD_BYTES.min(max.max(1)))
+                .await
+        }
+    };
+    Ok((value, permit))
 }
 
 /// Streaming sibling of [`proxy_fetch`] that does NOT buffer the artifact

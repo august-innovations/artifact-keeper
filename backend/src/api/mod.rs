@@ -46,9 +46,10 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 /// How long a cached repository record is considered fresh.
-/// Repository metadata (visibility, type, upstream URL) rarely changes, so
-/// 60 seconds is a safe balance between performance and propagation speed.
-pub const REPO_CACHE_TTL_SECS: u64 = 60;
+/// Repository metadata (visibility, type, upstream URL) rarely changes.
+/// A write still drops the entry immediately through LISTEN/NOTIFY; this
+/// timer is only the fallback when a notification is missed.
+pub const REPO_CACHE_TTL_SECS: u64 = 180;
 
 /// Cached repository metadata populated by the repo-visibility middleware
 /// and reused by format-handler resolvers to avoid a second DB round-trip.
@@ -644,7 +645,7 @@ mod tests {
 
     #[test]
     fn test_repo_cache_ttl_constant() {
-        assert_eq!(REPO_CACHE_TTL_SECS, 60);
+        assert_eq!(REPO_CACHE_TTL_SECS, 180);
     }
 
     #[tokio::test]

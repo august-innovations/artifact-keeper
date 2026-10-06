@@ -2241,12 +2241,12 @@ async fn apply_npm_scope_policy_config(
         None => None,
     };
 
-    if let Some(json) = scopes_json {
+    if let Some(ref json) = scopes_json {
         upsert_repo_config(
             db,
             repo_id,
             crate::api::handlers::npm::NPM_ALLOWED_SCOPES_KEY,
-            &json,
+            json,
         )
         .await?;
     }
@@ -2259,14 +2259,18 @@ async fn apply_npm_scope_policy_config(
         )
         .await?;
     }
-    if let Some(json) = patterns_json {
+    if let Some(ref json) = patterns_json {
         upsert_repo_config(
             db,
             repo_id,
             crate::api::handlers::npm::NPM_ALLOWED_NAME_PATTERNS_KEY,
-            &json,
+            json,
         )
         .await?;
+    }
+    if scopes_json.is_some() || allow_unscoped.is_some() || patterns_json.is_some() {
+        crate::api::handlers::npm::invalidate_npm_virtual_layout_cache().await;
+        crate::services::cache_invalidation::notify_npm_virtual_layout_changed(db).await;
     }
     Ok(())
 }
