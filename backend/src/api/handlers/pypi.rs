@@ -18690,15 +18690,22 @@ mod tests {
 
         // The later member now has the wheel. The remembered 503 from the
         // first member must not prevent this serve.
+        //
+        // wiremock keeps the first equal-priority mock that matches, so a
+        // 200 mounted after the 404 above is never selected and this request
+        // stays 503. A higher priority (1 beats the default 5) makes the
+        // serving mocks win once they are mounted.
         let wheel: &'static [u8] = b"PK\x03\x04 pegasus-from-second-member";
         Mock::given(method("GET"))
             .and(path(format!("/simple/{project}/")))
             .respond_with(ResponseTemplate::new(200).set_body_string("<html><body></body></html>"))
+            .with_priority(1)
             .mount(&missing)
             .await;
         Mock::given(method("GET"))
             .and(path(format!("/simple/{project}/{filename}")))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel))
+            .with_priority(1)
             .mount(&missing)
             .await;
         let served = super::serve_file(
