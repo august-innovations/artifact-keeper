@@ -2791,6 +2791,21 @@ async fn record_lkg_proxy_download(
     }
 }
 
+/// Remember a virtual-member download failure that is not "this member
+/// does not have the file".
+///
+/// 404 stays a fall-through: the member was consulted and the distribution
+/// is absent there. The first of anything else (503 from a saturated pool,
+/// 503 from an upstream 5xx, 500 from storage, 507 while bytes are missing)
+/// is what the client sees when no later member serves. A 404 must not
+/// replace that, or a private wheel whose hosted lookup failed and whose
+/// public upstream has no such project is reported as missing.
+fn remember_virtual_member_failure(saved: &mut Option<Response>, failure: Response) {
+    if failure.status() != StatusCode::NOT_FOUND && saved.is_none() {
+        *saved = Some(failure);
+    }
+}
+
 /// Serve a PyPI distribution download.
 ///
 /// Takes ONLY the PEP 503 normalized project name. The raw path segment is
@@ -3046,6 +3061,18 @@ async fn serve_file(
                     PypiOwnershipGuard::resolve(&state.db, repo.id, &members, project.as_str())
                         .await?;
 
+                // A member 404 means "this member does not have the file" and
+                // the walk continues. Any other status is a failure of a
+                // member that might have had it — a saturated pool is 503,
+                // an upstream 5xx arrives as 503. Those used to be logged and
+                // dropped, and when no member served, the walk answered 404
+                // "not found in any member". uv treats that as a missing
+                // package and does not retry, so a load failure looked like
+                // the wheel did not exist. Keep the first non-404 and return
+                // it when nothing serves. A later member that does serve
+                // still wins. Same rule as `serve_virtual_metadata`.
+                let mut first_member_error: Option<Response> = None;
+
                 for member in &members {
                     // #3404: apply the ownership guard BEFORE this member is
                     // consulted at all — not just before its upstream fetch.
@@ -3166,6 +3193,10 @@ async fn serve_file(
                                 error = %e.status(),
                                 "local fetch failed for virtual member"
                             );
+                            // Still try this member's upstream below when it
+                            // is remote. The status is only the answer if no
+                            // member serves.
+                            remember_virtual_member_failure(&mut first_member_error, e);
                         }
                     }
 
@@ -3223,6 +3254,10 @@ async fn serve_file(
                                             member_key = %member.key,
                                             status = %status,
                                             "scanned pypi virtual member did not serve; trying next member"
+                                        );
+                                        remember_virtual_member_failure(
+                                            &mut first_member_error,
+                                            resp,
                                         );
                                         continue;
                                     }
@@ -3285,12 +3320,16 @@ async fn serve_file(
                                         error = %e.status(),
                                         "remote PyPI fetch failed for virtual member"
                                     );
+                                    remember_virtual_member_failure(&mut first_member_error, e);
                                 }
                             }
                         }
                     }
                 }
 
+                if let Some(error) = first_member_error {
+                    return Err(error);
+                }
                 return Err(AppError::NotFound(
                     "Artifact not found in any member repository".to_string(),
                 )
@@ -8021,6 +8060,46 @@ mod tests {
             .await
             .insert(key.to_string(), (entry, std::time::Instant::now()));
         cache
+    }
+
+    #[test]
+    fn virtual_member_failure_keeps_503_and_ignores_a_later_404() {
+        let mut saved = None;
+        super::remember_virtual_member_failure(
+            &mut saved,
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap(),
+        );
+        assert!(saved.is_none(), "a member miss must not become the answer");
+
+        super::remember_virtual_member_failure(
+            &mut saved,
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::empty())
+                .unwrap(),
+        );
+        super::remember_virtual_member_failure(
+            &mut saved,
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap(),
+        );
+        super::remember_virtual_member_failure(
+            &mut saved,
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::empty())
+                .unwrap(),
+        );
+
+        assert_eq!(
+            saved.expect("the first non-404 must be kept").status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
@@ -18439,6 +18518,216 @@ mod tests {
             "negative control: removing the policy must restore the download"
         );
         assert_eq!(&after_body[..], cached_wheel);
+    }
+
+    /// A virtual download whose members fail for a reason other than "not
+    /// here" must return that status. Collapsing it to 404 makes uv treat a
+    /// saturated registry as a missing wheel and stop retrying.
+    ///
+    /// The upstream simple index answers 503, which the proxy maps to 503.
+    /// The member has no local row, so its local lookup is a real 404 and
+    /// must not replace the 503. The control mounts a 404 index instead and
+    /// must stay 404.
+    #[tokio::test]
+    async fn test_virtual_serve_file_preserves_upstream_503() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "pegasus-sdk";
+        let filename = "pegasus_sdk-1.10.0-py3-none-any.whl";
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        let virtual_info = fx.repo_info("virtual", None);
+        let project_name = proj(project);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let failed = super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            &project_name,
+            filename,
+            None,
+            &ctx,
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        let status = match failed {
+            Ok(response) | Err(response) => response.status(),
+        };
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an upstream 503 through a virtual repo must stay 503, not become 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_serve_file_stays_404_when_upstream_has_no_file() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "pegasus-sdk";
+        let filename = "pegasus_sdk-1.10.0-py3-none-any.whl";
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        let virtual_info = fx.repo_info("virtual", None);
+        let project_name = proj(project);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let missing = super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            &project_name,
+            filename,
+            None,
+            &ctx,
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        let status = match missing {
+            Ok(response) | Err(response) => response.status(),
+        };
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a genuine miss on every member must stay 404"
+        );
+    }
+
+    /// Hosted-then-remote, the production topology: the first member fails
+    /// with 503 and the second answers 404. The virtual download must stay
+    /// 503. A second case serves the wheel from the later member, so a
+    /// remembered 503 must not fail the request before that member is tried.
+    #[tokio::test]
+    async fn test_virtual_serve_file_keeps_first_member_503_across_members() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "pegasus-sdk";
+        let filename = "pegasus_sdk-1.10.0-py3-none-any.whl";
+
+        let failing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&failing)
+            .await;
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+
+        let (first_id, _first_key, first_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &failing.uri()).await;
+        let (second_id, _second_key, second_dir) =
+            tdh::create_repo(&fx.pool, "remote", "pypi").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(missing.uri())
+            .bind(second_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure second member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 2)",
+        )
+        .bind(fx.repo_id)
+        .bind(second_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach second member");
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let project_name = proj(project);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let failed = super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            &project_name,
+            filename,
+            None,
+            &ctx,
+        )
+        .await;
+        let failed_status = match failed {
+            Ok(response) | Err(response) => response.status(),
+        };
+
+        // The later member now has the wheel. The remembered 503 from the
+        // first member must not prevent this serve.
+        let wheel: &'static [u8] = b"PK\x03\x04 pegasus-from-second-member";
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html><body></body></html>"))
+            .mount(&missing)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/{filename}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel))
+            .mount(&missing)
+            .await;
+        let served = super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            &project_name,
+            filename,
+            None,
+            &ctx,
+        )
+        .await;
+        let (served_status, served_body) = collect_serve_3220(served).await;
+
+        cleanup_virtual_member(&fx.pool, first_id, &first_dir).await;
+        cleanup_virtual_member(&fx.pool, second_id, &second_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            failed_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a 503 from the first member must not become 404 when the next member misses"
+        );
+        assert_eq!(
+            served_status,
+            StatusCode::OK,
+            "a later member that has the file must still serve it"
+        );
+        assert_eq!(&served_body[..], wheel);
     }
 
     // -----------------------------------------------------------------------
