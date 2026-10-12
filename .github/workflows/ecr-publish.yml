@@ -52,7 +52,7 @@ jobs:
       - family=c8i.*+c8a.*+m8i.*+m8a.*+c8i-flex.*+m8i-flex.*
       - image=ubuntu22-full-x64
       - volume=160gb
-      - env=infra-prod
+      - env=infra-prod-blue
       - spot=false
     timeout-minutes: 90
     outputs:
