@@ -34,7 +34,7 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::cache_headers::{check_conditional_request, compute_etag};
@@ -3935,49 +3935,69 @@ fn npm_lkg_redirect(
     skip_all,
     fields(repo = %repo.key, package = %package_name, version = %version)
 )]
+/// `Err` means the packument could not be read, so the version's age is unknown.
 async fn npm_publish_time_for_version(
     state: &SharedState,
     repo: &RepoInfo,
     package_name: &str,
     version: &str,
-) -> Option<chrono::DateTime<Utc>> {
+) -> Result<Option<chrono::DateTime<Utc>>, ()> {
     if let Some(cached) = crate::services::upstream_metadata::npm_publish_time_cache()
         .npm_publish_time(repo.id, package_name, version)
     {
-        return Some(cached);
+        return Ok(Some(cached));
     }
-    if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
-        let encoded_name = encode_package_name_for_upstream(package_name);
-        // Capped like every other buffered packument read (#2181): this runs
-        // on the tarball download path, where an unbounded upstream metadata
-        // body must not be able to balloon memory.
-        //
-        // Fetch/cache split (#3297): same decoded cache key as the metadata
-        // handlers, so the packument this age-gate probe caches is the SAME
-        // entry `get_package_metadata` reads and refreshes — leaving this
-        // site on the encoded key would double-cache every scoped packument.
-        if let Ok((content, _, _budget_permit)) =
-            proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
-                proxy,
-                repo.id,
-                &repo.key,
-                upstream_url,
-                &encoded_name,
-                package_name,
-                None,
-                proxy_helpers::LARGE_METADATA_MAX_BYTES,
-            )
-            .await
+    let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) else {
+        return Ok(None);
+    };
+    let encoded_name = encode_package_name_for_upstream(package_name);
+    // Capped like every other buffered packument read (#2181): this runs
+    // on the tarball download path, where an unbounded upstream metadata
+    // body must not be able to balloon memory.
+    //
+    // Fetch/cache split (#3297): same decoded cache key as the metadata
+    // handlers, so the packument this age-gate probe caches is the SAME
+    // entry `get_package_metadata` reads and refreshes — leaving this
+    // site on the encoded key would double-cache every scoped packument.
+    let (content, _, _budget_permit) =
+        match proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            &encoded_name,
+            package_name,
+            None,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await
         {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&content) {
-                let times = UpstreamMetadataCache::parse_npm_publish_times(&json);
-                crate::services::upstream_metadata::npm_publish_time_cache()
-                    .store_npm_publish_times(repo.id, package_name, times.clone());
-                return times.get(version).copied();
+            Ok(fetched) => fetched,
+            Err(resp) => {
+                warn!(
+                    status = %resp.status(),
+                    "npm publish-time lookup failed; age gate cannot evaluate this download"
+                );
+                return Err(());
             }
+        };
+    let json = match serde_json::from_slice::<serde_json::Value>(&content) {
+        Ok(json) => json,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "npm publish-time lookup returned an unparseable packument; age gate cannot evaluate this download"
+            );
+            return Err(());
         }
-    }
-    None
+    };
+    let times = UpstreamMetadataCache::parse_npm_publish_times(&json);
+    crate::services::upstream_metadata::npm_publish_time_cache().store_npm_publish_times(
+        repo.id,
+        package_name,
+        times.clone(),
+    );
+    Ok(times.get(version).copied())
 }
 
 #[tracing::instrument(
@@ -4012,7 +4032,8 @@ async fn apply_npm_download_age_gate(
     // Publish-time evidence from the packument; under `first_seen` the time
     // itself is ignored, but presence in the upstream-served document is the
     // existence evidence that may start the version's observation clock.
-    let published_at = npm_publish_time_for_version(state, repo, package_name, &version).await;
+    let lookup = npm_publish_time_for_version(state, repo, package_name, &version).await;
+    let published_at = lookup.unwrap_or(None);
     let basis = match state.age_gate_service.as_deref() {
         Some(svc) => svc
             .download_basis(
@@ -4026,6 +4047,14 @@ async fn apply_npm_download_age_gate(
             .map_err(|e| e.into_response())?,
         None => published_at,
     };
+    // A failed lookup is not evidence the version is young: refuse with a
+    // retryable 503 instead of the terminal 451, and file no review.
+    if lookup.is_err() && basis.is_none() {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            &params.key,
+            package_name,
+        ));
+    }
     // The shared seam (#2264) owns the decision and the terminal 451; only
     // the LKG substitution below is npm-specific.
     let lkg = proxy_helpers::enforce_age_gate(
@@ -15164,6 +15193,77 @@ mod db_cov_tests {
             axum::http::StatusCode::OK,
             "aged version of a gated virtual npm member must still stream (200)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_serve_tarball_virtual_gated_member_publish_time_lookup_failure_is_503() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "lookup-failure-pkg";
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}/-/{package}-1.0.0.tgz")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"\x1f\x8b\x08 npm".as_slice()))
+            .mount(&upstream)
+            .await;
+
+        let (member_id, _mkey, member_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, is_public = true, \
+             age_gate_enabled = true, age_gate_min_age_days = 30 WHERE id = $2",
+        )
+        .bind(upstream.uri())
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach member");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            tdh::admin_auth_ext().as_ref(),
+            &fx.repo_key,
+            package,
+            &format!("{package}-1.0.0.tgz"),
+            &Default::default(),
+        )
+        .await;
+        let reviews: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM age_gate_reviews WHERE repository_id = $1")
+                .bind(member_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count reviews");
+
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        let status = result.map(|r| r.status()).unwrap_or_else(|e| e.status());
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reviews, 0);
     }
 
     /// Attach a freshly created local npm repo as a member of the fixture's
