@@ -2662,14 +2662,30 @@ async fn apply_pypi_download_age_gate(
     // Publish-time evidence from the project's upstream JSON metadata; under
     // `first_seen` the time itself is ignored, but presence in the document
     // is the existence evidence that may start the observation clock.
-    let published_at = if let (Some(svc), Some(upstream_url), Ok(client)) =
-        (svc, &repo.upstream_url, metadata_http_client())
-    {
-        svc.metadata_cache()
-            .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
-            .await
-            .ok()
-            .and_then(|times| times.get(&version).copied())
+    let mut lookup_failed = false;
+    let published_at = if let (Some(svc), Some(upstream_url)) = (svc, &repo.upstream_url) {
+        let fetched = match metadata_http_client() {
+            Ok(client) => {
+                svc.metadata_cache()
+                    .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        match fetched {
+            Ok(times) => times.get(&version).copied(),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    repo_key = %repo.key,
+                    project,
+                    version = %version,
+                    "PyPI publish-time lookup failed; age gate cannot evaluate this download"
+                );
+                lookup_failed = true;
+                None
+            }
+        }
     } else {
         None
     };
@@ -2686,6 +2702,14 @@ async fn apply_pypi_download_age_gate(
             .map_err(|e| e.into_response())?,
         None => published_at,
     };
+    // A failed lookup is not evidence the version is young: refuse with a
+    // retryable 503 instead of the terminal 451, and file no review.
+    if lookup_failed && basis.is_none() {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            &params.key,
+            project,
+        ));
+    }
 
     // The shared seam (#2264) owns the decision and the terminal 451; only
     // the LKG wheel-filename substitution below is pypi-specific.
@@ -12699,6 +12723,69 @@ mod tests {
             StatusCode::OK,
             "aged version of a gated virtual member must still resolve 200 (regression guard)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_virtual_gated_member_publish_time_lookup_failure_is_503() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "flaky";
+        let version = "1.0.0";
+        let filename = "flaky-1.0.0-py3-none-any.whl";
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/pypi/{project}/json")))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&upstream)
+            .await;
+
+        let (member_id, member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, true, &upstream.uri()).await;
+        seed_member_wheel(
+            &state,
+            &fx.pool,
+            fx.user_id,
+            member_id,
+            &member_key,
+            &member_dir,
+            &upstream.uri(),
+            project,
+            version,
+            filename,
+        )
+        .await;
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let result = super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            &proj(project),
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+        let reviews: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM age_gate_reviews WHERE repository_id = $1")
+                .bind(member_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count reviews");
+
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        let status = result.map(|r| r.status()).unwrap_or_else(|e| e.status());
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reviews, 0);
     }
 
     #[tokio::test]
