@@ -1054,7 +1054,7 @@ jobs:
           fi
 
       # `workflow_scan_gate_tests` pins ecr-publish.yml: backend image only,
-      # infra-dev on feature branches, infra-prod on main, no Helm deploy.
+      # infra-dev on feature and fix branches, infra-prod on main, no Helm deploy.
       # It lives in backend/tests/ so it is an INTEGRATION target, and it ran
       # in NO job at all (#3437).
       #

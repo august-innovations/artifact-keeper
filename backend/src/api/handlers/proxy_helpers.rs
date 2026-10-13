@@ -4901,8 +4901,10 @@ pub async fn local_fetch_or_redirect(
                 // `coordinated_retry_get`, which takes a cluster-wide advisory
                 // lease (#1609) and returns 507 if the object is still absent.
                 // The self-heal comes from the sole caller (the PyPI
-                // virtual-member loop) discarding that error and continuing to
-                // the remote member's upstream re-fetch.
+                // virtual-member loop) continuing to this member's upstream
+                // re-fetch. The 507 is remembered and is the response only
+                // when no member serves; a later member that has the file
+                // still wins.
                 //
                 // An `Err` from the probe means "unknown", not "absent", so it
                 // is logged rather than swallowed — otherwise an object-store

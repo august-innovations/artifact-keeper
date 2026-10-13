@@ -1,8 +1,9 @@
 name: Publish backend image
 
 # Builds the backend image and pushes it to Adaptive ECR. Feature-branch
-# pushes go to infra-dev only. Pushes to main go to infra-prod only. This
-# workflow does not Helm-deploy; infra-tools pins the digest.
+# and fix-branch pushes go to infra-dev only. Pushes to main go to
+# infra-prod only. This workflow does not Helm-deploy; infra-tools pins
+# the digest.
 #
 # The AWS role and login match nexus-cooldown in infra-tools. The deploy
 # node pool is amd64, so the image is linux/amd64. The build runs on RunsOn
@@ -24,6 +25,7 @@ on: # yamllint disable-line rule:truthy
     branches:
       - main
       - "feature/**"
+      - "fix/**"
   workflow_dispatch:
 
 permissions:

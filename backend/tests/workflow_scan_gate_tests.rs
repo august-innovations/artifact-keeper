@@ -117,6 +117,10 @@ fn feature_branches_publish_to_infra_dev_and_main_publishes_to_infra_prod() {
         "every other ref publishes to infra-dev"
     );
     assert!(
+        raw.contains("\"feature/**\"") && raw.contains("\"fix/**\""),
+        "feature and fix branches are the refs that publish to infra-dev"
+    );
+    assert!(
         raw.contains("${GITHUB_SHA}"),
         "the image tag is the full git SHA"
     );
