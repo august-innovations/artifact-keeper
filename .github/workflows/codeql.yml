@@ -8,10 +8,16 @@ on:
   schedule:
     - cron: '0 6 * * 1' # Weekly on Monday
 
+# Fork pull requests stay on GitHub-hosted: this repository is public and
+# RunsOn runners sit in the infra-prod network (same rule as ci.yml).
 jobs:
   analyze:
     name: Analyze
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","schedule"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=2","ram=4+8","family=m8a.*+m8i.*+m7a.*+m7i.*+c8a.*+c8i.*+c7a.*+c7i.*","image=ubuntu24-full-x64","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-latest' }}
     permissions:
       security-events: write
       contents: read

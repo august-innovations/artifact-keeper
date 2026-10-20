@@ -57,6 +57,14 @@ env:
   RUST_BACKTRACE: 1
   SQLX_OFFLINE: "true"
 
+# Runners: pushes, manual runs and same-repository pull requests run on
+# RunsOn (AWS, env=infra-prod-blue). Fork pull requests fall back to the
+# GitHub-hosted image each job names: this repository is public, and a
+# self-hosted runner in the infra-prod network must never execute fork code.
+# Merge-group runs also stay hosted (see the `merge_group` trigger above).
+# Where comments below say "hosted", they describe that fallback shape.
+# Labels are inline, not `.github/runs-on.yml`: RunsOn reads that file for a
+# public repository only from the default branch (see ecr-publish.yml).
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
   # DOCS-ONLY / BACKEND-CHANGE GATE
@@ -123,7 +131,11 @@ jobs:
   # if that read fails they fall back to the labels in the event payload.
   changes:
     name: 🔍 Docs-Only Gate
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=2","ram=4+8","family=m8g.*+m7g.*+m6g.*+c8g.*+c7g.*+c6g.*","image=ubuntu24-full-arm64","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -341,7 +353,11 @@ jobs:
   # base) — not from attacker-influenced checkout content.
   release-bump:
     name: 🔍 Release-Bump Gate
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=2","ram=4+8","family=m8g.*+m7g.*+m6g.*+c8g.*+c7g.*+c6g.*","image=ubuntu24-full-arm64","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -482,7 +498,11 @@ jobs:
     # every merge. Hosted it has no sccache and a 4-vCPU / 16 GB VM; the
     # estimate is 10-15 min cold, and the rust-cache below is saved from
     # `main` so PR runs are warm.
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=4","ram=16+32","family=m8a.*+m8i.*+m7a.*+m7i.*+r8a.*+r8i.*+r7a.*+r7i.*","image=ubuntu24-full-x64","volume=80gb","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     # 30, not 20: a cold rust-cache is a full `cargo clippy` of the
     # dependency graph, and the job has been cancelled at 20 with every step
     # green, once inside the cache-save step itself (#3944). A cancellation
@@ -663,7 +683,11 @@ jobs:
   # skipped by design.
   test-backend-unit-shard:
     name: 🧪 Unit Tests (${{ matrix.shard }})
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=4","ram=16+32","family=m8a.*+m8i.*+m7a.*+m7i.*+r8a.*+r8i.*+r7a.*+r7i.*","image=ubuntu24-full-x64","volume=80gb","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     # Measured locally per leg: ~2 min instrumented lib-test compile at -j4
     # (20-core aarch64 host; a 4-vCPU hosted runner is slower), ~2-4 min of
     # tests, plus the instrumented dependency graph when the cache misses.
@@ -893,7 +917,11 @@ jobs:
   # false (see that job), and `rust`/`bump_only` skip it as before.
   test-backend-integration:
     name: 🧪 Backend Integration Tests
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=4","ram=16+32","family=m8a.*+m8i.*+m7a.*+m7i.*+r8a.*+r8i.*+r7a.*+r7i.*","image=ubuntu24-full-x64","volume=80gb","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     # Hosted estimate 25-35 min cold (the pool run was ~2 min of test-crate
     # compile and ~6 min of serial tests on a warm persistent target dir).
     # The acceptance bar for staying on PRs is 35 min and 12 GiB peak RSS;
@@ -1368,7 +1396,11 @@ jobs:
   # to run; any other skip, and every failure or cancellation, fails.
   test-backend-unit:
     name: 🧪 Backend Unit Tests
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=2","ram=4+8","family=m8g.*+m7g.*+m6g.*+c8g.*+c7g.*+c6g.*","image=ubuntu24-full-arm64","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     timeout-minutes: 5
     needs: [changes, release-bump, test-backend-unit-shard, test-backend-integration]
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
@@ -1395,7 +1427,11 @@ jobs:
 
   shell-tests:
     name: 🐚 Shell Tests
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=2","ram=4+8","family=m8g.*+m7g.*+m6g.*+c8g.*+c7g.*+c6g.*","image=ubuntu24-full-arm64","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     needs: changes
     # Skip on docs-only PRs — see check-rust.
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
@@ -1802,7 +1838,11 @@ jobs:
   # no branch-protection change is needed for it to block.
   version-pin-bump:
     name: 🔖 Version Pin Bump
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=2","ram=4+8","family=m8g.*+m7g.*+m6g.*+c8g.*+c7g.*+c6g.*","image=ubuntu24-full-arm64","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     # PR-only: the question is whether THIS BRANCH moved a component's sources
     # without bumping its VERSION, which needs a base ref to diff against.
     if: ${{ github.event_name == 'pull_request' }}
@@ -1872,7 +1912,11 @@ jobs:
   # required context; CI Complete is.
   coverage-gates:
     name: 📊 Code Coverage
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=2","ram=4+8","family=m8g.*+m7g.*+m6g.*+c8g.*+c7g.*+c6g.*","image=ubuntu24-full-arm64","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     timeout-minutes: 15
     # The unit-test legs only, not the `test-backend-unit` aggregate: the
     # integration suites contribute no coverage, and waiting for them would
@@ -2361,7 +2405,11 @@ jobs:
     # The in-cluster suites (e2e.yml, scheduled-tests.yml, mesh, cache-
     # correctness, concurrency, the scheduled trivy scan) stay on
     # ak-e2e-runners.
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=4","ram=16+32","family=m8a.*+m8i.*+m7a.*+m7i.*+r8a.*+r8i.*+r7a.*+r7i.*","image=ubuntu24-full-x64","volume=80gb","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     # Depend on the required fast-CI gates as well as the image build so a
     # known-red Check Rust or unit-test run never launches smoke. Smoke only
     # runs when all three succeeded; if the backend image was skipped (no
@@ -2500,7 +2548,11 @@ jobs:
   # queue should spend its slots on the checks it waits for.
   detect-changes:
     name: 🔍 Detect Changes
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=2","ram=4+8","family=m8g.*+m7g.*+m6g.*+c8g.*+c7g.*+c6g.*","image=ubuntu24-full-arm64","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     timeout-minutes: 8
     if: ${{ github.event_name != 'merge_group' }}
     permissions:
@@ -2560,7 +2612,11 @@ jobs:
     # (20260907) reports 145 GB with 86 GB free before any cleanup (same
     # release/1.10.x job), against a build that holds the cooked target
     # dir, the loaded image and a ~505 MB gzipped tarball.
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=4","ram=16+32","family=m8a.*+m8i.*+m7a.*+m7i.*+r8a.*+r8i.*+r7a.*+r7i.*","image=ubuntu24-full-x64","volume=120gb","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     # The release profile's cold-cook worst case (60-90 min on a hosted
     # runner, per the schedule note in docker-publish.yml) set this ceiling.
     # With the `ci` profile the cook is always cold here (see the build
@@ -2662,7 +2718,11 @@ jobs:
     # GitHub-hosted for the same reason as build-backend-image above; a
     # small UBI image (docker-publish.yml built it in ~1 min on ubuntu-24.04
     # before #4206) that needs no pool.
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=4","ram=16+32","family=m8a.*+m8i.*+m7a.*+m7i.*+r8a.*+r8i.*+r7a.*+r7i.*","image=ubuntu24-full-x64","volume=80gb","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     timeout-minutes: 30
     needs: [changes, detect-changes]
     # Its own filter on every event (its Dockerfile and the one script the
@@ -2707,7 +2767,11 @@ jobs:
 
   security-audit:
     name: 🔒 Security Audit
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=2","ram=4+8","family=m8a.*+m8i.*+m7a.*+m7i.*+c8a.*+c8i.*+c7a.*+c7i.*","image=ubuntu24-full-x64","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     timeout-minutes: 15
     needs: changes
     # Skip on docs-only PRs — see check-rust. (Docs-only PRs never change
@@ -2733,7 +2797,11 @@ jobs:
 
   ci-complete:
     name: ✅ CI Complete
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ (contains(fromJSON('["push","workflow_dispatch"]'), github.event_name)
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      && fromJSON(format('["runs-on={0}","cpu=2","ram=4+8","family=m8g.*+m7g.*+m6g.*+c8g.*+c7g.*+c6g.*","image=ubuntu24-full-arm64","spot=price-capacity-optimized","env=infra-prod-blue"]', github.run_id))
+      || 'ubuntu-24.04' }}
     timeout-minutes: 15
     # Not smoke-e2e, build-backend-image or build-openscap-image: they are
     # advisory (see the container-chain note in the step below), and a

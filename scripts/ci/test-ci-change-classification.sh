@@ -84,8 +84,18 @@ open(f'{work}/integ_if.txt', 'w').write(integ_if + '\n')
 on = wf.get('on', wf.get(True, {}))
 facts = []
 facts.append('trigger_merge_group=' + str('merge_group' in (on or {})).lower())
-for j in ('check-rust', 'test-backend-integration', 'test-backend-unit', 'ci-complete'):
-    facts.append(f'runs_on_{j}=' + str(wf['jobs'][j].get('runs-on')))
+# A job either names ubuntu-24.04 or picks RunsOn only for pushes, manual
+# runs and same-repository pull requests, falling back to ubuntu-24.04.
+# Fork PRs and merge groups must never reach a RunsOn runner.
+runs_on_guarded = re.compile(
+    r"\$\{\{ \(contains\(fromJSON\('\[\"push\",\"workflow_dispatch\"\]'\), github\.event_name\)"
+    r" \|\| \(github\.event_name == 'pull_request' && github\.event\.pull_request\.head\.repo\.full_name == github\.repository\)\)"
+    r" && fromJSON\(format\('\[\"runs-on=\{0\}\",[^']*\]', github\.run_id\)\)"
+    r" \|\| 'ubuntu-24\.04' \}\}")
+for j, job in wf['jobs'].items():
+    ro = str(job.get('runs-on'))
+    shape = 'ubuntu-24.04' if ro == 'ubuntu-24.04' or runs_on_guarded.fullmatch(ro) else ro
+    facts.append(f'runs_on_{j}=' + shape)
 cc_needs = wf['jobs']['ci-complete'].get('needs', [])
 for j in ('smoke-e2e', 'build-backend-image', 'build-openscap-image'):
     facts.append(f'cc_needs_{j}=' + str(j in cc_needs).lower())
@@ -374,8 +384,8 @@ want_fact() {
   if [ "$(fact "$1")" = "$2" ]; then pass "$3"; else fail "$3: $1=$(fact "$1"), want $2"; fi
 }
 want_fact trigger_merge_group true "ci.yml triggers on merge_group (required checks must report in the queue)"
-for j in check-rust test-backend-integration test-backend-unit ci-complete; do
-  want_fact "runs_on_$j" ubuntu-24.04 "$j runs on pinned GitHub-hosted ubuntu-24.04"
+for j in $(sed -n 's/^runs_on_\([^=]*\)=.*/\1/p' "$WORK/facts.txt"); do
+  want_fact "runs_on_$j" ubuntu-24.04 "$j runs on GitHub-hosted ubuntu-24.04 for fork PRs and merge groups"
 done
 for j in smoke-e2e build-backend-image build-openscap-image; do
   want_fact "cc_needs_$j" false "CI Complete does not wait for advisory $j"

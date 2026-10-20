@@ -84,7 +84,14 @@ jobs:
 
   dependency-check:
     name: 🔍 Dependency Check
-    runs-on: ubuntu-latest
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - cpu=2
+      - ram=4+8
+      - family=m8g.*+m7g.*+m6g.*+c8g.*+c7g.*+c6g.*
+      - image=ubuntu24-full-arm64
+      - spot=price-capacity-optimized
+      - env=infra-prod-blue
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -107,7 +114,14 @@ jobs:
     # which is a hard gate — two jobs named "Security Scan" where one cannot
     # fail made "Security Scan is green/red" a coin flip over meaning.
     name: Security audit report (non-gating)
-    runs-on: ubuntu-latest
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - cpu=2
+      - ram=4+8
+      - family=m8g.*+m7g.*+m6g.*+c8g.*+c7g.*+c6g.*
+      - image=ubuntu24-full-arm64
+      - spot=price-capacity-optimized
+      - env=infra-prod-blue
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -143,7 +157,15 @@ jobs:
   # windows leg of publish-binaries.yml.
   windows-cross-build:
     name: 🪟 Windows Cross-Build
-    runs-on: ubuntu-latest
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - cpu=4
+      - ram=16+32
+      - family=m8a.*+m8i.*+m7a.*+m7i.*+r8a.*+r8i.*+r7a.*+r7i.*
+      - image=ubuntu24-full-x64
+      - volume=80gb
+      - spot=price-capacity-optimized
+      - env=infra-prod-blue
     permissions:
       contents: read
       issues: write

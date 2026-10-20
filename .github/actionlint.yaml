@@ -8,3 +8,12 @@ self-hosted-runner:
     - ak-e2e-runners
     - ak-beefy-runners
     - ak-docker-runners
+    # RunsOn (AWS) inline job labels.
+    - runs-on=*
+    - cpu=*
+    - ram=*
+    - family=*
+    - image=*
+    - volume=*
+    - spot=*
+    - env=*

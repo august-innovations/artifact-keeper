@@ -54,7 +54,14 @@ concurrency:
 jobs:
   lint:
     name: Lint harness scripts
-    runs-on: ubuntu-latest
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - cpu=2
+      - ram=4+8
+      - family=m8g.*+m7g.*+m6g.*+c8g.*+c7g.*+c6g.*
+      - image=ubuntu24-full-arm64
+      - spot=price-capacity-optimized
+      - env=infra-prod-blue
     steps:
       - uses: actions/checkout@v7.0.1
       - name: shellcheck

@@ -63,7 +63,14 @@ jobs:
 
   setup-pki:
     name: 🔐 Setup PKI
-    runs-on: ubuntu-latest
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - cpu=2
+      - ram=4+8
+      - family=m8g.*+m7g.*+m6g.*+c8g.*+c7g.*+c6g.*
+      - image=ubuntu24-full-arm64
+      - spot=price-capacity-optimized
+      - env=infra-prod-blue
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -283,7 +290,14 @@ jobs:
 
   e2e-complete:
     name: ✅ E2E Complete
-    runs-on: ubuntu-latest
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - cpu=2
+      - ram=4+8
+      - family=m8g.*+m7g.*+m6g.*+c8g.*+c7g.*+c6g.*
+      - image=ubuntu24-full-arm64
+      - spot=price-capacity-optimized
+      - env=infra-prod-blue
     needs: [native-client-tests, stress-tests, failure-tests]
     if: always()
     steps:
