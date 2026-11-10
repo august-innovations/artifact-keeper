@@ -16,6 +16,12 @@
               ]
             }
           }
+        },
+        "origin": {
+          "Table": {
+            "table": "format_handlers",
+            "name": "handler_type"
+          }
         }
       }
     ],

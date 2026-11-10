@@ -282,7 +282,10 @@ impl GoHandler {
                 .by_index(i)
                 .map_err(|e| AppError::Validation(format!("Failed to read zip entry: {}", e)))?;
 
-            let name = file.name().to_string();
+            let name = file
+                .name()
+                .map_err(|e| AppError::Validation(format!("Failed to read zip entry name: {}", e)))?
+                .into_owned();
 
             if name.ends_with("/go.mod") || name == "go.mod" {
                 let mut content = String::new();

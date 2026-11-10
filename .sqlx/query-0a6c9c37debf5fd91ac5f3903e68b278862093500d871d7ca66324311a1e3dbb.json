@@ -6,37 +6,79 @@
       {
         "ordinal": 0,
         "name": "logical_bytes",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_storage_stats",
+            "name": "logical_bytes"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "physical_bytes",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_storage_stats",
+            "name": "physical_bytes"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "unique_bytes",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_storage_stats",
+            "name": "unique_bytes"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "shared_bytes",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_storage_stats",
+            "name": "shared_bytes"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "blob_count",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_storage_stats",
+            "name": "blob_count"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "dedup_scope",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_storage_stats",
+            "name": "dedup_scope"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "computed_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "repository_storage_stats",
+            "name": "computed_at"
+          }
+        }
       }
     ],
     "parameters": {

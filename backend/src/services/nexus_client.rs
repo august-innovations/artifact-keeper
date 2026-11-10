@@ -9,8 +9,11 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::services::artifactory_client::{
-    AqlRange, AqlResponse, AqlResult, ArtifactoryError, PropertiesResponse, RepositoryListItem,
-    RetryConfig, SystemVersionResponse,
+    migration_timeout_secs_from_env, AqlRange, AqlResponse, AqlResult, ArtifactoryError,
+    PropertiesResponse, RepositoryListItem, RetryConfig, SystemVersionResponse,
+    DEFAULT_BUFFERED_TIMEOUT_SECS, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_READ_TIMEOUT_SECS,
+    MIGRATION_SOURCE_BUFFERED_TIMEOUT_ENV, MIGRATION_SOURCE_CONNECT_TIMEOUT_ENV,
+    MIGRATION_SOURCE_READ_TIMEOUT_ENV,
 };
 use crate::services::proxy_service::redact_url_for_diagnostics;
 
@@ -20,6 +23,10 @@ pub struct NexusAuth {
     pub username: String,
     pub password: String,
 }
+
+/// Listing pages [`NexusClient`]'s `count_artifacts` walks before reporting a
+/// lower bound (#3928): repositories of up to 2,000 assets are counted exactly.
+pub const NEXUS_COUNT_PAGE_BUDGET: usize = 2;
 
 /// Nexus client configuration
 #[derive(Debug, Clone)]
@@ -54,11 +61,22 @@ impl Default for NexusClientConfig {
                 username: String::new(),
                 password: String::new(),
             },
-            timeout_secs: 30,
-            connect_timeout_secs: 10,
+            // Operator-tunable through the same env overrides as the
+            // Artifactory client (#3926).
+            timeout_secs: migration_timeout_secs_from_env(
+                MIGRATION_SOURCE_READ_TIMEOUT_ENV,
+                DEFAULT_READ_TIMEOUT_SECS,
+            ),
+            connect_timeout_secs: migration_timeout_secs_from_env(
+                MIGRATION_SOURCE_CONNECT_TIMEOUT_ENV,
+                DEFAULT_CONNECT_TIMEOUT_SECS,
+            ),
             // Generous: it exists to stop a stalled buffered read, not to cap
             // how long a legitimately slow metadata call or download may take.
-            buffered_timeout_secs: 300,
+            buffered_timeout_secs: migration_timeout_secs_from_env(
+                MIGRATION_SOURCE_BUFFERED_TIMEOUT_ENV,
+                DEFAULT_BUFFERED_TIMEOUT_SECS,
+            ),
             throttle_delay_ms: 100,
             retry_config: RetryConfig::default(),
             cancel_token: CancellationToken::new(),
@@ -777,6 +795,24 @@ impl crate::services::source_registry::SourceRegistry for NexusClient {
         self.list_artifacts(repo_key, offset, limit).await
     }
 
+    /// A smaller walk than the default (#3928): one Nexus listing page of
+    /// [`COUNT_PAGE_SIZE`](crate::services::source_registry::COUNT_PAGE_SIZE)
+    /// rows costs many `/components` requests, each behind the client's
+    /// throttle delay, so the full default budget would make an assessment of
+    /// a large Nexus repository take minutes.
+    async fn count_artifacts(
+        &self,
+        repo_key: &str,
+    ) -> Result<crate::services::source_registry::ArtifactCount, ArtifactoryError> {
+        crate::services::source_registry::count_by_listing(
+            self,
+            repo_key,
+            crate::services::source_registry::COUNT_PAGE_SIZE,
+            NEXUS_COUNT_PAGE_BUDGET,
+        )
+        .await
+    }
+
     async fn list_artifacts_with_date_filter(
         &self,
         repo_key: &str,
@@ -1129,29 +1165,6 @@ mod tests {
         assert_eq!(body, b"payload");
     }
 
-    /// Collects `tracing` output emitted on this thread while the guard lives.
-    #[derive(Clone, Default)]
-    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogCapture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
-        type Writer = LogCapture;
-
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[tokio::test]
     async fn test_retry_warnings_redact_source_credentials() {
         let server = MockServer::start().await;
@@ -1161,20 +1174,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let capture = LogCapture::default();
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(capture.clone())
-                .with_max_level(tracing::Level::WARN)
-                .finish(),
-        );
+        let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
+        let _guard = capture.install(tracing::Level::WARN);
 
         // `source_connections.url` is accepted with userinfo, so the retry
         // warnings must never echo it verbatim (#2926).
         let client = retrying_client(server.uri().replace("http://", "http://svc:hunter2@"), 1);
         let _ = client.download_artifact("repo", "dir/file.bin").await;
 
-        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let logs = capture.text();
         assert!(
             logs.contains("Nexus request failed"),
             "expected a retry warning, got {logs:?}"

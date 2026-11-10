@@ -21,6 +21,10 @@
 //!   OSS dialect, which copies objects with a streaming PUT because OSS ignores
 //!   `x-amz-copy-source` (#3594); `aws` (alias `generic`) forces the plain S3
 //!   dialect. Unset infers OSS from an `*.aliyuncs.com` endpoint.
+//! - S3_MAX_PARTS: Most parts one multipart upload may use (default: 10000,
+//!   AWS's cap). Clamped into [1, 10000]. Streamed part sizes and the
+//!   part-count checks derive from it, so a lower budget grows parts sooner.
+//!   Lever for providers that cap an upload at 1,000 parts.
 //!
 //! For HTTP connection pool tuning:
 //! - S3_POOL_MAX_IDLE_PER_HOST: Maximum idle connections per host (default: 256)
@@ -40,6 +44,10 @@
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
 //! - S3_PRESIGN_EXPIRY_SECS: URL expiry in seconds (default: 3600)
+//! - S3_PUBLIC_ENDPOINT: Origin (`scheme://host[:port]`) that clients use to
+//!   reach the object store, when it differs from S3_ENDPOINT (e.g. an
+//!   in-cluster MinIO service name). Presigned URLs are signed for and point
+//!   at this host; the backend's own S3 calls keep S3_ENDPOINT (#4417).
 //!
 //! For CloudFront CDN:
 //! - CLOUDFRONT_DISTRIBUTION_URL: CloudFront distribution URL (optional)
@@ -65,12 +73,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
 
+use super::public_endpoint::{public_endpoint_from_env, EndpointPath};
 use super::{PresignedUrl, PresignedUrlSource, PutStreamResult, StoragePathFormat};
 use crate::error::{AppError, Result};
 
 /// S3's minimum multipart part size (5 MiB). Every part except the last must be
 /// at least this large. This is also the part size used for the first
-/// [`S3_PARTS_PER_TIER`] parts of an unknown-length stream, so the behaviour for
+/// [`s3_parts_per_tier`] parts of an unknown-length stream, so the behaviour for
 /// small/typical artifacts is identical to the historical fixed-size path.
 const S3_MULTIPART_CHUNK_SIZE: usize = 5 * 1024 * 1024;
 /// S3's maximum multipart part size (5 GiB). No single `UploadPart` may exceed
@@ -102,24 +111,48 @@ const S3_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// impossible. 30 minutes matches the ceiling the GCS backend already uses for
 /// its streaming client (`gcs.rs`), keeping a cliff without capping transfers.
 const S3_DEFAULT_BULK_TIMEOUT_SECS: u64 = 1800;
-/// S3 caps a multipart upload at 10,000 parts.
+/// S3 caps a multipart upload at 10,000 parts. Default and upper clamp of the
+/// configurable part budget ([`S3Config::max_parts`]); some S3-compatible
+/// providers cap an upload lower.
 const S3_MULTIPART_MAX_PARTS: usize = 10_000;
-/// S3's maximum object size (5 TiB). The adaptive part-size schedule is designed
-/// so an object up to this size can be streamed within the 10,000-part cap.
-const S3_MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024;
-/// When the object size is known up front we target this many parts (comfortably
-/// under the 10,000-part cap) so transient retries / off-by-one buffering never
-/// push us over the hard limit.
-const S3_MULTIPART_TARGET_PARTS: u64 = 9_000;
+
+/// When the object size is known up front we target this many parts: 90 % of
+/// the part budget (9,000 at 10,000), comfortably under the cap so transient
+/// retries / off-by-one buffering never push us over the hard limit.
+fn s3_target_parts(max_parts: usize) -> u64 {
+    (max_parts as u64 * 9 / 10).max(1)
+}
+
 /// Number of parts uploaded at each size tier before the part size doubles, used
-/// when the object length is unknown (pure streaming). With 1,000 parts per tier
-/// the size doubles 5 MiB → 10 MiB → … → 5 GiB across the first 10 tiers, so the
-/// full 10,000-part budget covers objects up to ~4.99 TiB (see
-/// [`adaptive_part_size`]).
-const S3_PARTS_PER_TIER: u32 = 1_000;
+/// when the object length is unknown (pure streaming): a tenth of the part
+/// budget (1,000 at 10,000). The size doubles 5 MiB → 10 MiB → … across the ten
+/// tiers that fill the budget, whatever its size (see [`adaptive_part_size`]).
+fn s3_parts_per_tier(max_parts: usize) -> u32 {
+    (max_parts / 10).max(1) as u32
+}
+
+/// Largest object an unknown-length stream can store within `max_parts` parts:
+/// the [`adaptive_part_size`] schedule summed over the whole budget.
+fn s3_streaming_capacity(max_parts: usize) -> u64 {
+    (0..max_parts as u32)
+        .map(|part_index| adaptive_part_size(None, part_index, max_parts))
+        .sum()
+}
+
+/// `bytes` rounded to the nearest TiB, GiB or MiB (the largest unit it
+/// reaches), for error messages.
+fn approx_binary_size(bytes: u64) -> String {
+    for (unit, name) in [(1u64 << 40, "TiB"), (1 << 30, "GiB")] {
+        if bytes >= unit {
+            return format!("{} {name}", (bytes + unit / 2) / unit);
+        }
+    }
+    format!("{} MiB", (bytes + (1 << 19)) >> 20)
+}
 
 /// Compute the S3 multipart part size (in bytes) to use for the part at
-/// `part_index` (0-based), given the total object size when it is known.
+/// `part_index` (0-based), given the total object size when it is known and the
+/// part budget `max_parts` ([`S3Config::max_parts`], 10,000 by default).
 ///
 /// This is the single source of truth for adaptive part sizing and is pure so it
 /// can be unit-tested exhaustively without a live S3.
@@ -127,28 +160,30 @@ const S3_PARTS_PER_TIER: u32 = 1_000;
 /// # Known size (`object_size = Some(n)`)
 /// We pick one fixed part size for the whole object:
 /// `clamp(ceil(n / TARGET_PARTS), MIN_PART, MAX_PART)`. Targeting
-/// [`S3_MULTIPART_TARGET_PARTS`] (9,000) parts keeps us under the 10,000-part cap
+/// [`s3_target_parts`] (9,000 at the default budget) keeps us under the part cap
 /// with margin. Capped at [`S3_MULTIPART_MAX_PART_SIZE`] (5 GiB), one part size
 /// reaches S3's 5 TiB object ceiling (5 GiB × 1,000 parts).
 ///
 /// # Unknown size (`object_size = None`, pure streaming)
-/// We grow the part size as the part index climbs so the 10,000-part budget can
+/// We grow the part size as the part index climbs so the part budget can
 /// cover a large object without knowing its length in advance. The size doubles
-/// every [`S3_PARTS_PER_TIER`] parts starting from [`S3_MULTIPART_CHUNK_SIZE`]
+/// every [`s3_parts_per_tier`] parts starting from [`S3_MULTIPART_CHUNK_SIZE`]
 /// (5 MiB) and is capped at [`S3_MULTIPART_MAX_PART_SIZE`] (5 GiB):
 /// `min(MAX_PART, MIN_PART << (part_index / PARTS_PER_TIER))`.
-/// The first 1,000 parts stay at 5 MiB, so small/typical objects are unaffected.
-/// Summed across all 10,000 parts this schedule covers ~4.99 TiB.
-fn adaptive_part_size(object_size: Option<u64>, part_index: u32) -> u64 {
+/// The first tenth of the budget (1,000 parts by default) stays at 5 MiB, so
+/// small/typical objects are unaffected. Summed across the whole budget this
+/// schedule covers ~4.88 TiB at 10,000 parts and ~500 GiB at 1,000
+/// ([`s3_streaming_capacity`]).
+fn adaptive_part_size(object_size: Option<u64>, part_index: u32, max_parts: usize) -> u64 {
     const MIN_PART: u64 = S3_MULTIPART_CHUNK_SIZE as u64;
     match object_size {
         Some(size) => {
             // ceil(size / TARGET_PARTS), then clamp into [MIN_PART, MAX_PART].
-            let target = size.div_ceil(S3_MULTIPART_TARGET_PARTS);
+            let target = size.div_ceil(s3_target_parts(max_parts));
             target.clamp(MIN_PART, S3_MULTIPART_MAX_PART_SIZE)
         }
         None => {
-            let tier = part_index / S3_PARTS_PER_TIER;
+            let tier = part_index / s3_parts_per_tier(max_parts);
             // 5 MiB << 10 == 5 GiB == MAX_PART, so any tier >= 10 is capped.
             // Clamp the shift first to avoid u64 overflow wrapping to 0 for very
             // large indices (`checked_shl` only guards shifts >= 64, not value
@@ -170,6 +205,8 @@ struct S3PartUploadContext<'a> {
     path: &'a ObjectPath,
     upload_id: &'a object_store::MultipartId,
     key: &'a str,
+    /// Part budget of the upload (see [`S3Config::max_parts`]).
+    max_parts: usize,
 }
 
 async fn collect_finished_s3_part(
@@ -186,10 +223,10 @@ async fn collect_finished_s3_part(
             parts.push(part);
             Ok(())
         }
-        Ok(Err(e)) => Err(AppError::Storage(format!(
-            "Multipart upload part failed for '{}': {}",
-            key, e
-        ))),
+        Ok(Err(e)) => Err(s3_storage_error(
+            format!("Multipart upload part failed for '{}'", key),
+            &e,
+        )),
         Err(e) => Err(AppError::Storage(format!(
             "Multipart upload task failed for '{}': {}",
             key, e
@@ -213,16 +250,23 @@ async fn wait_for_s3_part_capacity(
 /// payload and then failing opaquely at `complete_multipart`.
 ///
 /// Enforces the genuine S3 constraints (not the historical artificial ~50 GiB
-/// bound): at most [`S3_MULTIPART_MAX_PARTS`] parts and at most
-/// [`S3_MULTIPART_MAX_PART_SIZE`] (5 GiB) per part. With adaptive part sizing the
-/// effective object ceiling is S3's real ~5 TiB limit.
-fn ensure_s3_part_within_limit(next_part_index: usize, part_len: usize, key: &str) -> Result<()> {
-    if next_part_index >= S3_MULTIPART_MAX_PARTS {
-        let approx_tib = S3_MAX_OBJECT_SIZE / (1024 * 1024 * 1024 * 1024);
+/// bound): at most `max_parts` parts (the configured part budget, AWS's 10,000
+/// by default) and at most [`S3_MULTIPART_MAX_PART_SIZE`] (5 GiB) per part. With
+/// adaptive part sizing the effective object ceiling is
+/// [`s3_streaming_capacity`], ~5 TiB at the default budget.
+fn ensure_s3_part_within_limit(
+    next_part_index: usize,
+    part_len: usize,
+    key: &str,
+    max_parts: usize,
+) -> Result<()> {
+    if next_part_index >= max_parts {
         return Err(AppError::Storage(format!(
-            "Multipart upload for '{}' exceeded S3's {}-part limit; \
-             objects larger than ~{} TiB cannot be stored",
-            key, S3_MULTIPART_MAX_PARTS, approx_tib,
+            "Multipart upload for '{}' exceeded the {}-part limit; \
+             objects larger than ~{} cannot be stored",
+            key,
+            max_parts,
+            approx_binary_size(s3_streaming_capacity(max_parts)),
         )));
     }
     if part_len as u64 > S3_MULTIPART_MAX_PART_SIZE {
@@ -245,10 +289,10 @@ async fn enqueue_s3_part_upload(
 ) -> Result<()> {
     wait_for_s3_part_capacity(tasks, parts, context.key).await?;
     // Reject before spawning any part that would exceed a real S3 limit (the
-    // 10,000-part cap or the 5 GiB per-part cap). The predicate is unit-tested
+    // part budget or the 5 GiB per-part cap). The predicate is unit-tested
     // (`test_s3_part_within_limit_*`); keep the call here so a refactor of the
     // streaming loop can't silently drop the guard.
-    ensure_s3_part_within_limit(*next_part_index, part.len(), context.key)?;
+    ensure_s3_part_within_limit(*next_part_index, part.len(), context.key, context.max_parts)?;
 
     let store = context.store.clone();
     let part_path = context.path.clone();
@@ -407,8 +451,19 @@ fn copy_part_ranges(size: u64, part_size: u64) -> Vec<(u64, u64)> {
 /// and key of the source object, separated by a slash (/). ... The value must
 /// be URL-encoded" (S3 API Reference, UploadPartCopy). Each key segment is
 /// percent-encoded; the `/` separators are structural and stay literal.
+///
+/// The key named has to be the one the object was stored under (#4838).
+/// `object_store` writes each segment through
+/// [`PathPart`](object_store::path::PathPart), so the stored S3 key of
+/// `café a&b~c` is literally `caf%C3%A9 a&b%7Ec`; its own `CopyObject` then
+/// URL-encodes that stored form again for the header. S3 decodes the header
+/// once and looks the result up, so the value is the URL encoding of
+/// [`stored_key_form`], not of the caller's key: encoding the caller's key
+/// decodes to `café a&b~c`, which is not the stored object, and the multipart
+/// copy failed with `NoSuchKey` while a small object's single-request
+/// `CopyObject` succeeded.
 fn s3_copy_source_value(bucket: &str, full_key: &str) -> String {
-    let encoded: Vec<String> = full_key
+    let encoded: Vec<String> = stored_key_form(full_key)
         .split('/')
         .map(|segment| urlencoding::encode(segment).into_owned())
         .collect();
@@ -599,6 +654,10 @@ fn list_response_is_unparsable(message: &str) -> bool {
 struct ListBucketPage {
     /// `<Contents><Key>` values, in document order, exactly as sent.
     keys: Vec<String>,
+    /// `<Contents><LastModified>` of each key (parallel to `keys`), `None`
+    /// when absent or unparsable (#1570 review: the storage reindex needs
+    /// object age on the REST fallback too).
+    last_modified: Vec<Option<chrono::DateTime<chrono::Utc>>>,
     /// `<IsTruncated>`.
     is_truncated: bool,
     /// `<NextContinuationToken>`, absent when empty.
@@ -627,8 +686,8 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
 
-    fn local(name: &[u8]) -> String {
-        String::from_utf8_lossy(name).into_owned()
+    fn local(name: &str) -> String {
+        name.to_owned()
     }
 
     let mut reader = Reader::from_str(xml);
@@ -636,6 +695,10 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
     let mut stack: Vec<String> = Vec::new();
     let mut root: Option<String> = None;
     let mut text = String::new();
+    // Per-`<Contents>` accumulators: `<Key>` and `<LastModified>` may come in
+    // either order, so the entry is recorded when `</Contents>` closes.
+    let mut entry_key: Option<String> = None;
+    let mut entry_modified: Option<chrono::DateTime<chrono::Utc>> = None;
 
     loop {
         match reader.read_event() {
@@ -647,24 +710,23 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
                 stack.push(name);
                 text.clear();
             }
-            // `quick-xml` 0.41 reports an entity reference as its own event
+            // `quick-xml` reports an entity reference as its own event
             // rather than expanding it into the surrounding text, so a value
             // like `a&amp;b` arrives as Text("a"), GeneralRef("amp"),
             // Text("b") and the three fragments have to be reassembled here.
             Ok(Event::Text(e)) => {
-                if let Ok(decoded) = e.decode() {
-                    text.push_str(&decoded);
-                }
+                text.push_str(&e);
             }
             Ok(Event::GeneralRef(e)) => {
                 if let Ok(Some(resolved)) = e.resolve_char_ref() {
                     // Numeric reference: `&#38;` / `&#x26;`.
                     text.push(resolved);
-                } else if let Ok(name) = e.decode() {
+                } else {
                     // XML defines exactly these five named entities, and a
                     // list response has no DTD to declare any others. An
                     // unknown name is dropped rather than guessed at.
-                    match name.as_ref() {
+                    let name: &str = &e;
+                    match name {
                         "amp" => text.push('&'),
                         "lt" => text.push('<'),
                         "gt" => text.push('>'),
@@ -675,14 +737,26 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
                 }
             }
             // CDATA is literal by definition -- no entity expansion.
-            Ok(Event::CData(e)) => text.push_str(&String::from_utf8_lossy(&e)),
+            Ok(Event::CData(e)) => text.push_str(&e),
             Ok(Event::End(e)) => {
                 let closed = stack
                     .pop()
                     .unwrap_or_else(|| local(e.local_name().as_ref()));
                 let parent = stack.last().map(String::as_str).unwrap_or("");
                 match (parent, closed.as_str()) {
-                    ("Contents", "Key") => page.keys.push(std::mem::take(&mut text)),
+                    ("Contents", "Key") => entry_key = Some(std::mem::take(&mut text)),
+                    ("Contents", "LastModified") => {
+                        entry_modified = chrono::DateTime::parse_from_rfc3339(text.trim())
+                            .ok()
+                            .map(|d| d.with_timezone(&chrono::Utc));
+                    }
+                    ("ListBucketResult", "Contents") => {
+                        if let Some(key) = entry_key.take() {
+                            page.keys.push(key);
+                            page.last_modified.push(entry_modified.take());
+                        }
+                        entry_modified = None;
+                    }
                     ("ListBucketResult", "IsTruncated") => {
                         page.is_truncated = text.trim().eq_ignore_ascii_case("true");
                     }
@@ -695,7 +769,14 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
                 }
                 text.clear();
             }
-            Ok(Event::Eof) => break,
+            Ok(Event::Eof) => {
+                // A truncated body may end inside `<Contents>`: keep the key.
+                if let Some(key) = entry_key.take() {
+                    page.keys.push(key);
+                    page.last_modified.push(entry_modified.take());
+                }
+                break;
+            }
             // Decl, Comment, PI, DocType, and self-closing elements carry no
             // value we read.
             Ok(_) => {}
@@ -726,6 +807,12 @@ pub struct S3Config {
     pub region: String,
     /// Custom endpoint URL (for MinIO compatibility)
     pub endpoint: Option<String>,
+    /// Client-facing origin for presigned download URLs (`S3_PUBLIC_ENDPOINT`,
+    /// #4417). When set, presigned GET URLs are signed for and point at this
+    /// host instead of [`Self::endpoint`]; the backend's own requests are
+    /// unaffected. Validated by
+    /// [`crate::storage::public_endpoint::parse_public_endpoint`].
+    pub public_endpoint: Option<String>,
     /// Optional key prefix for all objects
     pub prefix: Option<String>,
     /// Enable redirect downloads via presigned URLs
@@ -781,6 +868,17 @@ pub struct S3Config {
     /// single copy may exceed AWS's 5 GiB cap. Default:
     /// [`S3_MAX_SINGLE_COPY_SIZE`] (5 GiB).
     pub max_single_copy_bytes: u64,
+    /// Most parts one multipart upload may use (`S3_MAX_PARTS`). Sizes the
+    /// parts of streamed uploads and bounds the part count of streamed uploads
+    /// and multipart copies. Operator lever for S3-compatible stores that cap
+    /// an upload below AWS's 10,000 parts.
+    /// Clamped at use into [1, 10,000]. Default: [`S3_MULTIPART_MAX_PARTS`].
+    pub max_parts: usize,
+    /// Connect timeout and retry budget for every request to the store
+    /// (`STORAGE_CONNECT_TIMEOUT_SECS` / `STORAGE_OPERATION_TIMEOUT_SECS`,
+    /// #5649). Without them each operation against a gone endpoint retried
+    /// 5s connection attempts for up to three minutes.
+    pub timeouts: crate::storage::StorageTimeouts,
 }
 
 /// CloudFront CDN configuration for signed URLs
@@ -801,6 +899,8 @@ impl S3Config {
             std::env::var("S3_BUCKET").map_err(|_| AppError::Config("S3_BUCKET not set".into()))?;
         let region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into());
         let endpoint = std::env::var("S3_ENDPOINT").ok();
+        let public_endpoint =
+            public_endpoint_from_env("S3_PUBLIC_ENDPOINT", EndpointPath::Forbidden)?;
         let prefix = std::env::var("S3_PREFIX").ok();
         if let Some(p) = prefix.as_deref() {
             if s3_prefix_collides_with_reserved_namespace(p) {
@@ -831,7 +931,10 @@ impl S3Config {
 
         // Dedicated signing credentials for presigned URLs (Option B)
         let presign_access_key = std::env::var("S3_PRESIGN_ACCESS_KEY_ID").ok();
-        let presign_secret_key = std::env::var("S3_PRESIGN_SECRET_ACCESS_KEY").ok();
+        let presign_secret_key = crate::config::secret_or_env("S3_PRESIGN_SECRET_ACCESS_KEY")
+            .ok()
+            .flatten()
+            .filter(|v| !v.is_empty());
 
         let ca_cert_path = std::env::var("S3_CA_CERT_PATH").ok();
         let insecure_tls = std::env::var("S3_INSECURE_TLS")
@@ -864,11 +967,16 @@ impl S3Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(S3_MAX_SINGLE_COPY_SIZE);
+        let max_parts: usize = std::env::var("S3_MAX_PARTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(S3_MULTIPART_MAX_PARTS);
 
         Ok(Self {
             bucket,
             region,
             endpoint,
+            public_endpoint,
             prefix,
             redirect_downloads,
             presign_expiry: Duration::from_secs(presign_expiry_secs),
@@ -885,6 +993,8 @@ impl S3Config {
             bulk_timeout_secs,
             control_timeout_secs,
             max_single_copy_bytes,
+            max_parts,
+            timeouts: crate::storage::StorageTimeouts::from_env(),
         })
     }
 
@@ -937,6 +1047,7 @@ impl S3Config {
             bucket,
             region,
             endpoint,
+            public_endpoint: None,
             prefix,
             redirect_downloads: false,
             presign_expiry: Duration::from_secs(3600),
@@ -953,6 +1064,8 @@ impl S3Config {
             bulk_timeout_secs: S3_DEFAULT_BULK_TIMEOUT_SECS,
             control_timeout_secs: S3_CONTROL_TIMEOUT.as_secs(),
             max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+            max_parts: S3_MULTIPART_MAX_PARTS,
+            timeouts: crate::storage::StorageTimeouts::default(),
         }
     }
 
@@ -965,6 +1078,13 @@ impl S3Config {
     /// Enable redirect downloads
     pub fn with_redirect_downloads(mut self, enabled: bool) -> Self {
         self.redirect_downloads = enabled;
+        self
+    }
+
+    /// Set the client-facing origin for presigned URLs (`S3_PUBLIC_ENDPOINT`,
+    /// #4417). The value is used as given; [`Self::from_env`] validates it.
+    pub fn with_public_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.public_endpoint = Some(endpoint.into());
         self
     }
 
@@ -1023,10 +1143,23 @@ impl S3Config {
         self
     }
 
+    /// Override the connect timeout and retry budget (#5649).
+    pub fn with_storage_timeouts(mut self, timeouts: crate::storage::StorageTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
     /// Override the single-copy ceiling in bytes (see
     /// [`Self::max_single_copy_bytes`]). Clamped at use into [5 MiB, 5 GiB].
     pub fn with_max_single_copy_bytes(mut self, bytes: u64) -> Self {
         self.max_single_copy_bytes = bytes;
+        self
+    }
+
+    /// Override the multipart part budget (see [`Self::max_parts`]). Clamped
+    /// at use into [1, 10,000].
+    pub fn with_max_parts(mut self, max_parts: usize) -> Self {
+        self.max_parts = max_parts;
         self
     }
 }
@@ -1092,7 +1225,7 @@ async fn ec2_instance_profile_available() -> bool {
         .unwrap_or_else(|_| EC2_IMDS_DEFAULT_ENDPOINT.to_string());
     let url = format!("{}/latest/api/token", endpoint.trim_end_matches('/'));
 
-    let client = match reqwest::Client::builder()
+    let client = match crate::services::http_client::plain_client_builder()
         .timeout(EC2_IMDS_PROBE_TIMEOUT)
         .connect_timeout(EC2_IMDS_PROBE_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -1141,10 +1274,125 @@ async fn ec2_instance_profile_available() -> bool {
 fn s3_requests_are_signed(access_key: Option<&str>, secret_key: Option<&str>) -> bool {
     let explicit_pair = (access_key.is_some() && secret_key.is_some())
         || (std::env::var("S3_ACCESS_KEY_ID").is_ok()
-            && std::env::var("S3_SECRET_ACCESS_KEY").is_ok())
+            && crate::config::secret_env_present("S3_SECRET_ACCESS_KEY"))
         || (std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-            && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok());
+            && crate::config::secret_env_present("AWS_SECRET_ACCESS_KEY"));
     explicit_pair || !anonymous_s3_enabled()
+}
+
+/// Which S3 client a retry policy is for (#5649).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum S3Plane {
+    /// Head, exists, list, delete, multipart create/abort: small requests.
+    Control,
+    /// Payload get/put, multipart parts, server-side copy.
+    Bulk,
+}
+
+/// Retries of one bulk S3 request. With the 3s connect timeout and the 2s
+/// backoff cap, a store that is gone answers `503` after about
+/// 6 x (3s + 2s) = 30s at most.
+const S3_BULK_MAX_RETRIES: usize = 5;
+
+/// The retry policy for each S3 client (#5649).
+///
+/// `object_store` retries a failed connect, a timeout and a 5xx for up to
+/// three minutes by default, backing off up to 15s between attempts. Against
+/// a stopped MinIO, whose host no longer answers, each attempt also waited
+/// out a 5s connect timeout, which turned every upload and download into a
+/// request that hung until the store came back.
+///
+/// `object_store` measures the retry budget from the start of the request
+/// and checks it only after a failure, so the budget must outlast the
+/// request itself, or a long transfer loses every retry: a multipart part
+/// answered `503 SlowDown` after 12s, or a download reset mid-stream, would
+/// fail outright under a 10s budget. Hence two policies:
+///
+/// * **Control**: budget `STORAGE_OPERATION_TIMEOUT_SECS` (default 15s),
+///   `object_store`'s retry count. These requests are short, so the budget
+///   is what binds and a dead store answers `503` within it.
+/// * **Bulk**: budget `STORAGE_BULK_RETRY_TIMEOUT_SECS` (default 180s, as
+///   `object_store`'s own) so a long transfer keeps its retries, bounded
+///   instead by [`S3_BULK_MAX_RETRIES`] when the store is gone.
+///
+/// Both cap the pause between attempts at
+/// [`crate::storage::STORAGE_MAX_RETRY_BACKOFF`]; with the connect timeout,
+/// that cap is what removes the hang.
+fn s3_retry_config(
+    timeouts: &crate::storage::StorageTimeouts,
+    plane: S3Plane,
+) -> object_store::RetryConfig {
+    let (max_retries, retry_timeout) = match plane {
+        S3Plane::Control => (
+            object_store::RetryConfig::default().max_retries,
+            timeouts.operation,
+        ),
+        S3Plane::Bulk => (S3_BULK_MAX_RETRIES, timeouts.bulk_retry),
+    };
+    object_store::RetryConfig {
+        backoff: object_store::BackoffConfig {
+            max_backoff: crate::storage::STORAGE_MAX_RETRY_BACKOFF,
+            ..Default::default()
+        },
+        max_retries,
+        retry_timeout,
+    }
+}
+
+/// `object_store`'s rendering of a non-success response (its `RequestError`),
+/// which names neither the request URL nor the object path.
+const S3_STATUS_PREFIX: &str = "Server returned non-2xx status code: ";
+/// `object_store`'s rendering of a 200 whose body is an error document.
+const S3_ERROR_BODY_PREFIX: &str = "Server returned error response: ";
+
+/// Whether an `object_store` error means the store could not be reached or
+/// did not answer in time, or refused the write for lack of space (#5649,
+/// #5650).
+///
+/// Only typed parts of the error are read, never the whole message, which
+/// carries the object path and request URL (a key named `QuotaExceeded.bin`
+/// must not make a 507):
+///
+/// * the transport kind of the `HttpError` `object_store` gave up on
+///   (connect / timeout / interrupted);
+/// * otherwise the failed response, taken from the one link of the error
+///   chain that renders only the response: `object_store`'s request error,
+///   `Server returned non-2xx status code: <status>: <body>`. The status is
+///   parsed from there and the error code from the body's `<Code>` element
+///   (MinIO's `XMinioAdminBucketQuotaExceeded` for a PUT into a bucket at its
+///   quota). The links above it prefix the method, URL and path.
+fn s3_failure_class(err: &object_store::Error) -> Option<crate::storage::StorageFailure> {
+    use crate::storage::failure::xml_error_code;
+    use crate::storage::StorageFailure;
+    use object_store::client::{HttpError, HttpErrorKind};
+
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if let Some(http) = e.downcast_ref::<HttpError>() {
+            return matches!(
+                http.kind(),
+                HttpErrorKind::Connect
+                    | HttpErrorKind::Timeout
+                    | HttpErrorKind::Request
+                    | HttpErrorKind::Interrupted
+            )
+            .then_some(StorageFailure::Unavailable);
+        }
+        let rendered = e.to_string();
+        if let Some(rest) = rendered.strip_prefix(S3_STATUS_PREFIX) {
+            let status = rest
+                .get(..3)
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+            let body = rest.split_once(": ").map_or("", |(_, body)| body);
+            return StorageFailure::from_http_status(status, xml_error_code(body));
+        }
+        if let Some(body) = rendered.strip_prefix(S3_ERROR_BODY_PREFIX) {
+            return StorageFailure::from_http_status(0, xml_error_code(body));
+        }
+        current = e.source();
+    }
+    None
 }
 
 /// Classify an `object_store::Error` from S3 into a human-readable
@@ -1167,8 +1415,13 @@ fn s3_requests_are_signed(access_key: Option<&str>, secret_key: Option<&str>) ->
 /// The original error string is appended as `caused by:` so the full
 /// message is still searchable in the logs.
 pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
-    let raw = err.to_string();
-    let l = raw.to_lowercase();
+    let full = err.to_string();
+    let l = full.to_lowercase();
+    // The raw text is kept for searchability, minus any request URL (#3954):
+    // object_store embeds the endpoint, bucket and key URL in generic and
+    // retry errors, and this message now reaches INFO logs and exported span
+    // status through the storage spans' `err` recording.
+    let raw = redact_urls_in_text(&full);
 
     let category = if l.contains("certificate")
         || l.contains("tls")
@@ -1230,7 +1483,27 @@ pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
         "S3 request failed"
     };
 
-    format!("{}. caused by: {}", category, raw)
+    // #5649 / #5650: lead with the marker the HTTP layer maps to
+    // `503 STORAGE_UNAVAILABLE` / `507 STORAGE_FULL`.
+    match s3_failure_class(err) {
+        Some(class) => class.tag(format!("{}. caused by: {}", category, raw)),
+        None => format!("{}. caused by: {}", category, raw),
+    }
+}
+
+/// Replace every `http(s)://...` URL in `text` with `<url>` (#3954).
+pub(crate) fn redact_urls_in_text(text: &str) -> std::borrow::Cow<'_, str> {
+    static URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\bhttps?://[^\s"'<>]+"#).expect("static regex")
+    });
+    URL.replace_all(text, "<url>")
+}
+
+/// `AppError::Storage` for a failed object-store call: `context`, then the
+/// [`classify_s3_error`] diagnostic, so no request URL (endpoint, bucket)
+/// reaches the error text that storage spans record (#3954).
+fn s3_storage_error(context: impl std::fmt::Display, err: &object_store::Error) -> AppError {
+    AppError::Storage(format!("{context}: {}", classify_s3_error(err)))
 }
 
 /// Generate the full S3 key with optional prefix.
@@ -1272,6 +1545,43 @@ fn strip_key_prefix(prefix: Option<&str>, key: &str) -> String {
         }
         None => key.to_string(),
     }
+}
+
+/// The object key `get`/`put` address for `key`: object_store's [`ObjectPath`]
+/// percent-encodes, segment by segment, every non-ASCII byte, the characters
+/// AWS and GCS advise against in object names (`%`, `<`, `>`, `#`, `[`, `~`,
+/// ...), and a `.`/`..` segment. An empty segment (a trailing `/`) is kept,
+/// so the result can scope a listing prefix (#4817).
+fn stored_key_form(key: &str) -> String {
+    key.split('/')
+        .map(|segment| {
+            object_store::path::PathPart::from(segment)
+                .as_ref()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Inverse of [`stored_key_form`] for a key a listing returned: the key
+/// `get`/`put` accept for the object stored under `stored`.
+///
+/// A listing returns stored keys, so without this a row path `uni-café.jar`
+/// lists as `uni-caf%C3%A9.jar`, and the storage reindex reports the row's
+/// object missing and the object a ghost (#4817). `None` for a key that no
+/// `put` produces and no `get` can read (an object another tool wrote with a
+/// raw `~` or a stray `%41`), and for one that decodes to a `.`/`..` segment.
+fn key_from_stored(stored: &str) -> Option<String> {
+    let mut segments = Vec::new();
+    for segment in stored.split('/') {
+        let decoded = urlencoding::decode(segment).ok()?;
+        if decoded == "." || decoded == ".." {
+            return None;
+        }
+        segments.push(decoded.into_owned());
+    }
+    let key = segments.join("/");
+    (ObjectPath::from(key.as_str()).as_ref() == stored).then_some(key)
 }
 
 /// Whether `S3_PREFIX` names (or sits inside) one of the reserved bucket-root
@@ -1334,6 +1644,10 @@ pub struct S3Backend {
     /// native `CopyObject`; larger ones use multipart `UploadPartCopy` with
     /// parts of this size.
     max_single_copy_bytes: u64,
+    /// Multipart part budget (already clamped into [1, 10,000], see
+    /// [`Self::effective_max_parts`]): sizes the parts of streamed uploads and
+    /// bounds the part count of streamed uploads and multipart copies.
+    max_parts: usize,
     /// False when the store was built unsigned (`S3_ALLOW_ANONYMOUS` with no
     /// credentials — `build_store` calls `with_skip_signature(true)`).
     ///
@@ -1348,6 +1662,11 @@ pub struct S3Backend {
     redirect_downloads: bool,
     cloudfront: Option<CloudFrontConfig>,
     path_format: StoragePathFormat,
+    /// Store used ONLY to presign the GET URLs handed to clients, built by
+    /// [`Self::build_signing_store`] when dedicated presign credentials or
+    /// `S3_PUBLIC_ENDPOINT` are configured. `None` signs with [`Self::store`].
+    /// Never used for the backend's own requests: its endpoint may be one the
+    /// backend cannot reach (#4417).
     signing_store: Option<AmazonS3>,
     /// When true, delete objects one at a time with HTTP DELETE instead of the
     /// S3 multi-object delete API (POST ?delete). Needed for providers like
@@ -1387,7 +1706,7 @@ impl S3Backend {
     ) -> Result<AmazonS3> {
         let timeout = (config.control_timeout_secs > 0)
             .then(|| Duration::from_secs(config.control_timeout_secs));
-        Self::build_store_with_timeout(config, access_key, secret_key, timeout)
+        Self::build_store_with_timeout(config, access_key, secret_key, timeout, S3Plane::Control)
     }
 
     /// Build the bulk-transfer store used for object payload movement:
@@ -1404,7 +1723,7 @@ impl S3Backend {
     ) -> Result<AmazonS3> {
         let timeout =
             (config.bulk_timeout_secs > 0).then(|| Duration::from_secs(config.bulk_timeout_secs));
-        Self::build_store_with_timeout(config, access_key, secret_key, timeout)
+        Self::build_store_with_timeout(config, access_key, secret_key, timeout, S3Plane::Bulk)
     }
 
     /// Clamp the configured single-copy ceiling into what the S3 API can
@@ -1420,13 +1739,20 @@ impl S3Backend {
             .clamp(S3_MULTIPART_CHUNK_SIZE as u64, S3_MAX_SINGLE_COPY_SIZE)
     }
 
+    /// Clamp the configured part budget into what S3 can honor: at least one
+    /// part and at most [`S3_MULTIPART_MAX_PARTS`] (AWS's 10,000-part cap).
+    fn effective_max_parts(config: &S3Config) -> usize {
+        config.max_parts.clamp(1, S3_MULTIPART_MAX_PARTS)
+    }
+
     /// HTTP client for hand-rolled S3 API calls that `object_store` does not
     /// expose (ranged `UploadPartCopy`, #3164). Honors the same custom-CA and
     /// insecure-TLS options as the object_store clients; each request is
     /// SigV4-signed per-call with [`AwsAuthorizer`], reusing the store's
     /// credential chain.
     fn build_raw_http_client(config: &S3Config) -> Result<reqwest::Client> {
-        let mut builder = reqwest::Client::builder();
+        let mut builder = crate::services::http_client::plain_client_builder()
+            .connect_timeout(config.timeouts.connect);
         if let Some(ca_path) = &config.ca_cert_path {
             let pem = std::fs::read(ca_path).map_err(|e| {
                 AppError::Config(format!("Failed to read CA cert '{}': {}", ca_path, e))
@@ -1451,10 +1777,17 @@ impl S3Backend {
         access_key: Option<&str>,
         secret_key: Option<&str>,
         timeout: Option<Duration>,
+        plane: S3Plane,
     ) -> Result<AmazonS3> {
         let mut client_opts = object_store::ClientOptions::new()
+            .with_user_agent(http::HeaderValue::from_static(
+                crate::services::http_client::DEFAULT_USER_AGENT,
+            ))
             .with_pool_max_idle_per_host(config.pool_max_idle_per_host)
-            .with_pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs));
+            .with_pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs))
+            // #5649: `object_store` allows 5s per connection attempt; a
+            // stopped store should be noticed sooner than that.
+            .with_connect_timeout(config.timeouts.connect);
 
         // `object_store` defaults this to 30s and applies it from the start of
         // connect until the response body is fully read, so it caps total
@@ -1498,7 +1831,8 @@ impl S3Backend {
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&config.bucket)
             .with_region(&config.region)
-            .with_client_options(client_opts);
+            .with_client_options(client_opts)
+            .with_retry(s3_retry_config(&config.timeouts, plane));
 
         if let Some(endpoint) = &config.endpoint {
             builder = builder.with_endpoint(endpoint);
@@ -1547,23 +1881,30 @@ impl S3Backend {
             );
         }
 
-        // Explicit credentials: function args > S3_* env vars > AWS_* env vars
+        // Explicit credentials: function args > S3_* env vars > AWS_* env vars.
+        // The secrets may come from a `<NAME>_FILE` mount (#4142); resolving
+        // them up front keeps the both-halts-of-the-pair fall-through of the
+        // original tuple patterns below, and a configured-but-unusable file is
+        // a hard error rather than a silent anonymous fallback.
+        let s3_secret =
+            crate::config::secret_or_env("S3_SECRET_ACCESS_KEY").map_err(AppError::Config)?;
+        let aws_secret =
+            crate::config::secret_or_env("AWS_SECRET_ACCESS_KEY").map_err(AppError::Config)?;
+        let aws_session_token =
+            crate::config::secret_or_env("AWS_SESSION_TOKEN").map_err(AppError::Config)?;
         if let Some(ak) = access_key {
             if let Some(sk) = secret_key {
                 builder = builder.with_access_key_id(ak).with_secret_access_key(sk);
             }
-        } else if let (Ok(ak), Ok(sk)) = (
-            std::env::var("S3_ACCESS_KEY_ID"),
-            std::env::var("S3_SECRET_ACCESS_KEY"),
-        ) {
+        } else if let (Ok(ak), Some(sk)) = (std::env::var("S3_ACCESS_KEY_ID"), s3_secret) {
             tracing::info!("Using S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY for S3 credentials");
             builder = builder.with_access_key_id(&ak).with_secret_access_key(&sk);
-        } else if let (Ok(ak), Ok(sk)) = (
-            std::env::var("AWS_ACCESS_KEY_ID"),
-            std::env::var("AWS_SECRET_ACCESS_KEY"),
-        ) {
+        } else if let (Ok(ak), Some(sk)) = (std::env::var("AWS_ACCESS_KEY_ID"), aws_secret) {
             builder = builder.with_access_key_id(&ak).with_secret_access_key(&sk);
-            if let Ok(token) = std::env::var("AWS_SESSION_TOKEN") {
+            // An empty token is not a token: the legacy `env::var` read
+            // passed a set-but-blank one through, which broke SigV4 against
+            // any STS-backed bucket.
+            if let Some(token) = aws_session_token.filter(|t| !t.is_empty()) {
                 builder = builder.with_token(token);
             }
         } else if anonymous_s3_enabled() {
@@ -1577,6 +1918,68 @@ impl S3Backend {
         builder
             .build()
             .map_err(|e| AppError::Config(format!("Failed to build S3 client: {}", e)))
+    }
+
+    /// The configuration [`Self::signing_store`] is built from, or `None`
+    /// when presigning can use the main store unchanged.
+    ///
+    /// The public endpoint replaces only the endpoint. Everything else --
+    /// bucket, region, credentials chain, path-style addressing -- stays the
+    /// same, so the URL is signed exactly as the backend would sign it for
+    /// itself, just for the host the client will send (SigV4 signs the
+    /// `host` header, so it cannot be rewritten after signing).
+    ///
+    /// CloudFront, when configured, signs every client URL itself, so the
+    /// public endpoint is ignored there (it would never be used).
+    fn signing_config(config: &S3Config) -> Option<S3Config> {
+        let dedicated_creds =
+            config.presign_access_key.is_some() && config.presign_secret_key.is_some();
+        let public_endpoint = config
+            .public_endpoint
+            .as_ref()
+            .filter(|_| config.cloudfront.is_none());
+        if !dedicated_creds && public_endpoint.is_none() {
+            return None;
+        }
+        let mut signing = config.clone();
+        signing.public_endpoint = public_endpoint.cloned();
+        if let Some(public) = public_endpoint {
+            signing.endpoint = Some(public.clone());
+        }
+        Some(signing)
+    }
+
+    /// Build the presign-only store (see [`Self::signing_store`]): dedicated
+    /// `S3_PRESIGN_*` credentials when set, otherwise the normal credential
+    /// chain, and `S3_PUBLIC_ENDPOINT` as the endpoint when set.
+    ///
+    /// Without dedicated keys the store resolves its own copy of the
+    /// credential chain, so under IRSA / ECS / web identity it fetches and
+    /// caches credentials separately from [`Self::store`] (harmless, one extra
+    /// STS or container-credential call per refresh).
+    fn build_signing_store(config: &S3Config) -> Result<Option<AmazonS3>> {
+        if config.public_endpoint.is_some() && config.cloudfront.is_some() {
+            tracing::info!(
+                "S3_PUBLIC_ENDPOINT is ignored: CloudFront is configured and signs the \
+                 presigned download URLs"
+            );
+        }
+        let Some(signing) = Self::signing_config(config) else {
+            return Ok(None);
+        };
+        // Only a complete pair overrides the chain: `build_store` with a lone
+        // access key would configure no credentials at all.
+        let (ak, sk) = match (&signing.presign_access_key, &signing.presign_secret_key) {
+            (Some(ak), Some(sk)) => {
+                tracing::info!("Using dedicated credentials for presigned URL signing");
+                (Some(ak.as_str()), Some(sk.as_str()))
+            }
+            _ => (None, None),
+        };
+        if let Some(public) = &signing.public_endpoint {
+            tracing::info!(public_endpoint = %public, "Presigned S3 URLs use S3_PUBLIC_ENDPOINT");
+        }
+        Self::build_store(&signing, ak, sk).map(Some)
     }
 
     /// Validate at startup that some recognized credential source is configured.
@@ -1624,9 +2027,9 @@ impl S3Backend {
             return Ok(());
         }
         let has_static_creds = (std::env::var("S3_ACCESS_KEY_ID").is_ok()
-            && std::env::var("S3_SECRET_ACCESS_KEY").is_ok())
+            && crate::config::secret_env_present("S3_SECRET_ACCESS_KEY"))
             || (std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-                && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok());
+                && crate::config::secret_env_present("AWS_SECRET_ACCESS_KEY"));
         let has_cloud_chain = std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_ok()
             || std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI").is_ok()
             || std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").is_ok();
@@ -1706,23 +2109,28 @@ impl S3Backend {
         let store = Self::build_store(&config, None, None)?;
         let bulk_store = Self::build_bulk_store(&config, None, None)?;
 
-        let signing_store = match (&config.presign_access_key, &config.presign_secret_key) {
-            (Some(ak), Some(sk)) => {
-                let ss = Self::build_store(&config, Some(ak), Some(sk))?;
-                tracing::info!("Using dedicated credentials for presigned URL signing");
-                Some(ss)
-            }
-            _ => None,
-        };
+        let signing_store = Self::build_signing_store(&config)?;
 
         if config.redirect_downloads {
             tracing::info!(
                 bucket = %config.bucket,
                 cloudfront = config.cloudfront.is_some(),
                 expiry_secs = config.presign_expiry.as_secs(),
-                dedicated_signing_creds = signing_store.is_some(),
+                dedicated_signing_creds = config.presign_access_key.is_some()
+                    && config.presign_secret_key.is_some(),
+                public_endpoint = config.public_endpoint.as_deref().unwrap_or("-"),
                 "S3 redirect downloads enabled"
             );
+            if config.endpoint.is_some()
+                && config.public_endpoint.is_none()
+                && config.cloudfront.is_none()
+            {
+                tracing::info!(
+                    "Presigned S3 URLs point at S3_ENDPOINT. If clients cannot reach that \
+                     address (for example an in-cluster service name), set \
+                     S3_PUBLIC_ENDPOINT to the address they use (#4417)."
+                );
+            }
         }
 
         if config.path_format != StoragePathFormat::Native {
@@ -1756,6 +2164,7 @@ impl S3Backend {
                 .then(|| Duration::from_secs(config.bulk_timeout_secs)),
             raw_http,
             max_single_copy_bytes: Self::effective_single_copy_ceiling(&config),
+            max_parts: Self::effective_max_parts(&config),
             sign_requests: s3_requests_are_signed(None, None),
             prefix: config.prefix,
             redirect_downloads: config.redirect_downloads,
@@ -1784,6 +2193,28 @@ impl S3Backend {
     /// Strip the prefix from an S3 key
     fn strip_prefix(&self, key: &str) -> String {
         strip_key_prefix(self.prefix.as_deref(), key)
+    }
+
+    /// A listed object as the key `get`/`put` accept: decoded from its
+    /// stored form (#4817), then with the prefix stripped, the inverse of
+    /// `full_key` followed by the [`ObjectPath`] conversion every write does.
+    fn listed_key(
+        &self,
+        stored: &str,
+        last_modified: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<super::ListedKey> {
+        let Some(full_key) = key_from_stored(stored) else {
+            tracing::warn!(
+                key = %stored,
+                "S3 listing: skipping an object whose key is not the stored form of any \
+                 key Artifact Keeper reads or writes (#4817)"
+            );
+            return None;
+        };
+        Some(super::ListedKey {
+            key: self.strip_prefix(&full_key),
+            last_modified,
+        })
     }
 
     /// Try to generate an Artifactory fallback path from a native path
@@ -1829,7 +2260,7 @@ impl S3Backend {
             Ok(result) => {
                 // STREAMING-EXEMPT: storage-internal object_store GetResult::bytes() full-body read — same exempt category as the S3/Azure/GCS get() fallbacks that back the streaming get impl; not one of the 3 clippy-gated shapes but tracked under #1608
                 let bytes = result.bytes().await.map_err(|e| {
-                    AppError::Storage(format!("Failed to read fallback '{}': {}", fallback_key, e))
+                    s3_storage_error(format!("Failed to read fallback '{}'", fallback_key), &e)
                 })?;
                 tracing::info!(
                     key = %key,
@@ -1840,10 +2271,13 @@ impl S3Backend {
                 Ok(Some(bytes))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get fallback object '{}' for '{}': {}",
-                fallback_key, key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!(
+                    "Failed to get fallback object '{}' for '{}'",
+                    fallback_key, key
+                ),
+                &e,
+            )),
         }
     }
 
@@ -1883,10 +2317,13 @@ impl S3Backend {
                 Ok(Some(bytes))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get fallback object range '{}' for '{}': {}",
-                fallback_key, key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!(
+                    "Failed to get fallback object range '{}' for '{}'",
+                    fallback_key, key
+                ),
+                &e,
+            )),
         }
     }
 
@@ -1906,20 +2343,27 @@ impl S3Backend {
             .signed_url(http::Method::DELETE, path, Duration::from_secs(300))
             .await
             .map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to generate presigned DELETE URL for '{}': {}",
-                    display_key, e
-                ))
+                s3_storage_error(
+                    format!(
+                        "Failed to generate presigned DELETE URL for '{}'",
+                        display_key
+                    ),
+                    &e,
+                )
             })?;
 
-        let response = reqwest::Client::new()
+        let response = crate::services::http_client::plain_client_builder()
+            .build()
+            .map_err(|e| AppError::Storage(format!("Failed to build HTTP client: {}", e)))?
             .delete(presigned_url)
             .send()
             .await
             .map_err(|e| {
+                // `without_url`: the URL is presigned, so it carries a signature.
                 AppError::Storage(format!(
                     "Failed to send DELETE request for '{}': {}",
-                    display_key, e
+                    display_key,
+                    e.without_url()
                 ))
             })?;
 
@@ -1955,7 +2399,7 @@ impl super::StorageBackend for S3Backend {
         self.path_format.has_fallback()
     }
 
-    #[tracing::instrument(skip(self, content), fields(otel.kind = "client", storage.system = "s3", storage.operation = "put"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, content), fields(otel.kind = "client", storage.system = "s3", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -1965,14 +2409,14 @@ impl super::StorageBackend for S3Backend {
             .await
             .map_err(|e| {
                 tracing::error!(key = %key, error = %e, "S3 put_object failed");
-                AppError::Storage(format!("Failed to put object '{}': {}", key, e))
+                s3_storage_error(format!("Failed to put object '{}'", key), &e)
             })?;
 
         tracing::debug!(key = %key, "S3 put object successful");
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get"))]
     async fn get(&self, key: &str) -> Result<Bytes> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -1981,7 +2425,7 @@ impl super::StorageBackend for S3Backend {
             Ok(result) => {
                 // STREAMING-EXEMPT: storage-internal object_store GetResult::bytes() full-body read — same exempt category as the S3/Azure/GCS get() fallbacks that back the streaming get impl; not one of the 3 clippy-gated shapes but tracked under #1608
                 let bytes = result.bytes().await.map_err(|e| {
-                    AppError::Storage(format!("Failed to read object '{}': {}", key, e))
+                    s3_storage_error(format!("Failed to read object '{}'", key), &e)
                 })?;
                 tracing::debug!(key = %key, size = bytes.len(), "S3 get object successful");
                 Ok(bytes)
@@ -1995,14 +2439,27 @@ impl super::StorageBackend for S3Backend {
                     key
                 )))
             }
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get object '{}': {}",
-                key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!("Failed to get object '{}'", key),
+                &e,
+            )),
         }
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "exists"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "exists_at_exact_key"))]
+    async fn exists_at_exact_key(&self, key: &str) -> Result<bool> {
+        let path: ObjectPath = self.full_key(key).into();
+        match self.store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(s3_storage_error(
+                format!("Failed to check existence of '{}'", key),
+                &e,
+            )),
+        }
+    }
+
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -2011,10 +2468,10 @@ impl super::StorageBackend for S3Backend {
             Ok(_) => return Ok(true),
             Err(object_store::Error::NotFound { .. }) => {}
             Err(e) => {
-                return Err(AppError::Storage(format!(
-                    "Failed to check existence of '{}': {}",
-                    key, e
-                )));
+                return Err(s3_storage_error(
+                    format!("Failed to check existence of '{}'", key),
+                    &e,
+                ));
             }
         }
 
@@ -2032,10 +2489,13 @@ impl super::StorageBackend for S3Backend {
                     }
                     Err(object_store::Error::NotFound { .. }) => {}
                     Err(e) => {
-                        return Err(AppError::Storage(format!(
-                            "Failed to check fallback existence of '{}' for '{}': {}",
-                            fallback_key, key, e
-                        )));
+                        return Err(s3_storage_error(
+                            format!(
+                                "Failed to check fallback existence of '{}' for '{}'",
+                                fallback_key, key
+                            ),
+                            &e,
+                        ));
                     }
                 }
             }
@@ -2044,7 +2504,7 @@ impl super::StorageBackend for S3Backend {
         Ok(false)
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "delete"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "delete"))]
     async fn delete(&self, key: &str) -> Result<()> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -2059,10 +2519,10 @@ impl super::StorageBackend for S3Backend {
             match self.store.delete(&path).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => {
-                    return Err(AppError::Storage(format!(
-                        "Failed to delete object '{}': {}",
-                        key, e
-                    )))
+                    return Err(s3_storage_error(
+                        format!("Failed to delete object '{}'", key),
+                        &e,
+                    ))
                 }
             }
         }
@@ -2071,9 +2531,13 @@ impl super::StorageBackend for S3Backend {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "copy"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "copy"))]
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         S3Backend::copy(self, source, dest).await
+    }
+
+    async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+        S3Backend::size(self, key).await.map(Some)
     }
 
     // Note: `put_file` is intentionally NOT overridden — the trait default in
@@ -2090,17 +2554,17 @@ impl super::StorageBackend for S3Backend {
     /// Returns `Ok(None)` when the object is missing rather than an error,
     /// so the freshness probe can treat "ETag unavailable" as "do not
     /// fast-path" without losing the distinction from a real I/O failure.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "head_etag"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "head_etag"))]
     async fn head_etag(&self, key: &str) -> Result<Option<String>> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
         match self.store.head(&path).await {
             Ok(meta) => Ok(meta.e_tag),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(AppError::Storage(format!(
-                "head_etag failed for '{}': {}",
-                key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!("head_etag failed for '{}'", key),
+                &e,
+            )),
         }
     }
 
@@ -2108,7 +2572,14 @@ impl super::StorageBackend for S3Backend {
         self.redirect_downloads
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_presigned_url"))]
+    /// S3 multipart uploads stream from the request body to the bucket without
+    /// a local file, so a chunked completion can assemble straight into a
+    /// staging object (#3916).
+    fn supports_streamed_assembly(&self) -> bool {
+        true
+    }
+
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_presigned_url"))]
     async fn get_presigned_url(
         &self,
         key: &str,
@@ -2145,15 +2616,15 @@ impl super::StorageBackend for S3Backend {
             .signed_url(http::Method::GET, &path, clamped_expiry)
             .await
             .map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to generate presigned URL for '{}': {}",
-                    key, e
-                ))
+                s3_storage_error(
+                    format!("Failed to generate presigned URL for '{}'", key),
+                    &e,
+                )
             })?;
 
         tracing::debug!(
             key = %key, expires_in_secs = clamped_expiry.as_secs(), source = "s3",
-            dedicated_creds = self.signing_store.is_some(),
+            dedicated_signer = self.signing_store.is_some(),
             "Generated S3 presigned URL"
         );
 
@@ -2164,7 +2635,11 @@ impl super::StorageBackend for S3Backend {
         }))
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "health_check"))]
+    async fn list_keys(&self, prefix: &str) -> Result<Option<Vec<super::ListedKey>>> {
+        self.list_with_modified(Some(prefix)).await.map(Some)
+    }
+
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "health_check"))]
     async fn health_check(&self) -> Result<()> {
         let path: ObjectPath = ".health-probe".into();
         match self.store.head(&path).await {
@@ -2176,7 +2651,7 @@ impl super::StorageBackend for S3Backend {
 
     // The span covers GET initiation (time-to-first-byte); the body transfer
     // happens later as the caller polls the returned stream.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_stream"))]
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -2213,21 +2688,21 @@ impl super::StorageBackend for S3Backend {
                 )));
             }
             Err(e) => {
-                return Err(AppError::Storage(format!(
-                    "Failed to get object '{}': {}",
-                    key_owned, e
-                )));
+                return Err(s3_storage_error(
+                    format!("Failed to get object '{}'", key_owned),
+                    &e,
+                ));
             }
         };
 
         let stream = result
             .into_stream()
-            .map(|r| r.map_err(|e| AppError::Storage(format!("Stream read error: {}", e))));
+            .map(|r| r.map_err(|e| s3_storage_error("Stream read error", &e)));
 
         Ok(Box::pin(stream))
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_range"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_range"))]
     async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -2260,10 +2735,13 @@ impl super::StorageBackend for S3Backend {
                     key
                 )))
             }
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get object range '{}' (offset={}, length={}): {}",
-                key, offset, length, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!(
+                    "Failed to get object range '{}' (offset={}, length={})",
+                    key, offset, length
+                ),
+                &e,
+            )),
         }
     }
 
@@ -2276,7 +2754,7 @@ impl super::StorageBackend for S3Backend {
     /// `AbortMultipartUpload` on drop, so the upload does not linger until the
     /// bucket's `AbortIncompleteMultipartUpload` lifecycle rule reclaims it. A
     /// successfully completed upload defuses the guard and is never aborted.
-    #[tracing::instrument(skip(self, stream), fields(otel.kind = "client", storage.system = "s3", storage.operation = "put_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, stream), fields(otel.kind = "client", storage.system = "s3", storage.operation = "put_stream"))]
     async fn put_stream(
         &self,
         key: &str,
@@ -2309,10 +2787,10 @@ impl super::StorageBackend for S3Backend {
                     total += data.len() as u64;
                     if upload_id.is_none() {
                         let id = self.store.create_multipart(&path).await.map_err(|e| {
-                            AppError::Storage(format!(
-                                "Failed to start multipart upload for '{}': {}",
-                                key, e
-                            ))
+                            s3_storage_error(
+                                format!("Failed to start multipart upload for '{}'", key),
+                                &e,
+                            )
                         })?;
                         abort_guard.arm(id.clone());
                         upload_id = Some(id);
@@ -2321,11 +2799,13 @@ impl super::StorageBackend for S3Backend {
                     while !data.is_empty() {
                         // Adaptive: the target part size grows with the part index
                         // for unknown-length streams (see `adaptive_part_size`), so
-                        // a 10,000-part budget can cover objects up to ~5 TiB. The
-                        // first 1,000 parts stay at 5 MiB, leaving small/typical
-                        // objects on the historical fixed-size happy path.
+                        // the default 10,000-part budget can cover objects up to
+                        // ~5 TiB. The first tenth of the budget stays at 5 MiB,
+                        // leaving small/typical objects on the historical
+                        // fixed-size happy path.
                         let current_part_size =
-                            adaptive_part_size(None, next_part_index as u32) as usize;
+                            adaptive_part_size(None, next_part_index as u32, self.max_parts)
+                                as usize;
                         if pending_part.is_empty() && data.len() >= current_part_size {
                             let part = data.split_to(current_part_size);
                             if let Err(e) = enqueue_s3_part_upload(
@@ -2338,6 +2818,7 @@ impl super::StorageBackend for S3Backend {
                                         .as_ref()
                                         .expect("multipart upload id initialized above"),
                                     key,
+                                    max_parts: self.max_parts,
                                 },
                                 &mut next_part_index,
                                 part,
@@ -2367,6 +2848,7 @@ impl super::StorageBackend for S3Backend {
                                         .as_ref()
                                         .expect("multipart upload id initialized above"),
                                     key,
+                                    max_parts: self.max_parts,
                                 },
                                 &mut next_part_index,
                                 part,
@@ -2400,6 +2882,7 @@ impl super::StorageBackend for S3Backend {
                         path: &path,
                         upload_id: &upload_id,
                         key,
+                        max_parts: self.max_parts,
                     },
                     &mut next_part_index,
                     pending_part.freeze(),
@@ -2431,10 +2914,10 @@ impl super::StorageBackend for S3Backend {
                 .await
             {
                 abort_guard.abort_now().await;
-                return Err(AppError::Storage(format!(
-                    "Failed to complete multipart upload for '{}': {}",
-                    key, e
-                )));
+                return Err(s3_storage_error(
+                    format!("Failed to complete multipart upload for '{}'", key),
+                    &e,
+                ));
             }
             // Upload completed: defuse the guard so drop never aborts it.
             abort_guard.disarm();
@@ -2453,6 +2936,17 @@ impl super::StorageBackend for S3Backend {
 impl S3Backend {
     /// List keys with optional prefix
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        Ok(self
+            .list_with_modified(prefix)
+            .await?
+            .into_iter()
+            .map(|l| l.key)
+            .collect())
+    }
+
+    /// [`Self::list`] that also carries each object's last-modified time
+    /// when the listing reports it (`None` on the #3593 REST fallback).
+    pub async fn list_with_modified(&self, prefix: Option<&str>) -> Result<Vec<super::ListedKey>> {
         // Compose the search prefix through `make_full_key` so a listing
         // resolves the same physical location a `get`/`put` of a key under it
         // would (#3368).
@@ -2488,9 +2982,11 @@ impl S3Backend {
                 .await
             {
                 Ok(objects) => {
-                    let keys: Vec<String> = objects
+                    let keys: Vec<super::ListedKey> = objects
                         .into_iter()
-                        .map(|meta| self.strip_prefix(meta.location.as_ref()))
+                        .filter_map(|meta| {
+                            self.listed_key(meta.location.as_ref(), Some(meta.last_modified))
+                        })
                         .collect();
                     tracing::debug!(prefix = ?prefix, count = keys.len(), "S3 list objects successful");
                     return Ok(keys);
@@ -2507,13 +3003,18 @@ impl S3Backend {
                     );
                 }
                 Err(e) => {
-                    return Err(AppError::Storage(format!("Failed to list objects: {}", e)));
+                    return Err(s3_storage_error("Failed to list objects", &e));
                 }
             }
         }
 
-        let full_keys = self.rest_list_objects(&search_prefix).await?;
-        let keys: Vec<String> = full_keys.iter().map(|key| self.strip_prefix(key)).collect();
+        let full_keys = self
+            .rest_list_objects(&stored_key_form(&search_prefix))
+            .await?;
+        let keys: Vec<super::ListedKey> = full_keys
+            .iter()
+            .filter_map(|(key, last_modified)| self.listed_key(key, *last_modified))
+            .collect();
 
         tracing::debug!(
             prefix = ?prefix,
@@ -2532,7 +3033,10 @@ impl S3Backend {
     /// [`AwsAuthorizer`] against the store's own credential chain (so IRSA and
     /// container credentials keep working), and it rides [`Self::raw_http`].
     /// Returns FULL keys — the caller strips the configured prefix.
-    async fn rest_list_objects(&self, search_prefix: &str) -> Result<Vec<String>> {
+    async fn rest_list_objects(
+        &self,
+        search_prefix: &str,
+    ) -> Result<Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>> {
         use object_store::signer::Signer;
 
         // Both `signed_url` and `credentials()` resolve credentials
@@ -2559,7 +3063,7 @@ impl S3Backend {
             .map_err(|e| {
                 AppError::Storage(format!(
                     "Failed to build a bucket URL for the S3 list fallback: {}",
-                    e
+                    redact_urls_in_text(&e.to_string())
                 ))
             })?;
         let root = bucket_root_url(&probe_url, S3_LIST_PROBE_SEGMENT);
@@ -2572,11 +3076,11 @@ impl S3Backend {
             .map_err(|e| {
                 AppError::Storage(format!(
                     "Failed to resolve S3 credentials for the list fallback: {}",
-                    e
+                    redact_urls_in_text(&e.to_string())
                 ))
             })?;
 
-        let mut keys: Vec<String> = Vec::new();
+        let mut keys: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
             let mut url = root.clone();
@@ -2599,7 +3103,11 @@ impl S3Backend {
                 .map_err(|e| {
                     AppError::Storage(format!("Failed to build an S3 list request: {}", e))
                 })?;
-            AwsAuthorizer::new(&credential, "s3", &self.region).authorize(&mut request, None);
+            AwsAuthorizer::new(&credential, "s3", &self.region)
+                .try_authorize(&mut request, None)
+                .map_err(|e| {
+                    AppError::Storage(format!("Failed to sign an S3 list request: {}", e))
+                })?;
 
             let mut send = self
                 .raw_http
@@ -2611,22 +3119,29 @@ impl S3Backend {
                 send = send.timeout(timeout);
             }
             let response = send.send().await.map_err(|e| {
-                AppError::Storage(format!("Failed to list objects (REST fallback): {}", e))
+                crate::storage::failure::transport_storage_error(
+                    "Failed to list objects (REST fallback)",
+                    e,
+                )
             })?;
 
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             if !status.is_success() {
-                return Err(AppError::Storage(format!(
-                    "Failed to list objects (REST fallback): {} {}: {}",
+                return Err(crate::storage::failure::status_storage_error(
                     status.as_u16(),
-                    status.canonical_reason().unwrap_or(""),
-                    body
-                )));
+                    crate::storage::failure::xml_error_code(&body),
+                    format!(
+                        "Failed to list objects (REST fallback): {} {}: {}",
+                        status.as_u16(),
+                        status.canonical_reason().unwrap_or(""),
+                        body
+                    ),
+                ));
             }
 
             let page = parse_list_bucket_result(&body)?;
-            keys.extend(page.keys);
+            keys.extend(page.keys.into_iter().zip(page.last_modified));
 
             match page.next_continuation_token {
                 Some(token) if page.is_truncated => {
@@ -2680,7 +3195,9 @@ impl S3Backend {
             if !copy_rejected_for_missing_length(&message) {
                 return Err(AppError::Storage(format!(
                     "Failed to copy '{}' to '{}': {}",
-                    source, dest, message
+                    source,
+                    dest,
+                    redact_urls_in_text(&message)
                 )));
             }
             tracing::warn!(
@@ -2743,7 +3260,7 @@ impl S3Backend {
                 AppError::Storage(format!(
                     "Failed to build copy URL for '{}': {}",
                     dest_path.as_ref(),
-                    e
+                    redact_urls_in_text(&e.to_string())
                 ))
             })
     }
@@ -2770,7 +3287,8 @@ impl S3Backend {
             .map_err(|e| {
                 AppError::Storage(format!(
                     "Failed to resolve S3 credentials for {}: {}",
-                    what, e
+                    what,
+                    redact_urls_in_text(&e.to_string())
                 ))
             })?;
 
@@ -2784,7 +3302,9 @@ impl S3Backend {
         let mut request = builder
             .body(object_store::client::HttpRequestBody::empty())
             .map_err(|e| AppError::Storage(format!("Failed to build {} request: {}", what, e)))?;
-        AwsAuthorizer::new(&credential, "s3", &self.region).authorize(&mut request, None);
+        AwsAuthorizer::new(&credential, "s3", &self.region)
+            .try_authorize(&mut request, None)
+            .map_err(|e| AppError::Storage(format!("Failed to sign {} request: {}", what, e)))?;
 
         let mut send = self
             .raw_http
@@ -2795,21 +3315,24 @@ impl S3Backend {
             // bulk ceiling, not reqwest's unbounded default.
             send = send.timeout(timeout);
         }
-        let response = send
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("{} failed to send: {}", what, e)))?;
+        let response = send.send().await.map_err(|e| {
+            crate::storage::failure::transport_storage_error(&format!("{what} failed to send"), e)
+        })?;
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(AppError::Storage(format!(
-                "{} failed: {} {}: {}",
-                what,
+            return Err(crate::storage::failure::status_storage_error(
                 status.as_u16(),
-                status.canonical_reason().unwrap_or(""),
-                body
-            )));
+                crate::storage::failure::xml_error_code(&body),
+                format!(
+                    "{} failed: {} {}: {}",
+                    what,
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or(""),
+                    body
+                ),
+            ));
         }
         parse_copy_part_etag(&body).ok_or_else(|| {
             AppError::Storage(format!(
@@ -2900,13 +3423,14 @@ impl S3Backend {
         // 1.7e9 ranges (~27 GiB resident) and completes rather than erroring.
         // The ceiling is clamped to >= 5 MiB at construction, so it is never 0.
         let part_count = size.div_ceil(self.max_single_copy_bytes);
-        if part_count > S3_MULTIPART_MAX_PARTS as u64 {
-            // Unreachable for real S3 (5 TiB object ceiling / 5 GiB parts =
-            // 1,024), but fail fast rather than opaquely at part 10,001 if an
-            // S3-compatible provider reports a larger object.
+        if part_count > self.max_parts as u64 {
+            // Unreachable for real S3 at the default budget (5 TiB object
+            // ceiling / 5 GiB parts = 1,024), but fail fast rather than opaquely
+            // past the part budget if an S3-compatible provider reports a larger
+            // object or caps an upload lower.
             return Err(AppError::Storage(format!(
-                "Multipart copy of '{}' would need {} parts, exceeding S3's {}-part limit",
-                source, part_count, S3_MULTIPART_MAX_PARTS,
+                "Multipart copy of '{}' would need {} parts, exceeding the {}-part limit",
+                source, part_count, self.max_parts,
             )));
         }
         let ranges = copy_part_ranges(size, self.max_single_copy_bytes);
@@ -2914,10 +3438,13 @@ impl S3Backend {
         let dest_path: ObjectPath = self.full_key(dest).into();
 
         let upload_id = self.store.create_multipart(&dest_path).await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to start multipart copy of '{}' -> '{}': {}",
-                source, dest, e
-            ))
+            s3_storage_error(
+                format!(
+                    "Failed to start multipart copy of '{}' -> '{}'",
+                    source, dest
+                ),
+                &e,
+            )
         })?;
         // Aborts the upload if this future is dropped mid-copy, mirroring
         // `put_stream`; defused on completion or by the inline aborts below.
@@ -3033,10 +3560,10 @@ impl S3Backend {
                 "Storage key not found: {}",
                 key
             ))),
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get size of '{}': {}",
-                key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!("Failed to get size of '{}'", key),
+                &e,
+            )),
         }
     }
 
@@ -3328,15 +3855,28 @@ mod tests {
     #[test]
     fn test_s3_part_within_limit_accepts_below_cap() {
         // The last valid index is S3_MULTIPART_MAX_PARTS - 1 (the 10,000th part).
-        assert!(ensure_s3_part_within_limit(0, S3_MULTIPART_CHUNK_SIZE, "k").is_ok());
+        assert!(ensure_s3_part_within_limit(
+            0,
+            S3_MULTIPART_CHUNK_SIZE,
+            "k",
+            S3_MULTIPART_MAX_PARTS
+        )
+        .is_ok());
         assert!(ensure_s3_part_within_limit(
             S3_MULTIPART_MAX_PARTS - 1,
             S3_MULTIPART_CHUNK_SIZE,
-            "k"
+            "k",
+            S3_MULTIPART_MAX_PARTS,
         )
         .is_ok());
         // A part exactly at the 5 GiB per-part maximum is accepted.
-        assert!(ensure_s3_part_within_limit(0, S3_MULTIPART_MAX_PART_SIZE as usize, "k").is_ok());
+        assert!(ensure_s3_part_within_limit(
+            0,
+            S3_MULTIPART_MAX_PART_SIZE as usize,
+            "k",
+            S3_MULTIPART_MAX_PARTS
+        )
+        .is_ok());
     }
 
     #[test]
@@ -3346,6 +3886,7 @@ mod tests {
             S3_MULTIPART_MAX_PARTS,
             S3_MULTIPART_CHUNK_SIZE,
             "blobs/abc",
+            S3_MULTIPART_MAX_PARTS,
         )
         .expect_err("part index at the cap must be rejected");
         let msg = err.to_string();
@@ -3368,7 +3909,7 @@ mod tests {
     fn test_s3_part_within_limit_rejects_oversized_part() {
         // A part above the 5 GiB per-part maximum is rejected with a clear error.
         let too_big = S3_MULTIPART_MAX_PART_SIZE as usize + 1;
-        let err = ensure_s3_part_within_limit(0, too_big, "blobs/huge")
+        let err = ensure_s3_part_within_limit(0, too_big, "blobs/huge", S3_MULTIPART_MAX_PARTS)
             .expect_err("a part over 5 GiB must be rejected");
         let msg = err.to_string();
         assert!(
@@ -3391,11 +3932,11 @@ mod tests {
     fn test_adaptive_part_size_small_known_object_uses_min_part() {
         // A tiny object never goes below the 5 MiB minimum part size.
         assert_eq!(
-            adaptive_part_size(Some(1), 0),
+            adaptive_part_size(Some(1), 0, S3_MULTIPART_MAX_PARTS),
             S3_MULTIPART_CHUNK_SIZE as u64
         );
         assert_eq!(
-            adaptive_part_size(Some(10 * MIB), 0),
+            adaptive_part_size(Some(10 * MIB), 0, S3_MULTIPART_MAX_PARTS),
             S3_MULTIPART_CHUNK_SIZE as u64
         );
     }
@@ -3404,15 +3945,15 @@ mod tests {
     fn test_adaptive_part_size_known_object_part_index_is_irrelevant() {
         // For a known size the part size is fixed regardless of index.
         let size = Some(100 * GIB);
-        let p0 = adaptive_part_size(size, 0);
-        assert_eq!(p0, adaptive_part_size(size, 5_000));
-        assert_eq!(p0, adaptive_part_size(size, 8_999));
+        let p0 = adaptive_part_size(size, 0, S3_MULTIPART_MAX_PARTS);
+        assert_eq!(p0, adaptive_part_size(size, 5_000, S3_MULTIPART_MAX_PARTS));
+        assert_eq!(p0, adaptive_part_size(size, 8_999, S3_MULTIPART_MAX_PARTS));
     }
 
     #[test]
     fn test_adaptive_part_size_known_100gib_stays_under_cap_and_max() {
         let size = 100 * GIB;
-        let part = adaptive_part_size(Some(size), 0);
+        let part = adaptive_part_size(Some(size), 0, S3_MULTIPART_MAX_PARTS);
         assert!(
             part <= S3_MULTIPART_MAX_PART_SIZE,
             "part {part} must not exceed the 5 GiB per-part max"
@@ -3428,7 +3969,7 @@ mod tests {
     fn test_adaptive_part_size_known_50gib_boundary() {
         // The historical artificial ceiling: 50 GiB must now be well within limits.
         let size = 50 * GIB;
-        let part = adaptive_part_size(Some(size), 0);
+        let part = adaptive_part_size(Some(size), 0, S3_MULTIPART_MAX_PARTS);
         let parts = size.div_ceil(part);
         assert!(parts <= S3_MULTIPART_MAX_PARTS as u64);
         assert!(part <= S3_MULTIPART_MAX_PART_SIZE);
@@ -3442,7 +3983,7 @@ mod tests {
         // below the 5 GiB per-part max, so it is used directly and the part count
         // stays at the 9,000-part target (<= the 10,000 cap).
         let size = 5 * TIB;
-        let part = adaptive_part_size(Some(size), 0);
+        let part = adaptive_part_size(Some(size), 0, S3_MULTIPART_MAX_PARTS);
         assert!(
             part <= S3_MULTIPART_MAX_PART_SIZE,
             "part {part} must not exceed the 5 GiB per-part max"
@@ -3454,7 +3995,7 @@ mod tests {
             "5 TiB must fit within the 10,000-part cap, got {parts} parts"
         );
         assert!(
-            parts <= S3_MULTIPART_TARGET_PARTS,
+            parts <= s3_target_parts(S3_MULTIPART_MAX_PARTS),
             "a known 5 TiB object should fit within the 9,000-part target, got {parts}"
         );
     }
@@ -3465,7 +4006,7 @@ mod tests {
         // size to the 5 GiB per-part maximum (the absolute ceiling is 5 GiB x
         // 10,000 = ~48.8 TiB, well above S3's real 5 TiB object limit).
         let size = 9_000 * (6 * GIB); // ceil(size/9000) = 6 GiB > MAX_PART
-        let part = adaptive_part_size(Some(size), 0);
+        let part = adaptive_part_size(Some(size), 0, S3_MULTIPART_MAX_PARTS);
         assert_eq!(part, S3_MULTIPART_MAX_PART_SIZE);
     }
 
@@ -3473,22 +4014,26 @@ mod tests {
     fn test_adaptive_part_size_unknown_first_tier_is_min_part() {
         // The first 1,000 parts of a stream stay at 5 MiB so small/typical
         // objects behave exactly like the historical fixed-size path.
-        assert_eq!(adaptive_part_size(None, 0), S3_MULTIPART_CHUNK_SIZE as u64);
         assert_eq!(
-            adaptive_part_size(None, 999),
+            adaptive_part_size(None, 0, S3_MULTIPART_MAX_PARTS),
+            S3_MULTIPART_CHUNK_SIZE as u64
+        );
+        assert_eq!(
+            adaptive_part_size(None, 999, S3_MULTIPART_MAX_PARTS),
             S3_MULTIPART_CHUNK_SIZE as u64
         );
     }
 
     #[test]
     fn test_adaptive_part_size_unknown_doubles_each_tier() {
-        // Size doubles every S3_PARTS_PER_TIER parts: 5 MiB -> 10 MiB -> 20 MiB.
+        // Size doubles every s3_parts_per_tier parts: 5 MiB -> 10 MiB -> 20 MiB.
+        let tier = s3_parts_per_tier(S3_MULTIPART_MAX_PARTS);
         assert_eq!(
-            adaptive_part_size(None, S3_PARTS_PER_TIER),
+            adaptive_part_size(None, tier, S3_MULTIPART_MAX_PARTS),
             2 * S3_MULTIPART_CHUNK_SIZE as u64
         );
         assert_eq!(
-            adaptive_part_size(None, 2 * S3_PARTS_PER_TIER),
+            adaptive_part_size(None, 2 * tier, S3_MULTIPART_MAX_PARTS),
             4 * S3_MULTIPART_CHUNK_SIZE as u64
         );
     }
@@ -3496,17 +4041,18 @@ mod tests {
     #[test]
     fn test_adaptive_part_size_unknown_caps_at_max_part() {
         // 5 MiB << 10 = 5 GiB == max part; tier 10 and beyond stay at the cap.
+        let tier = s3_parts_per_tier(S3_MULTIPART_MAX_PARTS);
         assert_eq!(
-            adaptive_part_size(None, 10 * S3_PARTS_PER_TIER),
+            adaptive_part_size(None, 10 * tier, S3_MULTIPART_MAX_PARTS),
             S3_MULTIPART_MAX_PART_SIZE
         );
         assert_eq!(
-            adaptive_part_size(None, 50 * S3_PARTS_PER_TIER),
+            adaptive_part_size(None, 50 * tier, S3_MULTIPART_MAX_PARTS),
             S3_MULTIPART_MAX_PART_SIZE
         );
         // Far-future index that would overflow a naive shift must still be capped.
         assert_eq!(
-            adaptive_part_size(None, u32::MAX),
+            adaptive_part_size(None, u32::MAX, S3_MULTIPART_MAX_PARTS),
             S3_MULTIPART_MAX_PART_SIZE
         );
     }
@@ -3518,7 +4064,7 @@ mod tests {
         // exceeding the per-part max or the part cap.
         let mut total: u64 = 0;
         for idx in 0..S3_MULTIPART_MAX_PARTS as u32 {
-            let part = adaptive_part_size(None, idx);
+            let part = adaptive_part_size(None, idx, S3_MULTIPART_MAX_PARTS);
             assert!(
                 part <= S3_MULTIPART_MAX_PART_SIZE,
                 "part at idx {idx} exceeded the 5 GiB max"
@@ -3526,12 +4072,103 @@ mod tests {
             assert!(part >= S3_MULTIPART_CHUNK_SIZE as u64);
             total += part;
         }
-        // Documented effective ceiling for unknown-length streams: ~4.99 TiB.
+        // Documented effective ceiling for unknown-length streams: ~4.88 TiB.
         let four_tib = 4 * TIB;
         assert!(
             total > four_tib && total <= 5 * TIB,
             "unknown-length schedule should cover ~5 TiB, got {total} bytes"
         );
+    }
+
+    // --- part budget (S3_MAX_PARTS) ---
+
+    /// Regression: some S3-compatible providers cap an upload at 1,000 parts,
+    /// and the unknown-length schedule kept 5 MiB parts for the first 1,000
+    /// parts, so every streamed blob above ~4.88 GiB failed at part 1,001. With a 1,000-part budget the schedule must cover
+    /// a large layer within the budget, and the guard must refuse the 1,001st
+    /// part before it reaches the provider.
+    #[test]
+    fn test_part_budget_1000_streams_80gib_within_1000_parts() {
+        const BUDGET: usize = 1_000;
+        let covered: u64 = (0..BUDGET as u32)
+            .map(|idx| adaptive_part_size(None, idx, BUDGET))
+            .sum();
+        assert!(
+            covered >= 80 * GIB,
+            "1,000 parts must cover at least 80 GiB, got {covered} bytes"
+        );
+        assert!(
+            ensure_s3_part_within_limit(BUDGET - 1, S3_MULTIPART_CHUNK_SIZE, "k", BUDGET).is_ok()
+        );
+        let err = ensure_s3_part_within_limit(BUDGET, S3_MULTIPART_CHUNK_SIZE, "blobs/abc", BUDGET)
+            .expect_err("part index 1,000 (the 1,001st part) must be refused");
+        assert!(err.to_string().contains("1000-part"), "{err}");
+    }
+
+    #[test]
+    fn test_part_budget_1000_known_size_targets_at_most_900_parts() {
+        const BUDGET: usize = 1_000;
+        let size = 80 * GIB;
+        let part = adaptive_part_size(Some(size), 0, BUDGET);
+        let parts = size.div_ceil(part);
+        assert!(
+            parts <= 900,
+            "80 GiB at a 1,000-part budget must use at most 900 parts, got {parts}"
+        );
+    }
+
+    #[test]
+    fn test_part_budget_limit_error_states_the_streaming_ceiling() {
+        let message = |max_parts: usize| {
+            ensure_s3_part_within_limit(max_parts, S3_MULTIPART_CHUNK_SIZE, "k", max_parts)
+                .expect_err("part index at the budget must be refused")
+                .to_string()
+        };
+        assert!(message(1_000).contains("~500 GiB"), "{}", message(1_000));
+        assert!(message(1).contains("~5 MiB"), "{}", message(1));
+    }
+
+    /// The default budget must reproduce the historical AWS schedule exactly.
+    #[test]
+    fn test_default_part_budget_keeps_the_aws_schedule() {
+        const BUDGET: usize = S3_MULTIPART_MAX_PARTS;
+        assert_eq!(BUDGET, 10_000);
+        assert_eq!(s3_target_parts(BUDGET), 9_000);
+        assert_eq!(s3_parts_per_tier(BUDGET), 1_000);
+        for (part_index, size) in [
+            (0, 5 * MIB),
+            (999, 5 * MIB),
+            (1_000, 10 * MIB),
+            (1_999, 10 * MIB),
+            (2_000, 20 * MIB),
+            (5_500, 160 * MIB),
+            (9_999, 2_560 * MIB),
+            (10_000, 5 * GIB),
+        ] {
+            assert_eq!(
+                adaptive_part_size(None, part_index, BUDGET),
+                size,
+                "part index {part_index}"
+            );
+        }
+        assert_eq!(
+            adaptive_part_size(Some(100 * GIB), 0, BUDGET),
+            (100 * GIB).div_ceil(9_000)
+        );
+        assert_eq!(s3_streaming_capacity(BUDGET), 1_023 * 1_000 * 5 * MIB);
+    }
+
+    #[test]
+    fn test_tiny_part_budget_keeps_tiers_and_target_positive() {
+        for budget in 1..10 {
+            assert_eq!(s3_parts_per_tier(budget), 1, "budget {budget}");
+            assert!(s3_target_parts(budget) >= 1, "budget {budget}");
+            assert_eq!(
+                adaptive_part_size(None, 0, budget),
+                S3_MULTIPART_CHUNK_SIZE as u64
+            );
+            assert!(adaptive_part_size(Some(GIB), 0, budget) <= S3_MULTIPART_MAX_PART_SIZE);
+        }
     }
 
     #[test]
@@ -4105,6 +4742,372 @@ mod tests {
         config.redirect_downloads = true;
         let backend = S3Backend::new(config).await;
         assert!(backend.is_ok());
+    }
+
+    // ---- S3_PUBLIC_ENDPOINT (#4417) ----
+
+    const PUBLIC_TEST_AK: &str = "AKIDPUBLIC4417";
+    const PUBLIC_TEST_SK: &str = "public-endpoint-secret-4417";
+
+    /// Recompute the SigV4 query-string signature of a presigned GET `url`
+    /// as the object store would when the request arrives with `Host: host`,
+    /// and report whether it matches the `X-Amz-Signature` in the URL.
+    /// Independent of object_store's signer, so it proves which host the
+    /// signature actually covers.
+    fn presigned_signature_valid_for_host(url: &url::Url, host: &str, secret: &str) -> bool {
+        use hmac::{Hmac, Mac};
+        fn hmac(key: &[u8], data: &str) -> Vec<u8> {
+            let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+            mac.update(data.as_bytes());
+            mac.finalize().into_bytes().to_vec()
+        }
+        let mut pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| k != "X-Amz-Signature")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        pairs.sort();
+        let query = pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let param = |name: &str| {
+            url.query_pairs()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default()
+        };
+        let amz_date = param("X-Amz-Date");
+        let credential = param("X-Amz-Credential");
+        let scope = credential
+            .split_once('/')
+            .map(|(_, s)| s)
+            .unwrap_or_default();
+        let mut scope_parts = scope.split('/');
+        let (day, region, service) = (
+            scope_parts.next().unwrap_or_default(),
+            scope_parts.next().unwrap_or_default(),
+            scope_parts.next().unwrap_or_default(),
+        );
+        let canonical_request = format!(
+            "GET\n{}\n{}\nhost:{}\n\nhost\nUNSIGNED-PAYLOAD",
+            url.path(),
+            query,
+            host
+        );
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+            amz_date,
+            scope,
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let k_date = hmac(format!("AWS4{secret}").as_bytes(), day);
+        let k_region = hmac(&k_date, region);
+        let k_service = hmac(&k_region, service);
+        let k_signing = hmac(&k_service, "aws4_request");
+        hex::encode(hmac(&k_signing, &string_to_sign)) == param("X-Amz-Signature")
+    }
+
+    /// Presign `key` on a backend built from `config` (redirects on, static
+    /// presign credentials so no credential chain is consulted).
+    async fn presign_with(mut config: S3Config, key: &str) -> url::Url {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        config.redirect_downloads = true;
+        config.presign_access_key = Some(PUBLIC_TEST_AK.to_string());
+        config.presign_secret_key = Some(PUBLIC_TEST_SK.to_string());
+        let backend = S3Backend::new(config).await.expect("backend builds");
+        let presigned =
+            StorageBackendTrait::get_presigned_url(&backend, key, Duration::from_secs(300))
+                .await
+                .expect("presign ok")
+                .expect("redirects enabled");
+        assert_eq!(presigned.source, PresignedUrlSource::S3);
+        url::Url::parse(&presigned.url).expect("presigned URL parses")
+    }
+
+    #[test]
+    fn test_signing_config_unset_public_endpoint_is_unchanged_4417() {
+        let config = S3Config::new(
+            "b".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            None,
+        );
+        assert!(config.public_endpoint.is_none());
+        assert!(
+            S3Backend::signing_config(&config).is_none(),
+            "no public endpoint and no presign creds: presign with the main store"
+        );
+    }
+
+    #[test]
+    fn test_signing_config_swaps_only_the_endpoint_4417() {
+        let config = S3Config::new(
+            "b".into(),
+            "eu-west-1".into(),
+            Some("http://storage-minio:9000".into()),
+            Some("pfx".into()),
+        )
+        .with_public_endpoint("https://dl.example.com");
+        let signing = S3Backend::signing_config(&config).expect("signing config");
+        assert_eq!(signing.endpoint.as_deref(), Some("https://dl.example.com"));
+        assert_eq!(signing.bucket, "b");
+        assert_eq!(signing.region, "eu-west-1");
+        assert_eq!(signing.prefix.as_deref(), Some("pfx"));
+        // The caller's config (and so the backend's own store) keeps the
+        // internal endpoint.
+        assert_eq!(
+            config.endpoint.as_deref(),
+            Some("http://storage-minio:9000")
+        );
+
+        // Dedicated creds without a public endpoint keep the internal one.
+        let mut creds_only = S3Config::new(
+            "b".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            None,
+        );
+        creds_only.presign_access_key = Some("ak".into());
+        creds_only.presign_secret_key = Some("sk".into());
+        let signing = S3Backend::signing_config(&creds_only).expect("signing config");
+        assert_eq!(
+            signing.endpoint.as_deref(),
+            Some("http://storage-minio:9000")
+        );
+
+        // A lone presign key is not a credential pair and changes nothing.
+        let mut half = S3Config::new("b".into(), "us-east-1".into(), None, None);
+        half.presign_access_key = Some("ak".into());
+        assert!(S3Backend::signing_config(&half).is_none());
+    }
+
+    fn test_cloudfront_config() -> CloudFrontConfig {
+        use rsa::pkcs8::EncodePrivateKey;
+        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap();
+        CloudFrontConfig {
+            distribution_url: "https://d1234.cloudfront.net".to_string(),
+            key_pair_id: "KTEST4417".to_string(),
+            private_key: key
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .unwrap()
+                .to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cloudfront_takes_precedence_over_public_endpoint_4417() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        let _env = AnonymousS3TestEnv::enter();
+        let config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            None,
+        )
+        .with_public_endpoint("https://dl.example.com")
+        .with_cloudfront(test_cloudfront_config())
+        .with_redirect_downloads(true);
+        assert!(
+            S3Backend::signing_config(&config).is_none(),
+            "CloudFront signs client URLs; the public endpoint must not build a signer"
+        );
+        let backend = S3Backend::new(config).await.expect("backend builds");
+        let presigned =
+            StorageBackendTrait::get_presigned_url(&backend, "a.bin", Duration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(presigned.source, PresignedUrlSource::CloudFront);
+        assert!(
+            presigned
+                .url
+                .starts_with("https://d1234.cloudfront.net/a.bin?"),
+            "{}",
+            presigned.url
+        );
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_without_public_endpoint_keeps_internal_host_4417() {
+        let _env = AnonymousS3TestEnv::enter();
+        let config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            None,
+        );
+        let url = presign_with(config, "maven/a.jar").await;
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("storage-minio"));
+        assert_eq!(url.port(), Some(9000));
+        assert_eq!(url.path(), "/artifacts/maven/a.jar");
+        assert!(presigned_signature_valid_for_host(
+            &url,
+            "storage-minio:9000",
+            PUBLIC_TEST_SK
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_signed_for_public_endpoint_path_style_4417() {
+        let _env = AnonymousS3TestEnv::enter();
+        let config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            Some("tenant-a".into()),
+        )
+        .with_public_endpoint("https://dl.example.com");
+        let url = presign_with(config, "oci/blobs/sha256/ab/abcd").await;
+
+        // Path-style addressing, same as the backend's own requests, on the
+        // public origin (default https port dropped).
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("dl.example.com"));
+        assert_eq!(url.port(), None);
+        assert_eq!(url.path(), "/artifacts/tenant-a/oci/blobs/sha256/ab/abcd");
+        assert!(url.as_str().contains("X-Amz-Signature="));
+
+        // The signature validates for the Host the client sends, and would
+        // be rejected for the internal host.
+        assert!(presigned_signature_valid_for_host(
+            &url,
+            "dl.example.com",
+            PUBLIC_TEST_SK
+        ));
+        assert!(!presigned_signature_valid_for_host(
+            &url,
+            "storage-minio:9000",
+            PUBLIC_TEST_SK
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_public_endpoint_with_port_over_aws_default_4417() {
+        let _env = AnonymousS3TestEnv::enter();
+        // No internal custom endpoint (AWS default) and a public origin with an
+        // explicit port: the port is part of the signed Host.
+        let config = S3Config::new("artifacts".into(), "us-west-2".into(), None, None)
+            .with_public_endpoint("http://s3-gw.example.com:8443");
+        let url = presign_with(config, "generic/file.bin").await;
+        assert_eq!(url.host_str(), Some("s3-gw.example.com"));
+        assert_eq!(url.port(), Some(8443));
+        assert_eq!(url.path(), "/artifacts/generic/file.bin");
+        assert!(presigned_signature_valid_for_host(
+            &url,
+            "s3-gw.example.com:8443",
+            PUBLIC_TEST_SK
+        ));
+        assert!(!presigned_signature_valid_for_host(
+            &url,
+            "s3-gw.example.com",
+            PUBLIC_TEST_SK
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_public_endpoint_does_not_move_backend_requests_4417() {
+        let _env = AnonymousS3TestEnv::enter();
+        // The backend's own calls must keep S3_ENDPOINT: point it at a mock
+        // and the public endpoint at an unroutable host, then HEAD an object.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+            .and(wiremock::matchers::path("/artifacts/k"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-length", "3")
+                    .insert_header("last-modified", "Mon, 05 Oct 2026 00:00:00 GMT")
+                    .insert_header("etag", "\"e\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            Some(server.uri()),
+            None,
+        )
+        .with_public_endpoint("http://public.invalid:9");
+        let backend = S3Backend::new(config).await.expect("backend builds");
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        assert!(StorageBackendTrait::exists(&backend, "k")
+            .await
+            .expect("exists ok"));
+    }
+
+    #[test]
+    fn test_s3_config_from_env_rejects_malformed_public_endpoint_4417() {
+        let _env = CredEnvTestEnv::enter();
+        let saved_bucket = std::env::var("S3_BUCKET").ok();
+        let saved_public = std::env::var("S3_PUBLIC_ENDPOINT").ok();
+        std::env::set_var("S3_BUCKET", "b");
+
+        std::env::set_var("S3_PUBLIC_ENDPOINT", "dl.example.com:9000");
+        let err = S3Config::from_env().expect_err("malformed public endpoint");
+        assert!(err.to_string().contains("S3_PUBLIC_ENDPOINT"), "{err}");
+
+        std::env::set_var("S3_PUBLIC_ENDPOINT", "https://dl.example.com/");
+        let config = S3Config::from_env().expect("valid public endpoint");
+        assert_eq!(
+            config.public_endpoint.as_deref(),
+            Some("https://dl.example.com")
+        );
+
+        std::env::remove_var("S3_PUBLIC_ENDPOINT");
+        assert!(S3Config::from_env().unwrap().public_endpoint.is_none());
+
+        match saved_bucket {
+            Some(v) => std::env::set_var("S3_BUCKET", v),
+            None => std::env::remove_var("S3_BUCKET"),
+        }
+        if let Some(v) = saved_public {
+            std::env::set_var("S3_PUBLIC_ENDPOINT", v);
+        }
+    }
+
+    #[test]
+    fn test_s3_max_parts_env_falls_back_and_clamps() {
+        let _env = CredEnvTestEnv::enter();
+        let saved: Vec<(&'static str, Option<String>)> = ["S3_BUCKET", "S3_MAX_PARTS"]
+            .into_iter()
+            .map(|name| (name, std::env::var(name).ok()))
+            .collect();
+        std::env::set_var("S3_BUCKET", "b");
+        let effective = |raw: Option<&str>| {
+            match raw {
+                Some(v) => std::env::set_var("S3_MAX_PARTS", v),
+                None => std::env::remove_var("S3_MAX_PARTS"),
+            }
+            S3Backend::effective_max_parts(&S3Config::from_env().expect("from_env"))
+        };
+
+        assert_eq!(effective(None), 10_000, "unset keeps AWS's cap");
+        assert_eq!(effective(Some("1000")), 1_000);
+        assert_eq!(effective(Some("abc")), 10_000, "invalid falls back");
+        assert_eq!(effective(Some("-1")), 10_000, "negative falls back");
+        assert_eq!(effective(Some("0")), 1, "zero clamps up to one part");
+        assert_eq!(effective(Some("25000")), 10_000, "above AWS's cap clamps");
+
+        restore_cred_env(saved);
+    }
+
+    #[tokio::test]
+    async fn test_s3_backend_new_clamps_the_part_budget() {
+        let _env = AnonymousS3TestEnv::enter();
+        for (configured, effective) in [(1_000, 1_000), (0, 1), (usize::MAX, 10_000)] {
+            let config = S3Config::new(
+                "test-bucket".to_string(),
+                "us-east-1".to_string(),
+                Some("http://localhost:9999".to_string()),
+                None,
+            )
+            .with_max_parts(configured);
+            let backend = S3Backend::new(config).await.expect("backend builds");
+            assert_eq!(backend.max_parts, effective, "configured {configured}");
+        }
     }
 
     #[tokio::test]
@@ -5023,6 +6026,7 @@ mod tests {
             bulk_timeout: Some(Duration::from_secs(S3_DEFAULT_BULK_TIMEOUT_SECS)),
             raw_http: reqwest::Client::new(),
             max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+            max_parts: S3_MULTIPART_MAX_PARTS,
             sign_requests: true,
             prefix: None,
             redirect_downloads: false,
@@ -5035,6 +6039,433 @@ mod tests {
             copy_length_fallback_latched: AtomicBool::new(false),
             disable_multi_delete,
         }
+    }
+
+    // --- #5649 / #5650: unreachable store and full bucket ---
+
+    /// An `S3Backend` for `endpoint` built through the production store
+    /// builders, so the connect timeout and retry budget in `config` are the
+    /// ones a deployment gets.
+    fn outage_backend(config: &S3Config) -> S3Backend {
+        let creds = (Some("AKIAIOSFODNN7EXAMPLE"), Some("secret"));
+        S3Backend {
+            store: S3Backend::build_store(config, creds.0, creds.1).expect("store"),
+            bulk_store: S3Backend::build_bulk_store(config, creds.0, creds.1).expect("bulk store"),
+            bucket: config.bucket.clone(),
+            region: config.region.clone(),
+            bulk_timeout: Some(Duration::from_secs(S3_DEFAULT_BULK_TIMEOUT_SECS)),
+            raw_http: S3Backend::build_raw_http_client(config).expect("raw client"),
+            max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+            max_parts: S3_MULTIPART_MAX_PARTS,
+            sign_requests: true,
+            prefix: None,
+            redirect_downloads: false,
+            cloudfront: None,
+            path_format: StoragePathFormat::Native,
+            signing_store: None,
+            provider: S3Provider::Generic,
+            control_timeout: Some(S3_CONTROL_TIMEOUT),
+            list_fallback_latched: AtomicBool::new(false),
+            copy_length_fallback_latched: AtomicBool::new(false),
+            disable_multi_delete: false,
+        }
+    }
+
+    fn outage_config(endpoint: &str) -> S3Config {
+        S3Config::new(
+            "ak-quota-bucket-5650".to_string(),
+            "us-east-1".to_string(),
+            Some(endpoint.to_string()),
+            None,
+        )
+        .with_storage_timeouts(crate::storage::StorageTimeouts {
+            connect: Duration::from_secs(1),
+            operation: Duration::from_secs(1),
+            bulk_retry: Duration::from_secs(1),
+        })
+    }
+
+    /// The status and body an error answers a client with.
+    ///
+    /// streaming-invariant: test scaffolding exempt — an error body is a small
+    /// bounded JSON document, not an artifact path (#1608).
+    #[allow(clippy::disallowed_methods)]
+    async fn client_view(err: AppError) -> (axum::http::StatusCode, String, bool) {
+        use axum::response::IntoResponse;
+        let response = err.into_response();
+        let status = response.status();
+        let retry_after = response.headers().contains_key("retry-after");
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        (
+            status,
+            String::from_utf8_lossy(&body).into_owned(),
+            retry_after,
+        )
+    }
+
+    /// A local endpoint whose connection attempts hang: a listener with a
+    /// zero backlog whose accept queue is already full, so the kernel drops
+    /// further SYNs, which is what a client sees when the store's host has
+    /// gone (a stopped MinIO container, a dead node) rather than refusing.
+    /// The returned guards keep the queue full.
+    async fn blackholed_endpoint() -> (String, Vec<std::net::TcpStream>, tokio::net::TcpListener) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let listener = socket.listen(0).expect("listen");
+        let addr = listener.local_addr().expect("addr");
+        let fillers = (0..4)
+            .filter_map(|_| {
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()
+            })
+            .collect();
+        (format!("http://{addr}"), fillers, listener)
+    }
+
+    /// #5649 regression: with the store's host gone, every operation must fail
+    /// within the connect timeout and retry budget and answer
+    /// `503 STORAGE_UNAVAILABLE` + `Retry-After`. Before the fix each attempt
+    /// waited out `object_store`'s 5s connect timeout and the attempts were
+    /// retried for up to three minutes, so the request hung until the store
+    /// came back (clients gave up on their own 30s timeout).
+    #[tokio::test]
+    async fn test_unreachable_store_fails_fast_with_503_5649() {
+        use crate::storage::StorageBackend as _;
+        let (endpoint, _fillers, _listener) = blackholed_endpoint().await;
+        let backend = outage_backend(&outage_config(&endpoint));
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(25), async {
+            (
+                backend
+                    .put("generic/x.bin", Bytes::from_static(b"payload"))
+                    .await,
+                backend.exists("generic/x.bin").await,
+            )
+        })
+        .await
+        .expect("storage operations against a vanished store must not hang");
+        assert!(
+            started.elapsed() < Duration::from_secs(12),
+            "two operations took {:?}; each is bounded by about budget (1s) + connect \
+             (1s) + the 2s backoff cap",
+            started.elapsed()
+        );
+        let errors = [outcome.0.expect_err("put"), outcome.1.expect_err("exists")];
+        for err in errors {
+            assert_unavailable_to_the_client(err).await;
+        }
+    }
+
+    /// #5649: a refused connection (nothing listening) is reported the same.
+    #[tokio::test]
+    async fn test_refused_connection_is_503_5649() {
+        use crate::storage::StorageBackend as _;
+        let backend = outage_backend(&outage_config("http://127.0.0.1:1"));
+        let err = tokio::time::timeout(Duration::from_secs(20), backend.get("generic/x.bin"))
+            .await
+            .expect("must not hang")
+            .expect_err("nothing listens on port 1");
+        assert_unavailable_to_the_client(err).await;
+    }
+
+    async fn assert_unavailable_to_the_client(err: AppError) {
+        let label = err.to_string();
+        assert_eq!(
+            err.storage_failure(),
+            Some(crate::storage::StorageFailure::Unavailable),
+            "{label}"
+        );
+        let (status, body, retry_after) = client_view(err).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{label}"
+        );
+        assert!(retry_after, "{label}: 503 must carry Retry-After");
+        assert!(body.contains("STORAGE_UNAVAILABLE"), "{body}");
+        assert!(!body.contains("127.0.0.1"), "{body}");
+    }
+
+    /// #5649: a store that answers but keeps failing with 503 is retried only
+    /// for the budget, then reported unavailable.
+    #[tokio::test]
+    async fn test_store_answering_503_is_unavailable_within_budget_5649() {
+        use crate::storage::StorageBackend as _;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(503).set_body_string(
+                "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
+            ))
+            .mount(&server)
+            .await;
+        let backend = outage_backend(&outage_config(&server.uri()));
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            backend.put("generic/x.bin", Bytes::from_static(b"payload")),
+        )
+        .await
+        .expect("must not hang")
+        .expect_err("a 503 store refuses the write");
+        assert_eq!(
+            err.storage_failure(),
+            Some(crate::storage::StorageFailure::Unavailable),
+            "{err}"
+        );
+    }
+
+    /// #5650 regression: MinIO refuses a PUT into a bucket at its quota with
+    /// `400 XMinioAdminBucketQuotaExceeded`. That must answer
+    /// `507 STORAGE_FULL` with a neutral body: before the fix it was
+    /// `500 STORAGE_ERROR`, and the OCI routes echoed the XML (bucket name,
+    /// request ids) to the client.
+    #[tokio::test]
+    async fn test_bucket_quota_refusal_is_507_with_neutral_body_5650() {
+        use crate::storage::StorageBackend as _;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let quota = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\
+            <Code>XMinioAdminBucketQuotaExceeded</Code><Message>Bucket quota exceeded</Message>\
+            <BucketName>ak-quota-bucket-5650</BucketName><Resource>/ak-quota-bucket-5650/x.bin\
+            </Resource><RequestId>187A0F1E2D3C4B5A</RequestId><HostId>dd9025bab4ad464b\
+            </HostId></Error>";
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(400).set_body_string(quota))
+            .mount(&server)
+            .await;
+        let backend = outage_backend(&outage_config(&server.uri()));
+
+        for err in [
+            backend
+                .put("generic/x.bin", Bytes::from_static(b"payload"))
+                .await
+                .expect_err("quota refuses the put"),
+            backend
+                .put_stream(
+                    "generic/y.bin",
+                    Box::pin(futures::stream::once(async {
+                        Ok(Bytes::from_static(b"payload"))
+                    })),
+                )
+                .await
+                .expect_err("quota refuses the streamed put"),
+        ] {
+            let label = err.to_string();
+            assert_eq!(
+                err.storage_failure(),
+                Some(crate::storage::StorageFailure::Full),
+                "{label}"
+            );
+            let (status, body, _) = client_view(err).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::INSUFFICIENT_STORAGE,
+                "{label}"
+            );
+            assert!(body.contains("STORAGE_FULL"), "{body}");
+            for needle in [
+                "XMinio",
+                "ak-quota-bucket-5650",
+                "187A0F1E2D3C4B5A",
+                "<Error>",
+            ] {
+                assert!(!body.contains(needle), "{needle} leaked: {body}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_s3_failure_class_reads_the_transport_kind_5649() {
+        use object_store::client::{HttpError, HttpErrorKind};
+        #[derive(Debug, thiserror::Error)]
+        #[error("boom")]
+        struct Boom;
+        for (kind, want) in [
+            (
+                HttpErrorKind::Connect,
+                Some(crate::storage::StorageFailure::Unavailable),
+            ),
+            (
+                HttpErrorKind::Timeout,
+                Some(crate::storage::StorageFailure::Unavailable),
+            ),
+            (HttpErrorKind::Decode, None),
+        ] {
+            let err = object_store::Error::Generic {
+                store: "S3",
+                source: Box::new(HttpError::new(kind, Boom)),
+            };
+            assert_eq!(s3_failure_class(&err), want, "{kind:?}");
+            assert_eq!(
+                crate::storage::StorageFailure::from_message(&classify_s3_error(&err)),
+                want,
+                "{kind:?}: the class must survive into the error text"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retry_budget_comes_from_the_storage_timeouts_5649() {
+        let timeouts = crate::storage::StorageTimeouts {
+            connect: Duration::from_secs(2),
+            operation: Duration::from_secs(7),
+            bulk_retry: Duration::from_secs(150),
+        };
+        let control = s3_retry_config(&timeouts, S3Plane::Control);
+        assert_eq!(control.retry_timeout, Duration::from_secs(7));
+        assert_eq!(
+            control.max_retries,
+            object_store::RetryConfig::default().max_retries
+        );
+        let bulk = s3_retry_config(&timeouts, S3Plane::Bulk);
+        assert_eq!(bulk.retry_timeout, Duration::from_secs(150));
+        assert_eq!(bulk.max_retries, S3_BULK_MAX_RETRIES);
+        for retry in [control, bulk] {
+            assert_eq!(
+                retry.backoff.max_backoff,
+                crate::storage::STORAGE_MAX_RETRY_BACKOFF
+            );
+        }
+    }
+
+    /// #5649 review: `object_store` measures the retry budget from the start
+    /// of the request, so a payload request that fails after running longer
+    /// than the control-plane budget must still be retried. A PUT answered
+    /// `503 SlowDown` after 3s, then accepted, succeeds although the
+    /// control-plane budget is 1s.
+    #[tokio::test]
+    async fn test_slow_bulk_request_keeps_its_retries_5649() {
+        use crate::storage::StorageBackend as _;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_string("<Error><Code>SlowDown</Code></Error>")
+                    .set_delay(Duration::from_secs(3)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"ok\""))
+            .mount(&server)
+            .await;
+        let config =
+            outage_config(&server.uri()).with_storage_timeouts(crate::storage::StorageTimeouts {
+                connect: Duration::from_secs(1),
+                operation: Duration::from_secs(1),
+                ..Default::default()
+            });
+        let backend = outage_backend(&config);
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            backend.put("generic/x.bin", Bytes::from_static(b"payload")),
+        )
+        .await
+        .expect("must not hang")
+        .expect("the retried PUT succeeds");
+    }
+
+    /// #5649 review: with the long default payload budget, a gone store
+    /// still answers 503 promptly; the bulk retry count is what bounds it.
+    #[tokio::test]
+    async fn test_dead_store_bounds_a_bulk_put_by_its_retry_count_5649() {
+        use crate::storage::StorageBackend as _;
+        let (endpoint, _fillers, _listener) = blackholed_endpoint().await;
+        let config =
+            outage_config(&endpoint).with_storage_timeouts(crate::storage::StorageTimeouts {
+                connect: Duration::from_secs(1),
+                ..Default::default()
+            });
+        let backend = outage_backend(&config);
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(40),
+            backend.put("generic/x.bin", Bytes::from_static(b"payload")),
+        )
+        .await
+        .expect("a bulk PUT against a gone store must not hang")
+        .expect_err("nothing answers");
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "took {:?}: 6 attempts x (1s connect + 2s backoff cap) at most",
+            started.elapsed()
+        );
+        assert_unavailable_to_the_client(err).await;
+    }
+
+    /// #5650 review: classification never reads the object key. A key that
+    /// spells out codes, answered with a plain 400 `AccessDenied` whose body
+    /// quotes the key, stays a 500 and leaves the health signal alone.
+    #[tokio::test]
+    async fn test_key_naming_a_code_does_not_classify_5650() {
+        use crate::storage::StorageBackend as _;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        crate::storage::failure::reset_failure_signal();
+        let key = "generic/QuotaExceeded-SlowDown-ServerBusy-OperationTimedOut.bin";
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(400).set_body_string(format!(
+                "<?xml version=\"1.0\"?><Error><Code>AccessDenied</Code>\
+                 <Message>XMinioAdminBucketQuotaExceeded</Message><Key>{key}</Key>\
+                 <Resource>/b/{key}</Resource></Error>"
+            )))
+            .mount(&server)
+            .await;
+        let backend = outage_backend(&outage_config(&server.uri()));
+        let err = backend
+            .put(key, Bytes::from_static(b"payload"))
+            .await
+            .expect_err("access denied");
+        assert_eq!(err.storage_failure(), None, "{err}");
+        let (status, _, _) = client_view(err).await;
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !crate::storage::failure::refused_for_space_within(
+                crate::storage::failure::STORAGE_FULL_SIGNAL_WINDOW
+            ),
+            "a spoofing key must not flip the storage health check"
+        );
+    }
+
+    /// #4980: the upload commit guard's presence check never answers from the
+    /// migration fallback key.
+    #[tokio::test]
+    async fn test_exists_at_exact_key_ignores_the_migration_fallback_4980() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("HEAD"))
+            .and(path_regex(".*/repos/generic/.*"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path_regex(".*/ab/abcdef.*"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "3")
+                    .insert_header("last-modified", "Mon, 06 Jul 2026 22:37:12 GMT")
+                    .insert_header("etag", "\"e\""),
+            )
+            .mount(&server)
+            .await;
+
+        let mut backend = mock_s3_backend(&server.uri(), false).await;
+        backend.path_format = StoragePathFormat::Migration;
+        let key = format!("repos/generic/{checksum}");
+        assert!(StorageBackendTrait::exists(&backend, &key).await.unwrap());
+        assert!(
+            !StorageBackendTrait::exists_at_exact_key(&backend, &key)
+                .await
+                .unwrap(),
+            "only the canonical key may answer the exact presence check"
+        );
     }
 
     #[tokio::test]
@@ -5339,6 +6770,7 @@ mod tests {
                     .then(|| Duration::from_secs(config.bulk_timeout_secs)),
                 raw_http: reqwest::Client::new(),
                 max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+                max_parts: S3_MULTIPART_MAX_PARTS,
                 sign_requests: true,
                 prefix: None,
                 redirect_downloads: false,
@@ -5423,6 +6855,7 @@ mod tests {
                 .then(|| Duration::from_secs(config.bulk_timeout_secs)),
             raw_http: reqwest::Client::new(),
             max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+            max_parts: S3_MULTIPART_MAX_PARTS,
             sign_requests: true,
             prefix: None,
             redirect_downloads: false,
@@ -5708,6 +7141,82 @@ mod tests {
         );
     }
 
+    /// The configured part budget reaches `put_stream`: at a one-part budget the
+    /// second part is refused before upload and the multipart upload aborted.
+    #[tokio::test]
+    async fn test_put_stream_refuses_a_part_beyond_the_part_budget() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param_is_missing("uploadId"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>budget-upload-id</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        let abort_guard = Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "budget-upload-id"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut backend = mock_s3_backend(&server.uri(), false).await;
+        backend.max_parts = 1;
+        let stream = futures::stream::iter(
+            (0..2).map(|_| Ok(Bytes::from(vec![b'x'; S3_MULTIPART_CHUNK_SIZE]))),
+        );
+
+        let err = StorageBackendTrait::put_stream(&backend, "budget-object", Box::pin(stream))
+            .await
+            .expect_err("a second part must be refused at a one-part budget");
+        assert!(err.to_string().contains("1-part limit"), "{err}");
+        assert_eq!(
+            abort_guard.received_requests().await.len(),
+            1,
+            "the refused upload must be aborted"
+        );
+    }
+
+    /// The configured part budget also bounds a server-side multipart copy: a
+    /// source that needs more parts is refused before any upload is created.
+    #[tokio::test]
+    async fn test_copy_refuses_a_multipart_copy_beyond_the_part_budget() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 10 GiB + 1 byte -> three 5 GiB part copies, one more than the budget.
+        let size = 2 * S3_MAX_SINGLE_COPY_SIZE + 1;
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", size.to_string())
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
+                    .insert_header("ETag", "\"large-source\""),
+            )
+            .mount(&server)
+            .await;
+
+        let mut backend = mock_s3_backend(&server.uri(), false).await;
+        backend.max_parts = 2;
+        let err = S3Backend::copy(&backend, "source-object", "dest-object")
+            .await
+            .expect_err("a three-part copy must be refused at a two-part budget");
+        assert!(
+            err.to_string()
+                .contains("would need 3 parts, exceeding the 2-part limit"),
+            "{err}"
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            requests.iter().all(|r| r.method.as_str() == "HEAD"),
+            "no multipart upload may be created"
+        );
+    }
+
     // ---- #3164: >5 GiB copies must be server-side UploadPartCopy, and the
     // destination must never be published before the copy fully succeeds ----
 
@@ -5839,6 +7348,135 @@ mod tests {
         );
     }
 
+    /// The multipart server-side copy must name the object as it is stored
+    /// (#4838).
+    ///
+    /// object_store writes every key segment through
+    /// [`PathPart`](object_store::path::PathPart), so the S3 key of
+    /// `café a&b~c` is literally `caf%C3%A9 a&b%7Ec`. S3 URL-decodes
+    /// `x-amz-copy-source` once and looks the result up, so the header must
+    /// be the URL encoding of that stored key. Encoding the caller's key
+    /// instead decodes to `café a&b~c`, which is not the stored object, and the
+    /// part copy is `NoSuchKey`, while a small object's single-request
+    /// CopyObject (object_store's own encoding) works.
+    ///
+    /// The fixture models S3: a part copy succeeds only when its header
+    /// decodes to the stored key; any other spelling answers `NoSuchKey`.
+    #[tokio::test]
+    async fn test_large_copy_names_source_in_stored_encoding_4838() {
+        use wiremock::matchers::{header, method, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 5 GiB + 1 byte -> two parts, so the copier has to take the
+        // UploadPartCopy path rather than a single CopyObject.
+        let size = 5_u64 * 1024 * 1024 * 1024 + 1;
+        // Non-ASCII, a space, `&` and `~`: object_store stores `é` and `~`
+        // percent-encoded and the space and `&` literal.
+        let source = "maven/r1/com/dtf/uni/1.0/uni-1.0-café a&b~c.jar";
+        let dest = "maven/r1/com/dtf/uni/1.0/uni-1.0-promoted.jar";
+        // The stored key, derived from object_store itself so the assertion
+        // can never drift from what a write actually creates.
+        let stored_key = ObjectPath::from(source).as_ref().to_string();
+        assert!(
+            stored_key.contains("caf%C3%A9 a&b%7Ec"),
+            "precondition: object_store stores the segment percent-encoded: {stored_key}"
+        );
+        // What S3 must receive: the stored key, URL-encoded once more.
+        let stored_source = format!(
+            "test-bucket/{}",
+            stored_key
+                .split('/')
+                .map(|seg| urlencoding::encode(seg).into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        assert_eq!(
+            urlencoding::decode(stored_source.trim_start_matches("test-bucket/")).unwrap(),
+            stored_key,
+            "precondition: the expected header decodes to the stored key"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", size.to_string())
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
+                    .insert_header("ETag", "\"large-source\""),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param_is_missing("uploadId"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>copy-upload-id</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        // A part copy that names the source in its stored encoding succeeds;
+        // any other spelling answers NoSuchKey, exactly as S3 does for a copy
+        // source that does not resolve to the object the key names.
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .and(header("x-amz-copy-source", stored_source.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyPartResult><ETag>&#34;part-copy-etag&#34;</ETag></CopyPartResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                "<Error><Code>NoSuchKey</Code><Message>The specified key does not \
+                 exist.</Message></Error>",
+            ))
+            .mount(&server)
+            .await;
+        let complete_guard = Mock::given(method("POST"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"complete-copy\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        S3Backend::copy(&backend, source, dest)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "#4838: a >5 GiB copy must name its source '{}', the way the write \
+                     stored it, and S3 must find it: {e}",
+                    stored_source
+                )
+            });
+
+        // The copy completed, and every part named the stored source.
+        assert_eq!(
+            complete_guard.received_requests().await.len(),
+            1,
+            "#4838: the multipart copy must be completed exactly once"
+        );
+        let part_copies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .filter_map(|r| {
+                r.headers
+                    .get("x-amz-copy-source")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(!part_copies.is_empty(), "#4838: no part copy was sent");
+        assert!(
+            part_copies.iter().all(|s| s == &stored_source),
+            "#4838: every part copy must name '{stored_source}', got {part_copies:?}"
+        );
+    }
+
     /// The integrity half of #3164: with the old restream shape, `dest` was
     /// already fully published (multipart upload completed) before any
     /// verification could run. With server-side part copies the publish point
@@ -5937,6 +7575,53 @@ mod tests {
             1,
             "a failed part copy must abort the pending multipart upload"
         );
+    }
+
+    /// #5133: S3 has no rename, so a promote is the server-side copy, and the
+    /// source stays for the caller's existing cleanup (nothing is deleted here).
+    #[tokio::test]
+    async fn test_promote_is_server_side_copy_and_keeps_source_5133() {
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/test-bucket/staged"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "5")
+                    .insert_header("last-modified", "Tue, 03 Nov 2026 00:00:00 GMT")
+                    .insert_header("etag", "\"x\""),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/test-bucket/blob"))
+            .and(header_exists("x-amz-copy-source"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<CopyObjectResult><ETag>\"x\"</ETag></CopyObjectResult>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        assert_eq!(
+            crate::storage::StorageBackend::stored_size(&backend, "staged")
+                .await
+                .unwrap(),
+            Some(5),
+            "the stored size comes from the HEAD"
+        );
+        crate::storage::StorageBackend::promote(&backend, "staged", "blob")
+            .await
+            .unwrap();
     }
 
     /// Positive control for #3164: copies at or below the 5 GiB threshold must
@@ -6222,6 +7907,27 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_redacts_request_urls_from_the_raw_text() {
+        // #3954: the message reaches INFO logs and exported span status.
+        let e = generic_err(
+            "Error performing GET https://minio.internal:9000/my-bucket/a/b?x=1 in 1s - boom",
+        );
+        let msg = classify_s3_error(&e);
+        assert!(!msg.contains("minio.internal"), "got: {msg}");
+        assert!(!msg.contains("my-bucket"), "got: {msg}");
+        assert!(
+            msg.contains("Error performing GET <url> in 1s - boom"),
+            "got: {msg}"
+        );
+        let err = s3_storage_error(format!("Failed to get object '{}'", "k"), &e);
+        assert!(
+            err.to_string()
+                .contains("Failed to get object 'k': S3 request failed. caused by:"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn test_classify_unknown_error_fallthrough() {
         // An unrecognized error must NOT be misclassified into a wrong
         // bucket; it should fall through to the generic "S3 request
@@ -6287,6 +7993,31 @@ mod tests {
         );
         assert!(!page.is_truncated);
         assert!(page.next_continuation_token.is_none());
+    }
+
+    /// #1570 review: the REST fallback must carry `<LastModified>` so the
+    /// storage reindex can tell settled ghosts from in-flight uploads on
+    /// endpoints (Alibaba OSS) that always use it.
+    #[test]
+    fn test_parse_list_response_carries_last_modified_1570() {
+        let page = parse_list_bucket_result(OSS_LIST_RESPONSE).expect("OSS sample must parse");
+        assert_eq!(page.last_modified.len(), page.keys.len());
+        assert!(page.last_modified.iter().all(Option::is_some), "{page:?}");
+
+        // Either element order, and a missing/garbled value is `None`.
+        let xml = r#"<ListBucketResult>
+            <Contents><LastModified>2020-06-22T11:42:35.000Z</LastModified><Key>a</Key></Contents>
+            <Contents><Key>b</Key></Contents>
+            <Contents><Key>c</Key><LastModified>not a date</LastModified></Contents>
+        </ListBucketResult>"#;
+        let page = parse_list_bucket_result(xml).expect("must parse");
+        assert_eq!(page.keys, vec!["a", "b", "c"]);
+        assert_eq!(
+            page.last_modified[0].map(|d| d.to_rfc3339()),
+            Some("2020-06-22T11:42:35+00:00".to_string())
+        );
+        assert_eq!(page.last_modified[1], None);
+        assert_eq!(page.last_modified[2], None);
     }
 
     #[test]
@@ -6774,6 +8505,224 @@ mod tests {
             keys,
             vec!["a.txt".to_string(), "b.txt".to_string()],
             "a truncated page must be followed, or a bucket over 1000 keys lists short"
+        );
+    }
+
+    /// Every key a `put` can write decodes back from its stored form to
+    /// itself, and a stored key no `put` writes decodes to nothing (#4817).
+    #[test]
+    fn test_key_from_stored_inverts_the_object_path_encoding_4817() {
+        let mut keys: Vec<String> = ROW_KEYS_4817.iter().map(|k| k.to_string()).collect();
+        keys.push("a/über straße/日本語/r&d'x.tar.gz".to_string());
+        keys.push("p/%/%25/%2E%2E/x".to_string());
+        keys.push(
+            (0x20u8..0x7f)
+                .map(char::from)
+                .filter(|c| *c != '/')
+                .collect(),
+        );
+        for key in &keys {
+            let stored = ObjectPath::from(key.as_str()).as_ref().to_owned();
+            assert_eq!(stored_key_form(key), stored, "{key}");
+            assert_eq!(
+                key_from_stored(&stored).as_deref(),
+                Some(key.as_str()),
+                "{key}"
+            );
+        }
+        for stray in ["a~b", "x%41", "x%2", "a/%2E%2E/b", "a/%2E", "%FF", "a//b"] {
+            assert_eq!(key_from_stored(stray), None, "{stray}");
+        }
+        assert_eq!(stored_key_form("maven/café/"), "maven/caf%C3%A9/");
+    }
+
+    /// A `ListObjectsV2` body listing `keys` (already in their stored form),
+    /// XML-escaped the way S3 escapes them.
+    fn list_body_4817(keys: &[String]) -> String {
+        let contents: String = keys
+            .iter()
+            .map(|k| {
+                let k = k
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;")
+                    .replace('\'', "&apos;");
+                format!(
+                    "<Contents><Key>{k}</Key><LastModified>2026-10-01T00:00:00.000Z</LastModified>\
+                     <ETag>\"e\"</ETag><Size>4</Size></Contents>"
+                )
+            })
+            .collect();
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>\
+             <Name>example-bucket</Name><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+        )
+    }
+
+    /// Row paths the storage reindex compares listed keys against (#4817):
+    /// non-ASCII, a space, `&`, every character object_store percent-encodes,
+    /// and a row path that itself looks percent-encoded.
+    const ROW_KEYS_4817: &[&str] = &[
+        "maven/r1/com/dtf/uni/1.0/uni-1.0-café.jar",
+        "maven/r1/com/dtf/sp/1.0/sp-1.0-a b.jar",
+        "maven/r1/com/dtf/amp/1.0/amp-1.0-r&d.jar",
+        "maven/r1/com/dtf/res/1.0/res-1.0-<x>[1]{2}#~|^`\"\\*?%.jar",
+        "maven/r1/com/dtf/pct/1.0/pct-1.0-caf%C3%A9.jar",
+    ];
+
+    /// `list` must return every key in the form `get`/`put` accept, even
+    /// though object_store stores non-ASCII and reserved characters
+    /// percent-encoded; otherwise the storage reindex reports the row as a
+    /// missing object and its stored key as a ghost (#4817).
+    #[tokio::test]
+    async fn test_list_returns_keys_get_and_put_accept_4817() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = SignedS3TestEnv::enter();
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"e\""))
+            .mount(&server)
+            .await;
+        let backend = S3Backend::new(S3Config::new(
+            "example-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some(server.uri()),
+            Some("example-prefix".to_string()),
+        ))
+        .await
+        .expect("S3Backend::new");
+        assert_eq!(backend.provider, S3Provider::Generic);
+
+        // Write every row path through the backend and record the object key
+        // each PUT actually created: the request path minus the bucket, URL
+        // decoded once (the HTTP layer's own encoding, not the key's).
+        for key in ROW_KEYS_4817 {
+            StorageBackendTrait::put(&backend, key, Bytes::from_static(b"body"))
+                .await
+                .expect("put");
+        }
+        let mut stored: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .map(|r| {
+                let p = r.url.path().strip_prefix("/example-bucket/").unwrap();
+                urlencoding::decode(p).unwrap().into_owned()
+            })
+            .collect();
+        assert!(
+            stored.contains(
+                &"example-prefix/maven/r1/com/dtf/uni/1.0/uni-1.0-caf%C3%A9.jar".to_string()
+            ),
+            "precondition: object_store percent-encodes a non-ASCII key on write: {stored:?}"
+        );
+        // An unregistered object written by another tool (a ghost), and one
+        // whose raw `~` no `put` can produce and no `get` can read.
+        stored.push("example-prefix/maven/r1/com/dtf/ghost/1.0/ghost-1.0-o'r&d.jar".to_string());
+        stored.push("example-prefix/maven/r1/stray/a~b.jar".to_string());
+
+        Mock::given(method("GET"))
+            .and(query_param("list-type", "2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(list_body_4817(&stored), "application/xml"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/example-bucket/example-prefix/maven/r1/com/dtf/uni/1.0/uni-1.0-caf%25C3%25A9.jar",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "4")
+                    .insert_header("last-modified", "Thu, 01 Oct 2026 00:00:00 GMT")
+                    .insert_header("etag", "\"e\"")
+                    .set_body_bytes(b"body".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let mut listed: Vec<String> = StorageBackendTrait::list_keys(&backend, "maven/r1/")
+            .await
+            .expect("list")
+            .expect("S3 can enumerate")
+            .into_iter()
+            .map(|l| l.key)
+            .collect();
+        listed.sort();
+        let mut expected: Vec<String> = ROW_KEYS_4817.iter().map(|k| k.to_string()).collect();
+        expected.push("maven/r1/com/dtf/ghost/1.0/ghost-1.0-o'r&d.jar".to_string());
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "listed keys must equal the row paths they were written under"
+        );
+
+        // The listed key reads the very object it names.
+        let body = StorageBackendTrait::get(&backend, "maven/r1/com/dtf/uni/1.0/uni-1.0-café.jar")
+            .await
+            .expect("get of a listed key");
+        assert_eq!(&body[..], b"body");
+    }
+
+    /// The #3593 REST fallback returns the same decoded keys, and scopes the
+    /// listing to the stored (encoded) form of a non-ASCII prefix (#4817).
+    #[tokio::test]
+    async fn test_rest_list_fallback_decodes_stored_keys_4817() {
+        use wiremock::matchers::{method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = SignedS3TestEnv::enter();
+        let server = MockServer::start().await;
+        let stored = vec![
+            "maven/caf%C3%A9/1.0/uni-1.0-caf%C3%A9.jar".to_string(),
+            "maven/caf%C3%A9/1.0/sp-1.0-a b.jar".to_string(),
+            "maven/caf%C3%A9/1.0/pct-1.0-caf%25C3%25A9.jar".to_string(),
+            "maven/caf%C3%A9/1.0/%2E%2E".to_string(),
+            "maven/caf%C3%A9/1.0/stray-%41.jar".to_string(),
+        ];
+        Mock::given(method("GET"))
+            .and(path_regex("^/example-bucket/?$"))
+            .and(query_param("list-type", "2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(list_body_4817(&stored), "application/xml"),
+            )
+            .mount(&server)
+            .await;
+        let backend = S3Backend::new(
+            S3Config::new(
+                "example-bucket".to_string(),
+                "cn-east-1".to_string(),
+                Some(server.uri()),
+                None,
+            )
+            .with_provider(S3Provider::Oss),
+        )
+        .await
+        .expect("S3Backend::new");
+
+        let keys = backend.list(Some("maven/café/")).await.expect("list");
+        assert_eq!(
+            keys,
+            vec![
+                "maven/café/1.0/uni-1.0-café.jar".to_string(),
+                "maven/café/1.0/sp-1.0-a b.jar".to_string(),
+                "maven/café/1.0/pct-1.0-caf%C3%A9.jar".to_string(),
+            ],
+            "stored keys must decode to the keys get/put accept; a key no put can produce, \
+             or one that decodes to a `..` segment, is left out"
+        );
+        let requests = server.received_requests().await.unwrap();
+        let query = requests[0].url.query().unwrap_or_default();
+        assert!(
+            query.contains("prefix=maven%2Fcaf%25C3%25A9%2F"),
+            "the listing must be scoped to the stored form of the prefix, got {query}"
         );
     }
 
@@ -7305,5 +9254,72 @@ mod integration_tests {
             copied.len(),
             etag
         );
+    }
+
+    /// #4838 live: a multipart server-side copy must name its source in the
+    /// encoding the object was stored under, proven against a real
+    /// S3-compatible server (MinIO), which is the only place the encoding
+    /// actually has to resolve to an object.
+    ///
+    /// The wiremock suite asserts the request shape; this asserts the server
+    /// accepts it, which is the whole failure mode: a source named with the
+    /// wrong encoding is `NoSuchKey`. The key mixes a non-ASCII character, a
+    /// space, `&` and `~`.
+    ///
+    ///   AK_S3_E2E=1 S3_BUCKET=ak-test S3_REGION=us-east-1 \
+    ///   S3_ENDPOINT=http://127.0.0.1:39164 S3_ACCESS_KEY_ID=... \
+    ///   S3_SECRET_ACCESS_KEY=... cargo test \
+    ///   test_large_copy_names_encoded_source_live_4838 -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn test_large_copy_names_encoded_source_live_4838() {
+        if std::env::var("AK_S3_E2E").ok().as_deref() != Some("1") {
+            println!("Skipping: set AK_S3_E2E=1 to run");
+            return;
+        }
+
+        // A 6 MiB ceiling makes a 16 MiB source need three ranged part copies,
+        // so the object cannot slip through a single CopyObject.
+        std::env::set_var("S3_MAX_SINGLE_COPY_BYTES", (6u64 * 1024 * 1024).to_string());
+        let config = S3Config::from_env().expect("S3Config::from_env");
+        let backend = S3Backend::new(config).await.expect("S3Backend::new");
+
+        // Non-ASCII, a space, `&` and `~`.
+        let run = uuid::Uuid::new_v4();
+        let source_key = format!("large-copy-4838/uni-1.0-café a&b~c-{run}.jar");
+        let dest_key = format!("large-copy-4838/uni-1.0-promoted-{run}.jar");
+
+        let len = 16 * 1024 * 1024_usize;
+        let content = Bytes::from(
+            (0..len)
+                .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+                .collect::<Vec<u8>>(),
+        );
+        StorageBackendTrait::put(&backend, &source_key, content.clone())
+            .await
+            .expect("seed non-ASCII source object");
+
+        backend
+            .copy(&source_key, &dest_key)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "#4838: a multipart copy of '{}' must name its source the way the \
+                 write stored it and MinIO must find it: {e}",
+                    source_key
+                )
+            });
+
+        let copied = StorageBackendTrait::get(&backend, &dest_key)
+            .await
+            .expect("read copied object");
+        assert!(
+            copied == content,
+            "#4838: destination bytes must equal source bytes"
+        );
+
+        let _ = StorageBackendTrait::delete(&backend, &source_key).await;
+        let _ = StorageBackendTrait::delete(&backend, &dest_key).await;
+        println!("#4838 live encoded multipart copy OK: len={}", copied.len());
     }
 }

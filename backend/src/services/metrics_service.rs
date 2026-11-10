@@ -3,39 +3,357 @@
 //! HTTP request instrumentation lives in `crate::api::middleware::metrics`.
 //! This module provides helpers for recording domain-specific metrics such as
 //! artifact uploads/downloads, security scans, backups, and storage gauges.
+//!
+//! The `metrics` facade can fan out to more than one recorder: `/metrics` is
+//! always served from the Prometheus recorder, and when OTLP metrics export is
+//! configured an OTel recorder is installed alongside it (#4337, see
+//! [`install_otel_recorder`]). The handle returned by [`init_metrics`] keeps
+//! rendering the Prometheus half.
+
+use std::sync::Mutex;
 
 use metrics::{counter, gauge, histogram};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use opentelemetry::KeyValue;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
-/// `route` label for the PyPI simple-project page cache. Later routes can
-/// reuse the same counter without a new series.
+/// `route` label for the PyPI simple-project page cache.
 pub const PYPI_SIMPLE_CACHE_ROUTE: &str = "simple_project";
 
-/// Initialize the Prometheus metrics recorder and return the handle for rendering.
-pub fn init_metrics() -> PrometheusHandle {
-    let builder = PrometheusBuilder::new();
-    builder
-        .install_recorder()
-        .expect("failed to install Prometheus recorder")
+pub(crate) const PYPI_SIMPLE_CACHE_LOOKUPS_METRIC: &str = "ak_pypi_simple_cache_lookups_total";
+
+/// The OpenTelemetry recorder handed over by `telemetry::init_tracing`, waiting
+/// for [`init_metrics`] to install it beside the Prometheus recorder.
+static PENDING_OTEL_RECORDER: Mutex<Option<Box<dyn metrics::Recorder + Send + Sync>>> =
+    Mutex::new(None);
+
+/// Name of the HTTP request latency histogram recorded by
+/// `crate::api::middleware::metrics`.
+pub const HTTP_REQUEST_DURATION_METRIC: &str = "ak_http_request_duration_seconds";
+
+/// Bucket upper bounds (seconds) for [`HTTP_REQUEST_DURATION_METRIC`] (#3954).
+///
+/// Without explicit buckets `metrics-exporter-prometheus` renders a histogram
+/// as a Prometheus *summary*: per-series quantiles pre-computed over the
+/// exporter's own window, which cannot be aggregated across replicas, paths or
+/// a chosen time range, so `histogram_quantile()` is unusable. Exporting
+/// `_bucket{le=...}` series instead makes fleet-wide percentiles computable.
+///
+/// The range is sized for a registry: 5 ms covers a cached metadata hit, the
+/// sub-second buckets cover database- and storage-bound requests, and the tail
+/// out to 60 s covers upstream proxy fetches and large blob transfers.
+pub const HTTP_REQUEST_DURATION_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
+/// The configured (not yet installed) Prometheus builder: bucketed export of
+/// the HTTP latency histogram, defaults for everything else. Split out of
+/// [`init_metrics`] so tests can build a local recorder from the exact
+/// production configuration without installing a process-global one.
+pub fn prometheus_builder() -> PrometheusBuilder {
+    PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(HTTP_REQUEST_DURATION_METRIC.to_string()),
+            HTTP_REQUEST_DURATION_BUCKETS,
+        )
+        .expect("HTTP_REQUEST_DURATION_BUCKETS is a non-empty constant")
 }
 
-/// Record an artifact upload event.
+/// Initialize the Prometheus metrics recorder and return the handle for rendering.
+///
+/// When OTLP metrics export is configured, `telemetry::init_tracing` (which
+/// `main` runs first) has handed an OpenTelemetry recorder to
+/// [`install_otel_recorder`]; the global recorder is then a fan-out of the
+/// Prometheus recorder and that one, so `/metrics` reports exactly what it
+/// does without OTLP. The `metrics` facade accepts one global recorder per
+/// process, which is why both halves are installed here, once, rather than the
+/// OTel half being added later.
+pub fn init_metrics() -> PrometheusHandle {
+    let otel = PENDING_OTEL_RECORDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let (recorder, handle) = build_global_recorder(otel);
+    metrics::set_global_recorder(recorder).expect("failed to install Prometheus recorder");
+    handle
+}
+
+/// The recorder [`init_metrics`] installs: the Prometheus recorder alone, or a
+/// fan-out of it and `otel`.
+pub(crate) fn build_global_recorder(
+    otel: Option<Box<dyn metrics::Recorder + Send + Sync>>,
+) -> (Box<dyn metrics::Recorder + Sync>, PrometheusHandle) {
+    let prometheus = prometheus_builder().build_recorder();
+    let handle = prometheus.handle();
+    let recorder: Box<dyn metrics::Recorder + Sync> = match otel {
+        Some(otel) => Box::new(
+            metrics_util::layers::FanoutBuilder::default()
+                .add_recorder(prometheus)
+                .add_recorder(otel)
+                .build(),
+        ),
+        None => Box::new(prometheus),
+    };
+    (recorder, handle)
+}
+
+/// Hand the OpenTelemetry `metrics` recorder to [`init_metrics`] (#4337).
+///
+/// Called by `telemetry::init_tracing` when OTLP metrics export is enabled,
+/// which `main` does before it calls [`init_metrics`] (the recorder must be in
+/// place before the startup pool connect records anything, #4828). Nothing is
+/// recorded to OTLP until [`init_metrics`] has installed the fan-out.
+pub fn install_otel_recorder(otel: impl metrics::Recorder + Send + Sync + 'static) {
+    *PENDING_OTEL_RECORDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(otel));
+}
+
+/// Count one HTTP connection closed because the client did not deliver a
+/// complete request head within `HTTP_HEADER_READ_TIMEOUT_SECS` (#4665): a
+/// slow or stalled client, the slow-loris shape. Idle keep-alive connections
+/// closed by the same timer are not counted.
+pub fn record_http_header_read_timeout() {
+    counter!("ak_http_header_read_timeouts_total").increment(1);
+}
+
+/// Count one database pool connection failure (#4549), labelled by `stage`:
+///
+///   * `startup` — an initial pool-connect attempt failed at boot: Postgres
+///     refusing sessions (`FATAL: sorry, too many clients already` seen from
+///     this side as a connect error) or the attempt hitting
+///     `DATABASE_ACQUIRE_TIMEOUT_SECS`. Each of the bounded startup retries
+///     increments once, so a refusal storm shows its shape before the process
+///     exits or recovers.
+///   * `request` — a pool acquire timed out while serving a request and the
+///     caller was answered `503 POOL_EXHAUSTED`.
+///
+/// The server-side `FATAL` lines themselves are only visible in the Postgres
+/// log: a pool growth attempt that fails is absorbed by sqlx's internal
+/// retry-until-acquire-timeout loop and leaves no other client-side trace.
+/// Together the two stages cover the two places #4549's saturation became
+/// visible — a replacement pod dying at startup and requests shedding load.
+pub fn record_db_pool_connection_failure(stage: &'static str) {
+    counter!("ak_db_pool_connection_failures_total", "stage" => stage.to_string()).increment(1);
+}
+
+/// Connections currently held open by the HTTP accept loop (#4676): every
+/// accepted TCP connection, from accept until hyper finishes with it,
+/// including idle keep-alive connections and ones still sending a request
+/// head. A slow-connection hold shows as this gauge climbing while request
+/// throughput does not.
+pub const HTTP_CONNECTIONS_OPEN_METRIC: &str = "ak_http_connections_open";
+
+/// Holds one unit of [`HTTP_CONNECTIONS_OPEN_METRIC`] for as long as it lives,
+/// so a connection task that ends any way (return, panic, cancellation)
+/// releases it.
+pub struct OpenConnectionGuard(());
+
+impl OpenConnectionGuard {
+    pub fn open() -> Self {
+        gauge!(HTTP_CONNECTIONS_OPEN_METRIC).increment(1.0);
+        Self(())
+    }
+}
+
+impl Drop for OpenConnectionGuard {
+    fn drop(&mut self) {
+        gauge!(HTTP_CONNECTIONS_OPEN_METRIC).decrement(1.0);
+    }
+}
+
+/// Count one request refused with 429 by a rate limiter (#4676). `limiter` is
+/// the limiter's fixed name (`login`, `login_global`, `token`, `auth`, `api`,
+/// `search`, `presign`, `password_change`, `upload`, `proxy_rescan`), never a
+/// key, user or address.
+pub fn record_rate_limit_rejection(limiter: &'static str) {
+    counter!("ak_rate_limit_rejections_total", "limiter" => limiter).increment(1);
+}
+
+/// Count one outbound URL refused by the SSRF guard (#4676), by the bounded
+/// surface that asked: `upstream`, `webhook`, `sso`, `ldap`, `plugin`,
+/// `peer`, `internal`. Recorded beside [`record_outbound_url_blocked`], whose
+/// `label` is the caller's free-text field name; this one is the series to
+/// alert on.
+pub fn record_ssrf_block(surface: &'static str) {
+    counter!("ak_ssrf_blocks_total", "surface" => surface).increment(1);
+}
+
+/// Where a rejected credential was presented, for `ak_auth_failures_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailureSurface {
+    /// `POST /api/v1/auth/login`, and a Bearer JWT, API token or `X-API-Key`
+    /// presented to any HTTP route.
+    Api,
+    /// HTTP Basic `username:password` presented to any HTTP route.
+    Basic,
+    /// The OCI credential exchange, `/v2/token`.
+    V2Token,
+    /// The CI OIDC token exchange, `POST /api/v1/auth/ci/token`.
+    CiOidc,
+    /// OIDC, SAML and LDAP sign-in.
+    Sso,
+}
+
+impl AuthFailureSurface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Basic => "basic",
+            Self::V2Token => "v2_token",
+            Self::CiOidc => "ci_oidc",
+            Self::Sso => "sso",
+        }
+    }
+}
+
+/// Why a credential was rejected, bucketed for `ak_auth_failures_total`. A
+/// closed set so no username, token or message text can become a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailureReason {
+    /// Wrong password for an account that can sign in locally (or a rejected
+    /// LDAP bind).
+    BadPassword,
+    /// No account that can sign in with a password: unknown or inactive
+    /// username, a federated account, or one with no stored password.
+    UnknownUser,
+    /// A token or assertion past its expiry.
+    Expired,
+    /// A wrong password against an account whose lockout is in force.
+    Lockout,
+    /// A token, assertion or header that did not validate.
+    InvalidToken,
+    /// A valid assertion that no policy admits (no CI OIDC mapping matches,
+    /// or the identity provider's user is refused by the provider's rules).
+    Scope,
+}
+
+impl AuthFailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BadPassword => "bad_password",
+            Self::UnknownUser => "unknown_user",
+            Self::Expired => "expired",
+            Self::Lockout => "lockout",
+            Self::InvalidToken => "invalid_token",
+            Self::Scope => "scope",
+        }
+    }
+
+    /// Bucket a rejected token's error: `Expired` when the validator said it
+    /// had expired (`jsonwebtoken`'s `ExpiredSignature`, "API token expired",
+    /// an expired SAML assertion), otherwise `fallback`. A message that does
+    /// not commit either way ("Invalid or expired SSO state") is `fallback`.
+    pub fn for_token_error(err: &crate::error::AppError, fallback: Self) -> Self {
+        let message = err.to_string().to_ascii_lowercase();
+        if message.contains("expired") && !message.contains("invalid or expired") {
+            Self::Expired
+        } else {
+            fallback
+        }
+    }
+
+    /// Bucket a local password rejection by the reason its audit event
+    /// records (`auth_service::LoginFailure::reason`).
+    pub fn for_login_audit_reason(reason: &str) -> Self {
+        match reason {
+            "invalid_password" => Self::BadPassword,
+            "account_locked" => Self::Lockout,
+            _ => Self::UnknownUser,
+        }
+    }
+}
+
+/// Count one rejected credential (#4676). Only a presented credential that
+/// failed counts: a request with no credential at all, and a check that could
+/// not complete (a 503 for a database outage or the bcrypt cap), do not.
+pub fn record_auth_failure(surface: AuthFailureSurface, reason: AuthFailureReason) {
+    counter!(
+        "ak_auth_failures_total",
+        "surface" => surface.as_str(),
+        "reason" => reason.as_str(),
+    )
+    .increment(1);
+}
+
+/// [`record_auth_failure`] for an error a credential check returned, counted
+/// only when the error is a credential or policy refusal (`Authentication`,
+/// `Unauthorized`, `Authorization`), never for an outage or a malformed
+/// request.
+pub fn record_auth_failure_for_error(
+    surface: AuthFailureSurface,
+    err: &crate::error::AppError,
+    fallback: AuthFailureReason,
+) {
+    use crate::error::AppError;
+    if matches!(
+        err,
+        AppError::Authentication(_) | AppError::Unauthorized(_) | AppError::Authorization(_)
+    ) {
+        record_auth_failure(surface, AuthFailureReason::for_token_error(err, fallback));
+    }
+}
+
+/// Count one proxy-scan decision on a pull (#4676). `verdict` is what the
+/// pull was judged as (`clean`, `vulnerable`, `pending` for a first pull
+/// served before its scan, `inconclusive` for an over-cap object or a scan
+/// that could not finish); `action` is what was done with it (`served`,
+/// `blocked` 403, `locked` 423, `recorded` for a record-only repository
+/// serving a vulnerable verdict). A vulnerable verdict below the
+/// repository's opted-in severity threshold is served as `clean`.
+pub fn record_proxy_scan_verdict(verdict: &'static str, action: &'static str) {
+    counter!(
+        "ak_proxy_scan_verdicts_total",
+        "verdict" => verdict,
+        "action" => action,
+    )
+    .increment(1);
+}
+
+/// A proxied file that got no scan for now because the in-flight table had no
+/// room (#5231): `423` under `fail_closed`, served `pending` otherwise. `limit`
+/// names what was out of room.
+pub fn record_proxy_scan_queue_refused(limit: &'static str) {
+    counter!("ak_proxy_scan_queue_refused_total", "limit" => limit).increment(1);
+}
+
+/// A queued `fail_closed` proxy scan dropped because no request wanted it any
+/// more (#5231).
+pub fn record_proxy_scan_abandoned() {
+    counter!("ak_proxy_scan_abandoned_total").increment(1);
+}
+
+/// Record one committed artifact upload: `ak_artifact_uploads_total` and the
+/// `ak_artifact_upload_size_bytes` histogram. Called from
+/// `scanner_service::trigger_scan_on_upload`, the post-commit step every
+/// upload path reaches (#4642). Labels are the repository key and format only,
+/// never an artifact name, so the series count stays bounded.
 pub fn record_artifact_upload(repo_key: &str, format: &str, size_bytes: u64) {
     counter!("ak_artifact_uploads_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(1);
     histogram!("ak_artifact_upload_size_bytes", "format" => format.to_string())
         .record(size_bytes as f64);
 }
 
-/// Record an artifact download event.
-pub fn record_artifact_download(repo_key: &str, format: &str) {
-    counter!("ak_artifact_downloads_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(1);
+/// Count `count` served artifact downloads in `ak_artifact_downloads_total`.
+/// Called by the download-event dispatcher once it has persisted the
+/// `download_statistics` rows (#4642), so the counter moves by the rows a
+/// flush wrote. Same bounded labels as [`record_artifact_upload`].
+pub fn record_artifact_downloads(repo_key: &str, format: &str, count: u64) {
+    counter!("ak_artifact_downloads_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(count);
 }
 
 /// Record a proxy-cache lookup. `result` is a stable low-cardinality
-/// string describing the outcome, used as a Prometheus label:
+/// string describing the outcome, used as a Prometheus label.
+///
+/// Both proxy fetch paths count, and a `HEAD` counts exactly like a `GET`
+/// (#5322): the buffered path (metadata documents) with the `miss_*` detail
+/// below, and the streaming path (package files, blobs, Hugging Face files,
+/// every proxied `HEAD`) with `hit`, `miss` and `negative_hit`. Before
+/// #5322 only the buffered path counted, so streamed serves never moved the
+/// counter. A cache-only probe that falls through to a fetch counts once.
 ///
 ///   * `hit` -- valid cached body returned to the caller
+///   * `miss` -- streaming path: no servable entry (absent, evicted, or stale
+///     and not revalidated), so the request went upstream
+///   * `negative_hit` -- streaming path: a cached upstream 404 was answered
 ///   * `miss_no_metadata` -- the metadata sidecar was absent (first
 ///     request for this key, OR sidecar was evicted/deleted out of band)
 ///   * `miss_expired` -- metadata loaded but `expires_at` was in the past
@@ -53,7 +371,10 @@ pub fn record_artifact_download(repo_key: &str, format: &str) {
 /// which branch is responsible for slow repeat requests. The repository
 /// label keeps cardinality bounded by the operator's repo count, which
 /// matches the existing `ak_artifact_downloads_total` shape.
-pub fn record_proxy_cache_lookup(repo_key: &str, result: &str) {
+pub fn record_proxy_cache_lookup(repo_key: &str, result: &'static str) {
+    // The same outcome tags the request's trace (#4455), as a span attribute
+    // only: the repository label above is the metric's only per-repo series.
+    crate::api::middleware::request_span::record_cache_outcome(result);
     counter!(
         "ak_proxy_cache_lookups_total",
         "repository" => repo_key.to_string(),
@@ -63,57 +384,137 @@ pub fn record_proxy_cache_lookup(repo_key: &str, result: &str) {
 }
 
 /// Record one lookup against the in-process PyPI simple-project page cache.
-///
-/// `result` is `hit`, `miss`, `bypass`, or `disabled`. `route` is
-/// [`PYPI_SIMPLE_CACHE_ROUTE`] for the simple-project page. The project name
-/// is not a label: its cardinality is unbounded. The repository label is
-/// bounded by the operator's repo count, matching
-/// [`record_proxy_cache_lookup`].
-///
-/// The same lookup is counted twice, on purpose, on two meters:
-///
-///   * Prometheus `ak_pypi_simple_cache_lookups_total`, which the existing
-///     scrape already collects
-///   * OpenTelemetry `ak.pypi.simple_cache.lookups`, exported on
-///     `OTEL_EXPORTER_OTLP_ENDPOINT` when that variable is set
-///
-/// This is a separate series from [`record_proxy_cache_lookup`]. That counter
-/// is the S3 proxy cache's hit rate for raw upstream bodies. Folding rebuilt
-/// menu lookups into it would change every dashboard that already charts it.
+/// The project name is excluded to bound label cardinality. The metrics
+/// recorder exports this counter to Prometheus and, when enabled, to OTLP.
 pub fn record_pypi_simple_cache_lookup(repo_key: &str, result: &str, route: &str) {
     counter!(
-        "ak_pypi_simple_cache_lookups_total",
+        PYPI_SIMPLE_CACHE_LOOKUPS_METRIC,
         "repository" => repo_key.to_string(),
         "result" => result.to_string(),
         "route" => route.to_string()
     )
     .increment(1);
-
-    // One instrument for the process. Created on the first lookup, which is
-    // after `telemetry` has installed the meter provider when
-    // `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Before that the global meter is a
-    // no-op, and this counter stays a no-op for the rest of the process.
-    pypi_simple_cache_lookups().add(
-        1,
-        &[
-            KeyValue::new("repository", repo_key.to_owned()),
-            KeyValue::new("result", result.to_owned()),
-            KeyValue::new("route", route.to_owned()),
-        ],
-    );
 }
 
-fn pypi_simple_cache_lookups() -> opentelemetry::metrics::Counter<u64> {
-    static COUNTER: std::sync::OnceLock<opentelemetry::metrics::Counter<u64>> =
-        std::sync::OnceLock::new();
-    COUNTER
-        .get_or_init(|| {
-            opentelemetry::global::meter("artifact-keeper")
-                .u64_counter("ak.pypi.simple_cache.lookups")
-                .with_description("Lookups against the in-process PyPI simple-project page cache")
-                .build()
-        })
-        .clone()
+/// A response served from a stale cache entry under the RFC 5861
+/// `stale-if-error` grace because the upstream was unreachable (#4581).
+///
+/// A sustained rate means a remote's upstream is down while clients keep
+/// getting 200s; alert on `rate(ak_proxy_stale_if_error_responses_total[5m]) > 0`.
+pub fn record_proxy_stale_if_error_response(repo_key: &str) {
+    counter!(
+        "ak_proxy_stale_if_error_responses_total",
+        "repo" => repo_key.to_string()
+    )
+    .increment(1);
+}
+
+/// Virtual conda merge pressure (#4608). `kind` is the merged document:
+/// `repodata`, `channeldata` or `shard_index`.
+///
+/// A cache hit is a request answered without running a merge of its own:
+/// `via="cache"` for a fresh merged document kept from an earlier merge,
+/// `via="stale"` for a kept document served stale while one background merge
+/// rebuilds it (#4879), and `via="singleflight"` for a request that waited on
+/// the merge another request for the same document was already running.
+pub fn record_conda_virtual_merge_cache_hit(kind: &'static str, via: &'static str) {
+    counter!("ak_conda_virtual_merge_cache_hits_total", "kind" => kind, "via" => via).increment(1);
+}
+
+/// A request that started a merge (no usable cached document, none in
+/// flight), in the foreground or as the background rebuild of a stale one.
+pub fn record_conda_virtual_merge_cache_miss(kind: &'static str) {
+    counter!("ak_conda_virtual_merge_cache_misses_total", "kind" => kind).increment(1);
+}
+
+/// A merge shed with 503 because it could not get a merge slot
+/// (`reason="queue"`) or its share of the buffered-metadata budget
+/// (`reason="budget"`) within `CONDA_VIRTUAL_MERGE_QUEUE_SECS`. Counted once
+/// per merge, not once per request sharing it.
+pub fn record_conda_virtual_merge_rejected(kind: &'static str, reason: &'static str) {
+    counter!("ak_conda_virtual_merge_rejected_total", "kind" => kind, "reason" => reason)
+        .increment(1);
+}
+
+/// Merges currently running (each holds one of
+/// `CONDA_VIRTUAL_MAX_CONCURRENT_MERGES` slots).
+pub fn set_conda_virtual_merge_inflight(merges: usize) {
+    gauge!("ak_conda_virtual_merge_inflight").set(merges as f64);
+}
+
+/// Bytes of the buffered-metadata budget currently reserved by virtual conda
+/// merges (fetch buffers, decoded member documents and merge output).
+pub fn set_conda_virtual_merge_bytes_reserved(bytes: usize) {
+    gauge!("ak_conda_virtual_merge_bytes_reserved").set(bytes as f64);
+}
+
+/// Bytes of the serve-time verification buffer budget currently reserved
+/// (#4989): small stored objects read whole and checked before their status
+/// is sent, held until the client has read them.
+pub fn set_serve_verify_buffer_bytes_reserved(bytes: usize) {
+    gauge!("ak_serve_verify_buffer_bytes_reserved").set(bytes as f64);
+}
+
+/// A small stored object served with its verification while streaming,
+/// because the verification buffer budget had no room for it (#4989). A
+/// steady rate means `AK_SERVE_VERIFY_BUFFER_BUDGET_BYTES` is too small for
+/// the load.
+pub fn record_serve_verify_buffer_fallback() {
+    counter!("ak_serve_verify_buffer_fallback_total").increment(1);
+}
+
+/// Outcome of a CEP-27 publish attestation decision (#4711). `outcome` is one
+/// of [`CONDA_ATTESTATION_OUTCOMES`]; `repository` is the repository key.
+///
+/// * `verified`: an attestation PUT whose bundle verified, and was stored.
+/// * `failed`: an attestation PUT whose bundle did not verify, stored anyway
+///   because `CONDA_ATTESTATION_REQUIRE_VERIFIED` is explicitly off.
+/// * `rejected`: an attestation PUT whose bundle did not verify, refused
+///   because verification is required (the default).
+/// * `absent`: a hosted package upload, which carries no attestation of its
+///   own (CEP-27 attestations are attached afterwards by PUT).
+pub fn record_conda_attestation(repo_key: &str, outcome: &'static str) {
+    debug_assert!(CONDA_ATTESTATION_OUTCOMES.contains(&outcome));
+    counter!(
+        "ak_conda_attestation_total",
+        "repository" => repo_key.to_string(),
+        "outcome" => outcome,
+    )
+    .increment(1);
+}
+
+/// The bounded `outcome` label values of `ak_conda_attestation_total`.
+pub const CONDA_ATTESTATION_OUTCOMES: [&str; 4] = ["verified", "failed", "absent", "rejected"];
+
+/// Install scripts found in an uploaded conda package's payload (#4711).
+/// `kind` is the conda hook the script implements (`pre-link`, `post-link`,
+/// `pre-unlink`), as `conda_scripts::classify_script_path` classifies it.
+pub fn record_conda_install_script_findings(repo_key: &str, kind: &'static str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    counter!(
+        "ak_conda_install_script_findings_total",
+        "repository" => repo_key.to_string(),
+        "kind" => kind,
+    )
+    .increment(count);
+}
+
+/// Remote records a virtual conda channel's package allowlist (#4576)
+/// dropped from one merge, per remote member (#4711). `repository` is the
+/// virtual repository's key and `member` the remote member's key. Counted
+/// once per merge, so cached and single-flighted requests add nothing.
+pub fn record_conda_allowlist_dropped(virtual_repo_key: &str, member: &str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    counter!(
+        "ak_conda_allowlist_dropped_total",
+        "repository" => virtual_repo_key.to_string(),
+        "member" => member.to_string(),
+    )
+    .increment(count);
 }
 
 /// Record a lookup against the npm attestation negative cache (#3764),
@@ -427,17 +828,384 @@ pub fn record_proxy_cache_quota_exceeded(repo_key: &str) {
     .increment(1);
 }
 
+/// Why a proxy-cache publish failed (#4319). A bounded label set: the class
+/// says which step of the publish refused, not what the error text was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyCachePublishFailure {
+    /// Writing the body to the backend failed: the buffered `put`, or the
+    /// streaming `put_stream` into the staging key, for a reason on the
+    /// storage side (an upstream error or the per-object ceiling is not
+    /// counted, the backend did nothing wrong there).
+    PutFailed,
+    /// The backend refused the server-side copy from the staging key onto the
+    /// live key (the GCS S3-compatible API answering 411 before #3737 was
+    /// this class).
+    CopyRejected,
+    /// The copy reported success but the live key does not hold the staged
+    /// bytes: a different size, or the ETag of an empty object (#4630).
+    PublishMismatch,
+    /// The body landed but the metadata sidecar that commits it could not be
+    /// written, so the entry reads as a miss.
+    CommitFailed,
+}
+
+impl ProxyCachePublishFailure {
+    /// The `class` label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PutFailed => "put_failed",
+            Self::CopyRejected => "copy_rejected",
+            Self::PublishMismatch => "publish_mismatch",
+            Self::CommitFailed => "commit_failed",
+        }
+    }
+}
+
+/// Record a proxy-cache publish that failed (#4319), labelled by the storage
+/// backend the proxy cache runs on and the failure class. The body was still
+/// served to the client; only the cache write was lost, so before this a
+/// backend that silently refused every cache write showed up in the logs
+/// only. Alert on `sum by (backend, class)
+/// (rate(ak_proxy_cache_publish_failures_total[5m])) > 0`.
+pub fn record_proxy_cache_publish_failure(backend: &'static str, class: ProxyCachePublishFailure) {
+    counter!(
+        "ak_proxy_cache_publish_failures_total",
+        "backend" => backend,
+        "class" => class.as_str()
+    )
+    .increment(1);
+}
+
+/// Record a proxy serve that kept a cached body because upstream answered a
+/// definitive 404/410 and the repository's `on_upstream_not_found` policy is
+/// `keep` (#4640). The counter is the observable signal that a served body no
+/// longer exists upstream, so an operator can list (and evict) content that is
+/// being kept past its upstream life.
+pub fn record_proxy_kept_on_upstream_not_found(repo_key: &str) {
+    counter!(
+        "ak_proxy_kept_on_upstream_not_found_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(1);
+}
+
+/// Entries and bytes the per-Remote proxy-cache cap evicted (#4660). A
+/// steady rate means the cap is smaller than the repository's working set and
+/// clients are refetching what it evicts.
+pub fn record_proxy_cache_cap_evictions(repo_key: &str, entries: u64, bytes: u64) {
+    counter!(
+        "ak_proxy_cache_cap_evicted_entries_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(entries);
+    counter!(
+        "ak_proxy_cache_cap_evicted_bytes_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(bytes);
+}
+
+/// An eviction run for the per-Remote proxy-cache cap could not get the cache
+/// under its cap, so the repository refuses new cache fills for a while
+/// (#4660). Any increment needs attention: storage is refusing deletes.
+pub fn record_proxy_cache_cap_refusing(repo_key: &str) {
+    counter!(
+        "ak_proxy_cache_cap_refusing_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(1);
+}
+
+/// Counters recorded while a test ran, as `(name, labels, value)`; read one
+/// with [`CounterCapture::get`].
+#[cfg(test)]
+pub(crate) struct CounterCapture(Vec<CapturedCounter>);
+
+/// One captured counter series: name, labels, value.
+#[cfg(test)]
+type CapturedCounter = (String, Vec<(String, String)>, u64);
+
+#[cfg(test)]
+impl CounterCapture {
+    /// The sum of every `name` series whose labels include all of `labels`.
+    pub(crate) fn get(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        self.0
+            .iter()
+            .filter(|(n, ls, _)| {
+                n == name
+                    && labels
+                        .iter()
+                        .all(|(k, v)| ls.iter().any(|(lk, lv)| lk == k && lv == v))
+            })
+            .map(|(_, _, v)| *v)
+            .sum()
+    }
+}
+
+/// Run `f` against a thread-local debugging recorder and return what it
+/// counted. Async work must run inside `f` on a current-thread runtime, so
+/// the increments happen on this thread.
+#[cfg(test)]
+pub(crate) fn capture_counters<R>(f: impl FnOnce() -> R) -> (R, CounterCapture) {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let out = metrics::with_local_recorder(&recorder, f);
+    let counters = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(ck, _, _, value)| match value {
+            DebugValue::Counter(v) => {
+                let key = ck.key();
+                Some((
+                    key.name().to_string(),
+                    key.labels()
+                        .map(|l| (l.key().to_string(), l.value().to_string()))
+                        .collect(),
+                    v,
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    (out, CounterCapture(counters))
+}
+
+/// Run an async test body on a current-thread runtime under
+/// [`capture_counters`].
+#[cfg(test)]
+pub(crate) fn capture_counters_async<F: std::future::Future>(
+    f: impl FnOnce() -> F,
+) -> (F::Output, CounterCapture) {
+    capture_counters(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime")
+            .block_on(f())
+    })
+}
+
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Render what a local recorder built from the production configuration
+    /// exports after `record` runs against it. A local recorder, because only
+    /// one global recorder may be installed per process.
+    fn render_with_production_recorder(record: impl FnOnce()) -> String {
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, record);
+        handle.render()
+    }
+
     #[test]
-    fn test_prometheus_builder_can_be_created() {
-        // Verify that PrometheusBuilder::new() compiles and runs. We cannot
-        // call install_recorder() in tests because only one global recorder
-        // is allowed per process.
-        let _builder = PrometheusBuilder::new();
+    fn test_stale_if_error_counter_is_labelled_by_repo() {
+        let out = render_with_production_recorder(|| {
+            record_proxy_stale_if_error_response("conda-forge");
+            record_proxy_stale_if_error_response("conda-forge");
+        });
+        assert!(
+            out.contains("ak_proxy_stale_if_error_responses_total{repo=\"conda-forge\"} 2"),
+            "unexpected exposition: {out}"
+        );
+    }
+
+    #[test]
+    fn test_http_request_duration_exports_as_bucketed_histogram() {
+        // #3954: without buckets the latency histogram rendered as a summary
+        // (`quantile=` series, no `_bucket`), so no aggregate percentile
+        // could be computed across replicas or paths.
+        let rendered = render_with_production_recorder(|| {
+            histogram!(HTTP_REQUEST_DURATION_METRIC, "method" => "GET", "path" => "/x", "status" => "200")
+                .record(0.042);
+        });
+
+        assert!(
+            rendered.contains("# TYPE ak_http_request_duration_seconds histogram"),
+            "expected histogram type line, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("quantile="),
+            "summary quantile series must be gone, got:\n{rendered}"
+        );
+        for le in ["0.005", "0.05", "1", "60", "+Inf"] {
+            assert!(
+                rendered.contains(&format!("le=\"{le}\"")),
+                "missing le={le} bucket, got:\n{rendered}"
+            );
+        }
+        // 0.042 s lands in the 0.05 bucket but not the 0.025 one.
+        assert!(rendered.contains(
+            "ak_http_request_duration_seconds_bucket{method=\"GET\",path=\"/x\",status=\"200\",le=\"0.05\"} 1"
+        ));
+        assert!(rendered.contains(
+            "ak_http_request_duration_seconds_bucket{method=\"GET\",path=\"/x\",status=\"200\",le=\"0.025\"} 0"
+        ));
+    }
+
+    #[test]
+    fn test_unbucketed_histograms_keep_summary_export() {
+        // Buckets are scoped to the HTTP latency metric only; every other
+        // histogram keeps its existing exposition shape.
+        let rendered = render_with_production_recorder(|| {
+            record_artifact_upload("my-repo", "maven", 1024);
+        });
+        assert!(
+            rendered.contains("# TYPE ak_artifact_upload_size_bytes summary"),
+            "got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_http_request_duration_buckets_span_5ms_to_60s_ascending() {
+        let b = HTTP_REQUEST_DURATION_BUCKETS;
+        assert_eq!(b.first(), Some(&0.005));
+        assert_eq!(b.last(), Some(&60.0));
+        assert!(b.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// #4711: the conda counters carry only bounded labels, and a zero
+    /// count creates no series.
+    #[test]
+    fn test_conda_security_counters_record_bounded_labels_4711() {
+        let ((), c) = capture_counters(|| {
+            for outcome in CONDA_ATTESTATION_OUTCOMES {
+                record_conda_attestation("local", outcome);
+            }
+            record_conda_install_script_findings("local", "post-link", 2);
+            record_conda_install_script_findings("local", "pre-link", 0);
+            record_conda_allowlist_dropped("virt", "remote-a", 5);
+            record_conda_allowlist_dropped("virt", "remote-b", 0);
+        });
+        for outcome in CONDA_ATTESTATION_OUTCOMES {
+            assert_eq!(
+                c.get(
+                    "ak_conda_attestation_total",
+                    &[("repository", "local"), ("outcome", outcome)]
+                ),
+                1
+            );
+        }
+        assert_eq!(
+            c.get(
+                "ak_conda_install_script_findings_total",
+                &[("repository", "local"), ("kind", "post-link")]
+            ),
+            2
+        );
+        assert_eq!(
+            c.get(
+                "ak_conda_install_script_findings_total",
+                &[("kind", "pre-link")]
+            ),
+            0
+        );
+        assert_eq!(
+            c.get(
+                "ak_conda_allowlist_dropped_total",
+                &[("repository", "virt"), ("member", "remote-a")]
+            ),
+            5
+        );
+        assert_eq!(
+            c.get(
+                "ak_conda_allowlist_dropped_total",
+                &[("member", "remote-b")]
+            ),
+            0
+        );
+    }
+
+    /// #4676: auth-failure reasons come from a closed set; message text only
+    /// ever selects between them.
+    #[test]
+    fn test_auth_failure_reason_bucketing_4676() {
+        use crate::error::AppError;
+        let expired = [
+            AppError::Authentication("Invalid token: ExpiredSignature".into()),
+            AppError::Authentication("API token expired".into()),
+            AppError::Authentication("Assertion has expired".into()),
+            AppError::Authentication("CI JWT validation failed: ExpiredSignature".into()),
+        ];
+        for err in expired {
+            assert_eq!(
+                AuthFailureReason::for_token_error(&err, AuthFailureReason::InvalidToken),
+                AuthFailureReason::Expired,
+                "{err}"
+            );
+        }
+        for err in [
+            AppError::Authentication("Invalid token: InvalidSignature".into()),
+            AppError::Authentication("Invalid or expired SSO state".into()),
+            AppError::Unauthorized("Token has been revoked".into()),
+        ] {
+            assert_eq!(
+                AuthFailureReason::for_token_error(&err, AuthFailureReason::InvalidToken),
+                AuthFailureReason::InvalidToken,
+                "{err}"
+            );
+        }
+        assert_eq!(
+            AuthFailureReason::for_login_audit_reason("invalid_password"),
+            AuthFailureReason::BadPassword
+        );
+        assert_eq!(
+            AuthFailureReason::for_login_audit_reason("account_locked"),
+            AuthFailureReason::Lockout
+        );
+        for reason in [
+            "unknown_or_inactive_user",
+            "federated_account",
+            "no_password_hash",
+        ] {
+            assert_eq!(
+                AuthFailureReason::for_login_audit_reason(reason),
+                AuthFailureReason::UnknownUser
+            );
+        }
+    }
+
+    /// #4676: only a credential or policy refusal counts; an outage or a
+    /// malformed request does not.
+    #[test]
+    fn test_auth_failure_for_error_counts_only_refusals_4676() {
+        use crate::error::AppError;
+        let ((), c) = capture_counters(|| {
+            for err in [
+                AppError::Authentication("Invalid token: ExpiredSignature".into()),
+                AppError::Unauthorized("Token has been revoked".into()),
+                AppError::Authorization("no automatic account creation".into()),
+                AppError::Database("connection refused".into()),
+                AppError::ServiceUnavailable("at capacity".into()),
+                AppError::Validation("Invalid request body".into()),
+                AppError::Internal("JWKS fetch failed".into()),
+            ] {
+                record_auth_failure_for_error(
+                    AuthFailureSurface::Sso,
+                    &err,
+                    AuthFailureReason::Scope,
+                );
+            }
+        });
+        assert_eq!(
+            c.get(
+                "ak_auth_failures_total",
+                &[("surface", "sso"), ("reason", "expired")]
+            ),
+            1
+        );
+        assert_eq!(
+            c.get(
+                "ak_auth_failures_total",
+                &[("surface", "sso"), ("reason", "scope")]
+            ),
+            2
+        );
+        assert_eq!(c.get("ak_auth_failures_total", &[]), 3);
     }
 
     #[test]
@@ -447,8 +1215,8 @@ mod tests {
     }
 
     #[test]
-    fn test_record_artifact_download_does_not_panic() {
-        record_artifact_download("my-repo", "npm");
+    fn test_record_artifact_downloads_does_not_panic() {
+        record_artifact_downloads("my-repo", "npm", 3);
     }
 
     #[test]

@@ -88,8 +88,9 @@ pub fn require_signing_key(
 /// satisfy these endpoints, so this is **409 Conflict**, not 500: the request
 /// is fine and the server is healthy — the repository's signing *configuration*
 /// conflicts with what the endpoint must produce, and only an operator can
-/// resolve it. Nothing will change until they do (#2651 proposes rejecting the
-/// combination at config time, upstream of here).
+/// resolve it. Nothing will change until they do. Key creation (#2651) and the
+/// signing config route (#5198) refuse the combination, so this is what a binding
+/// made before those checks gets, or one made directly in the database.
 ///
 /// The status matters operationally, because these endpoints are anonymous:
 /// every `dnf` poll of a misconfigured repo hits this path. Returning 500 +
@@ -128,7 +129,9 @@ mod tests {
 
     #[test]
     fn test_map_db_err_returns_500() {
-        let resp = map_db_err("connection refused");
+        // A query error, not an outage: an unreachable database is a 503
+        // since #4756.
+        let resp = map_db_err("error returned from database: relation \"t\" does not exist");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -222,9 +225,26 @@ mod tests {
     #[test]
     fn test_map_storage_err_unrelated_error_still_500() {
         // Unrelated storage messages must not be misclassified as 400.
-        let resp = map_storage_err("disk quota exceeded");
+        let resp = map_storage_err("object checksum mismatch");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // An untagged transport phrase is not a storage outage (#5649): only
+        // a backend's marker makes it a 503.
         let resp = map_storage_err("connection reset");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_map_storage_err_out_of_space_is_507_5650() {
+        // The filesystem backend tags ENOSPC / EDQUOT where it still has the
+        // `io::Error`; the re-wrapped text keeps the class.
+        let err = crate::storage::failure::io_storage_error(
+            &std::io::Error::from_raw_os_error(122),
+            "Failed to write k: Disk quota exceeded (os error 122)".into(),
+        );
+        let resp = map_storage_err(err);
+        assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+        // The same words without the tag (a key named that way) stay a 500.
+        let resp = map_storage_err("Failed to write 'Disk quota exceeded (os error 122)'");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

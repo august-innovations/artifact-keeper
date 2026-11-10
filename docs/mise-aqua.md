@@ -32,7 +32,9 @@ If you configure a GitHub token as upstream authentication, **every reader of th
 mirror must be trusted to access everything that token can read**. These formats
 reuse generic forwarding and do not impose a GitHub path allow-list. Repository
 access protects cached responses as well as cache misses, but does not reproduce
-GitHub's per-user permissions. Do not make a token-backed mirror public.
+GitHub's per-user permissions. Do not make a token-backed mirror public: the
+server refuses it unless `allow_public_with_upstream_credentials: true` is sent
+(see [repository visibility](repository-visibility.md#public-remotes-with-upstream-credentials)).
 
 Use separate mirrors and narrowly scoped upstream tokens for separate trust
 groups. Artifact Keeper credentials authenticate clients to the mirror; a
@@ -85,6 +87,15 @@ curl -u "$AK_USERNAME:$AK_TOKEN" -X PUT \
   'https://<artifact-keeper-host>/api/v1/repositories/github-releases/cache-ttl'
 ```
 
+The precedence rule is the same for every remote: a repository override
+replaces the default lifetime of every *mutable* path, whether it is shorter or
+longer than the default, and never affects immutable artifacts. The override can
+be set anywhere from 1 second to 315360000 seconds (about ten years); the maximum
+means mutable paths are never revalidated. Lowering the override also applies to
+entries that are already cached: an entry expires once the new lifetime has
+passed since it was cached or last revalidated. Raising it applies to each entry
+from its next revalidation.
+
 Fresh entries are served without upstream requests. On expiry, the proxy checks
 whether the content changed, using its existing conditional revalidation when
 an ETag is available and fetching again otherwise. Replaced release files are
@@ -98,8 +109,9 @@ from the last successful cache fill or revalidation, **not from the start of an
 outage**. We do not promise an unlimited outage window. Use the cache-purge API
 when an immediate refresh is required.
 
-Other paths, including `releases/latest/download/…` and GitHub API metadata, retain
-the conservative short lifetime. This change does not alter hosted-file deletion
+Other paths, including `releases/latest/download/…`, retain the conservative
+short lifetime. The one GitHub API path with the seven-day lifetime is the
+release-by-tag lookup described under [Installs without lockfiles](#installs-without-lockfiles). This change does not alter hosted-file deletion
 or replacement rules.
 
 ## Installs without lockfiles
@@ -116,9 +128,19 @@ remote named `github-api`, with `format: "github"` and
 
 Combine both rules under one `[settings.url_replacements]` table. The API mirror
 has the same access restrictions as the release mirror, particularly if supplied
-with a GitHub token. API responses keep the existing short cache lifetime and
-error fallback. Longer API caching is tracked in
-[issue #3658](https://github.com/artifact-keeper/artifact-keeper/issues/3658).
+with a GitHub token.
+
+mise resolves a pinned version through
+`repos/<owner>/<repo>/releases/tags/<tag>`. On a `github`, `mise` or `aqua`
+remote, that exact path shape gets the same **seven-day** finite lifetime as
+release assets, so a cold runner can still resolve pinned tools from the cache
+well into a GitHub outage. A tag's release can still be edited or have assets
+re-uploaded, so the response is revalidated on expiry rather than cached
+forever. A repository cache-lifetime override takes precedence here too, so a
+short override on the API mirror also shortens these lookups. Every other API
+response, including the paginated `repos/<owner>/<repo>/releases` list and
+`releases/latest`, keeps the conservative five-minute lifetime and the one-hour
+error fallback.
 
 ## Validation
 

@@ -12,7 +12,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::task_local;
 
 /// Default ceiling on the TOTAL bytes the buffered proxy-metadata path may hold
@@ -50,58 +50,9 @@ pub fn reservation_for_known_body(body_len: u64, max: usize) -> usize {
 /// A process-wide byte budget bounding the TOTAL memory the *buffered*
 /// proxy-metadata path may hold resident at once, independent of request
 /// concurrency (#2665).
-pub struct ProxyMetadataBudget {
-    sem: Arc<Semaphore>,
-    total: usize,
-}
+pub type ProxyMetadataBudget = crate::util::byte_budget::ByteBudget;
 
-impl ProxyMetadataBudget {
-    /// Build a budget of `total_bytes`, clamped to `[1, u32::MAX]` (and to
-    /// [`Semaphore::MAX_PERMITS`]).
-    pub fn new(total_bytes: usize) -> Self {
-        let ceiling = (u32::MAX as usize).min(Semaphore::MAX_PERMITS);
-        let total = total_bytes.clamp(1, ceiling);
-        Self {
-            sem: Arc::new(Semaphore::new(total)),
-            total,
-        }
-    }
-
-    /// Total budget in bytes.
-    pub fn total_bytes(&self) -> usize {
-        self.total
-    }
-
-    /// Currently unreserved bytes (observability / test helper).
-    pub fn available_bytes(&self) -> usize {
-        self.sem.available_permits()
-    }
-
-    fn permits_for(&self, bytes: usize) -> u32 {
-        // A single request can reserve at most the whole budget, so an oversized
-        // request degrades to "hold the whole budget" rather than deadlocking on
-        // a permit count the semaphore can never satisfy.
-        bytes.clamp(1, self.total) as u32
-    }
-
-    /// Reserve `bytes` of the budget, awaiting when it is exhausted. The
-    /// returned permit releases the reservation on drop — hold it for as long
-    /// as the buffered bytes are resident.
-    pub async fn reserve(&self, bytes: usize) -> OwnedSemaphorePermit {
-        Arc::clone(&self.sem)
-            .acquire_many_owned(self.permits_for(bytes))
-            .await
-            .expect("proxy metadata budget semaphore is never closed")
-    }
-
-    /// Non-blocking reservation: `None` when the budget cannot currently satisfy
-    /// `bytes`.
-    pub fn try_reserve(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
-        Arc::clone(&self.sem)
-            .try_acquire_many_owned(self.permits_for(bytes))
-            .ok()
-    }
-}
+use crate::util::byte_budget::BYTE_BUDGET_UNIT_BYTES;
 
 /// Process-wide buffered-proxy-metadata byte budget (#2665). Sized once from
 /// [`PROXY_METADATA_BUDGET_BYTES_ENV`] (default
@@ -113,12 +64,10 @@ pub fn proxy_metadata_budget() -> &'static ProxyMetadataBudget {
 fn budget_slot() -> &'static Arc<ProxyMetadataBudget> {
     static BUDGET: OnceLock<Arc<ProxyMetadataBudget>> = OnceLock::new();
     BUDGET.get_or_init(|| {
-        let total = std::env::var(PROXY_METADATA_BUDGET_BYTES_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_PROXY_METADATA_BUDGET_BYTES);
-        Arc::new(ProxyMetadataBudget::new(total))
+        Arc::new(crate::util::byte_budget::budget_from_env(
+            PROXY_METADATA_BUDGET_BYTES_ENV,
+            DEFAULT_PROXY_METADATA_BUDGET_BYTES,
+        ))
     })
 }
 
@@ -172,7 +121,7 @@ impl MetadataBudgetSession {
             self.held.store(0, Ordering::Relaxed);
         }
         let permit = self.budget.reserve(bytes).await;
-        let acquired = self.budget.permits_for(bytes) as usize;
+        let acquired = permit.num_permits();
         let mut guard = self.lock();
         *guard = Some(permit);
         self.held.store(acquired, Ordering::Relaxed);
@@ -197,6 +146,10 @@ impl MetadataBudgetSession {
     /// when every holder needs more than the free remainder.
     fn settle_to(&self, keep: usize) -> bool {
         let keep = keep.clamp(1, self.max);
+        if keep > self.budget.total_bytes() {
+            return false;
+        }
+        let keep = keep.div_ceil(BYTE_BUDGET_UNIT_BYTES);
         let mut guard = self.lock();
         let Some(permit) = guard.as_mut() else {
             return false;
@@ -212,7 +165,7 @@ impl MetadataBudgetSession {
             return true;
         }
         let delta = keep - held;
-        match self.budget.try_reserve(delta) {
+        match self.budget.try_reserve(delta * BYTE_BUDGET_UNIT_BYTES) {
             Some(more) => {
                 permit.merge(more);
                 self.held.store(keep, Ordering::Relaxed);
@@ -239,6 +192,21 @@ pub async fn enter<T>(session: Arc<MetadataBudgetSession>, fut: impl Future<Outp
 
 pub fn session_active() -> bool {
     current().is_some()
+}
+
+/// A detached fill owns a separate reservation so its caller can fall back
+/// to stale data while the fill is still running.
+pub fn detached_session() -> Option<Arc<MetadataBudgetSession>> {
+    current().map(|session| MetadataBudgetSession::new(Arc::clone(&session.budget), session.max))
+}
+
+/// Transfer the detached fill's reservation to the request that receives it.
+pub fn adopt_detached_permit(permit: OwnedSemaphorePermit) {
+    if let Some(session) = current() {
+        let held = permit.num_permits();
+        *session.lock() = Some(permit);
+        session.held.store(held, Ordering::Relaxed);
+    }
 }
 
 /// Reserve `body_len` plus overhead before reading a body whose size is
@@ -289,7 +257,11 @@ pub fn active_read_cap() -> Option<usize> {
     if held == 0 {
         None
     } else {
-        Some(held.min(session.max))
+        Some(
+            held.saturating_mul(BYTE_BUDGET_UNIT_BYTES)
+                .min(session.max)
+                .min(session.budget.total_bytes()),
+        )
     }
 }
 
@@ -346,7 +318,8 @@ mod tests {
         .await;
         assert_eq!(
             reserved_before_read,
-            200_000 + METADATA_RESERVATION_OVERHEAD_BYTES
+            (200_000 + METADATA_RESERVATION_OVERHEAD_BYTES)
+                .next_multiple_of(BYTE_BUDGET_UNIT_BYTES)
         );
     }
 

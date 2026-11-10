@@ -12,7 +12,20 @@ use uuid::Uuid;
 
 use crate::api::validation::validate_outbound_sso_url;
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::services::encryption::{decrypt_credentials, encrypt_credentials};
+
+/// A consumed download ticket: who minted it, what for, the path it is bound
+/// to, and the repository restriction of the minting credential.
+#[derive(Debug, Clone)]
+pub struct DownloadTicket {
+    pub user_id: Uuid,
+    pub purpose: String,
+    pub resource_path: Option<String>,
+    /// `None` for a ticket minted before its scope was recorded
+    /// (GHSA-2mfv-xg68-gq4p); redemption refuses those.
+    pub repo_scope: Option<AccessScope>,
+}
 
 /// Validate an OIDC `issuer_url` against the SSO outbound-URL SSRF guard
 /// before it is persisted. Uses the dedicated `SsoDiscovery` context
@@ -577,12 +590,20 @@ pub struct LdapTestResult {
 // ---------------------------------------------------------------------------
 
 pub fn encryption_key() -> String {
-    std::env::var("SSO_ENCRYPTION_KEY")
-        .or_else(|_| std::env::var("JWT_SECRET"))
-        .expect(
-            "Neither SSO_ENCRYPTION_KEY nor JWT_SECRET is set. \
-             At least one must be configured for SSO credential encryption.",
-        )
+    // #4142: either form may come from a mounted secret file. A
+    // configured-but-unusable file panics with the helper's message, the
+    // same way a missing key always has.
+    match crate::config::secret_or_env("SSO_ENCRYPTION_KEY").unwrap_or_else(|e| panic!("{e}")) {
+        Some(key) => key,
+        // An SSO_ENCRYPTION_KEY set but blank is used as-is (legacy
+        // behaviour preserved); only an unset one falls back to JWT_SECRET.
+        None => crate::config::secret_or_env("JWT_SECRET")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .expect(
+                "Neither SSO_ENCRYPTION_KEY nor JWT_SECRET is set. \
+                 At least one must be configured for SSO credential encryption.",
+            ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -977,6 +998,39 @@ impl AuthConfigService {
         Ok(rows.into_iter().map(|(name,)| name).collect())
     }
 
+    /// Disable every still-enabled LDAP provider the `LDAP_*` env bootstrap
+    /// manages (#4857), the LDAP analog of [`Self::disable_env_seeded_oidc`].
+    /// Called on boot when `LDAP_URL`/`LDAP_BASE_DN` are absent, so an
+    /// env-configured provider does not outlive its configuration: the login
+    /// page stops offering only the LDAP form and `local_login_enabled`
+    /// recovers once no enabled provider remains.
+    ///
+    /// "Env-managed" is a non-empty `env_owned_fields` record (migration 255),
+    /// which only the env bootstrap writes. Admin-created rows and rows that
+    /// predate the record (NULL), and rows an administrator re-enabled through
+    /// the admin API (which clears the record), are never touched. Rows are
+    /// disabled, never deleted; re-enabling through the admin API brings the
+    /// provider back (re-adding the env vars alone does not, because the
+    /// reconcile never touches `is_enabled` after the create, #3904).
+    ///
+    /// Returns the names of the providers that were disabled.
+    pub async fn disable_env_managed_ldap(pool: &PgPool) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"
+            UPDATE ldap_configs
+            SET is_enabled = FALSE, updated_at = NOW()
+            WHERE is_enabled = TRUE AND cardinality(env_owned_fields) > 0
+            RETURNING name
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("Failed to disable env-managed LDAP configs: {e}"))
+        })?;
+        Ok(rows.into_iter().map(|(name,)| name).collect())
+    }
+
     fn oidc_row_to_response(row: OidcConfigRow) -> OidcConfigResponse {
         OidcConfigResponse {
             id: row.id,
@@ -1092,15 +1146,24 @@ impl AuthConfigService {
             hex::encode(&encrypted)
         });
 
-        let user_filter = req.user_filter.unwrap_or_else(|| "(uid={0})".to_string());
-        let email_attribute = req.email_attribute.unwrap_or_else(|| "mail".to_string());
+        // Shared with the env reconcile, which resets an env-owned field the
+        // environment stopped setting to these same defaults (#3904).
+        use crate::services::ldap_env_bootstrap as defaults;
+        let user_filter = req
+            .user_filter
+            .unwrap_or_else(|| defaults::DEFAULT_USER_FILTER.to_string());
+        let email_attribute = req
+            .email_attribute
+            .unwrap_or_else(|| defaults::DEFAULT_EMAIL_ATTRIBUTE.to_string());
         let display_name_attribute = req
             .display_name_attribute
-            .unwrap_or_else(|| "cn".to_string());
-        let username_attribute = req.username_attribute.unwrap_or_else(|| "uid".to_string());
+            .unwrap_or_else(|| defaults::DEFAULT_DISPLAY_NAME_ATTRIBUTE.to_string());
+        let username_attribute = req
+            .username_attribute
+            .unwrap_or_else(|| defaults::DEFAULT_USERNAME_ATTRIBUTE.to_string());
         let groups_attribute = req
             .groups_attribute
-            .unwrap_or_else(|| "memberOf".to_string());
+            .unwrap_or_else(|| defaults::DEFAULT_GROUPS_ATTRIBUTE.to_string());
         let use_starttls = req.use_starttls.unwrap_or(false);
         let is_enabled = req.is_enabled.unwrap_or(true);
         let priority = req.priority.unwrap_or(0);
@@ -1171,6 +1234,11 @@ impl AuthConfigService {
         .await
         .map_err(|e| AppError::Internal(format!("Failed to get LDAP config: {e}")))?
         .ok_or_else(|| AppError::NotFound(format!("LDAP config {id} not found")))?;
+
+        // #3904: a field the admin API changes stops being env-owned, so a
+        // later boot without the variable keeps the admin's value.
+        let admin_changed =
+            crate::services::ldap_env_bootstrap::admin_changed_fields(&existing, &req);
 
         let name = req.name.unwrap_or(existing.name);
         let server_url = req.server_url.unwrap_or(existing.server_url);
@@ -1250,6 +1318,14 @@ impl AuthConfigService {
         .await
         .map_err(|e| AppError::Internal(format!("Failed to update LDAP config: {e}")))?;
 
+        crate::services::ldap_env_bootstrap::release_env_ownership(pool, id, &admin_changed)
+            .await?;
+        // An admin who enables the provider takes ownership of it (#4857), so
+        // a boot without LDAP_* does not disable it again.
+        if req.is_enabled == Some(true) {
+            Self::release_ldap_env_management(pool, id).await?;
+        }
+
         Ok(Self::ldap_row_to_response(row))
     }
 
@@ -1290,7 +1366,25 @@ impl AuthConfigService {
         .map_err(|e| AppError::Internal(format!("Failed to toggle LDAP config: {e}")))?
         .ok_or_else(|| AppError::NotFound(format!("LDAP config {id} not found")))?;
 
+        // An admin who re-enables the provider takes ownership of it (#4857),
+        // so a boot without LDAP_* does not disable it again. A later boot
+        // WITH LDAP_* records env ownership afresh.
+        if toggle.enabled {
+            Self::release_ldap_env_management(pool, id).await?;
+        }
+
         Ok(Self::ldap_row_to_response(row))
+    }
+
+    /// Clear an LDAP provider's env-ownership record (#4857), so
+    /// [`Self::disable_env_managed_ldap`] leaves it alone.
+    async fn release_ldap_env_management(pool: &PgPool, id: Uuid) -> Result<()> {
+        sqlx::query("UPDATE ldap_configs SET env_owned_fields = NULL WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
     }
 
     /// Build an [`LdapService`] from a stored config row and its decrypted bind
@@ -1436,13 +1530,21 @@ impl AuthConfigService {
         // Reject if every resolved address is an internal/private target;
         // otherwise pin the first vetted address (do not re-resolve, to
         // avoid a TOCTOU / DNS-rebind window).
+        let first = resolved.first().map(|sa| sa.ip());
         let vetted = resolved
             .into_iter()
             .find(|sa| !crate::api::validation::is_blocked_resolved_ip(sa.ip()));
         let Some(vetted) = vetted else {
-            return Err(AppError::Validation(
-                "LDAP server URL is not allowed (private/internal network)".to_string(),
-            ));
+            crate::services::metrics_service::record_ssrf_block("ldap");
+            // Name the setting that admits a private LDAP server (#4638).
+            return Err(match first {
+                Some(ip) => {
+                    crate::api::validation::blocked_resolved_ip_error("LDAP server URL", ip)
+                }
+                None => AppError::Validation(
+                    "LDAP server URL is not allowed (private/internal network)".to_string(),
+                ),
+            });
         };
 
         let result = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&vetted)).await;
@@ -2043,13 +2145,19 @@ impl AuthConfigService {
 
     /// Create a short-lived download ticket for a user.
     /// Tickets expire after 30 seconds and are single-use.
+    ///
+    /// `repo_scope` is the repository restriction of the credential minting
+    /// the ticket. It is stored with the ticket and restored when the ticket
+    /// is redeemed, so a ticket never reads more than its minter could
+    /// (GHSA-2mfv-xg68-gq4p).
     pub async fn create_download_ticket(
         pool: &PgPool,
         user_id: Uuid,
+        repo_scope: &AccessScope,
         purpose: &str,
         resource_path: Option<&str>,
     ) -> Result<String> {
-        Self::insert_download_ticket(pool, user_id, purpose, resource_path, None).await
+        Self::insert_download_ticket(pool, user_id, repo_scope, purpose, resource_path, None).await
     }
 
     /// Like [`Self::create_download_ticket`] but with an explicit lifetime.
@@ -2063,16 +2171,26 @@ impl AuthConfigService {
     pub async fn create_download_ticket_with_ttl(
         pool: &PgPool,
         user_id: Uuid,
+        repo_scope: &AccessScope,
         purpose: &str,
         resource_path: Option<&str>,
         ttl_secs: i64,
     ) -> Result<String> {
-        Self::insert_download_ticket(pool, user_id, purpose, resource_path, Some(ttl_secs)).await
+        Self::insert_download_ticket(
+            pool,
+            user_id,
+            repo_scope,
+            purpose,
+            resource_path,
+            Some(ttl_secs),
+        )
+        .await
     }
 
     async fn insert_download_ticket(
         pool: &PgPool,
         user_id: Uuid,
+        repo_scope: &AccessScope,
         purpose: &str,
         resource_path: Option<&str>,
         ttl_secs: Option<i64>,
@@ -2084,17 +2202,22 @@ impl AuthConfigService {
         );
 
         // `NULL` for `$5` keeps the column's own 30-second default, so the
-        // historical call shape is byte-for-byte unchanged.
+        // historical call shape is byte-for-byte unchanged. `$6` is NULL for
+        // an unrestricted minter and its allowlist otherwise.
         sqlx::query(
-            r#"INSERT INTO download_tickets (ticket, user_id, purpose, resource_path, expires_at)
+            r#"INSERT INTO download_tickets
+                   (ticket, user_id, purpose, resource_path, expires_at,
+                    scope_recorded, allowed_repo_ids)
                VALUES ($1, $2, $3, $4,
-                       NOW() + make_interval(secs => COALESCE($5, 30)::double precision))"#,
+                       NOW() + make_interval(secs => COALESCE($5, 30)::double precision),
+                       true, $6)"#,
         )
         .bind(&ticket)
         .bind(user_id)
         .bind(purpose)
         .bind(resource_path)
         .bind(ttl_secs)
+        .bind(repo_scope.as_allowed_repo_ids())
         .execute(pool)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2103,15 +2226,17 @@ impl AuthConfigService {
     }
 
     /// Validate and consume a download ticket (single-use).
-    /// Returns (user_id, purpose, resource_path) if valid.
-    pub async fn validate_download_ticket(
-        pool: &PgPool,
-        ticket: &str,
-    ) -> Result<(Uuid, String, Option<String>)> {
-        let row: (Uuid, String, Option<String>) = sqlx::query_as(
+    pub async fn validate_download_ticket(pool: &PgPool, ticket: &str) -> Result<DownloadTicket> {
+        let (user_id, purpose, resource_path, scope_recorded, allowed_repo_ids): (
+            Uuid,
+            String,
+            Option<String>,
+            bool,
+            Option<Vec<Uuid>>,
+        ) = sqlx::query_as(
             r#"DELETE FROM download_tickets
                WHERE ticket = $1 AND expires_at > NOW()
-               RETURNING user_id, purpose, resource_path"#,
+               RETURNING user_id, purpose, resource_path, scope_recorded, allowed_repo_ids"#,
         )
         .bind(ticket)
         .fetch_optional(pool)
@@ -2119,7 +2244,12 @@ impl AuthConfigService {
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::Authentication("Invalid or expired download ticket".into()))?;
 
-        Ok(row)
+        Ok(DownloadTicket {
+            user_id,
+            purpose,
+            resource_path,
+            repo_scope: scope_recorded.then(|| AccessScope::from(allowed_repo_ids)),
+        })
     }
 
     /// Clean up expired download tickets. Intended to be called periodically.
@@ -2262,7 +2392,9 @@ mod tests {
         // assert this when both env vars are absent; in CI (where JWT_SECRET
         // is set so DB-backed SSO tests can encrypt credentials), the test
         // skips this branch.
-        if std::env::var("SSO_ENCRYPTION_KEY").is_ok() || std::env::var("JWT_SECRET").is_ok() {
+        if crate::config::secret_env_present("SSO_ENCRYPTION_KEY")
+            || crate::config::secret_env_present("JWT_SECRET")
+        {
             return;
         }
         let result = std::panic::catch_unwind(encryption_key);
@@ -2283,7 +2415,9 @@ mod tests {
         // When JWT_SECRET is set, encryption_key() should return it as fallback
         // for SSO_ENCRYPTION_KEY. We just verify it returns a non-empty string.
         // (In CI, JWT_SECRET is typically set.)
-        if std::env::var("JWT_SECRET").is_ok() || std::env::var("SSO_ENCRYPTION_KEY").is_ok() {
+        if crate::config::secret_env_present("JWT_SECRET")
+            || crate::config::secret_env_present("SSO_ENCRYPTION_KEY")
+        {
             let key = encryption_key();
             assert!(!key.is_empty());
         }
@@ -2585,6 +2719,27 @@ mod tests {
             .await
             .expect_err("metadata IP must be rejected before connect");
         assert!(err.to_string().contains("private/internal network"));
+    }
+
+    #[tokio::test]
+    async fn test_probe_ldap_private_ip_refusal_names_allowlist_setting_4638() {
+        // The connectivity test is the call that produced the message in
+        // #4638. A private (relaxable) address must name the setting that
+        // admits it; a metadata address must not advertise it.
+        std::env::remove_var("AK_SSRF_ALLOW_PRIVATE_CIDRS");
+        std::env::remove_var("UPSTREAM_PRIVATE_IP_ALLOWLIST");
+        std::env::remove_var("UPSTREAM_ALLOW_PRIVATE_IPS");
+        let err = AuthConfigService::probe_ldap_endpoint("10.10.10.10", 389)
+            .await
+            .expect_err("private IP must be rejected before connect");
+        let msg = err.to_string();
+        assert!(msg.contains("private/internal network"), "msg: {msg}");
+        assert!(msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"), "msg: {msg}");
+
+        let err = AuthConfigService::probe_ldap_endpoint("169.254.169.254", 389)
+            .await
+            .expect_err("metadata IP must be rejected before connect");
+        assert!(!err.to_string().contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"));
     }
 
     #[tokio::test]
@@ -3290,7 +3445,8 @@ mod tests {
         /// `test_encryption_key_panics_when_unset` invariant). The coverage
         /// CI job sets JWT_SECRET, so these tests run there.
         fn encryption_key_available() -> bool {
-            std::env::var("SSO_ENCRYPTION_KEY").is_ok() || std::env::var("JWT_SECRET").is_ok()
+            crate::config::secret_env_present("SSO_ENCRYPTION_KEY")
+                || crate::config::secret_env_present("JWT_SECRET")
         }
 
         async fn cleanup_oidc(pool: &PgPool, id: Uuid) {

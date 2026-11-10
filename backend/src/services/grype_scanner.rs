@@ -646,6 +646,10 @@ pub struct GrypeScanner {
     /// does not pay an extra subprocess; failed probes expire after 60s so
     /// the field starts populating once the binary becomes available.
     cached_version: VersionCache,
+    /// Raw `grype db status` output (#3014), cached on the same hit/miss TTLs
+    /// as `cached_version` and parsed into the scan's vulnerability-database
+    /// provenance by [`crate::services::scanner_service::parse_grype_db_status`].
+    cached_db_status: VersionCache,
     /// Optional token minter for private-repo registry pulls (#2093). When
     /// wired, a registry-mode scan of a known repository injects a short-lived,
     /// single-repo-scoped JWT into grype's child process via
@@ -842,10 +846,70 @@ async fn copy_storage_object_to_file(
     })
 }
 
+/// Paths excluded from every `dir:` workspace scan (#5262).
+///
+/// A Maven-built JAR embeds its own build POM at
+/// `META-INF/maven/<groupId>/<artifactId>/pom.xml`. Once the scan workspace
+/// unpacks the archive, syft's directory POM cataloger reads that file and
+/// catalogs every DECLARED dependency, including `provided` and `test` scope,
+/// as though it were shipped in the archive. A Maven plugin that declares
+/// `maven-core` as `provided` was then blocked on `maven-core`'s CVEs even
+/// though the consumer's Maven installation supplies that code.
+///
+/// Nothing that grades the archive's real contents is lost: the original
+/// archive stays in the workspace, and syft's java-archive cataloger names
+/// the archive and every bundled or shaded component from the
+/// `pom.properties` entries inside it (the same signal the #4100 identity
+/// check reads), and nested JARs remain archives it opens. Only the
+/// extracted build POMs, which describe what the project was BUILT against,
+/// are skipped.
+///
+/// The one bundled component this gives up is a shaded dependency whose
+/// `pom.properties` was stripped while its `pom.xml` was kept: the
+/// java-archive cataloger names components from `pom.properties` only, so
+/// such a component was cataloged solely from the extracted POM. Shading
+/// tools copy both files or neither, and `grype file:` on the same JAR never
+/// saw it either.
+///
+/// Patterns are relative to the scan root; syft requires each to start with
+/// `./`, `*/` or `**/`.
+pub(crate) const GRYPE_DIR_EXCLUDES: &[&str] = &["**/META-INF/maven/**/pom.xml"];
+
 /// Where `docker/Dockerfile.backend` seeds the Grype vulnerability DB, and the
 /// value its `GRYPE_DB_CACHE_DIR` ENV points at. Kept in sync by
 /// `test_seeded_grype_db_cache_dir_matches_the_dockerfile`.
 const SEEDED_GRYPE_DB_CACHE_DIR: &str = "/home/artifact/.cache/grype";
+
+/// The DB-related env every grype child gets, scan or probe alike.
+///
+/// `GRYPE_DB_AUTO_UPDATE`, `GRYPE_DB_VALIDATE_AGE` and
+/// `GRYPE_CHECK_FOR_APP_UPDATE` are pinned to literal `"false"` (#1001); the
+/// fourth, `GRYPE_DB_CACHE_DIR`, has no single correct literal and is
+/// resolved by [`resolve_grype_db_cache_dir`] (#3434). One helper for both
+/// the scan spawn and the `grype db status` provenance probe (#3014): a probe
+/// that inherited only the backend's env would, in exactly the env-replacing
+/// deployments the resolver exists for, look in `$HOME/.cache/grype`, find
+/// nothing (or a different DB) and record the wrong vintage.
+fn grype_db_env() -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        ("GRYPE_DB_AUTO_UPDATE", "false".to_string()),
+        ("GRYPE_DB_VALIDATE_AGE", "false".to_string()),
+        ("GRYPE_CHECK_FOR_APP_UPDATE", "false".to_string()),
+    ];
+    if let Some(dir) = resolve_grype_db_cache_dir(
+        std::env::var("GRYPE_DB_CACHE_DIR").ok(),
+        Path::new(SEEDED_GRYPE_DB_CACHE_DIR).is_dir(),
+    ) {
+        env.push(("GRYPE_DB_CACHE_DIR", dir));
+    }
+    env
+}
+
+/// TTL for a successful `grype db status` provenance probe (#3014). Much
+/// shorter than the binary-version TTL: an air-gapped operator can import a
+/// new DB without restarting the backend, and scans should stop being
+/// stamped with the old vintage within minutes, not an hour.
+const GRYPE_DB_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Decide what `GRYPE_DB_CACHE_DIR` the grype child should be given, if any.
 ///
@@ -886,6 +950,7 @@ impl GrypeScanner {
         Self {
             scan_workspace,
             cached_version: VersionCache::new(),
+            cached_db_status: VersionCache::new(),
             auth: None,
             scan_identity: None,
             scan_token_ttl_seconds: 300,
@@ -1077,6 +1142,7 @@ impl GrypeScanner {
             scan_completeness: completeness_for(truncated),
             // Registry mode does not feed the #3003 identity gate; unchanged.
             cataloged: None,
+            vuln_db: None,
         })
     }
 
@@ -1105,7 +1171,7 @@ impl GrypeScanner {
         // catalog side channel (#3003 PR-2) rides the same single invocation
         // so the inline OCI proxy gate can tell "clean" from "graded nothing".
         let result = match self
-            .run_grype_with_catalog(&grype_target, Some(&bom_path), &[])
+            .run_grype_with_catalog(&grype_target, Some(&bom_path), &[], &[])
             .await
         {
             Ok(run) => {
@@ -1125,6 +1191,7 @@ impl GrypeScanner {
                     packages,
                     scan_completeness: completeness_for(truncated),
                     cataloged,
+                    vuln_db: None,
                 })
             }
             Err(e) => Err(fail_scan(
@@ -1260,18 +1327,15 @@ impl GrypeScanner {
             return Ok(None);
         };
 
+        // Per scan job, not per artifact (#4668): a second scan of the same
+        // image used to `remove_dir_all` the layout the first was reading.
         let layout_dir = PathBuf::from(&self.scan_workspace)
             .join("grype-oci")
-            .join(artifact.id.to_string());
-        if tokio::fs::metadata(&layout_dir).await.is_ok() {
-            tokio::fs::remove_dir_all(&layout_dir).await.map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to reset Grype OCI layout workspace {}: {}",
-                    layout_dir.display(),
-                    e
-                ))
-            })?;
-        }
+            .join(format!(
+                "{}-{}",
+                artifact.id,
+                crate::services::scanner_service::scan_job_suffix()
+            ));
 
         let blob_dir = layout_dir.join("blobs").join("sha256");
         tokio::fs::create_dir_all(&blob_dir).await.map_err(|e| {
@@ -1366,7 +1430,7 @@ impl GrypeScanner {
         // attempt mints a fresh one (#3565).
         let bom_path = workspace.with_extension("grype-bom.json");
         workspace.own_sidecar(bom_path.clone());
-        self.run_grype_with_catalog(&dir_arg, Some(&bom_path), &[])
+        self.run_grype_with_catalog(&dir_arg, Some(&bom_path), &[], GRYPE_DIR_EXCLUDES)
             .await
     }
 
@@ -1381,6 +1445,7 @@ impl GrypeScanner {
         scan_arg: &str,
         bom_path: Option<&Path>,
         auth_env: &[(&'static str, String)],
+        excludes: &[&str],
     ) -> Result<GrypeRun> {
         let mut command = tokio::process::Command::new("grype");
         // `tokio::process::Command` defaults `kill_on_drop` to `false`. This
@@ -1417,25 +1482,22 @@ impl GrypeScanner {
                 command.args([scan_arg, "-o", "json"]);
             }
         }
-        command
-            .env("GRYPE_DB_AUTO_UPDATE", "false")
-            .env("GRYPE_DB_VALIDATE_AGE", "false")
-            .env("GRYPE_CHECK_FOR_APP_UPDATE", "false");
-        // The fourth DB-related variable, for the same reason as the three
-        // above — see the doc comment on `run_grype_target`. Unlike them it has
-        // no single correct literal, so it is resolved rather than pinned; the
-        // helper documents why.
-        if let Some(dir) = resolve_grype_db_cache_dir(
-            std::env::var("GRYPE_DB_CACHE_DIR").ok(),
-            Path::new(SEEDED_GRYPE_DB_CACHE_DIR).is_dir(),
-        ) {
-            command.env("GRYPE_DB_CACHE_DIR", dir);
+        // The DB-related env (see the doc comment on `run_grype_target`),
+        // shared with the `grype db status` provenance probe (#3014) so the
+        // probe describes the DB this child actually grades against.
+        for (key, value) in grype_db_env() {
+            command.env(key, value);
         }
         // Registry-auth env for a scoped private-repo pull (#2093). Applied as
         // child-process env only — never persisted or logged. Empty for local
         // (dir-mode / oci-dir-mode) and anonymous registry scans.
         for (key, value) in auth_env {
             command.env(key, value);
+        }
+        // Path exclusions for `dir:` scans (#5262); empty for every other
+        // target.
+        for pattern in excludes {
+            command.args(["--exclude", pattern]);
         }
         let output = command
             .output()
@@ -1558,7 +1620,7 @@ impl GrypeScanner {
         // BOM sidecar is best-effort: `None` runs exactly today's
         // `[target, "-o", "json"]` invocation.
         let bom_path = self.bom_sidecar_path().await;
-        self.run_grype_with_catalog(target, bom_path.as_deref(), auth_env)
+        self.run_grype_with_catalog(target, bom_path.as_deref(), auth_env, &[])
             .await
     }
 
@@ -1617,6 +1679,7 @@ impl GrypeScanner {
                         .urls
                         .as_ref()
                         .and_then(|u| u.first().cloned()),
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
                 }
             })
             .collect()
@@ -1881,9 +1944,10 @@ impl Scanner for GrypeScanner {
         cached_cli_version(&self.cached_version, || async {
             let raw = capture_cli_version("grype", &["--version"]).await?;
             let cli = format_grype_version(&raw)?;
-            let db_build = match crate::services::scanner_service::capture_cli_output(
+            let db_build = match crate::services::scanner_service::capture_cli_output_with_env(
                 "grype",
                 &["db", "status"],
+                &grype_db_env(),
             )
             .await
             {
@@ -1895,6 +1959,39 @@ impl Scanner for GrypeScanner {
             ))
         })
         .await
+    }
+
+    /// Vulnerability-database provenance from `grype db status` (#3014):
+    /// `grype-db-<schema>` built at the DB's `built` timestamp. Probes the
+    /// JSON form first and falls back to the text form for grype releases
+    /// that predate `-o json`. `None` when no valid DB is installed.
+    async fn vuln_db(&self) -> Option<crate::models::security::VulnDbProvenance> {
+        let raw = crate::services::scanner_service::cached_cli_version_with_hit_ttl(
+            &self.cached_db_status,
+            GRYPE_DB_STATUS_TTL,
+            || async {
+                let env = grype_db_env();
+                match crate::services::scanner_service::capture_cli_output_with_env(
+                    "grype",
+                    &["db", "status", "-o", "json"],
+                    &env,
+                )
+                .await
+                {
+                    Some(json) => Some(json),
+                    None => {
+                        crate::services::scanner_service::capture_cli_output_with_env(
+                            "grype",
+                            &["db", "status"],
+                            &env,
+                        )
+                        .await
+                    }
+                }
+            },
+        )
+        .await?;
+        crate::services::scanner_service::parse_grype_db_status(&raw)
     }
 
     async fn scan(
@@ -1997,6 +2094,7 @@ impl GrypeScanner {
             packages,
             scan_completeness: completeness_for(truncated),
             cataloged,
+            vuln_db: None,
         })
     }
 
@@ -2820,6 +2918,7 @@ mod tests {
             manifest_body: Some(helm_body),
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         assert!(
             !grype().is_applicable_for_target(&target),
@@ -2849,6 +2948,7 @@ mod tests {
             manifest_body: Some(image_body),
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         assert!(grype().is_applicable_for_target(&target));
     }
@@ -3138,6 +3238,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         // The scan dispatch resolves a routable, repository-scoped ref.
@@ -3186,6 +3287,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         assert!(
             grype().is_applicable_for_target(&target),
@@ -3254,6 +3356,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         let layout = scanner
@@ -3360,6 +3463,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         let layout = scanner
@@ -3440,6 +3544,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
@@ -3488,6 +3593,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
 
@@ -4003,7 +4109,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
             zip.start_file("acme_widget-1.2.3.dist-info/METADATA", opts)
                 .unwrap();
             zip.write_all(
@@ -4082,6 +4188,160 @@ mod tests {
                 !p.name.starts_with('/'),
                 "a filesystem path reached the inventory: {:?}",
                 p
+            );
+        }
+    }
+
+    /// #5262: syft rejects an exclusion that does not start with `./`, `*/`
+    /// or `**/`, and the embedded-POM exclusion must stay scoped to build
+    /// POMs under `META-INF/maven/`, never `pom.properties`, which is how the
+    /// archive and its shaded components are identified.
+    #[test]
+    fn test_dir_excludes_are_valid_and_scoped_to_embedded_poms_5262() {
+        assert_eq!(GRYPE_DIR_EXCLUDES, &["**/META-INF/maven/**/pom.xml"]);
+        for pattern in GRYPE_DIR_EXCLUDES {
+            assert!(
+                ["./", "*/", "**/"].iter().any(|p| pattern.starts_with(p)),
+                "{pattern} must be root-relative for syft"
+            );
+            assert!(
+                !pattern.contains("pom.properties"),
+                "{pattern} must not hide archive identity"
+            );
+        }
+    }
+
+    /// A Maven-plugin-shaped JAR (#5262): its own `pom.properties`, a build
+    /// POM declaring `provided` and `test` dependencies, one shaded
+    /// component carrying its own `pom.properties`, and one nested JAR.
+    fn maven_plugin_jar_with_embedded_pom() -> Bytes {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+            let mut put = |path: &str, body: &str| {
+                zip.start_file(path, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            };
+            put("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n");
+            put(
+                "META-INF/maven/com.acme/acme-maven-plugin/pom.properties",
+                "groupId=com.acme\nartifactId=acme-maven-plugin\nversion=1.0.0\n",
+            );
+            put(
+                "META-INF/maven/com.acme/acme-maven-plugin/pom.xml",
+                r#"<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.acme</groupId>
+  <artifactId>acme-maven-plugin</artifactId>
+  <version>1.0.0</version>
+  <packaging>maven-plugin</packaging>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.maven</groupId>
+      <artifactId>maven-core</artifactId>
+      <version>3.2.5</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.maven</groupId>
+      <artifactId>maven-compat</artifactId>
+      <version>3.2.5</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
+"#,
+            );
+            put(
+                "META-INF/maven/com.google.code.gson/gson/pom.properties",
+                "groupId=com.google.code.gson\nartifactId=gson\nversion=2.8.0\n",
+            );
+            put("com/acme/plugin/Mojo.class", "not real bytecode");
+            zip.start_file("lib/commons-text-1.9.jar", opts).unwrap();
+            zip.write_all(&nested_jar_with_pom_properties()).unwrap();
+            zip.finish().unwrap();
+        }
+        Bytes::from(buf)
+    }
+
+    /// A JAR nested inside the plugin JAR, identified by its own
+    /// `pom.properties` only. The exclusion must leave it to the
+    /// java-archive cataloger.
+    fn nested_jar_with_pom_properties() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+            // syft skips a nested archive without a manifest.
+            zip.start_file("META-INF/MANIFEST.MF", opts).unwrap();
+            zip.write_all(b"Manifest-Version: 1.0\n").unwrap();
+            zip.start_file(
+                "META-INF/maven/org.apache.commons/commons-text/pom.properties",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(b"groupId=org.apache.commons\nartifactId=commons-text\nversion=1.9\n")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    /// END-TO-END against the REAL grype binary (#5262): the fix is a grype
+    /// flag, so only the binary can prove it. The unpacked build POM's
+    /// `provided`/`test` declarations must not be cataloged as shipped
+    /// components, while the JAR's own identity and its shaded component
+    /// still are. Skips only when grype is not installed; probe and scan
+    /// failures must fail the test.
+    #[tokio::test]
+    async fn e2e_maven_embedded_pom_declarations_are_not_cataloged_5262() {
+        match std::process::Command::new("grype").arg("version").output() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("grype not installed; skipping the embedded-POM catalog test");
+                return;
+            }
+            Err(e) => panic!("failed to run grype version: {e}"),
+            Ok(output) => assert!(
+                output.status.success(),
+                "grype version failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = GrypeScanner::new(dir.path().to_string_lossy().to_string());
+        let artifact = make_artifact("acme-maven-plugin-1.0.0.jar", "application/java-archive");
+
+        let output = scanner
+            .scan(&artifact, None, &maven_plugin_jar_with_embedded_pom())
+            .await
+            .expect("Grype must scan the embedded-POM regression fixture successfully");
+        let names: Vec<&str> = output.packages.iter().map(|p| p.name.as_str()).collect();
+
+        for declared in ["maven-core", "maven-compat"] {
+            assert!(
+                !names.contains(&declared),
+                "{declared} is only declared in the build POM and must not be \
+                 cataloged as shipped; inventory: {names:?}"
+            );
+            assert!(
+                !output.findings.iter().any(|f| f
+                    .affected_component
+                    .as_deref()
+                    .is_some_and(|c| c.contains(declared))),
+                "no finding may be raised against POM-only {declared}"
+            );
+        }
+        // Positive controls: excluding the POM must not cost the archive's
+        // own identity, its bundled (shaded) component or a nested JAR.
+        for shipped in ["acme-maven-plugin", "gson", "commons-text"] {
+            assert!(
+                names.contains(&shipped),
+                "{shipped} is in the archive and must stay cataloged; \
+                 inventory: {names:?}"
             );
         }
     }
@@ -4455,10 +4715,21 @@ mod tests {
         // `/.cache/grype` and unwritable under restricted-v2 (#3434).
         let body = grype_spawn_body();
         assert!(
-            body.contains(".env(\"GRYPE_DB_CACHE_DIR\", dir)"),
-            "run_grype_with_catalog must set GRYPE_DB_CACHE_DIR on the child, \
+            body.contains("grype_db_env()") && body.contains("command.env(key, value)"),
+            "run_grype_with_catalog must apply grype_db_env() to the child, \
              not rely on it being inherited from the image ENV. Body: {}",
             body
+        );
+        let helper = {
+            let start = src
+                .find("fn grype_db_env()")
+                .expect("grype_db_env must exist");
+            let rest = &src[start..];
+            &rest[..rest.find("\n}\n").expect("grype_db_env body")]
+        };
+        assert!(
+            helper.contains("env.push((\"GRYPE_DB_CACHE_DIR\", dir))"),
+            "grype_db_env must carry the resolved GRYPE_DB_CACHE_DIR (#3434): {helper}"
         );
 
         for (var, why) in [
@@ -4476,7 +4747,7 @@ mod tests {
             ),
         ] {
             assert!(
-                src.contains(&format!(".env(\"{}\", \"false\")", var)),
+                src.contains(&format!("(\"{}\", \"false\".to_string())", var)),
                 "run_grype_target must pin {}=\"false\" at the subprocess level; \
                  removing it {}",
                 var,
@@ -4490,6 +4761,22 @@ mod tests {
     /// stay out of the way everywhere else (a dev box has no
     /// /home/artifact/.cache/grype and grype's own $HOME default is correct
     /// there).
+    #[test]
+    fn test_grype_db_env_pins_the_db_vars_for_scan_and_probe() {
+        // #3014: the provenance probe and the scan child share this env.
+        let env = grype_db_env();
+        for var in [
+            "GRYPE_DB_AUTO_UPDATE",
+            "GRYPE_DB_VALIDATE_AGE",
+            "GRYPE_CHECK_FOR_APP_UPDATE",
+        ] {
+            assert!(
+                env.iter().any(|(k, v)| *k == var && v == "false"),
+                "{var} must be pinned to false: {env:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_resolve_grype_db_cache_dir_rules() {
         // Explicit value wins, in the image or out of it.

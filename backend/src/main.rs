@@ -169,6 +169,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Load configuration
     let config = Config::from_env()?;
+    artifact_keeper_backend::api::middleware::tracing::warn_if_trace_context_untrusted(&config);
 
     // Log active allocator
     #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
@@ -188,6 +189,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         git = artifact_keeper_backend::build_info::short_sha(),
         "Starting Artifact Keeper"
     );
+
+    // Install the Prometheus recorder before anything records a metric.
+    // `db::create_pool` counts failed initial connect attempts in
+    // `ak_db_pool_connection_failures_total{stage="startup"}`; with the
+    // recorder installed later those increments went to the `metrics`
+    // crate's no-op default and were never exported (#4828). The recorder
+    // needs nothing from the database or the rest of startup.
+    let metrics_handle = metrics_service::init_metrics();
+    tracing::info!("Prometheus metrics recorder initialized");
 
     // Connect to database
     let db_pool = db::create_pool(&config).await?;
@@ -230,6 +240,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         sqlx::query("SET lock_timeout = '5min'")
             .execute(&mut *conn)
             .await?;
+        // Clear INVALID leftovers of interrupted CREATE INDEX CONCURRENTLY
+        // migrations so the retry rebuilds them instead of skipping them
+        // (#4426). Under the migrator's own advisory lock, on this session.
+        artifact_keeper_backend::migration_repair::repair_invalid_concurrent_indexes(&mut conn)
+            .await?;
         artifact_keeper_backend::MIGRATOR.run(&mut *conn).await?;
         tracing::info!("Database migrations complete");
     }
@@ -254,23 +269,6 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             event = "setup_required",
             "Default admin password has not been changed. API mutations are gated by the setup middleware until the change-password flow runs. See the deployment documentation for credential bootstrap details."
         );
-    }
-
-    // Guest access is on by default for backward compatibility; a fresh install
-    // still exposes nothing because repositories are private unless marked
-    // public. Say so, loudly and once, when both are true (#3489).
-    {
-        use artifact_keeper_backend::api::middleware::guest_access;
-        let public_repositories = guest_access::public_repository_count(&db_pool).await?;
-        if let Some(message) =
-            guest_access::startup_notice(config.guest_access_enabled, public_repositories)
-        {
-            tracing::warn!(
-                event = "guest_access_public_repositories",
-                public_repositories,
-                "{message}"
-            );
-        }
     }
 
     // Bootstrap OIDC config from environment variables when no DB configs exist yet.
@@ -302,16 +300,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // pins the enforcement so this message and the behaviour cannot drift apart
     // again.
 
-    // Initialize WASM plugin system (T068)
     let plugins_dir =
         PathBuf::from(std::env::var("PLUGINS_DIR").unwrap_or_else(|_| "./plugins".to_string()));
-    let (plugin_registry, wasm_plugin_service) = initialize_wasm_plugins(
-        db_pool.clone(),
-        plugins_dir,
-        config.plugins_require_signed,
-        config.plugins_trusted_pubkey.clone(),
-    )
-    .await?;
+    let plugin_services =
+        initialize_wasm_plugins_if_enabled(&config, db_pool.clone(), plugins_dir).await?;
 
     // Initialize OpenSearch (optional, graceful fallback)
     let search_service = match &config.opensearch_url {
@@ -417,10 +409,6 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     };
 
-    // Initialize Prometheus metrics recorder
-    let metrics_handle = metrics_service::init_metrics();
-    tracing::info!("Prometheus metrics recorder initialized");
-
     // Issues #976, #1224: surface the upstream private-IP allowlist at
     // boot so the posture is obvious in startup logs. Metadata IPs
     // remain blocked unconditionally; the validator handles that. The
@@ -431,9 +419,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             target: "security",
             allowlist = %list,
             "AK_SSRF_ALLOW_PRIVATE_CIDRS (or alias UPSTREAM_PRIVATE_IP_ALLOWLIST) \
-             is set; upstream URLs may now target listed private CIDRs. Cloud \
+             is set; outbound targets (upstream and migration URLs, LDAP, \
+             SSO/OIDC, webhooks) may now be in the listed private CIDRs. Cloud \
              metadata IPs and loopback remain blocked. SSRF risk surface \
-             widened (issues #976, #1224)."
+             widened (issues #976, #1224, #4638)."
         );
     } else {
         if artifact_keeper_backend::api::validation::upstream_allow_private_ips_enabled() {
@@ -450,10 +439,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             tracing::warn!(
                 target: "security",
                 "WEBHOOK_ALLOW_PRIVATE_IPS=true; webhook delivery URLs may \
-                 now target ALL RFC1918 / unique-local addresses. Cloud \
-                 metadata IPs and loopback remain blocked. Prefer \
+                 now target ALL RFC1918 / unique-local addresses, whether or \
+                 not AK_SSRF_ALLOW_PRIVATE_CIDRS is also set. Cloud \
+                 metadata IPs and loopback remain blocked. Unset it and use \
                  AK_SSRF_ALLOW_PRIVATE_CIDRS with explicit CIDRs for a \
-                 narrower SSRF surface (issue #1435)."
+                 narrower SSRF surface (issues #1435, #4428)."
             );
         }
     }
@@ -518,6 +508,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             String,
             Arc<dyn artifact_keeper_backend::storage::StorageBackend>,
         > = HashMap::new();
+        // A backend that was configured but could not be initialized is
+        // recorded here as well as logged, so a repository on it answers a
+        // 503 naming the backend instead of a bare 500 STORAGE_ERROR (#4530).
+        let mut skipped_backends: HashMap<String, String> = HashMap::new();
 
         // Register the primary backend under its type name if it is not filesystem
         if config.storage_backend != "filesystem" {
@@ -527,30 +521,72 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         // Try to register additional backends if credentials are available and
         // they are not already the primary backend.
         if config.storage_backend != "s3" {
-            if let Ok(s3) = artifact_keeper_backend::storage::s3::S3Backend::from_env().await {
-                tracing::info!("Additional S3 storage backend registered");
-                backends.insert("s3".to_string(), Arc::new(s3));
+            match artifact_keeper_backend::storage::s3::S3Backend::from_env().await {
+                Ok(s3) => {
+                    tracing::info!("Additional S3 storage backend registered");
+                    backends.insert("s3".to_string(), Arc::new(s3));
+                }
+                // Not configured (no S3_BUCKET, no credentials) is the normal
+                // case and stays silent; a malformed public endpoint is an
+                // operator mistake worth surfacing (#4417).
+                Err(e) if e.to_string().contains("S3_PUBLIC_ENDPOINT") => {
+                    // ERROR rather than WARN: the backend is dead until the
+                    // operator fixes its configuration, so it must be
+                    // distinguishable from a cosmetic warning (#4530).
+                    tracing::error!(error = %e, "Additional S3 storage backend skipped");
+                    skipped_backends.insert("s3".to_string(), e.to_string());
+                }
+                Err(_) => {}
             }
         }
         if config.storage_backend != "azure" {
-            if let Ok(azure_cfg) = artifact_keeper_backend::storage::azure::AzureConfig::from_env()
-            {
-                if let Ok(azure) =
-                    artifact_keeper_backend::storage::azure::AzureBackend::new(azure_cfg).await
-                {
-                    tracing::info!("Additional Azure storage backend registered");
-                    backends.insert("azure".to_string(), Arc::new(azure));
+            match artifact_keeper_backend::storage::azure::AzureConfig::from_env() {
+                Ok(azure_cfg) => {
+                    match artifact_keeper_backend::storage::azure::AzureBackend::new(azure_cfg)
+                        .await
+                    {
+                        Ok(azure) => {
+                            tracing::info!("Additional Azure storage backend registered");
+                            backends.insert("azure".to_string(), Arc::new(azure));
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "Additional Azure storage backend skipped"
+                            );
+                            skipped_backends.insert("azure".to_string(), e.to_string());
+                        }
+                    }
                 }
+                Err(e) if e.to_string().contains("AZURE_STORAGE_PUBLIC_ENDPOINT") => {
+                    tracing::error!(error = %e, "Additional Azure storage backend skipped");
+                    skipped_backends.insert("azure".to_string(), e.to_string());
+                }
+                Err(_) => {}
             }
         }
         if config.storage_backend != "gcs" {
-            if let Ok(gcs_cfg) = artifact_keeper_backend::storage::gcs::GcsConfig::from_env() {
-                if let Ok(gcs) =
-                    artifact_keeper_backend::storage::gcs::GcsBackend::new(gcs_cfg).await
-                {
-                    tracing::info!("Additional GCS storage backend registered");
-                    backends.insert("gcs".to_string(), Arc::new(gcs));
+            match artifact_keeper_backend::storage::gcs::GcsConfig::from_env() {
+                Ok(gcs_cfg) => {
+                    match artifact_keeper_backend::storage::gcs::GcsBackend::new(gcs_cfg).await {
+                        Ok(gcs) => {
+                            tracing::info!("Additional GCS storage backend registered");
+                            backends.insert("gcs".to_string(), Arc::new(gcs));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Additional GCS storage backend skipped");
+                            skipped_backends.insert("gcs".to_string(), e.to_string());
+                        }
+                    }
                 }
+                // `GCS_BUCKET not set` is the ordinary "not configured" case
+                // and stays silent; any other configuration error means the
+                // operator asked for GCS and its configuration is broken.
+                Err(e) if !e.to_string().contains("GCS_BUCKET not set") => {
+                    tracing::error!(error = %e, "Additional GCS storage backend skipped");
+                    skipped_backends.insert("gcs".to_string(), e.to_string());
+                }
+                Err(_) => {}
             }
         }
 
@@ -560,19 +596,35 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             names
         };
         tracing::info!("Storage backends available: {:?}", available);
+        // The metric is a gauge because the set is fixed for the process
+        // lifetime: a scrape either sees 0 (everything configured works) or
+        // the number of dead backends to alert on (#4530). Set on every start
+        // so 0 is an observed value, not an absent series.
+        metrics::gauge!("ak_storage_backends_skipped").set(skipped_backends.len() as f64);
+        if !skipped_backends.is_empty() {
+            let mut skipped: Vec<String> = skipped_backends.keys().cloned().collect();
+            skipped.sort();
+            tracing::error!(
+                skipped = ?skipped,
+                "Storage backends configured but skipped at startup; repositories on them will \
+                 answer 503 until the configuration is fixed (#4530)"
+            );
+        }
 
-        Arc::new(
-            artifact_keeper_backend::storage::StorageRegistry::new(
-                backends,
-                config.storage_backend.clone(),
-            )
-            // #3368: filesystem locations are rooted at the repository's own
-            // directory (`<STORAGE_PATH>/<repo_key>`), but the proxy cache
-            // writes through a handle rooted at `STORAGE_PATH`. Hand the
-            // registry the global root so reserved bucket-root namespaces
-            // resolve to the same file through either handle.
-            .with_filesystem_bucket_root(&config.storage_path),
+        let mut registry = artifact_keeper_backend::storage::StorageRegistry::new(
+            backends,
+            config.storage_backend.clone(),
         )
+        // #3368: filesystem locations are rooted at the repository's own
+        // directory (`<STORAGE_PATH>/<repo_key>`), but the proxy cache
+        // writes through a handle rooted at `STORAGE_PATH`. Hand the
+        // registry the global root so reserved bucket-root namespaces
+        // resolve to the same file through either handle.
+        .with_filesystem_bucket_root(&config.storage_path);
+        for (name, error) in skipped_backends {
+            registry.record_skipped_backend(name, error);
+        }
+        Arc::new(registry)
     };
 
     // One-shot backfill of oci_manifest_refs for index manifests that
@@ -640,6 +692,26 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // Maintenance of the first-class `oci_manifests` existence table (#1683 /
+    // #4433): at startup the backfill of manifests committed before migration
+    // 268 plus the reconcile that removes rows for manifests no longer
+    // addressable, then the reconcile again every
+    // `OCI_MANIFESTS_RECONCILE_INTERVAL_SECS`. Every push/cache records its
+    // row inline. Backgrounded: nothing reads the table yet, the pass is
+    // idempotent, and it reads bodies from storage, so it must not delay the
+    // HTTP listener bind. Failures are logged inside and retried next pass.
+    {
+        let db_pool = db_pool.clone();
+        let storage_registry = storage_registry.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::oci_manifests::run_maintenance(
+                db_pool,
+                storage_registry,
+            )
+            .await;
+        });
+    }
+
     // One-shot repair for Docker/OCI artifacts imported by migration runs
     // that pre-date #2457: those runs stored manifest/blob bytes under
     // generic CAS keys with only `artifacts` rows, so migrated tags were
@@ -704,9 +776,68 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // #5293: `pull` replication was accepted (and the default) but never
+    // replicated anything; it is refused now. Name the rows written before
+    // that once per boot, leaving them unchanged.
+    {
+        let db_pool = db_pool.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::peer_instance_service::warn_inactive_pull_replication(
+                &db_pool,
+            )
+            .await;
+        });
+    }
+
+    // #4461: lifecycle regexes run in PostgreSQL. Policies stored before they
+    // were compiled by PostgreSQL at create/update time can carry a pattern
+    // that fails every run or (`\b`) protects nothing; name them once per
+    // boot without changing them.
+    {
+        let db_pool = db_pool.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::lifecycle_service::warn_invalid_lifecycle_regexes(
+                &db_pool,
+            )
+            .await;
+        });
+    }
+
+    // #4133: a CI OIDC provider whose audience is a Kubernetes API server's
+    // accepts every pod's default ServiceAccount token. Create and update
+    // refuse one now; name those stored before, once per boot, unchanged.
+    {
+        let db_pool = db_pool.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::ci_oidc_service::warn_kubernetes_api_server_audiences(
+                &db_pool,
+            )
+            .await;
+        });
+    }
+
+    // #1331: name every signing key that is bound to Debian/RPM metadata
+    // signing but cannot produce OpenPGP signatures (legacy PEM / X.509 keys),
+    // once per boot; with SIGNING_AUTO_MIGRATE_LEGACY_KEYS=true, replace each
+    // with a fresh key_type='gpg' key. Backgrounded: keygen is slow and this
+    // must never delay or fail startup.
+    {
+        let signing = artifact_keeper_backend::services::signing_service::SigningService::new(
+            db_pool.clone(),
+            &config.jwt_secret,
+        );
+        let auto_migrate = config.signing_auto_migrate_legacy_keys;
+        tokio::spawn(async move {
+            signing.run_legacy_key_scan(auto_migrate).await;
+        });
+    }
+
     // Initialize security scanner service
     let advisory_client = {
-        let mut client = AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok());
+        let mut client = AdvisoryClient::new(env_secret_or_log(
+            "GITHUB_TOKEN",
+            "continuing without a GitHub token",
+        ));
         // #4055: the client's answer cache is where new advisory data enters
         // the system; report detected changes so the leased scheduler tick
         // can re-evaluate stored environments against them.
@@ -785,16 +916,23 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     let scanner_service = Arc::new(scanner_service);
 
-    // Create application state with WASM plugin support
     let scheduler_storage = primary_storage.clone();
-    let mut app_state = api::AppState::with_wasm_plugins(
-        config.clone(),
-        db_pool.clone(),
-        primary_storage,
-        storage_registry.clone(),
-        plugin_registry,
-        wasm_plugin_service,
-    );
+    let mut app_state = match plugin_services {
+        Some((plugin_registry, wasm_plugin_service)) => api::AppState::with_wasm_plugins(
+            config.clone(),
+            db_pool.clone(),
+            primary_storage,
+            storage_registry.clone(),
+            plugin_registry,
+            wasm_plugin_service,
+        ),
+        None => api::AppState::new(
+            config.clone(),
+            db_pool.clone(),
+            primary_storage,
+            storage_registry.clone(),
+        ),
+    };
     app_state.set_scanner_service(scanner_service);
 
     // Initialize quality check service for health scoring and quality gates
@@ -851,11 +989,12 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .to_string();
     match StorageService::proxy_cache_from_config(&config).await {
         Ok(storage_svc) => {
-            let proxy_service = Arc::new(ProxyService::new(
-                db_pool.clone(),
-                Arc::new(storage_svc),
-                proxy_cache_scope,
-            ));
+            let proxy_service = Arc::new(
+                ProxyService::new(db_pool.clone(), Arc::new(storage_svc), proxy_cache_scope)
+                    .with_stale_if_error_grace_secs(config.proxy_stale_if_error_grace_secs)
+                    .with_upstream_settings(config.proxy_upstream)
+                    .with_upstream_fetch_audit(config.audit_upstream_fetches),
+            );
             app_state.set_proxy_service(proxy_service);
             tracing::info!(
                 proxy_cache_backend = %proxy_cache_backend,
@@ -898,6 +1037,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         ),
     );
     app_state.set_age_gate_service(age_gate_service);
+    // #4467: move age-gate state recorded under the pre-#4467 fingerprint of a
+    // credentialed upstream URL to the userinfo-free one, so the upgrade does
+    // not restart first-seen clocks or void approvals. Background, idempotent.
+    {
+        let pool = db_pool.clone();
+        tokio::spawn(async move {
+            match artifact_keeper_backend::services::age_gate_service::rekey_all_legacy_fingerprints(&pool).await {
+                Ok(0) => {}
+                Ok(moved) => tracing::info!(moved, "age gate: re-keyed legacy upstream fingerprints"),
+                Err(e) => tracing::warn!(error = %e, "age gate: legacy upstream fingerprint re-key failed; retried on next start"),
+            }
+        });
+    }
 
     // Initialize SMTP service (optional, graceful no-op when SMTP_HOST is absent)
     match SmtpService::new(&config) {
@@ -958,6 +1110,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     );
     tracing::info!("Email dispatcher started");
 
+    // #4336: recalculate a repository's grade status and coverage when an
+    // artifact is deleted from it, not only after the next scan.
+    artifact_keeper_backend::services::scan_result_service::spawn_score_refresher(
+        app_state.event_bus.clone(),
+        app_state.db.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // Start webhooks v2 producer: subscribes to EventBus and enqueues rows
     // into webhook_deliveries. The retry scheduler (every 30s) drives
     // actual HTTP delivery. See backend/src/services/webhook_producer.rs.
@@ -999,6 +1159,32 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .store(setup_required, std::sync::atomic::Ordering::Relaxed);
     let state = Arc::new(app_state);
 
+    // Prime the runtime guest-access handle (#867) with a real read before
+    // serving anything. Refuse to start if it fails: an instance an admin
+    // locked down through the API must not come up on the default (open).
+    let guest_access = state.guest_access_policy.try_refresh().await.map_err(|e| {
+        artifact_keeper_backend::error::AppError::Database(format!(
+            "failed to read the guest-access setting at startup: {e}"
+        ))
+    })?;
+
+    // Guest access is on by default for backward compatibility; a fresh install
+    // still exposes nothing because repositories are private unless marked
+    // public. Say so, loudly and once, when both are true (#3489).
+    {
+        use artifact_keeper_backend::api::middleware::guest_access;
+        let public_repositories = guest_access::public_repository_count(&state.db).await?;
+        if let Some(message) =
+            guest_access::startup_notice(guest_access.enabled, public_repositories)
+        {
+            tracing::warn!(
+                event = "guest_access_public_repositories",
+                public_repositories,
+                "{message}"
+            );
+        }
+    }
+
     // Fan out authorization-cache and npm computed-packument invalidations
     // from other replicas via Postgres LISTEN/NOTIFY (migration 142 triggers
     // + services/cache_invalidation.rs; the packument event is emitted
@@ -1019,6 +1205,17 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     )
     .await;
 
+    // #5288: install UPSTREAM_JOBS_PAUSED before the first scheduled upstream
+    // job can tick, and say once which jobs the switch holds off.
+    {
+        use artifact_keeper_backend::services::upstream_pause;
+        upstream_pause::set_env_default(config.upstream_jobs_paused);
+        let pause_state = upstream_pause::state(&db_pool).await;
+        if let Some(message) = upstream_pause::startup_message(&pause_state) {
+            tracing::warn!(event = "upstream_jobs_paused", "{message}");
+        }
+    }
+
     // #2249: proactive packument invalidation from npm's replication feed.
     // Opt-in (NPM_UPSTREAM_FEED_ENABLED); one replica consumes cluster-wide
     // via an advisory lock. Detached deliberately: lifecycle is governed by
@@ -1029,7 +1226,56 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             db_pool.clone(),
             state.npm_packument_cache.clone(),
             runtime_shutdown_token.clone(),
+            state.upstream_feed_status.clone(),
         );
+
+    // #4173: fill the stored CEP-16 shards of conda channels that held
+    // packages before the shard tables existed, in bounded, resumable
+    // batches. Exits once every repository is done. Detached deliberately:
+    // lifecycle is governed by the shutdown token.
+    artifact_keeper_backend::api::handlers::conda::spawn_conda_shard_backfill(
+        db_pool.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
+    // #4311: resume repository delete jobs that are pending or whose replica
+    // died mid-delete (their claim lapsed).
+    artifact_keeper_backend::api::handlers::repositories::spawn_repository_delete_resumer(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
+    // #5284: resume proxy-cache seed jobs that are pending or whose replica
+    // died or restarted mid-seed (their claim lapsed).
+    artifact_keeper_backend::api::handlers::repositories::spawn_cache_seed_resumer(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
+    // #4544: build the repodata of changed hosted RPM roots in the
+    // background and serve it from storage. Every replica ticks; a lease per
+    // root lets one of them build it. Detached deliberately: lifecycle is
+    // governed by the shutdown token.
+    artifact_keeper_backend::services::rpm_repodata_builder::spawn(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
+    // #5253: hourly upstream sync of Remote MCP registries. Every replica
+    // ticks; a scheduler lease picks one per tick and a per-repository
+    // cluster lock keeps a manual trigger from overlapping a run.
+    artifact_keeper_backend::services::mcp_remote::spawn(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
+    // #5253: the MCP registry's async package resolver (fills Remote backing
+    // repositories for versions published `resolving`). Every replica ticks;
+    // jobs are row-claimed.
+    artifact_keeper_backend::services::mcp_resolver::spawn(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
 
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
     scheduler_service::spawn_all(
@@ -1040,6 +1286,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         state.smtp_service.clone(),
         state.event_bus.clone(),
         advisory_client.clone(),
+        state.proxy_service.clone(),
     );
 
     // Keep a handle for the gRPC server before the sync worker consumes db_pool
@@ -1056,6 +1303,30 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // Conditionally clone state for the metrics listener before the router takes
     // ownership. The clone only happens when METRICS_PORT is actually configured.
     let metrics_state = config.metrics_port.map(|_| state.clone());
+
+    // Trusted-proxy ranges for the `http_request` span builder below (#4195),
+    // shared into the per-request closure without copying the list.
+    let trace_context_trusted_proxies: std::sync::Arc<
+        [artifact_keeper_backend::api::middleware::rate_limit::CidrRange],
+    > = config.rate_limit_trusted_proxy_cidrs.clone().into();
+
+    // With trusted proxies configured but no XFF_TRUSTED_FOR_AUTHZ
+    // assertion, authorization-grade client-IP resolution fails closed:
+    // IP-conditioned permission rules (#1849) deny every proxied request and
+    // auth-audit rows record NULL for the client IP. That is the safe
+    // default — a proxy that does not append XFF leaves the chain wholly
+    // attacker-controlled — but it surprises operators whose topology IS
+    // appending, so say so loudly at startup.
+    if !config.rate_limit_trusted_proxy_cidrs.is_empty() && !config.xff_trusted_for_authz {
+        tracing::warn!(
+            "RATE_LIMIT_TRUSTED_PROXY_CIDRS is set but XFF_TRUSTED_FOR_AUTHZ is not: \
+             IP-conditioned permission rules (allowed_cidrs) and auth-audit IP attribution \
+             resolve the client as UNKNOWN for requests arriving through trusted proxies \
+             (fail closed). Set XFF_TRUSTED_FOR_AUTHZ=true only after confirming every \
+             trusted proxy APPENDS X-Forwarded-For (Caddy and ingress-nginx do; Envoy \
+             Gateway passes inbound XFF through unsanitized)."
+        );
+    }
 
     // Build router
     let app = Router::new()
@@ -1148,12 +1419,44 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                 }
             }
         })
+        // #5253: a refusal the shared middleware gives on an `/mcp/` path is
+        // re-rendered as problem+json with `no-store` (and the read routes'
+        // CORS headers); every other path passes through untouched.
+        .layer(axum::middleware::from_fn(
+            artifact_keeper_backend::api::handlers::mcp::mcp_surface_guard,
+        ))
+        // #5253: MCP registry read routes answer cross-origin preflights
+        // themselves (any origin, GET only, no credentials); the instance CORS
+        // layer above would otherwise answer them same-origin.
+        .layer(axum::middleware::from_fn(
+            artifact_keeper_backend::api::handlers::mcp::mcp_cors_preflight,
+        ))
         .layer(axum::middleware::from_fn(
             artifact_keeper_backend::api::middleware::security_headers::security_headers_middleware,
         ))
         .layer(TraceLayer::new_for_http().make_span_with(
-            artifact_keeper_backend::api::middleware::tracing::make_http_request_span,
+            move |request: &axum::http::Request<axum::body::Body>| {
+                // Inbound W3C trace context is adopted only from trusted
+                // proxies once RATE_LIMIT_TRUSTED_PROXY_CIDRS is set (#4195).
+                artifact_keeper_backend::api::middleware::tracing::make_http_request_span(
+                    request,
+                    &trace_context_trusted_proxies,
+                )
+            },
+        )
+        // Status, body size and 5xx error status onto the same span (#4455),
+        // then the default DEBUG "finished processing request" event.
+        .on_response(
+            artifact_keeper_backend::api::middleware::request_span::RecordResponseOnSpan::default(),
         ));
+
+    // #5253: optional host-level MCP registry (`/v0.1/...`, `/v0/...`).
+    let app = artifact_keeper_backend::api::handlers::mcp_edges::mount_default_repo(
+        app,
+        artifact_keeper_backend::api::handlers::mcp_edges::default_repo_from_env(
+            std::env::var("MCP_DEFAULT_REPO").ok().as_deref(),
+        ),
+    );
 
     // The concrete shutdown token used by all servers and background tasks
     // is resolved earlier in run_server (see `runtime_shutdown_token`) so
@@ -1170,7 +1473,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .unwrap_or_else(|_| "9090".to_string())
         .parse::<u16>()
         .unwrap_or(9090);
-    let grpc_addr: SocketAddr = format!("0.0.0.0:{}", grpc_port).parse()?;
+    // `SocketAddr::new` rather than a `format!`ed string so an IPv6 bind IP
+    // (`::1`) needs no brackets (#2161).
+    let grpc_addr = SocketAddr::new(config.grpc_bind_ip, grpc_port);
 
     // Reuse the existing pool instead of creating a second one (PgPool is Arc-backed)
     let sbom_server = SbomGrpcServer::new(grpc_db_pool.clone());
@@ -1245,11 +1550,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     if let (Some(metrics_port), Some(metrics_state)) = (config.metrics_port, metrics_state) {
         tracing::warn!(
             port = metrics_port,
+            bind_ip = %config.metrics_bind_ip,
             "Starting unauthenticated metrics listener - \
              ensure this port is not reachable from untrusted networks"
         );
-        let metrics_addr: SocketAddr = format!("0.0.0.0:{}", metrics_port).parse()?;
+        let metrics_addr = SocketAddr::new(config.metrics_bind_ip, metrics_port);
         let metrics_shutdown = shutdown_token.clone();
+        let header_read_timeout = config.http_header_read_timeout();
         tokio::spawn(async move {
             let metrics_app = Router::new()
                 .route(
@@ -1260,9 +1567,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             match tokio::net::TcpListener::bind(metrics_addr).await {
                 Ok(listener) => {
                     tracing::info!("Metrics listener on {}", metrics_addr);
-                    if let Err(e) = axum::serve(listener, metrics_app)
-                        .with_graceful_shutdown(async move { metrics_shutdown.cancelled().await })
-                        .await
+                    if let Err(e) = artifact_keeper_backend::api::serve::serve(
+                        listener,
+                        metrics_app.into_make_service(),
+                        header_read_timeout,
+                        async move { metrics_shutdown.cancelled().await },
+                    )
+                    .await
                     {
                         tracing::error!("Metrics listener error: {}", e);
                     }
@@ -1276,7 +1587,28 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     }
 
     let http_shutdown_token = shutdown_token.clone();
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // #4647: the accept queue a CPU-starved process drains slowly. Logged so
+    // an operator can see what the kernel actually granted.
+    let listen_backlog = config.http_listen_backlog();
+    let somaxconn = artifact_keeper_backend::api::serve::read_somaxconn();
+    let listener = artifact_keeper_backend::api::serve::bind_listener(addr, listen_backlog).await?;
+    tracing::info!(
+        requested = ?listen_backlog,
+        somaxconn = ?somaxconn,
+        effective = ?artifact_keeper_backend::api::serve::effective_listen_backlog(
+            listen_backlog,
+            somaxconn
+        ),
+        "HTTP listener accept backlog (HTTP_LISTEN_BACKLOG; unset = OS maximum)"
+    );
+    if let (Some(requested), Some(cap)) = (listen_backlog, somaxconn) {
+        if requested > cap {
+            tracing::warn!(
+                "HTTP_LISTEN_BACKLOG={requested} exceeds net.core.somaxconn={cap}; the kernel \
+                 caps the accept queue at {cap}. Raise the sysctl to use the larger value."
+            );
+        }
+    }
     // Install `ConnectInfo<SocketAddr>` so the TCP peer address is available
     // in request extensions. Without it, `extract_client_ip_addr` never sees
     // a peer and the per-IP rate-limit key degenerates to the constant
@@ -1296,9 +1628,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // injecting `ConnectInfo` fails here at startup. Gated to the serve path
     // so unit tests that build the Router directly never trip it.
     assert_connect_info_wired(app.clone()).await;
-    axum::serve(listener, connect_info_make_service(app))
-        .with_graceful_shutdown(async move { http_shutdown_token.cancelled().await })
-        .await?;
+    //
+    // Served through `api::serve` rather than `axum::serve` so slow clients
+    // are bounded by HTTP_HEADER_READ_TIMEOUT_SECS (#4665): axum 0.7 sets no
+    // hyper timer, so a client trickling its request head held the socket
+    // indefinitely.
+    artifact_keeper_backend::api::serve::serve(
+        listener,
+        connect_info_make_service(app),
+        config.http_header_read_timeout(),
+        async move { http_shutdown_token.cancelled().await },
+    )
+    .await?;
 
     tracing::info!("HTTP server shut down");
 
@@ -1306,7 +1647,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 }
 
 /// The single source of truth for installing `ConnectInfo<SocketAddr>` on the
-/// HTTP serve path (#2023). Both the real `axum::serve` call and the boot-time
+/// HTTP serve path (#2023). Both the real `api::serve::serve` call and the boot-time
 /// guard route through this adapter, so the guard validates exactly the wiring
 /// that is served — reverting it (e.g. to a plain `into_make_service()`) is a
 /// one-line change here that the guard then catches at startup.
@@ -1433,6 +1774,29 @@ fn main() -> Result<()> {
 ///
 /// Creates the plugin registry, loads active plugins from the database,
 /// and returns both the registry and the plugin service.
+async fn initialize_wasm_plugins_if_enabled(
+    config: &Config,
+    db_pool: sqlx::PgPool,
+    plugins_dir: PathBuf,
+) -> Result<Option<(Arc<PluginRegistry>, Arc<WasmPluginService>)>> {
+    if !config.plugins_enabled {
+        tracing::info!(
+            event = "plugins_disabled_by_operator",
+            "WASM plugin runtime disabled by operator"
+        );
+        return Ok(None);
+    }
+
+    initialize_wasm_plugins(
+        db_pool,
+        plugins_dir,
+        config.plugins_require_signed,
+        config.plugins_trusted_pubkey.clone(),
+    )
+    .await
+    .map(Some)
+}
+
 async fn initialize_wasm_plugins(
     db_pool: sqlx::PgPool,
     plugins_dir: PathBuf,
@@ -1722,6 +2086,20 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a secret for a path where a broken `<NAME>_FILE` must not take the
+/// process down (#4142): log the error — naming the variable and the path,
+/// never the contents — and treat the secret as absent, exactly as if the
+/// variable were unset.
+fn env_secret_or_log(name: &str, on_error: &str) -> Option<String> {
+    match artifact_keeper_backend::config::secret_or_env(name) {
+        Ok(secret) => secret,
+        Err(e) => {
+            tracing::error!(error = %e, "{name}_FILE is set but unusable; {on_error}");
+            None
+        }
+    }
+}
+
 /// Build a CreateOidcConfigRequest from OIDC_* environment variables.
 /// Returns None if any of the three required env vars are missing or empty.
 ///
@@ -1739,7 +2117,7 @@ fn build_oidc_bootstrap_request(
         name: std::env::var("OIDC_NAME").ok(),
         issuer: std::env::var("OIDC_ISSUER").ok(),
         client_id: std::env::var("OIDC_CLIENT_ID").ok(),
-        client_secret: std::env::var("OIDC_CLIENT_SECRET").ok(),
+        client_secret: env_secret_or_log("OIDC_CLIENT_SECRET", "not bootstrapping OIDC"),
         scopes: std::env::var("OIDC_SCOPES").ok(),
         groups_claim: std::env::var("OIDC_GROUPS_CLAIM").ok(),
         admin_group: std::env::var("OIDC_ADMIN_GROUP").ok(),
@@ -1760,86 +2138,85 @@ fn build_oidc_bootstrap_request(
 /// The provider named by LDAP_NAME (default `default`) is reconciled on every
 /// boot. If providers already exist but none carries that name, bootstrap skips
 /// creation and warns rather than duplicating a pre-existing provider (#1887).
+/// The reconcile writes only the fields the environment owns and preserves
+/// admin-API-set values for the rest (#3904); the rule lives in
+/// `services::ldap_env_bootstrap`.
 async fn bootstrap_ldap_from_env(db: &sqlx::PgPool) -> Result<()> {
-    use artifact_keeper_backend::services::auth_config_service::{
-        plan_provider_reconcile, AuthConfigService, ReconcileAction,
+    use artifact_keeper_backend::services::auth_config_service::AuthConfigService;
+    use artifact_keeper_backend::services::ldap_env_bootstrap::{
+        reconcile_ldap_from_env, warn_discarded_fields, LdapEnvOutcome,
     };
 
     let req = match build_ldap_bootstrap_request() {
         Some(r) => r,
-        None => return Ok(()),
-    };
-
-    // Reconcile the env-managed provider (matched by name) on every boot so
-    // changing LDAP_* env and redeploying takes effect. Other (UI-created)
-    // providers are left untouched.
-    let existing = AuthConfigService::list_ldap(db).await?;
-    let pairs: Vec<(uuid::Uuid, String)> =
-        existing.iter().map(|c| (c.id, c.name.clone())).collect();
-
-    match plan_provider_reconcile(&req.name, &pairs) {
-        ReconcileAction::Create => {
-            let config = AuthConfigService::create_ldap(db, req).await?;
-            tracing::info!(
-                "Bootstrapped LDAP provider '{}' (id={}) from environment variables",
-                config.name,
-                config.id
-            );
+        None => {
+            // LDAP_* is not set: disable any provider the env bootstrap still
+            // manages (#4857, the #2819 OIDC pattern), so the login page
+            // stops offering only an LDAP form for a directory the operator
+            // removed and local login recovers once no enabled provider
+            // remains. Admin-created providers, and env-seeded ones an
+            // administrator re-enabled, are untouched.
+            for name in AuthConfigService::disable_env_managed_ldap(db).await? {
+                tracing::warn!(
+                    "Disabled LDAP provider '{}': it was seeded from LDAP_* environment \
+                     variables that are no longer set. Re-enable it via the admin API to keep \
+                     using it (that also takes manual ownership of it).",
+                    name
+                );
+            }
+            return Ok(());
         }
-        ReconcileAction::Update(id) => {
-            let name = req.name.clone();
-            let cfg = AuthConfigService::update_ldap(db, id, req.into()).await?;
+    };
+    let wanted = req.name.clone();
+
+    match reconcile_ldap_from_env(db, req).await? {
+        LdapEnvOutcome::Created { id, name } => tracing::info!(
+            "Bootstrapped LDAP provider '{}' (id={}) from environment variables",
+            name,
+            id
+        ),
+        LdapEnvOutcome::Reconciled {
+            id,
+            name,
+            discarded,
+        } => {
+            warn_discarded_fields(&name, &discarded);
             tracing::info!(
                 "Reconciled env-managed LDAP provider '{}' (id={}) from environment variables",
                 name,
-                cfg.id
+                id
             );
         }
-        ReconcileAction::Skip(existing_name) => {
-            tracing::warn!(
-                "LDAP_* env set but an LDAP provider ('{}') already exists and none is named \
-                 '{}'; env bootstrap skipped to avoid creating a duplicate. Set LDAP_NAME to the \
-                 existing provider's name (or rename it to '{}') to let env vars manage it, or \
-                 unset LDAP_*.",
-                existing_name,
-                req.name,
-                req.name
-            );
-        }
+        LdapEnvOutcome::Skipped { existing_name } => tracing::warn!(
+            "LDAP_* env set but an LDAP provider ('{}') already exists and none is named \
+             '{}'; env bootstrap skipped to avoid creating a duplicate. Set LDAP_NAME to the \
+             existing provider's name (or rename it to '{}') to let env vars manage it, or \
+             unset LDAP_*.",
+            existing_name,
+            wanted,
+            wanted
+        ),
     }
 
     Ok(())
 }
 
-/// Raw LDAP environment variable values for bootstrap.
-#[derive(Default)]
-struct LdapEnvVars {
-    name: Option<String>,
-    url: Option<String>,
-    base_dn: Option<String>,
-    bind_dn: Option<String>,
-    bind_password: Option<String>,
-    user_filter: Option<String>,
-    username_attr: Option<String>,
-    email_attr: Option<String>,
-    display_name_attr: Option<String>,
-    groups_attr: Option<String>,
-    group_base_dn: Option<String>,
-    group_filter: Option<String>,
-    admin_group_dn: Option<String>,
-    use_starttls: Option<String>,
-}
-
 /// Build a CreateLdapConfigRequest from LDAP_* environment variables.
-/// Returns None if any of the required env vars are missing or empty.
+/// Returns None if any of the required env vars are missing or empty. The
+/// assembly itself lives in `services::ldap_env_bootstrap` so the library's
+/// unit-test target covers it.
 fn build_ldap_bootstrap_request(
 ) -> Option<artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest> {
+    use artifact_keeper_backend::services::ldap_env_bootstrap::{
+        build_ldap_request_from_values, LdapEnvVars,
+    };
+
     build_ldap_request_from_values(LdapEnvVars {
         name: std::env::var("LDAP_NAME").ok(),
         url: std::env::var("LDAP_URL").ok(),
         base_dn: std::env::var("LDAP_BASE_DN").ok(),
         bind_dn: std::env::var("LDAP_BIND_DN").ok(),
-        bind_password: std::env::var("LDAP_BIND_PASSWORD").ok(),
+        bind_password: env_secret_or_log("LDAP_BIND_PASSWORD", "not bootstrapping LDAP"),
         user_filter: std::env::var("LDAP_USER_FILTER").ok(),
         username_attr: std::env::var("LDAP_USERNAME_ATTR").ok(),
         email_attr: std::env::var("LDAP_EMAIL_ATTR").ok(),
@@ -1849,52 +2226,6 @@ fn build_ldap_bootstrap_request(
         group_filter: std::env::var("LDAP_GROUP_FILTER").ok(),
         admin_group_dn: std::env::var("LDAP_ADMIN_GROUP_DN").ok(),
         use_starttls: std::env::var("LDAP_USE_STARTTLS").ok(),
-    })
-}
-
-/// Pure function that assembles a CreateLdapConfigRequest from optional values.
-/// Returns None if the LDAP server URL or base DN are missing or empty: both
-/// are required to bind and search the directory.
-fn build_ldap_request_from_values(
-    env: LdapEnvVars,
-) -> Option<artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest> {
-    use artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest;
-
-    let server_url = env.url.filter(|v| !v.is_empty())?;
-    let user_base_dn = env.base_dn.filter(|v| !v.is_empty())?;
-
-    let name = env
-        .name
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "default".to_string());
-
-    let use_starttls = env
-        .use_starttls
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-
-    Some(CreateLdapConfigRequest {
-        name,
-        server_url,
-        bind_dn: env.bind_dn.filter(|v| !v.is_empty()),
-        bind_password: env.bind_password.filter(|v| !v.is_empty()),
-        user_base_dn,
-        user_filter: env.user_filter.filter(|v| !v.is_empty()),
-        group_base_dn: env.group_base_dn.filter(|v| !v.is_empty()),
-        group_filter: env.group_filter.filter(|v| !v.is_empty()),
-        email_attribute: env.email_attr.filter(|v| !v.is_empty()),
-        display_name_attribute: env.display_name_attr.filter(|v| !v.is_empty()),
-        username_attribute: env.username_attr.filter(|v| !v.is_empty()),
-        groups_attribute: env.groups_attr.filter(|v| !v.is_empty()),
-        admin_group_dn: env.admin_group_dn.filter(|v| !v.is_empty()),
-        use_starttls: Some(use_starttls),
-        // TLS trust for the env-bootstrapped provider stays governed by the
-        // global LDAP_INSECURE_TLS / LDAP_CA_CERT_PATH env fallback (#2782);
-        // the per-provider overrides are set via the admin SSO API.
-        insecure_skip_verify: None,
-        ca_certificate: None,
-        is_enabled: Some(true),
-        priority: Some(0),
     })
 }
 
@@ -1927,6 +2258,13 @@ async fn provision_admin_user(
         );
         return Ok(false);
     }
+
+    // #4142: ADMIN_PASSWORD may also come from a mounted secret file
+    // (ADMIN_PASSWORD_FILE). Resolve it once so every read below sees the
+    // same value; a configured-but-unusable file aborts startup rather than
+    // silently degrading to a generated password.
+    let admin_password = artifact_keeper_backend::config::secret_or_env("ADMIN_PASSWORD")
+        .map_err(artifact_keeper_backend::error::AppError::Config)?;
 
     // #2803: a password preset by the deployment (env var, or a mounted
     // secret file) is consulted ONLY on the create branch below, so a restart
@@ -2007,16 +2345,47 @@ async fn provision_admin_user(
     // `external_id IS NOT NULL` routes that case to the create branch, whose
     // upsert is itself guarded against clobbering a federated row.
     //
+    // The row examined here is the built-in `admin` account and only that one
+    // (#4634). Everything that follows -- arming the setup gate, regenerating
+    // `admin.password`, rewriting the password hash -- is about that account
+    // (every write below is keyed on `username = 'admin'`, and the password
+    // file and the setup instructions name it). The lookup used to be
+    // `LIMIT 1` over EVERY local admin with no `ORDER BY`, so an unrelated
+    // admin created in the UI with a temporary password and not yet logged in
+    // could be the row returned: the gate armed on its flag and the real
+    // `admin`, with nothing pending, had its password replaced. Other admins
+    // with a pending change are still forced to rotate at their own login.
+    //
     // `is_active` is read alongside, NOT filtered on (#3723): filtering would
     // route a deactivated built-in admin to the create branch, whose upsert
     // overwrites its hash and re-arms the gate on every boot.
     let admin_row: Option<(bool, bool)> = sqlx::query_as(
         "SELECT must_change_password, is_active FROM users \
-         WHERE is_admin = true AND external_id IS NULL LIMIT 1",
+         WHERE username = 'admin' AND is_admin = true AND external_id IS NULL",
     )
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    // No built-in `admin`, but another local admin exists (the operator renamed
+    // or removed it): an admin account is already provisioned, so there is
+    // nothing to create, no password to regenerate and no gate to arm. This is
+    // the "an admin exists" half of the old lookup, kept as a plain existence
+    // check that cannot depend on row order.
+    if admin_row.is_none() {
+        let other_local_admin: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE is_admin = true AND external_id IS NULL)",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+        if other_local_admin {
+            tx.commit()
+                .await
+                .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+            return Ok(false);
+        }
+    }
 
     let demo_mode = matches!(std::env::var("DEMO_MODE").as_deref(), Ok("true" | "1"));
 
@@ -2033,9 +2402,15 @@ async fn provision_admin_user(
         .await
         .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
+        // #4313: say so when ADMIN_PASSWORD no longer matches the account.
+        // It only seeds the admin on first boot, so editing it afterwards (a
+        // quickstart user trying to "set" the password in .env) used to
+        // change nothing and leave no trace of why the login kept failing.
+        admin_password_env_ignored(&mut tx, admin_password.clone()).await?;
+
         if !must_change && !demo_mode {
-            if let Ok(env_pw) = std::env::var("ADMIN_PASSWORD") {
-                if is_insecure_default_password(&env_pw) {
+            if let Some(env_pw) = admin_password.as_deref() {
+                if is_insecure_default_password(env_pw) {
                     tracing::warn!("ADMIN_PASSWORD matches a well-known default.");
                     sqlx::query(
                         "UPDATE users SET must_change_password = true WHERE username = 'admin'",
@@ -2146,7 +2521,7 @@ async fn provision_admin_user(
         must_change,
         preset_from,
     } = match decide_initial_admin_credential(
-        std::env::var("ADMIN_PASSWORD").ok(),
+        admin_password.clone(),
         preset_password,
         demo_mode,
         policy,
@@ -2257,13 +2632,57 @@ async fn provision_admin_user(
         // password came from ADMIN_PASSWORD but matched an insecure default,
         // it was already supplied by the operator and is presumably logged
         // elsewhere; we still force a change but don't re-emit it.
-        let echo = std::env::var("ADMIN_PASSWORD").ok().is_none();
+        let echo = admin_password.is_none();
         log_admin_setup_banner(&password_file, echo.then_some(password.as_str()));
         Ok(true)
     } else {
         tracing::info!("Admin user created with password from ADMIN_PASSWORD env var");
         Ok(false)
     }
+}
+
+/// Whether `ADMIN_PASSWORD` is set but no longer matches the built-in admin
+/// account that already exists, logging a warning when it does not (#4313).
+///
+/// `ADMIN_PASSWORD` is applied only when the admin account is created; a
+/// restart never resets an existing password (#2803). An operator who edits
+/// the variable after the first boot therefore logs in with a password the
+/// account never had, and nothing said why. The value is compared, never
+/// logged.
+async fn admin_password_env_ignored(
+    tx: &mut sqlx::PgConnection,
+    admin_password: Option<String>,
+) -> Result<bool> {
+    let Some(env_pw) = admin_password.filter(|p| !p.is_empty()) else {
+        return Ok(false);
+    };
+    let hash: Option<String> = sqlx::query_scalar(
+        "SELECT password_hash FROM users \
+         WHERE username = 'admin' AND is_admin = true AND external_id IS NULL \
+           AND auth_provider = 'local'",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?
+    .flatten();
+    let Some(hash) = hash else {
+        return Ok(false);
+    };
+    if AuthService::verify_password(&env_pw, &hash)
+        .await
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    tracing::warn!(
+        "ADMIN_PASSWORD is set but does not match the existing 'admin' account, so it is \
+         being ignored: it only sets the password when the account is first created, and a \
+         restart never resets it. Log in with the password from the first boot (an \
+         installer-generated .env records it; otherwise see admin.password in the storage \
+         volume) and change it in the UI. For a fresh evaluation stack, remove the volumes \
+         (docker compose down -v) and start again."
+    );
+    Ok(true)
 }
 
 /// Generate a random 20-character password for the admin user.
@@ -2718,10 +3137,9 @@ mod tests {
     /// creating tests outside it. Un-ignore with the fix in #3796.
     #[tokio::test]
     async fn provision_admin_user_does_not_arm_gate_for_inactive_admin_3723() {
-        // Runs on its own freshly-migrated database (#3796): the function's
-        // existing-admin lookup is `LIMIT 1` over every local admin, so the
-        // shared unit-test database, where hundreds of tests create admins,
-        // could never guarantee the precondition this test needs.
+        // Runs on its own freshly-migrated database (#3796): the shared
+        // unit-test database, where hundreds of tests create admins, could
+        // never guarantee the precondition this test needs.
         let Some(iso) = artifact_keeper_backend::testing::try_isolated_pool().await else {
             return;
         };
@@ -2735,9 +3153,8 @@ mod tests {
             .execute(&pool)
             .await
             .expect("clear leftover");
-        // The lookup under test is `LIMIT 1` over every local admin, so any
-        // other local admin row (a leftover from an aborted run of another
-        // DB-backed test) would make its result arbitrary. Say so up front
+        // Any other local admin row (a leftover from an aborted run of another
+        // DB-backed test) would change which branch runs. Say so up front
         // rather than failing a later assertion for an unrelated reason.
         sqlx::query(
             "INSERT INTO users (username, email, password_hash, auth_provider, is_admin,                                 must_change_password, is_active)              VALUES ('admin', $1, 'seed-hash-3723', 'local', true, true, false)",
@@ -2811,6 +3228,85 @@ mod tests {
         );
         assert!(file_written, "the missing password file is regenerated");
         assert_ne!(hash_after, "seed-hash-3723");
+    }
+
+    /// #4634: an unrelated admin that still holds a temporary password must
+    /// not arm the setup gate or cause the built-in `admin`'s password to be
+    /// regenerated. The pending admin is inserted FIRST, so a sequential scan
+    /// (what the old `LIMIT 1` lookup did on a table this small) returns it
+    /// before `admin`.
+    #[tokio::test]
+    async fn provision_admin_user_ignores_other_admins_pending_change_4634() {
+        let Some(iso) = artifact_keeper_backend::testing::try_isolated_pool().await else {
+            return;
+        };
+        let pool = iso.pool.clone();
+        for (username, hash, must_change) in [
+            ("pending-4634", "seed-hash-pending", true),
+            ("admin", "seed-hash-admin", false),
+        ] {
+            sqlx::query(
+                "INSERT INTO users (username, email, password_hash, auth_provider, is_admin, \
+                                    must_change_password) \
+                 VALUES ($1, $2, $3, 'local', true, $4)",
+            )
+            .bind(username)
+            .bind(format!("{username}@test.local"))
+            .bind(hash)
+            .bind(must_change)
+            .execute(&pool)
+            .await
+            .expect("seed admin");
+        }
+        async fn hash_of(pool: &sqlx::PgPool, username: &str) -> Option<String> {
+            sqlx::query_scalar::<_, String>("SELECT password_hash FROM users WHERE username = $1")
+                .bind(username)
+                .fetch_optional(pool)
+                .await
+                .expect("read hash")
+        }
+
+        let dir = std::env::temp_dir().join(format!("ak-provision-4634-{}", uuid::Uuid::new_v4()));
+        let password_file = dir.join("admin.password");
+        let policy = PasswordPolicyConfig::default();
+
+        let armed = provision_admin_user(&pool, dir.to_str().unwrap(), &policy)
+            .await
+            .expect("provision_admin_user");
+        let admin_hash = hash_of(&pool, "admin").await;
+        let pending_hash = hash_of(&pool, "pending-4634").await;
+        let file_written = password_file.exists();
+
+        // No built-in `admin` at all (renamed or removed), another admin still
+        // pending: nothing is created, regenerated or armed either.
+        sqlx::query("DELETE FROM users WHERE username = 'admin'")
+            .execute(&pool)
+            .await
+            .expect("remove built-in admin");
+        let armed_without_builtin = provision_admin_user(&pool, dir.to_str().unwrap(), &policy)
+            .await
+            .expect("provision_admin_user (no built-in admin)");
+        let recreated = hash_of(&pool, "admin").await;
+        let file_written_without_builtin = password_file.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !armed,
+            "another admin's pending change must not arm the gate"
+        );
+        assert_eq!(
+            admin_hash.as_deref(),
+            Some("seed-hash-admin"),
+            "the built-in admin's password must not be regenerated"
+        );
+        assert_eq!(pending_hash.as_deref(), Some("seed-hash-pending"));
+        assert!(!file_written, "no admin.password may be written");
+        assert!(
+            !armed_without_builtin,
+            "a missing built-in admin with another admin present arms nothing"
+        );
+        assert_eq!(recreated, None, "an existing admin means no new admin");
+        assert!(!file_written_without_builtin);
     }
 
     // -----------------------------------------------------------------
@@ -2997,6 +3493,50 @@ mod tests {
             &strict,
         )
         .is_err());
+    }
+
+    /// #4313: an ADMIN_PASSWORD edited after the first boot is reported as
+    /// ignored instead of silently doing nothing; the first-boot value, an
+    /// unset or empty variable, and a missing account are not.
+    #[tokio::test]
+    async fn changed_admin_password_env_is_reported_as_ignored_4313() {
+        let Some(iso) = artifact_keeper_backend::testing::try_isolated_pool().await else {
+            return;
+        };
+        let pool = iso.pool.clone();
+        let mut conn = pool.acquire().await.expect("conn");
+        assert!(
+            !admin_password_env_ignored(&mut conn, Some("Anything-4313!".into()))
+                .await
+                .expect("no admin yet"),
+            "no account yet: nothing to compare"
+        );
+        let hash = AuthService::hash_password("First-Boot-4313!")
+            .await
+            .expect("hash");
+        sqlx::query(
+            "INSERT INTO users (username, email, password_hash, is_admin, must_change_password, \
+             auth_provider) VALUES ('admin', 'admin@localhost', $1, true, false, 'local')",
+        )
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("seed admin");
+
+        for (value, ignored) in [
+            (Some("Edited-Later-4313!"), true),
+            (Some("First-Boot-4313!"), false),
+            (Some(""), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                admin_password_env_ignored(&mut conn, value.map(str::to_string))
+                    .await
+                    .expect("compare"),
+                ignored,
+                "{value:?}"
+            );
+        }
     }
 
     /// End-to-end over the real provisioning path: first boot installs the
@@ -3430,158 +3970,40 @@ mod tests {
         assert_eq!(hash.len(), 48, "SHA-384 produces 48 bytes");
     }
 
-    // -----------------------------------------------------------------------
-    // build_ldap_request_from_values (issue #1434)
-    // -----------------------------------------------------------------------
-
-    fn ldap_env(url: Option<&str>, base_dn: Option<&str>) -> LdapEnvVars {
-        LdapEnvVars {
-            url: url.map(String::from),
-            base_dn: base_dn.map(String::from),
+    #[tokio::test]
+    async fn disabled_plugins_skip_runtime_directory_and_database_loading() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("must-not-be-created");
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake").unwrap();
+        let config = Config {
+            plugins_enabled: false,
             ..Default::default()
-        }
+        };
+        let services = initialize_wasm_plugins_if_enabled(&config, pool, plugins_dir.clone())
+            .await
+            .expect("disabled plugins must not initialize runtime state");
+        assert!(services.is_none());
+        assert!(!plugins_dir.exists());
     }
 
-    #[test]
-    fn test_ldap_bootstrap_request_required_fields() {
-        let req = build_ldap_request_from_values(ldap_env(
-            Some("ldap://dc.local:389"),
-            Some("DC=domain,DC=local"),
-        ))
-        .unwrap();
-
-        assert_eq!(req.name, "default");
-        assert_eq!(req.server_url, "ldap://dc.local:389");
-        assert_eq!(req.user_base_dn, "DC=domain,DC=local");
-        // Bootstrapped providers are enabled so they show up in the SSO list.
-        assert_eq!(req.is_enabled, Some(true));
-        assert_eq!(req.priority, Some(0));
-        assert_eq!(req.use_starttls, Some(false));
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_name_override() {
-        // LDAP_NAME lets operators point the env-managed provider at an
-        // existing one, mirroring OIDC_NAME (#1887).
-        let req = build_ldap_request_from_values(LdapEnvVars {
-            name: Some("Corporate AD".to_string()),
-            url: Some("ldap://dc.local:389".to_string()),
-            base_dn: Some("DC=domain,DC=local".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(req.name, "Corporate AD");
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_empty_name_defaults() {
-        let req = build_ldap_request_from_values(LdapEnvVars {
-            name: Some("".to_string()),
-            url: Some("ldap://dc.local:389".to_string()),
-            base_dn: Some("DC=domain,DC=local".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(req.name, "default");
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_missing_url() {
-        let req = build_ldap_request_from_values(ldap_env(None, Some("DC=domain,DC=local")));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_missing_base_dn() {
-        let req = build_ldap_request_from_values(ldap_env(Some("ldap://dc.local:389"), None));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_empty_url() {
-        let req = build_ldap_request_from_values(ldap_env(Some(""), Some("DC=domain,DC=local")));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_empty_base_dn() {
-        let req = build_ldap_request_from_values(ldap_env(Some("ldap://dc.local:389"), Some("")));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_full_active_directory_config() {
-        // Mirrors the Active Directory example from issue #1434.
-        let req = build_ldap_request_from_values(LdapEnvVars {
-            name: None,
-            url: Some("ldap://dc.local:389".to_string()),
-            base_dn: Some("DC=domain,DC=local".to_string()),
-            bind_dn: Some("user@domain".to_string()),
-            bind_password: Some("superPassword".to_string()),
-            user_filter: Some("(sAMAccountName={0})".to_string()),
-            username_attr: Some("sAMAccountName".to_string()),
-            email_attr: None,
-            display_name_attr: None,
-            groups_attr: None,
-            group_base_dn: Some("OU=Groups,DC=domain,DC=local".to_string()),
-            group_filter: Some("(memberUid={0})".to_string()),
-            admin_group_dn: Some("CN=admin_users_group,OU=Groups,DC=domain,DC=local".to_string()),
-            use_starttls: Some("false".to_string()),
-        })
-        .unwrap();
-
-        assert_eq!(req.bind_dn.as_deref(), Some("user@domain"));
-        assert_eq!(req.bind_password.as_deref(), Some("superPassword"));
-        assert_eq!(req.user_filter.as_deref(), Some("(sAMAccountName={0})"));
-        assert_eq!(req.username_attribute.as_deref(), Some("sAMAccountName"));
-        assert_eq!(
-            req.group_base_dn.as_deref(),
-            Some("OU=Groups,DC=domain,DC=local")
-        );
-        assert_eq!(req.group_filter.as_deref(), Some("(memberUid={0})"));
-        assert_eq!(
-            req.admin_group_dn.as_deref(),
-            Some("CN=admin_users_group,OU=Groups,DC=domain,DC=local")
-        );
-        assert_eq!(req.use_starttls, Some(false));
-        assert_eq!(req.is_enabled, Some(true));
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_starttls_truthy_values() {
-        for v in ["true", "1"] {
-            let req = build_ldap_request_from_values(LdapEnvVars {
-                url: Some("ldap://dc.local:389".to_string()),
-                base_dn: Some("DC=domain,DC=local".to_string()),
-                use_starttls: Some(v.to_string()),
-                ..Default::default()
-            })
-            .unwrap();
-            assert_eq!(
-                req.use_starttls,
-                Some(true),
-                "value {v} should enable STARTTLS"
-            );
-        }
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_empty_optional_fields_become_none() {
-        // Empty strings (e.g. unset compose interpolations) must not produce
-        // empty bind DNs or filters that would break directory binds.
-        let req = build_ldap_request_from_values(LdapEnvVars {
-            url: Some("ldap://dc.local:389".to_string()),
-            base_dn: Some("DC=domain,DC=local".to_string()),
-            bind_dn: Some("".to_string()),
-            bind_password: Some("".to_string()),
-            user_filter: Some("".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-
-        assert!(req.bind_dn.is_none());
-        assert!(req.bind_password.is_none());
-        assert!(req.user_filter.is_none());
+    /// The default (`PLUGINS_ENABLED` unset) still builds the runtime: the
+    /// registry and service come back and the plugins directory is created,
+    /// exactly as before the gate existed (#4650).
+    #[tokio::test]
+    async fn enabled_plugins_initialize_runtime_and_create_directory() {
+        let Some(iso) = artifact_keeper_backend::testing::try_isolated_pool().await else {
+            return;
+        };
+        let temp_dir = tempfile::tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("plugins");
+        let config = Config::default();
+        assert!(config.plugins_enabled, "the runtime is on by default");
+        let services =
+            initialize_wasm_plugins_if_enabled(&config, iso.pool.clone(), plugins_dir.clone())
+                .await
+                .expect("enabled plugins initialize the runtime");
+        assert!(services.is_some());
+        assert!(plugins_dir.is_dir());
     }
 }
 // warm cache benchmark

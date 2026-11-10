@@ -6,87 +6,189 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "repository_id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "repository_id"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "name",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "name"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "key_type",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "key_type"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "fingerprint",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "fingerprint"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "key_id",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "key_id"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "public_key_pem",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "public_key_pem"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "private_key_enc",
-        "type_info": "Bytea"
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "private_key_enc"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "algorithm",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "algorithm"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "uid_name",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "uid_name"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "uid_email",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "uid_email"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "expires_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "expires_at"
+          }
+        }
       },
       {
         "ordinal": 12,
         "name": "is_active",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "is_active"
+          }
+        }
       },
       {
         "ordinal": 13,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 14,
         "name": "created_by",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "created_by"
+          }
+        }
       },
       {
         "ordinal": 15,
         "name": "rotated_from",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "rotated_from"
+          }
+        }
       },
       {
         "ordinal": 16,
         "name": "last_used_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "signing_keys",
+            "name": "last_used_at"
+          }
+        }
       }
     ],
     "parameters": {

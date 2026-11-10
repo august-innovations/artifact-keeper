@@ -65,7 +65,11 @@ pub fn test_config() -> Config {
 
 /// Build a `SharedState` over the given pool with a filesystem storage backend.
 pub fn build_state(pool: PgPool) -> SharedState {
-    let cfg = test_config();
+    build_state_with_config(pool, test_config())
+}
+
+/// [`build_state`] over a caller-adjusted [`test_config`].
+pub fn build_state_with_config(pool: PgPool, cfg: Config) -> SharedState {
     std::fs::create_dir_all(&cfg.storage_path).expect("create storage dir");
     let storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = Arc::new(
         artifact_keeper_backend::storage::filesystem::FilesystemStorage::new(&cfg.storage_path),

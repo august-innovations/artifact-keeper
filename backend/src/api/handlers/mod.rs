@@ -4,12 +4,143 @@ use axum::http::HeaderMap;
 
 /// Request marker set by peer replication writes. Receiving handlers use this
 /// to avoid queuing the replicated write back to the origin peer.
+///
+/// The marker is a client-set header, so it is a routing hint only (sync-loop
+/// suppression, the OCI replication routes' entry check). It never grants a
+/// privilege on its own: every replication *exemption* goes through
+/// [`trusted_peer_replication`] (#5455).
 pub(crate) fn is_replication_request(headers: &HeaderMap) -> bool {
     headers
         .get("x-artifact-keeper-replication")
         .and_then(|value| value.to_str().ok())
         .map(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
         .unwrap_or(false)
+}
+
+/// Whether this request is a peer replication that may take a replication
+/// exemption: skipping the storage quota, bringing the source row's metadata
+/// instead of the server deriving it, refreshing an identical or mutable
+/// replicated row in place, deleting a released (immutable) artifact, or
+/// writing to and deleting from an MCP registry through the generic routes.
+///
+/// The one decision for every such exemption (#5455), so the chunked, raw,
+/// multipart, delete and immutability paths cannot drift apart. The
+/// replication header is client-set, so it must accompany an independently
+/// authenticated peer identity. Nothing binds an inbound credential to a
+/// registered peer (`peer_instances.api_key` is the key this instance
+/// presents to that peer, not the one the peer presents here); a peer link
+/// is set up with an instance administrator's token on the receiving side,
+/// and an administrator can already override every one of these checks, so
+/// the administrator is the peer identity. A service account is an ordinary
+/// writer: with the header it gets exactly what it gets without it.
+///
+/// Fan-out suppression (not queuing a replicated write back out to peers)
+/// stays keyed on the raw header ([`is_replication_request`]) by design. A
+/// writer that forges it can only keep its own write from fanning out, which
+/// it could equally do by not writing; keying it on this decision instead
+/// would make a peer whose key is a service-account token push every write it
+/// receives straight back to the origin, a replication loop.
+pub(crate) fn trusted_peer_replication(
+    auth: &crate::api::middleware::auth::AuthExtension,
+    headers: &HeaderMap,
+) -> bool {
+    trusted_peer_replication_marked(auth, is_replication_request(headers))
+}
+
+/// [`trusted_peer_replication`] for a call site whose replication marker is
+/// not (only) the request header: a chunked upload session records the
+/// marker at creation and the completion request may not repeat it.
+pub(crate) fn trusted_peer_replication_marked(
+    auth: &crate::api::middleware::auth::AuthExtension,
+    marked: bool,
+) -> bool {
+    if marked && !auth.is_admin {
+        warn_ignored_replication_header(auth);
+    }
+    marked && auth.is_admin
+}
+
+/// Seconds between two [`warn_ignored_replication_header`] lines, so a peer
+/// pushing a backlog under the wrong key logs once a minute, not per request.
+const IGNORED_REPLICATION_WARN_INTERVAL_SECS: i64 = 60;
+
+/// Unix seconds of the last [`warn_ignored_replication_header`] line.
+static IGNORED_REPLICATION_LAST_WARN: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// Whether a throttled warning last written at `last` is due again at `now`.
+fn throttled_warn_due(last: i64, now: i64, interval: i64) -> bool {
+    last == i64::MIN || now.saturating_sub(last) >= interval
+}
+
+/// Rate-limited operator hint (#5455): a request carried the replication
+/// header under a credential that is not an administrator's, so it was
+/// handled as an ordinary write. Usually a peer link whose key here is a
+/// service-account token.
+fn warn_ignored_replication_header(auth: &crate::api::middleware::auth::AuthExtension) {
+    use std::sync::atomic::Ordering;
+    let now = chrono::Utc::now().timestamp();
+    let last = IGNORED_REPLICATION_LAST_WARN.load(Ordering::Relaxed);
+    if !throttled_warn_due(last, now, IGNORED_REPLICATION_WARN_INTERVAL_SECS) {
+        return;
+    }
+    if IGNORED_REPLICATION_LAST_WARN
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    tracing::warn!(
+        user_id = %auth.user_id,
+        username = %auth.username,
+        service_account = auth.is_service_account,
+        "replication header from non-admin principal ignored; re-issue the peer key as an \
+         administrator token"
+    );
+}
+
+/// Queue push sync tasks for a freshly committed hosted upload so every
+/// subscribed push/mirror peer receives it (#4725).
+///
+/// The native-format handlers write their artifact rows directly, so they do
+/// not pass through `ArtifactService::finalize_upload`, which queues these
+/// tasks for the generic upload path. This helper is the shared replacement:
+/// call it once the artifact row (and its metadata) is committed, with the
+/// request's headers so a peer replication write is never fanned back out to
+/// other peers.
+pub(crate) async fn queue_push_sync_tasks_for_upload(
+    db: &sqlx::PgPool,
+    headers: &HeaderMap,
+    repository_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    path: &str,
+    size_bytes: i64,
+) {
+    if is_replication_request(headers) {
+        return;
+    }
+    queue_push_sync_tasks_now(db, repository_id, artifact_id, path, size_bytes).await;
+}
+
+/// [`queue_push_sync_tasks_for_upload`] for a call site that already knows the
+/// write is not a replication (it threaded an `enqueue_sync_tasks: bool` down
+/// from its handler instead of the `HeaderMap`).
+pub(crate) async fn queue_push_sync_tasks_now(
+    db: &sqlx::PgPool,
+    repository_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    path: &str,
+    size_bytes: i64,
+) {
+    crate::services::peer_instance_service::PeerInstanceService::new(db.clone())
+        .queue_push_sync_tasks(&crate::services::peer_instance_service::PublishedArtifact {
+            id: artifact_id,
+            repository_id,
+            path,
+            size_bytes,
+            created_at: chrono::Utc::now(),
+        })
+        .await;
 }
 
 /// Remove any soft-deleted artifact at the given `(repository_id, path)` so
@@ -154,15 +285,31 @@ pub fn db_err(e: impl std::fmt::Display) -> axum::response::Response {
     error_helpers::map_db_err(e.to_string())
 }
 
+/// Whether a database error, as its rendered text, means the database could
+/// not be reached or could not answer (#4750). Format handlers only hold the
+/// error's `Display` (a `sqlx::Error`, or the `String` a cache or service
+/// wrapped it in), so this routes it through the same
+/// [`crate::error::AppError::is_db_unavailable`] the generic path uses
+/// instead of keeping a second list of markers (#4765).
+fn is_db_unavailable_display<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
+    crate::error::AppError::Database(e.to_string()).is_db_unavailable()
+}
+
 /// Pick the HTTP status for a database error when the response envelope is
 /// format-specific (npm/OCI/Git-LFS/etc.) and cannot go through `db_err`.
 ///
 /// A saturated sqlx pool is transient capacity, so it must surface as 503
-/// (clients back off); every other DB failure stays 500. Callers keep their
-/// own format-specific error body and pass this for the status argument
-/// (#2083).
+/// (clients back off) (#2083). So must a database that cannot be reached or
+/// cannot answer: a closed pool, a lost or refused connection, a statement
+/// timeout, a server shutting down. That is the same classification
+/// [`crate::error::AppError::is_db_unavailable`] gives the generic path
+/// (#4750), so an `npm install`, a `docker pull` or a Git LFS batch during an
+/// outage sees a retryable 503 rather than a 500 (#4765). Every other DB
+/// failure (a query or data error) stays 500. Callers keep their own
+/// format-specific error body and pass this for the status argument; the
+/// envelope helpers add `Retry-After` through [`with_retry_after_on_503`].
 pub fn db_status<E: std::fmt::Display + ?Sized>(e: &E) -> axum::http::StatusCode {
-    if crate::error::is_pool_timeout(&e.to_string()) {
+    if is_db_unavailable_display(e) {
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     } else {
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -185,12 +332,17 @@ pub fn db_status<E: std::fmt::Display + ?Sized>(e: &E) -> axum::http::StatusCode
 ///
 /// Pool saturation is transient capacity rather than a fault, so it gets the
 /// same wording (and `WARN` level) as the `db_err` path; pair this with
-/// [`db_status`] for the matching 503 (#2083).
+/// [`db_status`] for the matching 503 (#2083). An unreachable database
+/// (#4750's classification) gets its own retry wording, logged at `ERROR`,
+/// matching the 503 `db_status` now picks for it (#4765).
 pub fn db_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
     let raw = e.to_string();
     if crate::error::is_pool_timeout(&raw) {
         tracing::warn!(error = %raw, code = "POOL_EXHAUSTED", "Request error");
         "Database connection pool is saturated, retry shortly"
+    } else if is_db_unavailable_display(&raw) {
+        tracing::error!(error = %raw, code = "DATABASE_UNAVAILABLE", "Request error");
+        "Database is temporarily unavailable, retry shortly"
     } else {
         tracing::error!(error = %raw, code = "DATABASE_ERROR", "Request error");
         "Database operation failed"
@@ -302,17 +454,56 @@ pub mod metadata_epoch;
 #[cfg(test)]
 pub(crate) mod test_db_helpers;
 
+#[cfg(test)]
+pub(crate) mod mcp_shadow_fixtures;
+
+/// #4559: router-level tests for tokens scoped to a virtual repository.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod virtual_token_scope_tests;
+
+/// #4690: router-level tests that a virtual's REST listings explain an empty
+/// result to a caller granted the virtual but none of its members.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod virtual_members_notice_tests;
+
+/// #4498: router-level tests that an unreadable repository answers exactly
+/// like a missing one on the REST read endpoints.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod repo_read_existence_tests;
+
+/// #4570: router-level tests that a Git LFS batch download action can be
+/// followed on a private repository.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod gitlfs_download_auth_tests;
+
+/// #4506: router-level tests that origin policies gate proxy-cache-only
+/// content of Remote repositories.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod proxy_origin_policy_tests;
+
 pub mod admin;
+pub mod admin_config;
 pub mod admin_security;
 pub mod age_gate;
+pub mod agent_plugins;
 pub mod alpine;
 pub mod analytics;
 pub mod ansible;
 pub mod approval;
 pub mod artifact_labels;
+pub mod artifact_presence;
 pub mod artifacts;
+pub mod attestations;
 pub mod auth;
+pub mod banners;
+pub mod bazel;
 pub mod builds;
+pub mod bundles;
 pub mod cache_headers;
 pub mod cargo;
 pub mod chef;
@@ -326,6 +517,8 @@ pub mod cran;
 pub mod curation;
 pub mod debian;
 pub mod dependency_track;
+pub mod device;
+pub mod download_holds;
 pub mod email_subscriptions;
 pub mod environments;
 pub mod events;
@@ -340,16 +533,28 @@ pub mod huggingface;
 pub mod image_builds;
 pub mod incus;
 pub mod jetbrains;
+pub mod last_promotion;
 pub mod lifecycle;
 pub mod maven;
 pub mod maven_proxy;
+pub mod mcp;
+pub mod mcp_capabilities;
+pub mod mcp_edges;
+pub mod mcp_health;
+pub mod mcp_namespace_proofs;
+pub mod mcp_remote;
+pub mod mcp_virtual;
+pub mod mcp_write;
 pub mod migration;
 pub mod monitoring;
 pub mod npm;
 pub mod nuget;
+pub mod oci_blob_redirect;
+pub mod oci_digest;
 pub mod oci_v2;
 pub mod package_analysis;
 pub mod packages;
+pub mod pacman;
 pub mod peer;
 pub mod peer_instance_labels;
 pub mod peers;
@@ -360,8 +565,13 @@ pub mod projects;
 pub mod promotion;
 pub mod promotion_rules;
 pub mod protobuf;
+pub mod protobuf_bsr;
+pub mod proxy_cache_cap;
 pub mod proxy_helpers;
+pub(crate) mod proxy_scan_archive;
+pub(crate) mod proxy_scan_inflight;
 pub mod pub_registry;
+pub mod publish_quota;
 pub mod puppet;
 pub mod pypi;
 pub mod quality_gates;
@@ -382,6 +592,7 @@ pub mod smtp;
 pub mod sso;
 pub mod sso_admin;
 pub mod storage_gc;
+pub mod storage_integrity;
 pub mod swift;
 pub mod sync_policies;
 pub mod system_config;
@@ -389,8 +600,10 @@ pub mod telemetry;
 pub mod terraform;
 pub mod totp;
 pub mod transfer;
+pub mod trash;
 pub mod tree;
 pub mod upload;
+pub mod upload_body;
 pub mod users;
 pub mod vscode;
 pub mod wasm_proxy;
@@ -548,7 +761,9 @@ mod tests {
 
     #[test]
     fn test_db_err_returns_500() {
-        let resp = db_err("connection refused");
+        // A query error, not an outage: an unreachable database is a 503
+        // since #4756.
+        let resp = db_err("error returned from database: relation \"t\" does not exist");
         assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -561,17 +776,48 @@ mod tests {
     }
 
     #[test]
-    fn test_db_status_sheds_pool_timeout_only() {
+    fn test_db_status_sheds_pool_timeout_and_outage_only() {
         // Format-specific envelopes (npm/OCI/Git-LFS/etc.) keep their body and
-        // pass db_status for the status: 503 on pool timeout, 500 otherwise.
+        // pass db_status for the status: 503 on pool timeout (#2083) or an
+        // unreachable database (#4765), 500 for a query or data error.
         assert_eq!(
             db_status(&sqlx::Error::PoolTimedOut.to_string()),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
-        assert_eq!(
-            db_status("connection refused"),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
-        );
+        for outage in [
+            sqlx::Error::PoolClosed.to_string(),
+            sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "Connection refused (os error 111)",
+            ))
+            .to_string(),
+            "error returned from database: canceling statement due to statement timeout"
+                .to_string(),
+        ] {
+            assert_eq!(
+                db_status(&outage),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{outage}"
+            );
+            assert_eq!(
+                db_err_message(&outage),
+                "Database is temporarily unavailable, retry shortly",
+                "{outage}"
+            );
+        }
+        for fault in [
+            sqlx::Error::RowNotFound.to_string(),
+            "error returned from database: relation \"t\" does not exist".to_string(),
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#
+                .to_string(),
+        ] {
+            assert_eq!(
+                db_status(&fault),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{fault}"
+            );
+            assert_eq!(db_err_message(&fault), "Database operation failed");
+        }
     }
 
     #[test]
@@ -2250,7 +2496,16 @@ mod raw_error_body_class_tests {
     /// #3718's storage and IO wordings for the same class. `I/O error: {` is
     /// preventive — `upload.rs` answers a constant `"I/O error"` today — so the
     /// gate covers the spelling a future site is as likely to reach for.
-    const STORAGE_NEEDLES: &[&str] = &["\"Storage error: {", "\"IO error: {", "\"I/O error: {"];
+    ///
+    /// #3907 adds the two wordings the detailed health payload used for the
+    /// filesystem probe, which interpolated the same `std::io::Error`.
+    const STORAGE_NEEDLES: &[&str] = &[
+        "\"Storage error: {",
+        "\"IO error: {",
+        "\"I/O error: {",
+        "\"Storage path not accessible: {",
+        "\"Storage write failed: {",
+    ];
 
     /// `AppError` variants whose [`crate::error::AppError::user_message`] is a
     /// fixed string, so a `format!` passed to them never reaches a client. The
@@ -2296,11 +2551,11 @@ mod raw_error_body_class_tests {
     ///     operator configured (a migration source connection, an IdP's
     ///     published JWK, the jemalloc profiler, a remote repository's upstream
     ///     URL), on a diagnostic route whose entire job is reporting why that
-    ///     configuration did not work. All are admin-gated except
-    ///     `POST /repositories/{key}/test-upstream`, which is reachable by any
-    ///     caller who can read the repository — and returns `upstream_url` in
-    ///     its own success body, so the error names nothing the caller could
-    ///     not already read.
+    ///     configuration did not work. All are admin-gated:
+    ///     `POST /repositories/{key}/test-upstream` needs repository admin,
+    ///     and its "Failed to reach upstream" error is built from the HTTP
+    ///     client error without the request URL, so it names no credentials
+    ///     stored in the upstream URL.
     ///
     /// A third group needs no entry: the webhook retry worker and the Incus
     /// session reaper build these strings for a background task's log, not for
@@ -2334,11 +2589,6 @@ mod raw_error_body_class_tests {
         (
             "proxy_helpers.rs",
             "Failed to read metadata JSON",
-            "caller input",
-        ),
-        (
-            "proxy_helpers.rs",
-            "Failed to read upload body",
             "caller input",
         ),
         (
@@ -2637,6 +2887,16 @@ mod raw_error_body_class_tests {
         assert!(carries_a_needle(r#"    &format!("Storage error: {}", e),"#));
         assert!(carries_a_needle(r#"    format!("IO error: {e}"),"#));
         assert!(carries_a_needle(r#"    format!("I/O error: {}", e),"#));
+        assert!(carries_a_needle(
+            r#"    message: Some(format!("Storage path not accessible: {}", e)),"#
+        ));
+        assert!(carries_a_needle(
+            r#"    message: Some(format!("Storage write failed: {e}")),"#
+        ));
+        // #3907's replacement names the step without interpolating.
+        assert!(!carries_a_needle(
+            r#"    Err(e) => unhealthy_filesystem_storage("Storage write failed", &e),"#
+        ));
         // The sweep's own replacements must NOT read as offenders.
         assert!(!carries_a_needle(
             r#"    crate::api::handlers::storage_err_message(&e),"#
@@ -2738,6 +2998,186 @@ mod raw_error_body_class_tests {
              them — a stale exemption silently excuses the next site that reuses the \
              wording:\n{}",
             unmatched.join("\n")
+        );
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod replication_peer_identity_gate_5455 {
+    // -----------------------------------------------------------------------
+    // #5455: every replication exemption goes through one decision.
+    //
+    // The replication header is client-set. "A service account plus the
+    // header" was once read as a peer on the chunked, raw, multipart, delete
+    // and immutability paths, each with its own copy of the rule, and the
+    // copies drifted (#5368 narrowed the MCP one only). The exemptions now
+    // call `trusted_peer_replication` / `trusted_peer_replication_marked`;
+    // this gate pins every exemption site to them and every remaining raw
+    // use of the marker to the routing-only sites below.
+    // -----------------------------------------------------------------------
+    use super::like_pattern_escape_class_tests::{rust_sources, test_module_line_ranges};
+
+    /// Production uses of the raw marker, `is_replication_request(..)`, per
+    /// file: all are routing (sync-loop suppression, the OCI replication
+    /// routes' entry check, the Maven plugin-prefix merge, the chunked
+    /// commit's marker that feeds `trusted_peer_replication_marked`). A new
+    /// use that would grant an exemption must call the helper instead; a
+    /// genuinely routing-only one is added here.
+    const RAW_MARKER_SITES: &[(&str, usize)] = &[
+        ("api/handlers/mod.rs", 2),
+        ("api/handlers/debian.rs", 1),
+        ("api/handlers/goproxy.rs", 1),
+        ("api/handlers/incus.rs", 2),
+        ("api/handlers/maven.rs", 2),
+        ("api/handlers/npm.rs", 1),
+        ("api/handlers/oci_v2.rs", 1),
+        ("api/handlers/pypi.rs", 1),
+        ("api/handlers/repositories.rs", 2),
+        ("api/handlers/upload.rs", 1),
+    ];
+
+    /// `(file, fn)` of every replication exemption: each must decide through
+    /// the shared helper, directly or through `mcp_generic_mutation_refusal`
+    /// (itself pinned here). `delete_artifact`'s immutability guard needs
+    /// none: the helper implies an admin, who is exempt anyway.
+    const EXEMPTION_SITES: &[(&str, &str)] = &[
+        ("api/handlers/upload.rs", "create_session"),
+        ("api/handlers/upload.rs", "complete_session_commit"),
+        (
+            "api/handlers/repositories.rs",
+            "persist_generic_staged_upload",
+        ),
+        (
+            "api/handlers/repositories.rs",
+            "mcp_generic_mutation_refusal",
+        ),
+        ("api/handlers/repositories.rs", "delete_artifact"),
+    ];
+
+    fn relative(path: &std::path::Path) -> String {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        path.strip_prefix(&src)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// Non-comment production lines (1-based number, text) of `src`.
+    fn production_lines(src: &str) -> Vec<(usize, &str)> {
+        let tests = test_module_line_ranges(src);
+        src.lines()
+            .enumerate()
+            .map(|(i, line)| (i + 1, line))
+            .filter(|(n, line)| {
+                !tests.iter().any(|(from, to)| n >= from && n <= to)
+                    && !line.trim_start().starts_with("//")
+            })
+            .collect()
+    }
+
+    /// The body of the top-level `fn name(` in `src`, up to its closing
+    /// brace at column 0.
+    fn fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+        let at = [format!("async fn {name}("), format!("fn {name}(")]
+            .iter()
+            .find_map(|needle| src.find(needle.as_str()))?;
+        let end = src[at..].find("\n}\n").map(|e| at + e).unwrap_or(src.len());
+        Some(&src[at..end])
+    }
+
+    #[test]
+    fn raw_replication_marker_is_routing_only() {
+        let mut seen = std::collections::BTreeMap::<String, usize>::new();
+        for (path, src) in rust_sources() {
+            let file = relative(&path);
+            for (_, line) in production_lines(&src) {
+                if line.contains("is_replication_request(")
+                    && !line.contains("fn is_replication_request(")
+                {
+                    *seen.entry(file.clone()).or_default() += 1;
+                }
+            }
+        }
+        let expected: std::collections::BTreeMap<String, usize> = RAW_MARKER_SITES
+            .iter()
+            .map(|(f, n)| (f.to_string(), *n))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "#5455: a raw `is_replication_request` use changed. The header is \
+             client-set; an exemption must decide through \
+             `trusted_peer_replication`, and a routing-only use is listed in \
+             RAW_MARKER_SITES"
+        );
+    }
+
+    #[test]
+    fn no_replication_decision_trusts_a_service_account() {
+        let mut offenders = Vec::new();
+        for (path, src) in rust_sources() {
+            let file = relative(&path);
+            for (n, line) in production_lines(&src) {
+                let lower = line.to_ascii_lowercase();
+                let retired = line.contains("replication_exemption_trusted")
+                    || line.contains("mcp_replication_trusted");
+                if retired || (lower.contains("replication") && line.contains("is_service_account"))
+                {
+                    offenders.push(format!("{file}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "#5455: a service account (or a retired per-path rule) decides a \
+             replication exemption; use `trusted_peer_replication`:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn ignored_header_warning_is_throttled() {
+        use super::throttled_warn_due as due;
+        assert!(due(i64::MIN, 0, 60), "the first one is written");
+        assert!(!due(1_000, 1_059, 60));
+        assert!(due(1_000, 1_060, 60));
+        // A non-admin marked request is still refused while the warning is
+        // being throttled.
+        let writer = crate::api::middleware::auth::AuthExtension {
+            is_service_account: true,
+            ..Default::default()
+        };
+        assert!(!super::trusted_peer_replication_marked(&writer, true));
+        assert!(!super::trusted_peer_replication_marked(&writer, true));
+    }
+
+    #[test]
+    fn every_exemption_site_uses_the_shared_decision() {
+        let sources: std::collections::BTreeMap<String, String> = rust_sources()
+            .into_iter()
+            .map(|(path, src)| (relative(&path), src))
+            .collect();
+        for (file, name) in EXEMPTION_SITES {
+            let src = sources
+                .get(*file)
+                .unwrap_or_else(|| panic!("{file} not found"));
+            let body = fn_body(src, name).unwrap_or_else(|| panic!("{file}: fn {name} not found"));
+            assert!(
+                body.contains("trusted_peer_replication(")
+                    || body.contains("trusted_peer_replication_marked(")
+                    || body.contains("mcp_generic_mutation_refusal("),
+                "#5455: {file}::{name} must decide its replication exemption \
+                 through `trusted_peer_replication`"
+            );
+        }
+        let helper = fn_body(
+            &sources["api/handlers/mod.rs"],
+            "trusted_peer_replication_marked",
+        )
+        .expect("the shared decision");
+        assert!(
+            !helper.contains("is_service_account"),
+            "#5455: a service account is not a peer identity"
         );
     }
 }

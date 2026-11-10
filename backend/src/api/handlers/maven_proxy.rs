@@ -188,6 +188,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
                     // Row-less companion object: not anchored to an artifact row.
                     artifact_id: None,
                     etag: None,
+                    stale_since: None,
                 });
             }
         }
@@ -222,6 +223,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
             // Cloud flat-key legacy object: not anchored to our artifact row.
             artifact_id: None,
             etag: None,
+            stale_since: None,
         });
     }
 
@@ -275,12 +277,18 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
             // quarantine, so the policy verdict depended on which row Gate 2
             // happened to pick as the anchor.
             Some((own_id, false, quarantine_status, quarantine_until)) => {
-                crate::services::quarantine_service::check_download_allowed(
+                if let Err(refusal) = crate::services::quarantine_service::check_download_allowed(
                     quarantine_status.as_deref(),
                     quarantine_until,
                     chrono::Utc::now(),
-                )
-                .map_err(|e| e.into_response())?;
+                ) {
+                    // #4510: a scan-policy hold answers the policy 403.
+                    return Err(crate::services::quarantine_service::refine_hold_refusal(
+                        db, own_id, repo_id, refusal,
+                    )
+                    .await
+                    .into_response());
+                }
                 crate::services::quarantine_service::enforce_scan_policy_gate(db, own_id, repo_id)
                     .await
                     .map_err(|e| e.into_response())?;
@@ -350,7 +358,10 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     // downloadable, on the direct hosted route as well as through a virtual.
     // This mirrors `proxy_helpers::local_lookup_artifact`, which applies the
     // same two halves to rows that DO exist.
-    check_quarantine_row(&primary)?;
+    //
+    // #4510: a scan-policy hold on the anchor answers the policy 403, as the
+    // anchor's own download does, not the quarantine 409.
+    check_quarantine_row(db, &primary, repo_id).await?;
     crate::services::quarantine_service::enforce_scan_policy_gate(db, primary.id, repo_id)
         .await
         .map_err(|e| e.into_response())?;
@@ -382,6 +393,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
         // Remote proxy-cache stream: not our artifact row (#1278), unrecorded.
         artifact_id: None,
         etag: None,
+        stale_since: None,
     })
 }
 
@@ -1126,6 +1138,68 @@ mod tests {
         );
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #4510: the storage-direct fallback answers a scan-policy hold on the
+    /// anchor primary with the policy 403, like the primary's own download,
+    /// and keeps the quarantine 409 for an administrator's hold.
+    #[tokio::test]
+    async fn test_storage_fallback_answers_scan_policy_hold_with_403_4510() {
+        let Some((pool, state, repo_id, repo, user_id)) = maven_fixture().await else {
+            return;
+        };
+        let primary_id = insert_primary_jar(
+            &pool,
+            repo_id,
+            user_id,
+            "com/example/hold4510/1.0/hold4510-1.0.jar",
+            "maven/com/example/hold4510/1.0/hold4510-1.0.jar",
+        )
+        .await;
+        put_artifact_bytes(
+            &state,
+            &repo,
+            "maven/com/example/hold4510/1.0/hold4510-1.0.pom",
+            Bytes::from_static(b"<project>hold4510</project>"),
+        )
+        .await
+        .expect("put");
+        let location = repo.storage_location();
+        let mut seen = Vec::new();
+        for source in ["scan_policy", "admin"] {
+            sqlx::query(
+                "UPDATE artifacts SET quarantine_status = 'quarantined', \
+                 quarantine_until = NULL, quarantine_source = $2 WHERE id = $1",
+            )
+            .bind(primary_id)
+            .bind(source)
+            .execute(&pool)
+            .await
+            .expect("hold the primary");
+            let status = match maven_local_fetch_storage_fallback(
+                &pool,
+                &state,
+                repo_id,
+                &location,
+                "com/example/hold4510/1.0/hold4510-1.0.pom",
+            )
+            .await
+            {
+                Ok(_) => StatusCode::OK,
+                Err(e) => e.status(),
+            };
+            seen.push((source, status));
+        }
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(
+            seen,
+            vec![
+                ("scan_policy", StatusCode::FORBIDDEN),
+                ("admin", StatusCode::CONFLICT)
+            ],
+            "#4510: a scan-policy hold on the anchor is a 403, an admin hold a 409"
+        );
     }
 
     #[tokio::test]

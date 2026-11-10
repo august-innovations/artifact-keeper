@@ -1097,6 +1097,19 @@ impl MigrationWorker {
                 let source_path = build_source_path(repo_key, &artifact_path);
                 let size = artifact.size.unwrap_or(0);
 
+                // The source's own generated index is not content: AK builds
+                // it from the imported rows, and a copied one would be listed
+                // as a bogus package (#2525).
+                if is_source_generated_index(package_type, &artifact_path) {
+                    tracing::debug!(
+                        repo = %repo_key,
+                        path = %artifact_path,
+                        "Skipping the source's generated package index"
+                    );
+                    *skipped += 1;
+                    continue;
+                }
+
                 // Dry run: report what would move and stop here. First branch
                 // in the body on purpose, ahead of every DB read/write, the
                 // download, and the storage put.
@@ -1123,13 +1136,25 @@ impl MigrationWorker {
                     continue;
                 }
 
+                // #4740: a `.deb`'s component comes from the source's
+                // `deb.component` property when it has one; resolved once here
+                // and threaded through, since the duplicate check below already
+                // needs the destination path it decides.
+                let debian_component = self
+                    .debian_component(client.as_ref(), repo_key, package_type, &artifact_path)
+                    .await;
+
                 // Check for duplicates in the artifacts table (cross-job support)
                 // This is checked BEFORE creating migration_item so we avoid tracking
                 // duplicates that already exist, which makes delta migrations work
                 let should_skip_duplicate = self
                     .check_artifact_duplicate(
                         keys.target.as_str(),
-                        &artifact_path,
+                        &duplicate_lookup_path(
+                            package_type,
+                            &artifact_path,
+                            debian_component.as_deref(),
+                        ),
                         &source_path,
                         &ExpectedChecksums {
                             sha256: expected_sha256.clone(),
@@ -1146,6 +1171,14 @@ impl MigrationWorker {
                         path = %artifact_path,
                         "Skipping duplicate artifact (already exists with matching checksum)"
                     );
+                    // #3927: repair a pre-fix import's missing Maven
+                    // coordinates instead of skipping past them.
+                    self.repair_migrated_maven_metadata(
+                        keys.target.as_str(),
+                        package_type,
+                        &artifact_path,
+                    )
+                    .await;
                     *skipped += 1;
                     continue;
                 }
@@ -1189,6 +1222,7 @@ impl MigrationWorker {
                     failed,
                     skipped,
                     transferred,
+                    debian_component.as_deref(),
                 )
                 .await?;
 
@@ -1303,21 +1337,38 @@ impl MigrationWorker {
         failed: &mut i32,
         skipped: &mut i32,
         transferred: &mut i64,
+        debian_component: Option<&str>,
     ) -> Result<(), MigrationError> {
         // Read the source by source key; write the destination by target key.
         let repo_key = keys.source.as_str();
         let should_skip = self
             .check_artifact_duplicate(
                 keys.target.as_str(),
-                artifact_path,
+                &duplicate_lookup_path(package_type, artifact_path, debian_component),
                 source_path,
                 &expected,
                 conflict_resolution,
                 package_type,
             )
             .await?;
+        // #4657: a `.deb` imported before the importer registered Debian
+        // packages is re-imported (in place) rather than skipped.
+        let should_skip = should_skip
+            && !self
+                .debian_registration_missing(
+                    keys.target.as_str(),
+                    package_type,
+                    artifact_path,
+                    debian_component,
+                )
+                .await;
 
         if should_skip {
+            // #3927: a repository migrated before the importer wrote Maven
+            // coordinates has rows but no `maven-metadata.xml`; re-running the
+            // job repairs it here instead of skipping past it.
+            self.repair_migrated_maven_metadata(keys.target.as_str(), package_type, artifact_path)
+                .await;
             self.migration_service
                 .skip_item(item_id, "Artifact already exists")
                 .await?;
@@ -1335,6 +1386,7 @@ impl MigrationWorker {
                 artifact_path,
                 include_metadata,
                 &expected,
+                debian_component,
             )
             .await
         {
@@ -1377,6 +1429,229 @@ impl MigrationWorker {
         }
 
         Ok(())
+    }
+
+    /// The `artifact_metadata` document the RPM upload paths record for a
+    /// `.rpm`, read from the migrated file's header (#3925). `None` for other
+    /// formats and files, for an unreadable header, and for a header over the
+    /// repodata indexing limits (which a native upload would refuse; here the
+    /// package is still migrated and listed from its filename).
+    async fn migration_rpm_metadata(
+        &self,
+        package_type: &str,
+        artifact_path: &str,
+        temp_path: &std::path::Path,
+    ) -> Option<serde_json::Value> {
+        if !package_type.eq_ignore_ascii_case("rpm") || !artifact_path.ends_with(".rpm") {
+            return None;
+        }
+        let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+        let prefix = crate::api::handlers::upload::read_rpm_header_prefix(temp_path)
+            .await
+            .ok()?;
+        // Parsing an untrusted header (up to `RPM_HEADER_READ_MAX`) is CPU
+        // work; keep it off the async runtime, as the upload paths do.
+        let filename = filename.to_string();
+        match tokio::task::spawn_blocking(move || {
+            crate::api::handlers::rpm::build_rpm_artifact_metadata(&filename, &prefix)
+        })
+        .await
+        {
+            Ok(Ok(meta)) => meta,
+            // Unlike an upload, which refuses an over-limit header with 400,
+            // the migration still moves the bytes: the package is listed from
+            // its filename, and the repodata heal marks it unparseable.
+            Ok(Err(_)) => {
+                tracing::warn!(
+                    path = %artifact_path,
+                    "RPM header exceeds the repodata indexing limits; migrated without header metadata"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %artifact_path,
+                    error = %e,
+                    "RPM header parse task failed; migrated without header metadata"
+                );
+                None
+            }
+        }
+    }
+
+    /// The component the source records for a Debian package (#4740), read
+    /// from its `deb.component` property. `None` for other formats and files,
+    /// a source without properties (Nexus), and a failed lookup: the path
+    /// then decides (see [`debian_destination_path`]).
+    async fn debian_component(
+        &self,
+        client: &dyn SourceRegistry,
+        repo_key: &str,
+        package_type: &str,
+        artifact_path: &str,
+    ) -> Option<String> {
+        if !package_type.eq_ignore_ascii_case("debian")
+            || !is_debian_package_file(extract_name_from_path(artifact_path))
+        {
+            return None;
+        }
+        match client.get_properties(repo_key, artifact_path).await {
+            Ok(props) => props
+                .properties
+                .as_ref()
+                .and_then(debian_component_from_properties),
+            Err(e) => {
+                tracing::debug!(
+                    repo = %repo_key,
+                    path = %artifact_path,
+                    error = %e,
+                    "could not read deb.component; the path decides the component"
+                );
+                None
+            }
+        }
+    }
+
+    /// The parsed control file of a migrated `.deb`, validated exactly as the
+    /// native `PUT /debian/<repo>/pool/...` and the chunked completion (#1846)
+    /// validate it, against the pool path the row is stored under (#4657).
+    /// `None` for other formats and files, and for a package whose control
+    /// file is unreadable or disagrees with its file name: a native upload
+    /// refuses those with 400; here the bytes still move and the package is
+    /// listed from its file name, as before.
+    async fn migration_debian_package(
+        &self,
+        package_type: &str,
+        artifact_path: &str,
+        temp_path: &std::path::Path,
+        debian_component: Option<&str>,
+    ) -> Option<crate::api::handlers::debian::StagedDebianPackage> {
+        if !package_type.eq_ignore_ascii_case("debian") {
+            return None;
+        }
+        let stored_path = debian_destination_path(artifact_path, debian_component);
+        match crate::api::handlers::debian::finalize_from_staged(&stored_path, temp_path).await {
+            Ok(package) => package,
+            Err(reason) => {
+                tracing::warn!(
+                    path = %artifact_path,
+                    reason = %reason,
+                    "Debian control file unreadable or inconsistent; migrated without package registration"
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether a Debian package already imported under its pool path still
+    /// lacks the control document the native upload records (#4657). A
+    /// repository migrated before the fix has the rows but none of that, so
+    /// a re-run must re-import such an item instead of skipping it as a
+    /// duplicate; the re-import refreshes the row in place. `false` for every
+    /// other format and file, and on a lookup error (the skip stands).
+    async fn debian_registration_missing(
+        &self,
+        target_key: &str,
+        package_type: &str,
+        artifact_path: &str,
+        debian_component: Option<&str>,
+    ) -> bool {
+        if !package_type.eq_ignore_ascii_case("debian")
+            || crate::services::artifact_metadata::parse_name_and_version(
+                "debian",
+                extract_name_from_path(artifact_path),
+                artifact_path,
+            )
+            .version
+            .is_none()
+        {
+            return false;
+        }
+        let registered = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM artifacts a \
+                 JOIN repositories r ON r.id = a.repository_id \
+                 JOIN artifact_metadata am ON am.artifact_id = a.id \
+                 WHERE r.key = $1 AND a.path = $2 AND a.is_deleted = false \
+                   AND am.format = 'debian')",
+        )
+        .bind(target_key)
+        .bind(debian_destination_path(artifact_path, debian_component))
+        .fetch_one(&self.db)
+        .await;
+        match registered {
+            Ok(registered) => !registered,
+            Err(e) => {
+                tracing::warn!(
+                    repo = %target_key,
+                    path = %artifact_path,
+                    error = %e,
+                    "could not check the Debian registration of an already-migrated package"
+                );
+                false
+            }
+        }
+    }
+
+    /// Give an already-imported Maven file the `artifact_metadata` row that
+    /// `maven-metadata.xml` generation reads, when it has none (#3927).
+    ///
+    /// Only fills a gap: an existing row (a live deploy's POM-derived one, or
+    /// one this importer already wrote) is left untouched. Best-effort, like
+    /// the catalog and search side effects: a failure here is logged and never
+    /// fails or re-transfers an item whose content is already in place.
+    async fn repair_migrated_maven_metadata(
+        &self,
+        target_key: &str,
+        package_type: &str,
+        artifact_path: &str,
+    ) {
+        let Some(meta) = migration_maven_metadata(package_type, artifact_path) else {
+            return;
+        };
+        let stored_path = migration_destination_path(package_type, artifact_path);
+        let result = sqlx::query_scalar::<_, Uuid>(
+            "WITH target AS ( \
+                 SELECT a.id, a.repository_id \
+                 FROM artifacts a \
+                 JOIN repositories r ON r.id = a.repository_id \
+                 WHERE r.key = $1 AND a.path = $2 AND a.is_deleted = false \
+             ), inserted AS ( \
+                 INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                 SELECT id, 'maven', $3 FROM target \
+                 ON CONFLICT (artifact_id) DO NOTHING \
+                 RETURNING artifact_id \
+             ) \
+             SELECT t.repository_id FROM target t \
+             JOIN inserted i ON i.artifact_id = t.id",
+        )
+        .bind(target_key)
+        .bind(&stored_path)
+        .bind(&meta)
+        .fetch_optional(&self.db)
+        .await;
+        match result {
+            Ok(Some(repository_id)) => {
+                if let (Some(group_id), Some(maven_artifact_id)) = (
+                    meta.get("groupId").and_then(|v| v.as_str()),
+                    meta.get("artifactId").and_then(|v| v.as_str()),
+                ) {
+                    crate::api::handlers::maven::invalidate_maven_metadata_cache(
+                        repository_id,
+                        group_id,
+                        maven_artifact_id,
+                    )
+                    .await;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                repo = %target_key,
+                path = %artifact_path,
+                error = %e,
+                "could not backfill Maven coordinates for an already-migrated artifact"
+            ),
+        }
     }
 
     /// Verify checksum and record transfer result as completed or failed
@@ -1884,6 +2159,7 @@ impl MigrationWorker {
         artifact_path: &str,
         include_metadata: bool,
         expected: &ExpectedChecksums,
+        debian_component: Option<&str>,
     ) -> Result<TransferResult, MigrationError> {
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
@@ -2082,6 +2358,14 @@ impl MigrationWorker {
         // and is bounded for npm/helm because those tarballs are small.
         // Returns None for unknown formats; the artifact INSERT proceeds
         // either way and only the metadata row is skipped.
+        // #4657: a `.deb` is registered the way the native upload registers
+        // it: its control document (what `Packages`/`Release` render) is
+        // written with the row below, and the catalog row and maintainer-
+        // script analysis follow the commit.
+        let debian_package = self
+            .migration_debian_package(package_type, artifact_path, &temp_path, debian_component)
+            .await;
+
         // #2561: permit-scoped decode; on saturation skip the best-effort
         // extraction (only the metadata row is skipped).
         let extracted_metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
@@ -2091,7 +2375,26 @@ impl MigrationWorker {
             )
         })
         .ok()
-        .flatten();
+        .flatten()
+        // #3927: Maven coordinates carry no archive metadata to extract, but
+        // `maven-metadata.xml` is generated from `artifact_metadata` rows
+        // (`format = 'maven'`, `groupId`/`artifactId`). Without one a migrated
+        // coordinate resolved by exact version yet had no metadata document,
+        // so LATEST/RELEASE resolution fell through to another repository.
+        .or_else(|| migration_maven_metadata(package_type, artifact_path))
+        .or_else(|| {
+            debian_package
+                .as_ref()
+                .map(|package| package.control_document().clone())
+        });
+
+        // #3925: an RPM's header metadata (summary, requires/provides, the
+        // #3801 repodata block) is what repodata renders beyond the filename.
+        // Read the same bounded header prefix the generic upload path reads,
+        // from the spilled temp file, and record it after the row commits.
+        let rpm_metadata = self
+            .migration_rpm_metadata(package_type, artifact_path, &temp_path)
+            .await;
 
         // Get metadata if requested
         let metadata = if include_metadata {
@@ -2210,6 +2513,7 @@ impl MigrationWorker {
                     &parsed,
                     filename,
                     artifact_path,
+                    debian_component,
                 );
 
                 // Path-traversal guard: the stored path is used verbatim as
@@ -2369,6 +2673,21 @@ impl MigrationWorker {
                             Some(&sha256_hex),
                         )
                         .await?;
+                        // #4657: a `.deb` an earlier import kept at its source
+                        // path outside `pool/<component>/` now lives under
+                        // `pool/main/`; retire the old row (same bytes only).
+                        if package_type.eq_ignore_ascii_case("debian")
+                            && identity.path != artifact_path
+                        {
+                            retire_rows_at_paths(
+                                &mut tx,
+                                repository_id,
+                                &[artifact_path.to_string()],
+                                Some(&identity.path),
+                                Some(&sha256_hex),
+                            )
+                            .await?;
+                        }
                         Some(id)
                     }
                 };
@@ -2495,6 +2814,46 @@ impl MigrationWorker {
 
                 tx.commit().await?;
 
+                // #3925: record the RPM header metadata through the helper the
+                // native and generic upload paths share (it also bumps the
+                // repository so the repodata cache re-renders). Best-effort:
+                // without it the package is still listed, from its filename.
+                if let (Some(id), Some(meta)) = (artifact_id, &rpm_metadata) {
+                    if let Err(e) = crate::api::handlers::rpm::record_rpm_metadata(
+                        &self.db,
+                        id,
+                        repository_id,
+                        meta,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            path = %artifact_path,
+                            error = %e,
+                            "could not record RPM header metadata for a migrated package"
+                        );
+                    }
+                }
+
+                // #3927: a GET of this GA's `maven-metadata.xml` during the
+                // migration cached the version set as it stood then; drop it so
+                // the next resolve sees the version just imported.
+                if artifact_id.is_some() {
+                    if let Some(meta) = &extracted_metadata {
+                        if let (Some(group_id), Some(maven_artifact_id)) = (
+                            meta.get("groupId").and_then(|v| v.as_str()),
+                            meta.get("artifactId").and_then(|v| v.as_str()),
+                        ) {
+                            crate::api::handlers::maven::invalidate_maven_metadata_cache(
+                                repository_id,
+                                group_id,
+                                maven_artifact_id,
+                            )
+                            .await;
+                        }
+                    }
+                }
+
                 // #2676: surface the migrated artifact in the packages
                 // catalog. The web UI's Packages tab reads `packages` /
                 // `package_versions` (via /api/v1/packages), NOT `artifacts`
@@ -2509,7 +2868,28 @@ impl MigrationWorker {
                 // best-effort by contract (a catalog failure must not fail
                 // an item whose content already committed — the wrapper
                 // logs and swallows, mirroring the live paths).
-                if let Some(entry) = migration_catalog_entry(package_type, &oci_role, &parsed) {
+                // #4657: a parsed `.deb` gets the native upload's catalog row
+                // (with its description), maintainer-script analysis and
+                // repository bump instead of the filename-derived entry below.
+                if let (Some(id), Some(package)) = (artifact_id, &debian_package) {
+                    let (upload, deb_head) = package.parts();
+                    crate::api::handlers::debian::record_debian_package_extras(
+                        &self.db,
+                        repository_id,
+                        id,
+                        content_size as i64,
+                        &sha256_hex,
+                        upload,
+                        deb_head,
+                    )
+                    .await;
+                }
+                let catalog_entry = if debian_package.is_some() {
+                    None
+                } else {
+                    migration_catalog_entry(package_type, artifact_path, &oci_role, &parsed)
+                };
+                if let Some(entry) = catalog_entry {
                     let size_bytes = match (&oci_role, &oci_manifest_body) {
                         // Docker: size the catalog row like the live push —
                         // config+layers for an image manifest, plus the sum
@@ -3434,10 +3814,114 @@ fn migration_artifact_path(
         // (e.g. com/example/artifact/version/file.jar) that clients use
         // verbatim when resolving.
         "maven" | "gradle" | "sbt" | "ivy" => artifact_path.to_string(),
+        // #4657: Debian packages live under `pool/<component>/`, the layout
+        // `Packages` indexes and `apt` downloads from.
+        "debian" => debian_destination_path(artifact_path, None),
         _ => match version {
             Some(ver) if !ver.is_empty() => format!("{}/{}/{}", parsed_name, ver, filename),
             _ => artifact_path.to_string(),
         },
+    }
+}
+
+/// Component a migrated `.deb` outside `pool/<component>/` is filed under.
+const DEFAULT_DEBIAN_COMPONENT: &str = "main";
+
+/// Whether `file_name` is a Debian binary package.
+fn is_debian_package_file(file_name: &str) -> bool {
+    [".deb", ".udeb", ".ddeb"]
+        .iter()
+        .any(|ext| file_name.ends_with(ext))
+}
+
+/// Whether a path below `pool/` starts with a Debian pool *prefix* rather
+/// than a component: `z/zlib/...` or `libz/libzstd/...`, the
+/// `pool/<letter>/<name>/` layout a Nexus apt repository stores its packages
+/// in and a mirror of Ubuntu's pool keeps without its component segment
+/// (#4740). Read as `pool/<component>/`, the letter became the component and
+/// the package was missing from `dists/<dist>/main/`.
+fn is_pool_prefix_layout(below_pool: &str) -> bool {
+    let mut segments = below_pool.split('/');
+    let (Some(prefix), Some(name), Some(_)) = (segments.next(), segments.next(), segments.next())
+    else {
+        return false;
+    };
+    let is_prefix = prefix.len() == 1 || (prefix.len() == 4 && prefix.starts_with("lib"));
+    is_prefix && name.starts_with(prefix)
+}
+
+/// A `deb.component` property value usable as one `pool/<component>/` path
+/// segment, or `None` (the path then decides, as without the property).
+fn valid_debian_component(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let ok = !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'));
+    ok.then_some(value)
+}
+
+/// The component an Artifactory item's properties record for it (#4740):
+/// the first usable `deb.component` value.
+fn debian_component_from_properties(
+    properties: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<String> {
+    properties
+        .get("deb.component")?
+        .iter()
+        .find_map(|v| valid_debian_component(v))
+        .map(str::to_string)
+}
+
+/// Where a Debian repository's file is stored (#4657, #4740).
+///
+/// A binary package is filed under `pool/<component>/`, the layout the Debian
+/// handler indexes. The component is, in order: `component` (the source's
+/// `deb.component` property, see [`debian_component_from_properties`]); the
+/// path's own `pool/<component>/` segment; and [`DEFAULT_DEBIAN_COMPONENT`]
+/// for a path with no component segment, such as Artifactory's "Set Me Up"
+/// `pool/<file>.deb` or the `pool/<letter>/<name>/` layout of a Nexus apt
+/// repository (see [`is_pool_prefix_layout`]). The source path, minus a
+/// leading `pool/`, follows the component unless it already starts with it.
+/// Every other file keeps its path.
+pub(crate) fn debian_destination_path(artifact_path: &str, component: Option<&str>) -> String {
+    let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+    if !is_debian_package_file(filename) {
+        return artifact_path.to_string();
+    }
+    let rest = artifact_path.trim_start_matches('/');
+    let rest = rest.strip_prefix("pool/").unwrap_or(rest);
+    let component = match component {
+        Some(component) => component,
+        None if crate::api::handlers::debian::staged_package_target(artifact_path).is_some()
+            && !is_pool_prefix_layout(rest) =>
+        {
+            return artifact_path.to_string();
+        }
+        None => DEFAULT_DEBIAN_COMPONENT,
+    };
+    match rest.strip_prefix(component) {
+        Some(below) if below.starts_with('/') => format!("pool/{rest}"),
+        _ => format!("pool/{component}/{rest}"),
+    }
+}
+
+/// The path the duplicate check looks an item up under: a `.deb`'s
+/// destination (#4740), since a re-run must find a package under the
+/// component it is now filed in, and must re-import (and retire) one an
+/// earlier run stored under the wrong component. Every other item keeps its
+/// source-relative path.
+fn duplicate_lookup_path(
+    package_type: &str,
+    artifact_path: &str,
+    debian_component: Option<&str>,
+) -> String {
+    if package_type.eq_ignore_ascii_case("debian") {
+        debian_destination_path(artifact_path, debian_component)
+    } else {
+        artifact_path.to_string()
     }
 }
 
@@ -3502,6 +3986,7 @@ pub(crate) fn migration_artifact_identity(
     parsed: &crate::services::artifact_metadata::ParsedArtifact,
     filename: &str,
     artifact_path: &str,
+    debian_component: Option<&str>,
 ) -> Option<MigratedArtifactIdentity> {
     match oci_role {
         OciRole::Blob { .. } => None,
@@ -3514,13 +3999,17 @@ pub(crate) fn migration_artifact_identity(
                 .to_string(),
         }),
         OciRole::NotOci => {
-            let path = migration_artifact_path(
-                package_type,
-                &parsed.name,
-                parsed.version.as_deref(),
-                filename,
-                artifact_path,
-            );
+            let path = if package_type == "debian" {
+                debian_destination_path(artifact_path, debian_component)
+            } else {
+                migration_artifact_path(
+                    package_type,
+                    &parsed.name,
+                    parsed.version.as_deref(),
+                    filename,
+                    artifact_path,
+                )
+            };
             Some(MigratedArtifactIdentity {
                 path,
                 name: parsed.name.clone(),
@@ -3585,15 +4074,22 @@ pub(crate) struct CatalogEntry {
 ///   row is `<image>@<tag>`, exactly like the live manifest-PUT handler.
 ///   Digest-addressed child manifests and layer/config blobs are skipped
 ///   (mirrors the live path's `oci_reference_is_tag` filter).
-/// - Maven family: skipped. Live maven catalog names are
-///   `groupId:artifactId` and `parse_name_and_version` recovers only the
-///   artifactId, so writing rows here would diverge from the shape the
-///   repository components view expects (follow-up, not in #2676's scope).
+/// - Maven/Gradle: the live upload handler catalogues `groupId:artifactId`
+///   at the directory version, and `parse_name_and_version` recovers only the
+///   artifactId, so the coordinate is read back out of `artifact_path` with
+///   the same derivation the catalog backfill uses
+///   ([`backfill_catalog_coordinates`]). Checksum sidecars and
+///   `maven-metadata.xml` get no row. Skipping the whole family left a
+///   migrated Maven repository with an empty Packages tab (#4691).
+/// - SBT/Ivy: skipped (their layout is not a Maven GAV path).
 /// - Everything else (helm, nuget, npm, pypi, generic, ...): a row is
 ///   written whenever the importer recovered a version, under the same
 ///   `(name, version)` the artifact row itself carries.
+///
+/// [`backfill_catalog_coordinates`]: crate::services::package_service::backfill_catalog_coordinates
 pub(crate) fn migration_catalog_entry(
     package_type: &str,
+    artifact_path: &str,
     oci_role: &OciRole,
     parsed: &crate::services::artifact_metadata::ParsedArtifact,
 ) -> Option<CatalogEntry> {
@@ -3612,7 +4108,21 @@ pub(crate) fn migration_catalog_entry(
         }
         OciRole::NotOci => {
             let pt = package_type.to_lowercase();
-            if matches!(pt.as_str(), "maven" | "gradle" | "sbt" | "ivy") {
+            if matches!(pt.as_str(), "maven" | "gradle") {
+                let (name, version) =
+                    crate::services::package_service::backfill_catalog_coordinates(
+                        &pt,
+                        artifact_path,
+                        &parsed.name,
+                        parsed.version.as_deref(),
+                    )?;
+                return Some(CatalogEntry {
+                    name,
+                    version,
+                    format: pt,
+                });
+            }
+            if matches!(pt.as_str(), "sbt" | "ivy") {
                 return None;
             }
             let version = parsed.version.clone()?;
@@ -3623,6 +4133,79 @@ pub(crate) fn migration_catalog_entry(
             })
         }
     }
+}
+
+/// Whether `artifact_path` is an index the source registry generates for a
+/// format whose index Artifact Keeper builds itself from the imported rows.
+///
+/// Debian (#4657): everything under `dists/`. CRAN (#2525): `PACKAGES`,
+/// `PACKAGES.gz`, `PACKAGES.rds` and `PACKAGES.json` under `src/contrib/` or `bin/.../contrib/<r-version>/`. AK's
+/// CRAN handler lists every `artifacts` row of the repository, so a copied
+/// `PACKAGES` file would appear in the served index as a package called
+/// `PACKAGES` with no version.
+pub(crate) fn is_source_generated_index(package_type: &str, artifact_path: &str) -> bool {
+    // Debian (#4657): everything under `dists/` (`Release`, `InRelease`,
+    // `Packages*`, `by-hash/...`) is the source's APT index, signed with the
+    // source's key. AK renders and signs its own from the `pool/` rows, so the
+    // copies were only clutter in the artifact list.
+    if package_type.eq_ignore_ascii_case("debian") {
+        return artifact_path.trim_start_matches('/').starts_with("dists/");
+    }
+    if !package_type.eq_ignore_ascii_case("cran") {
+        return false;
+    }
+    let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+    matches!(
+        filename,
+        "PACKAGES" | "PACKAGES.gz" | "PACKAGES.rds" | "PACKAGES.json"
+    )
+}
+
+/// The `artifact_metadata` document a live `mvn deploy` stores for a Maven
+/// file, derived from its repository path (#3927).
+///
+/// `maven-metadata.xml` for a hosted repository is generated from
+/// `artifact_metadata` rows with `format = 'maven'` keyed on
+/// `groupId`/`artifactId` (`handlers::maven::load_maven_metadata_entry`), so an
+/// imported coordinate without such a row is invisible to LATEST/RELEASE
+/// resolution. This builds the same `groupId`/`artifactId`/`version`/
+/// `extension`(/`classifier`) shape the upload handler writes.
+///
+/// Returns `None` for non-Maven formats, for paths that do not parse as
+/// `group/artifact/version/file`, and for the metadata document and checksum
+/// sidecars themselves: those live beside a coordinate rather than being one,
+/// and parsing `com/ex/lib/maven-metadata.xml` as a GAV would invent a
+/// version called `lib`.
+pub(crate) fn migration_maven_metadata(
+    package_type: &str,
+    artifact_path: &str,
+) -> Option<serde_json::Value> {
+    if !package_type.eq_ignore_ascii_case("maven") {
+        return None;
+    }
+    let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+    let lower = filename.to_ascii_lowercase();
+    if lower.starts_with("maven-metadata")
+        || [".md5", ".sha1", ".sha256", ".sha512", ".asc"]
+            .iter()
+            .any(|suffix| lower.ends_with(suffix))
+    {
+        return None;
+    }
+    let coords = crate::formats::maven::MavenHandler::parse_coordinates(artifact_path).ok()?;
+    if coords.group_id.is_empty() {
+        return None;
+    }
+    let mut meta = serde_json::json!({
+        "groupId": coords.group_id,
+        "artifactId": coords.artifact_id,
+        "version": coords.version,
+        "extension": coords.extension,
+    });
+    if let Some(classifier) = coords.classifier {
+        meta["classifier"] = serde_json::Value::String(classifier);
+    }
+    Some(meta)
 }
 
 /// Reject artifact paths that could escape the repository root once stored
@@ -3701,6 +4284,20 @@ async fn retire_legacy_migration_rows(
     require_checksum: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
     let legacy = legacy_migration_paths(keys, artifact_path);
+    retire_rows_at_paths(tx, repository_id, &legacy, keep_path, require_checksum).await
+}
+
+/// Soft-delete the live rows at `paths` (except `keep_path`, and only those
+/// holding `require_checksum` when given). The statement behind
+/// [`retire_legacy_migration_rows`], also used for a `.deb` a pre-#4657
+/// import stored outside `pool/<component>/` (see [`debian_destination_path`]).
+async fn retire_rows_at_paths(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repository_id: Uuid,
+    paths: &[String],
+    keep_path: Option<&str>,
+    require_checksum: Option<&str>,
+) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE artifacts SET is_deleted = true, updated_at = NOW() \
          WHERE repository_id = $1 AND is_deleted = false \
@@ -3708,7 +4305,7 @@ async fn retire_legacy_migration_rows(
            AND ($4::text IS NULL OR checksum_sha256 = $4)",
     )
     .bind(repository_id)
-    .bind(&legacy)
+    .bind(paths)
     .bind(keep_path)
     .bind(require_checksum)
     .execute(&mut **tx)
@@ -3717,9 +4314,9 @@ async fn retire_legacy_migration_rows(
     if retired > 0 {
         tracing::info!(
             repository_id = %repository_id,
-            source_path = %artifact_path,
+            paths = ?paths,
             retired,
-            "retired legacy-shaped artifacts rows from a pre-#3533/#3654 import"
+            "retired legacy-shaped artifacts rows from an earlier import"
         );
     }
     Ok(retired)
@@ -4339,10 +4936,11 @@ mod tests {
             // `fallback()` formats: no per-format parser at all.
             ("generic", "corp/1.0/app-1.0.tgz", "app-1.0.tgz"),
             ("raw", "corp/1.0/app-1.0.tgz", "app-1.0.tgz"),
+            // A `.deb` has a version since #4657; a source tarball does not.
             (
                 "debian",
-                "pool/main/n/nginx/nginx_1.0_amd64.deb",
-                "nginx_1.0_amd64.deb",
+                "pool/main/n/nginx/nginx_1.0.orig.tar.gz",
+                "nginx_1.0.orig.tar.gz",
             ),
             ("rpm", "packages/x86_64/pkg.rpm", "pkg.rpm"),
             ("cargo", "api/v1/crates/serde/1.0.0/download", "download"),
@@ -4421,6 +5019,7 @@ mod tests {
             ),
             "1.31.1",
             "v2/busybox/manifests/1.31.1",
+            None,
         )
         .expect("manifest must produce an artifacts row");
         assert_eq!(identity.path, "v2/busybox/manifests/1.31.1");
@@ -4450,6 +5049,7 @@ mod tests {
             ),
             "manifest.json",
             &format!("v2/app/manifests/{reference}"),
+            None,
         )
         .expect("digest-referenced child manifest must produce an artifacts row");
         assert_eq!(identity.path, format!("v2/app/manifests/{reference}"));
@@ -4473,6 +5073,7 @@ mod tests {
             ),
             &format!("sha256:{hex}"),
             &format!("v2/app/blobs/sha256:{hex}"),
+            None,
         );
         assert!(
             identity.is_none(),
@@ -4493,6 +5094,7 @@ mod tests {
             ),
             "lodash-4.17.21.tgz",
             "lodash/-/lodash-4.17.21.tgz",
+            None,
         )
         .expect("non-OCI artifact must produce an artifacts row");
         assert_eq!(identity.path, "lodash/4.17.21/lodash-4.17.21.tgz");
@@ -8228,6 +8830,7 @@ mod tests {
                 "irrelevant/path",
                 false,
                 &expected,
+                None,
             )
             .await;
 
@@ -8429,6 +9032,7 @@ mod tests {
                 "irrelevant/path",
                 false,
                 &expected,
+                None,
             )
             .await;
 
@@ -8770,6 +9374,7 @@ mod tests {
                     sha256: None,
                     sha1: None,
                 },
+                None,
             )
             .await
     }
@@ -8824,6 +9429,7 @@ mod tests {
                 &mut failed,
                 &mut skipped,
                 &mut transferred,
+                None,
             )
             .await
             .expect("process_single_artifact");
@@ -9828,6 +10434,7 @@ mod tests {
                     sha256: None,
                     sha1: None,
                 },
+                None,
             )
             .await
             .expect_err("a second, different manifest for hello:latest must fail the item");
@@ -10376,6 +10983,7 @@ mod tests {
         };
         let entry = migration_catalog_entry(
             "docker",
+            "",
             &OciRole::Manifest {
                 image: "org/app".to_string(),
                 reference: "v1.2".to_string(),
@@ -10399,6 +11007,7 @@ mod tests {
         assert_eq!(
             migration_catalog_entry(
                 "docker",
+                "",
                 &OciRole::Manifest {
                     image: "app".to_string(),
                     reference: format!("sha256:{}", "a".repeat(64)),
@@ -10411,6 +11020,7 @@ mod tests {
         assert_eq!(
             migration_catalog_entry(
                 "docker",
+                "",
                 &OciRole::Blob {
                     digest: format!("sha256:{}", "b".repeat(64)),
                 },
@@ -10428,7 +11038,7 @@ mod tests {
         };
         // Version recovered => catalog row under the parsed identity, with
         // the format key lowercased.
-        let entry = migration_catalog_entry("NuGet", &OciRole::NotOci, &parsed)
+        let entry = migration_catalog_entry("NuGet", "", &OciRole::NotOci, &parsed)
             .expect("versioned non-OCI artifact must produce a catalog entry");
         assert_eq!(entry.name, "MyPackage");
         assert_eq!(entry.version, "1.0.0");
@@ -10441,18 +11051,39 @@ mod tests {
             version: None,
         };
         assert_eq!(
-            migration_catalog_entry("generic", &OciRole::NotOci, &unversioned),
+            migration_catalog_entry("generic", "blob.bin", &OciRole::NotOci, &unversioned),
             None
         );
 
-        // Maven-family catalog names are `groupId:artifactId`; the parser
-        // only recovers the artifactId, so no row is written (follow-up).
+        // #4691: Maven/Gradle catalog names are `groupId:artifactId` at the
+        // directory version, read from the path (the parser only recovers the
+        // artifactId), exactly as a live `mvn deploy` registers them.
+        let jar = crate::services::artifact_metadata::ParsedArtifact {
+            name: "guava".to_string(),
+            version: Some("31.1-jre".to_string()),
+        };
+        let jar_path = "com/google/guava/guava/31.1-jre/guava-31.1-jre.jar";
+        for format in ["maven", "Maven", "gradle"] {
+            let entry = migration_catalog_entry(format, jar_path, &OciRole::NotOci, &jar)
+                .unwrap_or_else(|| panic!("{format} jar must produce a catalog entry"));
+            assert_eq!(entry.name, "com.google.guava:guava", "{format}");
+            assert_eq!(entry.version, "31.1-jre", "{format}");
+            assert_eq!(entry.format, format.to_lowercase());
+        }
+        // Sidecars and the repository metadata document are not packages.
+        for path in [
+            "com/google/guava/guava/31.1-jre/guava-31.1-jre.jar.sha1",
+            "com/google/guava/guava/maven-metadata.xml",
+        ] {
+            assert_eq!(
+                migration_catalog_entry("maven", path, &OciRole::NotOci, &jar),
+                None,
+                "{path}"
+            );
+        }
+        // SBT/Ivy layouts are not Maven GAV paths: still skipped.
         assert_eq!(
-            migration_catalog_entry("maven", &OciRole::NotOci, &parsed),
-            None
-        );
-        assert_eq!(
-            migration_catalog_entry("gradle", &OciRole::NotOci, &parsed),
+            migration_catalog_entry("sbt", jar_path, &OciRole::NotOci, &jar),
             None
         );
 
@@ -10462,7 +11093,7 @@ mod tests {
             name: "github.com/gorilla/mux".to_string(),
             version: Some("v1.8.0".to_string()),
         };
-        let go_entry = migration_catalog_entry("go", &OciRole::NotOci, &go_parsed)
+        let go_entry = migration_catalog_entry("go", "", &OciRole::NotOci, &go_parsed)
             .expect("versioned go module must produce a catalog entry");
         assert_eq!(go_entry.name, "github.com/gorilla/mux");
         assert_eq!(go_entry.version, "v1.8.0");
@@ -10579,6 +11210,1092 @@ mod tests {
             single_catalog_row(&pool, repo_id).await,
             Some(("mychart".to_string(), "1.2.3".to_string())),
             "migrated helm chart must appear in the packages catalog"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3927: migrated Maven coordinates must feed maven-metadata.xml
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_source_generated_index_cran_2525() {
+        for path in [
+            "src/contrib/PACKAGES",
+            "src/contrib/PACKAGES.gz",
+            "src/contrib/PACKAGES.rds",
+            "bin/windows/contrib/4.3/PACKAGES",
+        ] {
+            assert!(is_source_generated_index("cran", path), "{path}");
+        }
+        assert!(!is_source_generated_index(
+            "cran",
+            "src/contrib/dplyr_1.1.4.tar.gz"
+        ));
+        // Only CRAN: a generic repository's file called PACKAGES is content.
+        assert!(!is_source_generated_index(
+            "generic",
+            "src/contrib/PACKAGES"
+        ));
+    }
+
+    #[test]
+    fn test_migration_maven_metadata_shape_3927() {
+        let meta = migration_maven_metadata("maven", "com/example/lib/1.2.0/lib-1.2.0-sources.jar")
+            .expect("a Maven artifact path yields coordinates");
+        assert_eq!(meta["groupId"], "com.example");
+        assert_eq!(meta["artifactId"], "lib");
+        assert_eq!(meta["version"], "1.2.0");
+        assert_eq!(meta["extension"], "jar");
+        assert_eq!(meta["classifier"], "sources");
+
+        let pom = migration_maven_metadata("MAVEN", "com/example/lib/1.2.0/lib-1.2.0.pom")
+            .expect("case-insensitive format match");
+        assert_eq!(pom["extension"], "pom");
+        assert!(pom.get("classifier").is_none());
+    }
+
+    #[test]
+    fn test_migration_maven_metadata_skips_sidecars_and_other_formats_3927() {
+        // The metadata document itself would otherwise parse as version `lib`.
+        assert!(migration_maven_metadata("maven", "com/example/lib/maven-metadata.xml").is_none());
+        assert!(
+            migration_maven_metadata("maven", "com/example/lib/maven-metadata.xml.sha1").is_none()
+        );
+        assert!(
+            migration_maven_metadata("maven", "com/example/lib/1.0/lib-1.0.jar.sha1").is_none()
+        );
+        assert!(migration_maven_metadata("maven", "com/example/lib/1.0/lib-1.0.jar.asc").is_none());
+        // Too short to be group/artifact/version/file.
+        assert!(migration_maven_metadata("maven", "lib/1.0/lib-1.0.jar").is_none());
+        assert!(migration_maven_metadata("npm", "com/example/lib/1.0/lib-1.0.jar").is_none());
+    }
+
+    /// The versions `maven-metadata.xml` generation reads for one GA: the
+    /// same predicate as `handlers::maven::load_maven_metadata_entry`.
+    async fn maven_metadata_versions(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        group_id: &str,
+        artifact_id: &str,
+    ) -> Vec<String> {
+        let mut versions: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT a.version FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.is_deleted = false \
+               AND am.format = 'maven' \
+               AND am.metadata->>'groupId' = $2 \
+               AND am.metadata->>'artifactId' = $3 \
+               AND a.version IS NOT NULL",
+        )
+        .bind(repo_id)
+        .bind(group_id)
+        .bind(artifact_id)
+        .fetch_all(pool)
+        .await
+        .expect("query maven metadata versions");
+        versions.sort();
+        versions
+    }
+
+    /// #3927: after migrating a Maven repository, the dynamic
+    /// `maven-metadata.xml` generator must see every imported version, so
+    /// LATEST/RELEASE resolve against the migrated repository instead of
+    /// falling through. Pre-fix the importer wrote no `artifact_metadata` row
+    /// for Maven files, the generator found no versions and answered 404.
+    #[tokio::test]
+    async fn test_maven_import_feeds_metadata_generation_3927() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig3927-maven", "maven").await;
+
+        let paths = [
+            "com/example/lib/1.0.0/lib-1.0.0.pom",
+            "com/example/lib/1.0.0/lib-1.0.0.jar",
+            "com/example/lib/1.1.0/lib-1.1.0.jar",
+            "com/example/lib/1.1.0/lib-1.1.0.jar.sha1",
+            "com/example/lib/maven-metadata.xml",
+        ];
+        let mut files = std::collections::HashMap::new();
+        for p in paths {
+            files.insert(p.to_string(), bytes::Bytes::from(format!("bytes of {p}")));
+        }
+        for p in paths {
+            transfer_one(&worker, &storage, &files, &repo_key, "maven", p)
+                .await
+                .unwrap_or_else(|e| panic!("maven transfer of {p} must succeed: {e}"));
+        }
+
+        assert_eq!(
+            maven_metadata_versions(&pool, repo_id, "com.example", "lib").await,
+            vec!["1.0.0".to_string(), "1.1.0".to_string()],
+            "every migrated version must be visible to maven-metadata.xml generation"
+        );
+
+        // Sidecars and the source's own metadata document carry no GAV row.
+        let sidecar_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 \
+               AND (a.path LIKE '%.sha1' OR a.path LIKE '%maven-metadata.xml')",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count sidecar metadata rows");
+        assert_eq!(
+            sidecar_rows, 0,
+            "sidecars must not be recorded as coordinates"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// The Maven import paths every #4691 test transfers: two versions of one
+    /// module, plus a checksum sidecar and the source's own metadata document,
+    /// which are not packages.
+    const MAVEN_4691_PATHS: [&str; 5] = [
+        "com/example/lib/1.0.0/lib-1.0.0.pom",
+        "com/example/lib/1.0.0/lib-1.0.0.jar",
+        "com/example/lib/1.1.0/lib-1.1.0.jar",
+        "com/example/lib/1.1.0/lib-1.1.0.jar.sha1",
+        "com/example/lib/maven-metadata.xml",
+    ];
+
+    async fn import_maven_4691(
+        worker: &MigrationWorker,
+        storage: &Arc<dyn StorageBackend>,
+        repo_key: &str,
+    ) {
+        let mut files = std::collections::HashMap::new();
+        for p in MAVEN_4691_PATHS {
+            files.insert(p.to_string(), bytes::Bytes::from(format!("bytes of {p}")));
+        }
+        for p in MAVEN_4691_PATHS {
+            transfer_one(worker, storage, &files, repo_key, "maven", p)
+                .await
+                .unwrap_or_else(|e| panic!("maven transfer of {p} must succeed: {e}"));
+        }
+    }
+
+    /// Every `(package name, version)` catalog row of a repository, sorted.
+    async fn catalog_rows(pool: &sqlx::PgPool, repo_id: Uuid) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT p.name, pv.version FROM packages p \
+             JOIN package_versions pv ON pv.package_id = p.id \
+             WHERE p.repository_id = $1 ORDER BY p.name, pv.version",
+        )
+        .bind(repo_id)
+        .fetch_all(pool)
+        .await
+        .expect("list catalog rows")
+    }
+
+    fn maven_4691_expected_rows() -> Vec<(String, String)> {
+        vec![
+            ("com.example:lib".to_string(), "1.0.0".to_string()),
+            ("com.example:lib".to_string(), "1.1.0".to_string()),
+        ]
+    }
+
+    /// #4691: a Maven repository migrated from Nexus must show its packages on
+    /// the Packages tab, which reads `packages`/`package_versions`. Pre-fix the
+    /// importer skipped the catalog for the whole Maven family, so a migrated
+    /// repository with every file stored listed no packages at all. The rows
+    /// must use the `groupId:artifactId` name a live `mvn deploy` registers,
+    /// skip sidecars and `maven-metadata.xml`, and stay single on a re-run.
+    #[tokio::test]
+    async fn test_maven_import_populates_package_catalog_4691() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig4691-maven", "maven").await;
+
+        import_maven_4691(&worker, &storage, &repo_key).await;
+        assert_eq!(
+            catalog_rows(&pool, repo_id).await,
+            maven_4691_expected_rows(),
+            "every migrated Maven version must appear in the packages catalog \
+             under groupId:artifactId"
+        );
+
+        import_maven_4691(&worker, &storage, &repo_key).await;
+        assert_eq!(
+            catalog_counts(&pool, repo_id).await,
+            (1, 2),
+            "re-running the migration must not duplicate catalog rows"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #4691 recovery: a repository imported before the fix has `artifacts`
+    /// rows and an empty catalog. `POST /api/v1/admin/packages/backfill`
+    /// (`PackageService::backfill_catalog`, #3659) must rebuild exactly the
+    /// rows a fixed import writes, so operators can repair it in place without
+    /// re-running the migration.
+    #[tokio::test]
+    async fn test_maven_catalog_backfill_repairs_pre_fix_import_4691() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig4691-backfill", "maven").await;
+
+        import_maven_4691(&worker, &storage, &repo_key).await;
+        // Reproduce a pre-fix import: the files are in, the catalog is empty.
+        sqlx::query("DELETE FROM packages WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("clear catalog");
+        assert_eq!(catalog_counts(&pool, repo_id).await, (0, 0));
+
+        crate::services::package_service::PackageService::new(pool.clone())
+            .backfill_catalog(Some(repo_id))
+            .await
+            .expect("catalog backfill");
+        assert_eq!(
+            catalog_rows(&pool, repo_id).await,
+            maven_4691_expected_rows(),
+            "the backfill must restore the migrated Maven versions"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// Mock Maven source for the #3927 job-level test: one repository of
+    /// `(directory, filename)` entries, each served with fixed bytes and no
+    /// advertised digests (so a re-run treats them as duplicates).
+    struct MavenSource {
+        repo_key: String,
+        files: Vec<(&'static str, &'static str)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::source_registry::SourceRegistry for MavenSource {
+        async fn ping(
+            &self,
+        ) -> Result<bool, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(true)
+        }
+        async fn get_version(
+            &self,
+        ) -> Result<
+            crate::services::artifactory_client::SystemVersionResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            unimplemented!("not called by process_job")
+        }
+        async fn list_repositories(
+            &self,
+        ) -> Result<
+            Vec<crate::services::artifactory_client::RepositoryListItem>,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(vec![mk_source_repo(&self.repo_key, "LOCAL", "maven2")])
+        }
+        async fn list_artifacts(
+            &self,
+            repo_key: &str,
+            offset: i64,
+            limit: i64,
+        ) -> Result<
+            crate::services::artifactory_client::AqlResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            use crate::services::artifactory_client::{AqlRange, AqlResponse, AqlResult};
+            let start = (offset.max(0) as usize).min(self.files.len());
+            let end = start
+                .saturating_add(limit.max(0) as usize)
+                .min(self.files.len());
+            let results: Vec<AqlResult> = self.files[start..end]
+                .iter()
+                .map(|(dir, name)| AqlResult {
+                    repo: repo_key.to_string(),
+                    path: (*dir).to_string(),
+                    name: (*name).to_string(),
+                    size: Some(3),
+                    created: None,
+                    modified: None,
+                    sha256: None,
+                    actual_sha1: None,
+                })
+                .collect();
+            let page = results.len() as i64;
+            Ok(AqlResponse {
+                results,
+                range: AqlRange {
+                    start_pos: offset,
+                    end_pos: offset + page,
+                    total: page,
+                },
+            })
+        }
+        async fn download_artifact(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<bytes::Bytes, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(bytes::Bytes::from_static(b"jar"))
+        }
+        async fn get_properties(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<
+            crate::services::artifactory_client::PropertiesResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(crate::services::artifactory_client::PropertiesResponse {
+                properties: None,
+                uri: None,
+            })
+        }
+        fn source_type(&self) -> &'static str {
+            "maven-mock"
+        }
+    }
+
+    /// #3927 end to end through `process_job`: the first run records the
+    /// coordinates; a repository left without them (the pre-fix state) is
+    /// repaired by simply running the job again, through the job loop's real
+    /// duplicate-skip path, without re-transferring anything.
+    #[tokio::test]
+    async fn test_maven_job_rerun_repairs_missing_coordinates_3927() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "mvn-3927").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO repositories (key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $1, $2, 'local', 'maven'::repository_format, true) RETURNING id",
+        )
+        .bind(&repo_key)
+        .bind(tmp.path().to_str().expect("utf-8 tempdir"))
+        .fetch_one(&pool)
+        .await
+        .expect("seed maven destination");
+
+        let source = Arc::new(MavenSource {
+            repo_key: repo_key.clone(),
+            files: vec![
+                ("com/example/lib/1.0.0", "lib-1.0.0.jar"),
+                ("com/example/lib/1.1.0", "lib-1.1.0.jar"),
+            ],
+        });
+        let config = WorkerConfig {
+            throttle_delay_ms: 0,
+            ..WorkerConfig::default()
+        };
+
+        run_job_with_source(&pool, job_id, source.clone(), config.clone()).await;
+        let expected = vec!["1.0.0".to_string(), "1.1.0".to_string()];
+        assert_eq!(
+            maven_metadata_versions(&pool, repo_id, "com.example", "lib").await,
+            expected,
+            "the first run records the coordinates"
+        );
+
+        // Pre-fix state: rows present, coordinates missing.
+        sqlx::query(
+            "DELETE FROM artifact_metadata WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("strip coordinates");
+
+        let rerun_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO migration_jobs (source_connection_id, job_type, config) \
+             VALUES ($1, 'full', $2) RETURNING id",
+        )
+        .bind(conn_id)
+        .bind(serde_json::json!({ "include_repos": [repo_key.as_str()] }))
+        .fetch_one(&pool)
+        .await
+        .expect("seed re-run job");
+        run_job_with_source(&pool, rerun_id, source, config).await;
+
+        let (completed, skipped): (i32, i32) = sqlx::query_as(
+            "SELECT completed_items, skipped_items FROM migration_jobs WHERE id = $1",
+        )
+        .bind(rerun_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read re-run counters");
+        assert_eq!((completed, skipped), (0, 2), "the re-run transfers nothing");
+        assert_eq!(
+            maven_metadata_versions(&pool, repo_id, "com.example", "lib").await,
+            expected,
+            "the re-run's duplicate-skip path backfills the coordinates"
+        );
+
+        let _ = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(rerun_id)
+            .execute(&pool)
+            .await;
+        cleanup_repo(&pool, repo_id).await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// #3927: a repository migrated before the fix has artifact rows but no
+    /// Maven coordinates. Re-running the job skips those items as duplicates;
+    /// the skip path must backfill the coordinates so the repair needs no
+    /// re-transfer, and must leave an existing row alone.
+    #[tokio::test]
+    async fn test_maven_remigration_backfills_missing_coordinates_3927() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig3927-repair", "maven").await;
+
+        let path = "org/acme/tool/2.0.0/tool-2.0.0.jar";
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), bytes::Bytes::from_static(b"tool jar"));
+        transfer_one(&worker, &storage, &files, &repo_key, "maven", path)
+            .await
+            .expect("maven transfer must succeed");
+
+        // Simulate the pre-fix state: the row exists, its coordinates do not.
+        sqlx::query(
+            "DELETE FROM artifact_metadata WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("strip coordinates");
+        assert!(maven_metadata_versions(&pool, repo_id, "org.acme", "tool")
+            .await
+            .is_empty());
+
+        worker
+            .repair_migrated_maven_metadata(&repo_key, "maven", path)
+            .await;
+        assert_eq!(
+            maven_metadata_versions(&pool, repo_id, "org.acme", "tool").await,
+            vec!["2.0.0".to_string()],
+            "the duplicate-skip path must backfill the missing coordinates"
+        );
+
+        // A second pass is a no-op: the row is not rewritten or duplicated.
+        worker
+            .repair_migrated_maven_metadata(&repo_key, "maven", path)
+            .await;
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifact_metadata am \
+             JOIN artifacts a ON a.id = am.artifact_id WHERE a.repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count metadata rows");
+        assert_eq!(rows, 1);
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #2525: a migrated CRAN source package lands at the native
+    /// `<name>/<version>/<name>_<version>.tar.gz` path with its coordinates,
+    /// in the packages catalog; a binary keeps its source path.
+    #[tokio::test]
+    async fn test_cran_import_uses_native_layout_2525() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2525-cran", "cran").await;
+
+        let src = "src/contrib/Archive/dplyr/dplyr_1.1.3.tar.gz";
+        let bin = "bin/windows/contrib/4.3/dplyr_1.1.3.zip";
+        let mut files = std::collections::HashMap::new();
+        files.insert(src.to_string(), bytes::Bytes::from_static(b"src tarball"));
+        files.insert(bin.to_string(), bytes::Bytes::from_static(b"win binary"));
+        for p in [src, bin] {
+            transfer_one(&worker, &storage, &files, &repo_key, "cran", p)
+                .await
+                .unwrap_or_else(|e| panic!("cran transfer of {p} must succeed: {e}"));
+        }
+
+        let mut rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT path, name, version FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_all(&pool)
+                .await
+                .expect("query rows");
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (bin.to_string(), "dplyr_1.1.3.zip".to_string(), None),
+                (
+                    "dplyr/1.1.3/dplyr_1.1.3.tar.gz".to_string(),
+                    "dplyr".to_string(),
+                    Some("1.1.3".to_string())
+                ),
+            ]
+        );
+        assert_eq!(
+            single_catalog_row(&pool, repo_id).await,
+            Some(("dplyr".to_string(), "1.1.3".to_string()))
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// A minimal, valid `.deb` (ar: `debian-binary`, `control.tar.gz`,
+    /// `data.tar.gz`) whose control file names `package`/`version`/`arch`.
+    fn test_deb(package: &str, version: &str, arch: &str) -> bytes::Bytes {
+        fn ar_member(out: &mut Vec<u8>, name: &str, content: &[u8]) {
+            let header = format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                name,
+                0,
+                0,
+                0,
+                "100644",
+                content.len()
+            );
+            out.extend_from_slice(header.as_bytes());
+            out.extend_from_slice(content);
+            if content.len() % 2 == 1 {
+                out.push(b'\n');
+            }
+        }
+        fn tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut builder = tar::Builder::new(Vec::new());
+            for (name, body) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, name, *body)
+                    .expect("append");
+            }
+            let tar_bytes = builder.into_inner().expect("tar bytes");
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            std::io::Write::write_all(&mut enc, &tar_bytes).expect("gzip");
+            enc.finish().expect("gzip finish")
+        }
+        let control = format!(
+            "Package: {package}\nVersion: {version}\nArchitecture: {arch}\n\
+             Maintainer: Test <test@example.local>\nSection: utils\n\
+             Description: {package} from the migration test\n"
+        );
+        let mut deb = b"!<arch>\n".to_vec();
+        ar_member(&mut deb, "debian-binary", b"2.0\n");
+        ar_member(
+            &mut deb,
+            "control.tar.gz",
+            &tar_gz(&[("./control", control.as_bytes())]),
+        );
+        ar_member(&mut deb, "data.tar.gz", &tar_gz(&[]));
+        bytes::Bytes::from(deb)
+    }
+
+    /// #4657: a Debian repository migrated from Artifactory imported its files
+    /// but no packages. Two `.deb`s, one in the conventional
+    /// `pool/<component>/` layout and one at Artifactory's "Set Me Up" path
+    /// directly under `pool/`, must both produce catalog rows, a `debian`
+    /// control document, and an entry in the rendered `Packages` index.
+    #[tokio::test]
+    async fn test_debian_import_registers_packages_4657() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig4657-deb", "debian").await;
+
+        let conventional = "pool/main/h/hello/hello_1.0-1_amd64.deb";
+        let set_me_up = "pool/world_2.0_all.deb";
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            conventional.to_string(),
+            test_deb("hello", "1.0-1", "amd64"),
+        );
+        files.insert(set_me_up.to_string(), test_deb("world", "2.0", "all"));
+        for p in [conventional, set_me_up] {
+            transfer_one(&worker, &storage, &files, &repo_key, "debian", p)
+                .await
+                .unwrap_or_else(|e| panic!("debian transfer of {p} must succeed: {e}"));
+        }
+
+        let mut catalog: Vec<(String, String)> = sqlx::query_as(
+            "SELECT p.name, pv.version FROM packages p \
+             JOIN package_versions pv ON pv.package_id = p.id \
+             WHERE p.repository_id = $1 ORDER BY p.name",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("query catalog");
+        catalog.sort();
+        assert_eq!(
+            catalog,
+            vec![
+                ("hello".to_string(), "1.0-1".to_string()),
+                ("world".to_string(), "2.0".to_string()),
+            ],
+            "both migrated .debs must be in the packages catalog"
+        );
+
+        let documents: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifact_metadata am \
+             JOIN artifacts a ON a.id = am.artifact_id \
+             WHERE a.repository_id = $1 AND am.format = 'debian' \
+               AND am.metadata->>'component' = 'main'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count control documents");
+        assert_eq!(documents, 2, "each .deb carries its control document");
+
+        let packages =
+            crate::api::handlers::debian::render_packages_index(&pool, repo_id, "main", "amd64")
+                .await
+                .expect("render Packages");
+        assert!(packages.contains("Package: hello\n"), "{packages}");
+        assert!(packages.contains("Package: world\n"), "{packages}");
+        assert!(
+            packages.contains("Description: hello from the migration test"),
+            "the control file, not just the file name, feeds the index: {packages}"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #4657: a repository imported before the fix has the `.deb` rows but no
+    /// control documents or catalog rows. Re-running the job must register
+    /// them instead of skipping the items as duplicates.
+    #[tokio::test]
+    async fn test_debian_remigration_registers_previously_imported_debs_4657() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig4657-rerun", "debian").await;
+        let path = "pool/main/h/hello/hello_1.0-1_amd64.deb";
+        let body = test_deb("hello", "1.0-1", "amd64");
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), body.clone());
+        transfer_one(&worker, &storage, &files, &repo_key, "debian", path)
+            .await
+            .expect("first import");
+        // Pre-fix state: the row exists, nothing else does.
+        sqlx::query(
+            "DELETE FROM artifact_metadata WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("strip metadata");
+        sqlx::query("DELETE FROM packages WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("strip catalog");
+
+        let keys = RepoKeys {
+            source: repo_key.clone(),
+            target: repo_key.clone(),
+        };
+        let run = || async {
+            let mut c = (0i32, 0i32, 0i32, 0i64);
+            worker
+                .process_single_artifact(
+                    Uuid::new_v4(),
+                    Arc::new(MapSource {
+                        files: files.clone(),
+                    }),
+                    storage.clone(),
+                    &keys,
+                    "debian",
+                    path,
+                    path,
+                    body.len() as i64,
+                    ExpectedChecksums {
+                        sha256: None,
+                        sha1: None,
+                    },
+                    ConflictResolution::Skip,
+                    false,
+                    &mut c.0,
+                    &mut c.1,
+                    &mut c.2,
+                    &mut c.3,
+                    None,
+                )
+                .await
+                .expect("process_single_artifact");
+            c
+        };
+        let counters = run().await;
+        assert_eq!(
+            (counters.0, counters.1, counters.2),
+            (1, 0, 0),
+            "an unregistered .deb is re-imported, not skipped"
+        );
+        assert_eq!(
+            single_catalog_row(&pool, repo_id).await,
+            Some(("hello".to_string(), "1.0-1".to_string()))
+        );
+
+        // Once registered, a further re-run skips it as before.
+        let again = run().await;
+        assert_eq!((again.0, again.1, again.2), (0, 0, 1));
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    #[test]
+    fn test_debian_destination_path_component_4740() {
+        let ubuntu_layout = "pool/h/hello/hello_1.0-1_amd64.deb";
+        // The source's `deb.component` decides when present.
+        assert_eq!(
+            debian_destination_path(ubuntu_layout, Some("contrib")),
+            "pool/contrib/h/hello/hello_1.0-1_amd64.deb"
+        );
+        assert_eq!(
+            debian_destination_path(
+                "pool/contrib/h/hello/hello_1.0-1_amd64.deb",
+                Some("contrib")
+            ),
+            "pool/contrib/h/hello/hello_1.0-1_amd64.deb",
+            "a path already under the component keeps it"
+        );
+        assert_eq!(
+            debian_destination_path("pool/hello_1.0-1_amd64.deb", Some("contrib")),
+            "pool/contrib/hello_1.0-1_amd64.deb"
+        );
+        // Without it, the `pool/<letter>/<name>/` layout (Nexus apt, an
+        // Ubuntu pool mirror) has no component segment and files under main,
+        // where the letter used to become the component.
+        for (src, dst) in [
+            (ubuntu_layout, "pool/main/h/hello/hello_1.0-1_amd64.deb"),
+            (
+                "pool/libz/libzstd1/libzstd1_1.5_amd64.deb",
+                "pool/main/libz/libzstd1/libzstd1_1.5_amd64.deb",
+            ),
+        ] {
+            assert_eq!(debian_destination_path(src, None), dst, "{src}");
+            assert_eq!(migration_destination_path("debian", src), dst, "{src}");
+            assert_eq!(duplicate_lookup_path("debian", src, None), dst, "{src}");
+        }
+        // A real component segment still decides without the property.
+        for kept in [
+            "pool/main/h/hello/hello_1.0-1_amd64.deb",
+            "pool/universe/libz/libzstd1/libzstd1_1.5_amd64.deb",
+            "pool/contrib/x_2_all.udeb",
+        ] {
+            assert_eq!(debian_destination_path(kept, None), kept);
+        }
+        // Non-package files and other formats are untouched.
+        assert_eq!(
+            debian_destination_path("pool/h/hello/hello_1.0.orig.tar.gz", Some("contrib")),
+            "pool/h/hello/hello_1.0.orig.tar.gz"
+        );
+        assert_eq!(
+            duplicate_lookup_path("generic", ubuntu_layout, Some("contrib")),
+            ubuntu_layout
+        );
+    }
+
+    #[test]
+    fn test_debian_component_from_properties_4740() {
+        let props = |vals: &[&str]| {
+            std::collections::HashMap::from([(
+                "deb.component".to_string(),
+                vals.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
+            )])
+        };
+        assert_eq!(
+            debian_component_from_properties(&props(&["contrib"])),
+            Some("contrib".to_string())
+        );
+        assert_eq!(
+            debian_component_from_properties(&props(&["../x", " non-free "])),
+            Some("non-free".to_string()),
+            "an unusable value is skipped, not turned into a path"
+        );
+        assert_eq!(
+            debian_component_from_properties(&props(&["a/b", ".."])),
+            None
+        );
+        assert_eq!(
+            debian_component_from_properties(&std::collections::HashMap::new()),
+            None
+        );
+    }
+
+    /// A [`MapSource`] whose items carry Artifactory properties.
+    struct PropertiesSource {
+        files: std::collections::HashMap<String, bytes::Bytes>,
+        properties: std::collections::HashMap<String, Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::source_registry::SourceRegistry for PropertiesSource {
+        async fn ping(
+            &self,
+        ) -> Result<bool, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(true)
+        }
+        async fn get_version(
+            &self,
+        ) -> Result<
+            crate::services::artifactory_client::SystemVersionResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            unimplemented!()
+        }
+        async fn list_repositories(
+            &self,
+        ) -> Result<
+            Vec<crate::services::artifactory_client::RepositoryListItem>,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(vec![])
+        }
+        async fn list_artifacts(
+            &self,
+            _repo_key: &str,
+            _offset: i64,
+            _limit: i64,
+        ) -> Result<
+            crate::services::artifactory_client::AqlResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            unimplemented!()
+        }
+        async fn download_artifact(
+            &self,
+            repo_key: &str,
+            path: &str,
+        ) -> Result<bytes::Bytes, crate::services::artifactory_client::ArtifactoryError> {
+            MapSource {
+                files: self.files.clone(),
+            }
+            .download_artifact(repo_key, path)
+            .await
+        }
+        async fn get_properties(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<
+            crate::services::artifactory_client::PropertiesResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(crate::services::artifactory_client::PropertiesResponse {
+                properties: Some(self.properties.clone()),
+                uri: None,
+            })
+        }
+        fn source_type(&self) -> &'static str {
+            "artifactory"
+        }
+    }
+
+    /// #4740: a `.deb` in the `pool/<letter>/<name>/` layout was filed under
+    /// the letter as its component. With `deb.component` on the source item
+    /// it lands in that component; without it, in `main`.
+    #[tokio::test]
+    async fn test_debian_migration_takes_component_from_deb_component_4740() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig4740", "debian").await;
+        let keys = RepoKeys {
+            source: repo_key.clone(),
+            target: repo_key.clone(),
+        };
+        let hello = "pool/h/hello/hello_1.0-1_amd64.deb";
+        let world = "pool/w/world/world_2.0_all.deb";
+
+        for (path, body, properties) in [
+            (
+                hello,
+                test_deb("hello", "1.0-1", "amd64"),
+                std::collections::HashMap::from([(
+                    "deb.component".to_string(),
+                    vec!["contrib".to_string()],
+                )]),
+            ),
+            (
+                world,
+                test_deb("world", "2.0", "all"),
+                std::collections::HashMap::new(),
+            ),
+        ] {
+            let source = PropertiesSource {
+                files: std::collections::HashMap::from([(path.to_string(), body)]),
+                properties,
+            };
+            let component = worker
+                .debian_component(&source, &repo_key, "debian", path)
+                .await;
+            worker
+                .transfer_artifact(
+                    None,
+                    Arc::new(source),
+                    storage.clone(),
+                    &keys,
+                    "debian",
+                    path,
+                    false,
+                    &ExpectedChecksums {
+                        sha256: None,
+                        sha1: None,
+                    },
+                    component.as_deref(),
+                )
+                .await
+                .expect("transfer .deb");
+        }
+
+        let mut rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT a.path, am.metadata->>'component' FROM artifacts a \
+             LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read rows");
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "pool/contrib/h/hello/hello_1.0-1_amd64.deb".to_string(),
+                    Some("contrib".to_string())
+                ),
+                (
+                    "pool/main/w/world/world_2.0_all.deb".to_string(),
+                    Some("main".to_string())
+                ),
+            ]
+        );
+        let contrib =
+            crate::api::handlers::debian::render_packages_index(&pool, repo_id, "contrib", "amd64")
+                .await
+                .expect("render contrib Packages");
+        assert!(contrib.contains("Package: hello\n"), "{contrib}");
+        let main =
+            crate::api::handlers::debian::render_packages_index(&pool, repo_id, "main", "amd64")
+                .await
+                .expect("render main Packages");
+        assert!(main.contains("Package: world\n"), "{main}");
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    #[test]
+    fn test_debian_destination_path_4657() {
+        // Already in the indexed `pool/<component>/` layout: unchanged.
+        for kept in [
+            "pool/main/h/hello/hello_1.0-1_amd64.deb",
+            "pool/contrib/x_2_all.udeb",
+            "pool/main/n/nginx/nginx_1.0.orig.tar.gz",
+            "README.txt",
+        ] {
+            assert_eq!(debian_destination_path(kept, None), kept);
+            assert_eq!(migration_destination_path("debian", kept), kept);
+        }
+        // Artifactory "Set Me Up" layout and arbitrary paths move under main.
+        for (src, dst) in [
+            ("pool/world_2.0_all.deb", "pool/main/world_2.0_all.deb"),
+            (
+                "focal/world_2.0_all.deb",
+                "pool/main/focal/world_2.0_all.deb",
+            ),
+            ("/world_2.0_all.deb", "pool/main/world_2.0_all.deb"),
+        ] {
+            assert_eq!(debian_destination_path(src, None), dst, "{src}");
+            assert_eq!(migration_destination_path("debian", src), dst, "{src}");
+        }
+    }
+
+    #[test]
+    fn test_is_source_generated_index_debian_4657() {
+        for path in [
+            "dists/focal/InRelease",
+            "dists/focal/Release",
+            "dists/focal/Release.gpg",
+            "dists/focal/main/binary-amd64/Packages.gz",
+            "dists/focal/main/binary-amd64/by-hash/SHA256/08f0458b1ab9085e7b167251ff1fde1e",
+        ] {
+            assert!(is_source_generated_index("debian", path), "{path}");
+        }
+        assert!(!is_source_generated_index(
+            "debian",
+            "pool/main/h/hello/hello_1.0-1_amd64.deb"
+        ));
+        assert!(!is_source_generated_index(
+            "generic",
+            "dists/focal/InRelease"
+        ));
+    }
+
+    /// #3925: a migrated `.rpm` must carry the header metadata the native and
+    /// generic upload paths record, so the dynamically rendered repodata
+    /// advertises its summary and dependencies, not just a filename.
+    #[tokio::test]
+    async fn test_rpm_import_records_header_metadata_3925() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig3925-rpm", "rpm").await;
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ak-meta-test-1.0-1.noarch.rpm");
+        let bytes = std::fs::read(&fixture).expect("read rpm fixture");
+        let path = "Packages/a/ak-meta-test-1.0-1.noarch.rpm";
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), bytes::Bytes::from(bytes));
+        transfer_one(&worker, &storage, &files, &repo_key, "rpm", path)
+            .await
+            .expect("rpm transfer must succeed");
+
+        let meta: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT am.metadata FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND am.format = 'rpm'",
+        )
+        .bind(repo_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query rpm metadata");
+        let meta = meta.expect("the migrated .rpm must have a header-metadata row");
+        assert_eq!(meta["name"], "ak-meta-test", "{meta}");
+        assert!(
+            meta.get(crate::api::handlers::rpm::RPM_REPODATA_KEY)
+                .is_some(),
+            "the repodata block is recorded: {meta}"
         );
 
         cleanup_repo(&pool, repo_id).await;
@@ -10784,9 +12501,11 @@ mod tests {
     struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
     impl LogCapture {
-        fn install(&self) -> tracing::subscriber::DefaultGuard {
+        fn install(&self) -> crate::api::handlers::test_db_helpers::CaptureGuard {
             use tracing_subscriber::layer::SubscriberExt;
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+            crate::api::handlers::test_db_helpers::set_capture_default(
+                tracing_subscriber::registry().with(self.clone()),
+            )
         }
         fn contains(&self, needle: &str) -> bool {
             self.0.lock().unwrap().iter().any(|l| l.contains(needle))

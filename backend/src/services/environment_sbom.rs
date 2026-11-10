@@ -111,15 +111,29 @@ pub fn generate_environment_sbom(
         .scopes()
         .into_iter()
         .map(|scope| {
-            let graph = ScopeGraph::build(env, &scope);
-            let document = match format {
-                SbomFormat::CycloneDX => cyclonedx_document(env, name, &graph),
-                SbomFormat::SPDX => spdx_document(env, name, &graph),
-            };
+            let document = generate_scope_document(env, name, format, &scope);
             ScopedSbom { scope, document }
         })
         .collect();
     EnvironmentSbom { format, documents }
+}
+
+/// Render ONE graph of `env` as an SBOM document.
+///
+/// The per-scope half of [`generate_environment_sbom`], so a caller that
+/// streams or budgets its output (the `/sbom/environment` route, #4670) can
+/// hold one document at a time instead of every platform's at once.
+pub fn generate_scope_document(
+    env: &LockedEnvironment,
+    name: &str,
+    format: SbomFormat,
+    scope: &Scope,
+) -> Value {
+    let graph = ScopeGraph::build(env, scope);
+    match format {
+        SbomFormat::CycloneDX => cyclonedx_document(env, name, &graph),
+        SbomFormat::SPDX => spdx_document(env, name, &graph),
+    }
 }
 
 // ---------------------------------------------------------------------------

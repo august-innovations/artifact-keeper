@@ -6,17 +6,35 @@
       {
         "ordinal": 0,
         "name": "name",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "name"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "version",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "version"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "created_at"
+          }
+        }
       }
     ],
     "parameters": {

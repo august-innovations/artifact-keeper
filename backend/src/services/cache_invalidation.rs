@@ -59,6 +59,16 @@ const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 /// to a `_v2` channel without confusing old replicas during a rolling deploy.
 pub const CACHE_INVALIDATION_CHANNEL: &str = "ak_cache_invalidation_v1";
 
+/// Channel of [`InvalidationEvent::CondaRepodataInvalidated`] (#4174), same
+/// envelope, same listener. Kept off [`CACHE_INVALIDATION_CHANNEL`] because a
+/// replica that does not know an event answers it with
+/// [`conservative_flush_all`]: during a rolling upgrade every conda rebuild
+/// (each upload and each backfill batch) would make every 1.11.x replica
+/// drop its authorization caches and re-run bcrypt per API token. Older
+/// replicas do not listen here. Missing the event costs nothing but memory,
+/// since every conda read checks the subdir revision.
+pub const CONDA_REPODATA_INVALIDATION_CHANNEL: &str = "ak_conda_repodata_invalidation_v1";
+
 /// Payload schema version expected inside each notification envelope.
 pub const CACHE_INVALIDATION_VERSION: u8 = 1;
 
@@ -102,6 +112,21 @@ pub enum InvalidationEvent {
     /// A missed notification converges when [`crate::api::handlers::npm`]
     /// entries pass their TTL.
     NpmVirtualLayoutChanged,
+    /// A Remote repository's upstream filter was saved or removed (#4399).
+    /// Each replica drops its compiled copy so the change applies at once
+    /// rather than after the filter cache TTL.
+    ///
+    /// Emitted application-side by [`notify_upstream_filter_changed`].
+    UpstreamFilterChanged { repo_id: Uuid },
+    /// A hosted conda repository's shards and revisions were rebuilt for
+    /// `subdirs` (#4174). Each replica drops its kept repodata documents,
+    /// shard indexes and channeldata for them. Correctness does not depend
+    /// on it: every conda read checks the subdir revision first, so a missed
+    /// event only keeps a superseded entry in memory until it is evicted.
+    ///
+    /// Emitted by the rebuild transaction in `handlers/conda/shard_store.rs`
+    /// on [`CONDA_REPODATA_INVALIDATION_CHANNEL`], not on the shared one.
+    CondaRepodataInvalidated { repo_id: Uuid, subdirs: Vec<String> },
 }
 
 /// Versioned wrapper matching the exact JSON the triggers emit.
@@ -162,10 +187,12 @@ pub async fn apply_invalidation_event(
         }
         InvalidationEvent::RepositoryChanged { old_key, new_key } => {
             invalidate_repo_key(&handles.repo_cache, &handles.repo_miss_cache, old_key).await;
+            crate::api::handlers::npm::invalidate_npm_virtual_layout_cache().await;
             invalidate_repo_key(&handles.repo_cache, &handles.repo_miss_cache, new_key).await;
         }
         InvalidationEvent::RepositoryDeleted { key } => {
             invalidate_repo_key(&handles.repo_cache, &handles.repo_miss_cache, key).await;
+            crate::api::handlers::npm::invalidate_npm_virtual_layout_cache().await;
         }
         InvalidationEvent::PermissionsChanged => {
             handles.permission_service.invalidate_cache();
@@ -179,6 +206,12 @@ pub async fn apply_invalidation_event(
         }
         InvalidationEvent::NpmVirtualLayoutChanged => {
             crate::api::handlers::npm::invalidate_npm_virtual_layout_cache().await;
+        }
+        InvalidationEvent::UpstreamFilterChanged { repo_id } => {
+            crate::services::upstream_filter::invalidate_cached_filter(*repo_id).await;
+        }
+        InvalidationEvent::CondaRepodataInvalidated { repo_id, subdirs } => {
+            crate::api::handlers::conda::invalidate_cached_repodata(*repo_id, subdirs).await;
         }
     }
 }
@@ -374,6 +407,57 @@ pub async fn notify_npm_packument_invalidated(pool: &PgPool, repo_keys: &[String
     }
 }
 
+/// Serialize one [`InvalidationEvent::CondaRepodataInvalidated`] envelope.
+/// A repository rebuilds a bounded batch of keys per transaction, so the
+/// subdir list stays far below the NOTIFY payload limit; a list that would
+/// not fit is truncated to an empty one, which the receiver reads as "every
+/// subdir of the repository".
+pub fn conda_repodata_invalidation_payload(repo_id: Uuid, subdirs: &[String]) -> String {
+    let payload = |subdirs: Vec<String>| {
+        serde_json::to_string(&InvalidationEnvelope {
+            v: CACHE_INVALIDATION_VERSION,
+            event: InvalidationEvent::CondaRepodataInvalidated { repo_id, subdirs },
+        })
+        .expect("conda repodata invalidation envelope must serialize")
+    };
+    let full = payload(subdirs.to_vec());
+    if full.len() <= NOTIFY_PAYLOAD_SOFT_MAX_BYTES {
+        full
+    } else {
+        payload(Vec::new())
+    }
+}
+
+/// Serialize one [`InvalidationEvent::UpstreamFilterChanged`] envelope.
+pub fn upstream_filter_changed_payload(repo_id: Uuid) -> String {
+    serde_json::to_string(&InvalidationEnvelope {
+        v: CACHE_INVALIDATION_VERSION,
+        event: InvalidationEvent::UpstreamFilterChanged { repo_id },
+    })
+    .expect("upstream filter invalidation envelope must serialize")
+}
+
+/// Publish an [`InvalidationEvent::UpstreamFilterChanged`] so every listening
+/// replica drops its compiled upstream filter for `repo_id` (#4399).
+/// Best-effort: on failure other replicas converge within the filter cache
+/// TTL (30 s).
+pub async fn notify_upstream_filter_changed(pool: &PgPool, repo_id: Uuid) {
+    if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(CACHE_INVALIDATION_CHANNEL)
+        .bind(upstream_filter_changed_payload(repo_id))
+        .execute(pool)
+        .await
+    {
+        counter!("ak_cache_invalidation_notify_errors_total").increment(1);
+        tracing::warn!(
+            error = %e,
+            repository_id = %repo_id,
+            "failed to publish upstream filter invalidation; \
+             other replicas converge within the filter cache TTL"
+        );
+    }
+}
+
 /// Connect a dedicated [`sqlx::postgres::PgListener`], `LISTEN` on
 /// [`CACHE_INVALIDATION_CHANNEL`], conservatively flush the local caches
 /// (notifications may have been missed before this point), then spawn the
@@ -469,7 +553,13 @@ async fn connect_and_flush(
             return None;
         }
     };
-    if let Err(e) = listener.listen(CACHE_INVALIDATION_CHANNEL).await {
+    if let Err(e) = listener
+        .listen_all([
+            CACHE_INVALIDATION_CHANNEL,
+            CONDA_REPODATA_INVALIDATION_CHANNEL,
+        ])
+        .await
+    {
         tracing::warn!(error = %e, "cache-invalidation LISTEN failed");
         return None;
     }
@@ -594,6 +684,9 @@ mod tests {
                 package: "@acme/webapp".to_string(),
             },
             InvalidationEvent::NpmVirtualLayoutChanged,
+            InvalidationEvent::UpstreamFilterChanged {
+                repo_id: Uuid::new_v4(),
+            },
         ];
         for event in events {
             let payload = serde_json::to_string(&InvalidationEnvelope {
@@ -605,6 +698,21 @@ mod tests {
                 .unwrap_or_else(|e| panic!("payload {payload} must parse, got: {e}"));
             assert_eq!(parsed, event, "round-trip mismatch for {payload}");
         }
+    }
+
+    /// #4399: the application-side upstream-filter event round-trips through
+    /// the listener's parser, and applying it is accepted by every replica.
+    #[tokio::test]
+    async fn upstream_filter_changed_payload_parses_and_applies() {
+        let repo_id = Uuid::new_v4();
+        let payload = upstream_filter_changed_payload(repo_id);
+        assert!(
+            payload.contains(r#""kind":"upstream_filter_changed""#),
+            "{payload}"
+        );
+        let event = parse_invalidation_payload(&payload).expect("payload parses");
+        assert_eq!(event, InvalidationEvent::UpstreamFilterChanged { repo_id });
+        apply_invalidation_event(&test_handles(), &event).await;
     }
 
     #[test]

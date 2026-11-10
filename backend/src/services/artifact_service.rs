@@ -36,29 +36,41 @@ const CANCEL_SUPERSEDED_PUSH_TASKS_SQL: &str = r#"
 
 /// Fan out a `delete` sync task to every eligible peer subscribed to the
 /// artifact's repository in push/mirror mode.
+///
+/// Not filtered on `pi.status`: the sync worker already skips offline peers when it claims
+/// tasks, so filtering here dropped the delete instead of deferring it, and the peer kept the
+/// artifact once it came back.
+///
+/// Each task carries the peer address (repository key and path) so it still
+/// reaches the peer after the row is purged (#5624).
 const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
-                INSERT INTO sync_tasks (id, peer_instance_id, artifact_id, task_type, status, priority)
-                SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0
+                INSERT INTO sync_tasks (
+                    id, peer_instance_id, artifact_id, task_type, status, priority,
+                    target_repository_id, target_repository_key, target_path
+                )
+                SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0,
+                       r.id, r.key, a.path
                 FROM peer_instances pi
                 JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id
                 JOIN artifacts a ON a.repository_id = prs.repository_id AND a.id = $1
+                JOIN repositories r ON r.id = a.repository_id
                 WHERE pi.is_local = false
-                  AND pi.status IN ('online', 'syncing')
                   AND prs.replication_mode::text IN ('push', 'mirror')
                   AND prs.sync_enabled = true
-                ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
+                ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET
+                    status = 'pending',
+                    retry_count = 0,
+                    error_message = NULL,
+                    started_at = NULL,
+                    completed_at = NULL,
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL,
+                    target_repository_id = EXCLUDED.target_repository_id,
+                    target_repository_key = EXCLUDED.target_repository_key,
+                    target_path = EXCLUDED.target_path
+                WHERE sync_tasks.status <> 'in_progress'
                 "#;
-
-/// Select all peer subscriptions (with their optional artifact filter) that are
-/// eligible to receive a push of a newly uploaded artifact in the repository.
-const PUSH_MIRROR_SUBSCRIPTIONS_SQL: &str = r#"
-                    SELECT prs.peer_instance_id, sp.artifact_filter
-                    FROM peer_repo_subscriptions prs
-                    LEFT JOIN sync_policies sp ON sp.id = prs.policy_id
-                    WHERE prs.repository_id = $1
-                      AND prs.sync_enabled = true
-                      AND prs.replication_mode::text IN ('push', 'mirror')
-                    "#;
 
 /// The three content digests persisted on every artifact row.
 ///
@@ -159,6 +171,33 @@ pub(crate) async fn enforce_path_immutability(
     version: Option<&str>,
     checksum_sha256: &str,
 ) -> Result<()> {
+    enforce_path_immutability_with(
+        db,
+        repository_id,
+        repo,
+        path,
+        version,
+        checksum_sha256,
+        false,
+    )
+    .await
+}
+
+/// [`enforce_path_immutability`] for a conditional write (#4186).
+/// `replaces_current` is true when the write carries an `If-Match` that the
+/// caller has already found to hold: the client named the live content it
+/// replaces, so check 1 (live overwrite) does not apply. Check 2, the
+/// release-immutability backstop, still does, so a released coordinate
+/// cannot be swapped for different bytes even with a matching `If-Match`.
+pub(crate) async fn enforce_path_immutability_with(
+    db: &PgPool,
+    repository_id: Uuid,
+    repo: Option<&Repository>,
+    path: &str,
+    version: Option<&str>,
+    checksum_sha256: &str,
+    replaces_current: bool,
+) -> Result<()> {
     let versioning_active = repo
         .map(|r| versioning_applies(&r.format, r.versioning_enabled))
         .unwrap_or(false);
@@ -174,7 +213,8 @@ pub(crate) async fn enforce_path_immutability(
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     if let Some(existing) = existing {
-        if !versioning_active && existing.version == version.map(String::from) {
+        if !versioning_active && !replaces_current && existing.version == version.map(String::from)
+        {
             return Err(AppError::Conflict(
                 "Artifact version already exists and is immutable".to_string(),
             ));
@@ -385,6 +425,379 @@ async fn dedup_probe(storage: &dyn StorageBackend, storage_key: &str) -> bool {
             false
         }
     }
+}
+
+/// Journal the object a conditional replace (#4186) left without a row as a
+/// storage GC candidate. Recorded in the publishing transaction so it exists
+/// exactly when the replace commits. Idempotent; the candidate sweep drops
+/// the row without touching the object if anything still references the key.
+async fn record_replaced_object_gc_candidate(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo: &Repository,
+    old_key: &str,
+) -> Result<()> {
+    let scope =
+        crate::services::storage_gc_service::oci_gc_candidate_scope(&repo.storage_location());
+    sqlx::query(
+        "INSERT INTO oci_gc_candidates \
+             (storage_key, storage_backend, storage_path, source_repository_id) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING",
+    )
+    .bind(old_key)
+    .bind(&scope.backend)
+    .bind(&scope.path)
+    .bind(repo.id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
+/// The live artifact's recorded SHA-256 at `(repository_id, path)`, the value
+/// a precondition is evaluated against (#4186). `None` when the path holds no
+/// live artifact; a soft-deleted row counts as absent, as it does for a GET.
+pub(crate) async fn current_live_checksum(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT checksum_sha256 FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .fetch_optional(db)
+    .await
+    .map(|v| v.map(|c| c.trim().to_string()))
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
+/// One `If-Match` / `If-None-Match` header value (#4186): the wildcard `*`, or
+/// a list of entity tags. Only the opaque part of each tag is kept; a weak tag
+/// (`W/"..."`) is remembered as weak because `If-Match` uses the strong
+/// comparison (RFC 9110 section 13.1.1), under which a weak tag never matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntityTagCondition {
+    Any,
+    Tags(Vec<EntityTag>),
+}
+
+/// One entity tag from a precondition header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityTag {
+    pub weak: bool,
+    pub opaque: String,
+}
+
+impl EntityTagCondition {
+    /// Parse a header value. `None` when the value is not a valid
+    /// `*` / entity-tag list, which the caller answers with 400 rather than
+    /// silently ignoring a precondition the client meant to set.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw == "*" {
+            return Some(Self::Any);
+        }
+        let mut tags = Vec::new();
+        for part in raw.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (weak, rest) = match part.strip_prefix("W/") {
+                Some(rest) => (true, rest),
+                None => (false, part),
+            };
+            let opaque = rest.strip_prefix('"')?.strip_suffix('"')?;
+            if opaque.contains('"') {
+                return None;
+            }
+            tags.push(EntityTag {
+                weak,
+                opaque: opaque.to_string(),
+            });
+        }
+        (!tags.is_empty()).then_some(Self::Tags(tags))
+    }
+
+    /// Whether `current` (the target's ETag opaque value, `None` when there is
+    /// no current representation) satisfies this condition as `If-Match`
+    /// (strong comparison).
+    fn matches_strong(&self, current: Option<&str>) -> bool {
+        match (self, current) {
+            (_, None) => false,
+            (Self::Any, Some(_)) => true,
+            (Self::Tags(tags), Some(cur)) => tags
+                .iter()
+                .any(|t| !t.weak && t.opaque.eq_ignore_ascii_case(cur)),
+        }
+    }
+
+    /// Whether `current` matches this condition under the weak comparison
+    /// `If-None-Match` uses.
+    fn matches_weak(&self, current: Option<&str>) -> bool {
+        match (self, current) {
+            (_, None) => false,
+            (Self::Any, Some(_)) => true,
+            (Self::Tags(tags), Some(cur)) => {
+                tags.iter().any(|t| t.opaque.eq_ignore_ascii_case(cur))
+            }
+        }
+    }
+}
+
+/// What [`guard_cas_key_for_commit`] found for a content-addressed key while
+/// an upload's commit transaction holds the key's GC journal slot (#4980).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CasKeyGuard {
+    /// No storage GC delete of the key is in flight and its object is
+    /// present: commit, and no later GC delete can remove it.
+    Clear,
+    /// A storage GC pass holds a fresh journal lease on the key, so its delete
+    /// may still land after this upload commits. Roll back and wait.
+    Collecting,
+    /// The object is gone (a GC delete finished after the upload wrote or
+    /// deduplicated it). Roll back and write the bytes again.
+    Missing,
+}
+
+/// How long an upload waits, in total, for a storage GC delete of its key to
+/// finish before it gives up with a retryable 503 (#4980). GC deletes a
+/// claimed key right after its claim, so the wait normally ends in
+/// milliseconds; it only runs out when a GC pass stopped between its claim and
+/// its delete and the journal lease has not lapsed yet. A delete that failed
+/// clears its own lease (#5168).
+pub(crate) const CAS_COMMIT_GC_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long after a storage GC pass took an `oci_gc_candidates` row as a lease
+/// (`leased_at`, migration 302) the upload commit guard assumes its delete may
+/// still be in flight (#4980). GC deletes a claimed key right after claiming it,
+/// so a lease older than this belongs to a pass that stopped (a delete that
+/// failed clears its lease, #5168); the candidate sweep retries those with a
+/// fresh re-check. The same
+/// 15 minutes the OCI blob sweep's delete claim lasts.
+const GC_DELETE_LEASE_SQL: &str = "INTERVAL '15 minutes'";
+
+/// Make an upload's commit visible to storage GC before it trusts the bytes
+/// under `storage_key` (#4980). Call it first in the transaction that inserts
+/// the `artifacts` row, and commit that transaction only on
+/// [`CasKeyGuard::Clear`].
+///
+/// Storage GC journals every key it is about to delete in `oci_gc_candidates`
+/// (one row per `(backend, scope, key)`, unique) before its delete, and drops
+/// the row after the delete. Its orphan-key claim takes the slot with
+/// `INSERT .. ON CONFLICT DO UPDATE`, and the candidate sweep leases an
+/// existing row with `FOR UPDATE SKIP LOCKED`; both re-check the key's
+/// references only after that. This upserts the same slot, so until this
+/// transaction ends:
+///
+/// * a GC claim that journals after this point blocks on the slot, commits
+///   after this upload's row, and its pre-delete re-check sees the row and
+///   keeps the object;
+/// * a candidate sweep skips the locked row, or re-checks after this commit;
+/// * a GC claim that journaled or leased the row before this point stamped
+///   its `leased_at` (migration 302), which is reported as
+///   [`CasKeyGuard::Collecting`] for 15 minutes: its delete may not have run
+///   yet and its re-check may already have passed, so the upload must not
+///   commit.
+///
+/// A slot this upload created is deleted again in the same transaction, so a
+/// commit leaves no journal row behind. A row that is not leased (a candidate a
+/// repository delete recorded, waiting out `BLOB_GC_MIN_AGE_SECS`, or a delete
+/// that failed and cleared its lease) or whose lease is older (a pass that
+/// stopped) is left to the candidate sweep, which
+/// re-checks after this commit and keeps the object.
+/// The presence check then runs while the slot is held: GC can no longer
+/// start a delete this commit does not see, and no delete is in flight, so an
+/// object present now stays. It asks [`StorageBackend::exists_at_exact_key`],
+/// a HEAD, not a write; the slot is never held across an upload's write.
+/// A failed HEAD is treated as present (see the match below).
+///
+/// Lock order: this slot first, then the quota ledger and the `artifacts`
+/// row. A GC claim locks the soft-deleted `artifacts` rows of the key first and
+/// the slot second, so re-uploading to the very path whose trashed row GC is
+/// collecting can deadlock with it. Postgres then aborts one of the two
+/// transactions and neither commits anything: the GC pass skips the key until
+/// its next run, or the upload fails with a retryable error.
+pub(crate) async fn guard_cas_key_for_commit(
+    conn: &mut sqlx::PgConnection,
+    storage: &dyn StorageBackend,
+    location: &crate::storage::StorageLocation,
+    storage_key: &str,
+) -> Result<CasKeyGuard> {
+    let scope = crate::services::storage_gc_service::oci_gc_candidate_scope(location);
+    let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+    let sql = format!(
+        "INSERT INTO oci_gc_candidates (storage_key, storage_backend, storage_path) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (storage_backend, storage_path, storage_key) \
+             DO UPDATE SET recorded_at = oci_gc_candidates.recorded_at \
+         RETURNING id, (xmax = 0) AS inserted, \
+                   COALESCE(leased_at >= NOW() - {GC_DELETE_LEASE_SQL}, false) AS leased"
+    );
+    let (id, inserted, leased): (i64, bool, bool) = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+        .bind(storage_key)
+        .bind(&scope.backend)
+        .bind(&scope.path)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    if inserted {
+        // Ours: keep the slot locked until commit, but leave no row.
+        sqlx::query("DELETE FROM oci_gc_candidates WHERE id = $1")
+            .bind(id)
+            .execute(&mut *conn)
+            .await
+            .map_err(db_err)?;
+    } else if leased {
+        return Ok(CasKeyGuard::Collecting);
+    }
+    match storage.exists_at_exact_key(storage_key).await {
+        Ok(true) => Ok(CasKeyGuard::Clear),
+        Ok(false) => Ok(CasKeyGuard::Missing),
+        // "Unknown", not "absent" (#3517): failing every upload while a backend
+        // throttles HEADs would trade a narrow race for an outage. The journal
+        // half still holds (no GC delete is in flight and none can start
+        // unseen), so only a delete that finished before this check, in the
+        // same window the HEAD failed, goes unnoticed.
+        Err(e) => {
+            tracing::warn!(
+                storage_key,
+                error = %e,
+                "Upload commit guard could not confirm its object is stored; committing"
+            );
+            Ok(CasKeyGuard::Clear)
+        }
+    }
+}
+
+/// The retryable answer when an upload cannot be committed safely while a
+/// storage GC delete of its content holds the key (#4980).
+pub(crate) fn cas_key_busy_error() -> AppError {
+    AppError::ServiceUnavailable(
+        "Identical content is being removed by storage garbage collection; retry the upload"
+            .to_string(),
+    )
+}
+
+/// The outcome of [`begin_guarded_cas_commit`].
+pub(crate) enum GuardedCasCommit {
+    /// The guard is clear: insert the row in this transaction and commit it.
+    Ready(sqlx::Transaction<'static, sqlx::Postgres>),
+    /// The object is gone; write it again (or fail retryably) and retry.
+    Missing,
+}
+
+/// Open an upload's commit transaction behind [`guard_cas_key_for_commit`]
+/// (#4980), waiting up to [`CAS_COMMIT_GC_WAIT`] while a storage GC delete of
+/// the key may still land. Returns the retryable [`cas_key_busy_error`] when
+/// the wait runs out.
+pub(crate) async fn begin_guarded_cas_commit(
+    db: &PgPool,
+    storage: &dyn StorageBackend,
+    location: &crate::storage::StorageLocation,
+    storage_key: &str,
+) -> Result<GuardedCasCommit> {
+    let deadline = std::time::Instant::now() + CAS_COMMIT_GC_WAIT;
+    let mut backoff = std::time::Duration::from_millis(50);
+    loop {
+        let mut tx = db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        match guard_cas_key_for_commit(&mut tx, storage, location, storage_key).await? {
+            CasKeyGuard::Clear => return Ok(GuardedCasCommit::Ready(tx)),
+            CasKeyGuard::Missing => return Ok(GuardedCasCommit::Missing),
+            CasKeyGuard::Collecting => {
+                drop(tx);
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        storage_key,
+                        "Upload refused: storage GC still holds a delete lease on its content"
+                    );
+                    return Err(cas_key_busy_error());
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+/// The preconditions of a conditional write (#4186), evaluated against the
+/// artifact's current ETag, which is its recorded SHA-256 (the value the
+/// generic download route emits as `ETag` and `X-Checksum-Sha256`).
+///
+/// The handler evaluates it once before reading the body, so a write that is
+/// bound to fail is refused before any byte is staged. The authoritative
+/// evaluation runs again in the publishing transaction with the target row
+/// locked ([`ArtifactService::upload_content_conditional`]), so of two
+/// conditional writers racing on the same ETag exactly one commits and the
+/// other gets 412, the same single-winner shape #4832 gives unconditional
+/// writers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WritePrecondition {
+    pub if_match: Option<EntityTagCondition>,
+    pub if_none_match: Option<EntityTagCondition>,
+}
+
+impl WritePrecondition {
+    /// `None` when neither header was sent: an unconditional write.
+    pub fn new(
+        if_match: Option<EntityTagCondition>,
+        if_none_match: Option<EntityTagCondition>,
+    ) -> Option<Self> {
+        (if_match.is_some() || if_none_match.is_some()).then_some(Self {
+            if_match,
+            if_none_match,
+        })
+    }
+
+    /// RFC 9110 section 13.2.2 order for a state-changing method: `If-Match`
+    /// first, then `If-None-Match`. `current` is the live artifact's SHA-256,
+    /// `None` when the path holds no live artifact (absent or soft-deleted).
+    pub fn holds(&self, current: Option<&str>) -> bool {
+        let current = current.map(str::trim);
+        if let Some(cond) = &self.if_match {
+            if !cond.matches_strong(current) {
+                return false;
+            }
+        }
+        if let Some(cond) = &self.if_none_match {
+            if cond.matches_weak(current) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a write that passed this precondition replaces the live
+    /// artifact the client named. A matched `If-Match` is an explicit
+    /// compare-and-swap on the current content, so it lifts the
+    /// "a second upload to an occupied path is a 409" rule (the live-overwrite
+    /// check); the release-immutability backstop still applies.
+    pub fn replaces_current(&self) -> bool {
+        self.if_match.is_some()
+    }
+
+    /// The 412 a failed precondition is answered with.
+    pub fn failed(path: &str) -> AppError {
+        AppError::PreconditionFailed(format!(
+            "Precondition failed: the current state of '{path}' does not match If-Match / If-None-Match"
+        ))
+    }
+}
+
+/// The bytes an upload can write again if the commit guard finds its object
+/// gone (#4980).
+enum CasRewrite {
+    Bytes(Bytes),
+    Stream(BoxStream<'static, Result<Bytes>>),
+    StagedObject(String),
+    /// The body was a stream the first write consumed.
+    Unavailable,
 }
 
 /// Artifact service
@@ -646,15 +1059,22 @@ impl ArtifactService {
 
         // Quota, live-overwrite check, and the release-immutability
         // backstop — shared with the streaming path.
-        self.preflight_upload(repository_id, path, version, size_bytes, &checksum_sha256)
-            .await?;
+        self.preflight_upload(
+            repository_id,
+            path,
+            version,
+            size_bytes,
+            &checksum_sha256,
+            None,
+        )
+        .await?;
 
         // Check if content already exists (deduplication)
         let content_exists = dedup_probe(self.storage.as_ref(), &storage_key).await;
 
         if !content_exists {
             // Store the actual content
-            self.storage.put(&storage_key, data).await?;
+            self.storage.put(&storage_key, data.clone()).await?;
         }
 
         self.finalize_upload(
@@ -671,6 +1091,8 @@ impl ArtifactService {
             uploaded_by,
             enqueue_sync_tasks,
             None,
+            None,
+            CasRewrite::Bytes(data),
         )
         .await
     }
@@ -716,6 +1138,7 @@ impl ArtifactService {
             uploaded_by,
             enqueue_sync_tasks,
             catalog_name,
+            None,
         )
         .await
     }
@@ -726,6 +1149,10 @@ impl ArtifactService {
     /// the content-addressed key with a backend `copy` (server-side on S3 and
     /// GCS) so the body never touches local disk. Every other semantic --
     /// preflight, dedup-first, finalize -- is shared.
+    ///
+    /// `precondition` makes the write conditional (#4186): it is checked in
+    /// the preflight (412 before any byte is written) and again, with the
+    /// target row locked, in the publishing transaction.
     #[allow(clippy::too_many_arguments)]
     pub async fn upload_content_with_sync_options(
         &self,
@@ -740,18 +1167,36 @@ impl ArtifactService {
         uploaded_by: Option<Uuid>,
         enqueue_sync_tasks: bool,
         catalog_name: Option<&str>,
+        precondition: Option<&WritePrecondition>,
     ) -> Result<Artifact> {
         let storage_key = Self::storage_key_from_checksum(&digests.sha256);
 
-        self.preflight_upload(repository_id, path, version, size_bytes, &digests.sha256)
-            .await?;
+        self.preflight_upload(
+            repository_id,
+            path,
+            version,
+            size_bytes,
+            &digests.sha256,
+            precondition,
+        )
+        .await?;
 
         // Dedup check FIRST: skip `put_stream` on a warm blob so we never
         // rewrite content that is already present under its content-addressed
         // key (== its SHA-256).
         let content_exists = dedup_probe(self.storage.as_ref(), &storage_key).await;
 
-        if !content_exists {
+        // What the commit guard can write again if storage GC removes the
+        // object before the row commits (#4980): a body the dedup hit left
+        // unread, or the staged object, which the caller keeps until this
+        // returns.
+        let wrote_object = !content_exists;
+        let rewrite = if content_exists {
+            match content {
+                UploadContent::Stream(stream) => CasRewrite::Stream(stream),
+                UploadContent::StagedObject(staged_key) => CasRewrite::StagedObject(staged_key),
+            }
+        } else {
             match content {
                 UploadContent::Stream(stream) => {
                     let put = self.storage.put_stream(&storage_key, stream).await?;
@@ -765,31 +1210,76 @@ impl ArtifactService {
                             put.checksum_sha256, digests.sha256
                         )));
                     }
+                    CasRewrite::Unavailable
                 }
                 // The stager hashed these exact bytes on their way into the
                 // staged object, so `digests` already describes them.
                 UploadContent::StagedObject(staged_key) => {
                     self.storage.copy(&staged_key, &storage_key).await?;
+                    CasRewrite::StagedObject(staged_key)
                 }
             }
-        }
+        };
 
-        self.finalize_upload(
-            repository_id,
-            path,
-            name,
-            version,
-            content_type,
-            size_bytes,
-            &digests.sha256,
-            &digests.sha1,
-            &digests.md5,
-            &storage_key,
-            uploaded_by,
-            enqueue_sync_tasks,
-            catalog_name,
+        let finalized = self
+            .finalize_upload(
+                repository_id,
+                path,
+                name,
+                version,
+                content_type,
+                size_bytes,
+                &digests.sha256,
+                &digests.sha1,
+                &digests.md5,
+                &storage_key,
+                uploaded_by,
+                enqueue_sync_tasks,
+                catalog_name,
+                precondition,
+                rewrite,
+            )
+            .await;
+        if finalized.is_err() && wrote_object {
+            // #3916: this upload wrote the content-addressed object but its row
+            // did not commit (a conditional writer that lost, a racing
+            // immutable publish, a quota denial). Hand the key to storage GC's
+            // candidate sweep, which deletes it after its grace window unless
+            // a row references it by then; nothing else would ever find it.
+            self.journal_unreferenced_upload_object(repository_id, &storage_key)
+                .await;
+        }
+        finalized
+    }
+
+    /// Record `storage_key`, written by an upload into `repository_id` whose
+    /// row did not commit, as a storage GC candidate (#3916). Best-effort: a
+    /// failure only leaves the object as it was before this hand-off existed.
+    pub(crate) async fn journal_unreferenced_upload_object(
+        &self,
+        repository_id: Uuid,
+        storage_key: &str,
+    ) {
+        let Ok(repo) = self.repo_service.get_by_id(repository_id).await else {
+            return;
+        };
+        let scope =
+            crate::services::storage_gc_service::oci_gc_candidate_scope(&repo.storage_location());
+        if let Err(e) = sqlx::query(
+            "INSERT INTO oci_gc_candidates \
+                 (storage_key, storage_backend, storage_path, source_repository_id) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING",
         )
+        .bind(storage_key)
+        .bind(&scope.backend)
+        .bind(&scope.path)
+        .bind(repository_id)
+        .execute(&self.db)
         .await
+        {
+            tracing::warn!(storage_key, error = %e, "Could not hand an uncommitted upload's object to storage GC");
+        }
     }
 
     /// Pre-storage validation shared by the buffered and streaming upload
@@ -806,17 +1296,27 @@ impl ArtifactService {
         version: Option<&str>,
         size_bytes: i64,
         checksum_sha256: &str,
+        precondition: Option<&WritePrecondition>,
     ) -> Result<()> {
+        // #4186: a precondition is evaluated before any other refusal, so a
+        // compare-and-swap that lost gets 412 rather than the immutability
+        // 409 below. Unlocked here (an early, cheap refusal); the publishing
+        // transaction re-evaluates it with the row locked.
+        if let Some(precondition) = precondition {
+            let current = current_live_checksum(&self.db, repository_id, path).await?;
+            if !precondition.holds(current.as_deref()) {
+                return Err(WritePrecondition::failed(path));
+            }
+        }
         crate::services::rpm_layout::validate_upload(&self.db, repository_id, path).await?;
-        // Check quota
-        if !self
+        // Check quota (repository quota and, if any, its project's aggregate
+        // quota, #2474).
+        if let Some(scope) = self
             .repo_service
-            .check_quota(repository_id, size_bytes)
+            .quota_preflight(repository_id, size_bytes)
             .await?
         {
-            return Err(AppError::QuotaExceeded(
-                "Repository storage quota exceeded".to_string(),
-            ));
+            return Err(scope.into_error());
         }
 
         // Both immutability checks live in `enforce_path_immutability` so the
@@ -826,16 +1326,100 @@ impl ArtifactService {
         // (#3924), because this function — the documented chokepoint — was
         // simply never on it.
         let repo = self.repo_service.get_by_id(repository_id).await;
-        enforce_path_immutability(
+        let immutability = enforce_path_immutability_with(
             &self.db,
             repository_id,
             repo.as_ref().ok(),
             path,
             version,
             checksum_sha256,
+            precondition.is_some_and(WritePrecondition::replaces_current),
         )
-        .await?;
+        .await;
+        // #4186: a concurrent writer can commit between the precondition
+        // check above and this one. If the precondition no longer holds, that
+        // is what refused the write: answer 412, not the immutability 409.
+        if let (Err(AppError::Conflict(_)), Some(precondition)) = (&immutability, precondition) {
+            let current = current_live_checksum(&self.db, repository_id, path).await?;
+            if !precondition.holds(current.as_deref()) {
+                return Err(WritePrecondition::failed(path));
+            }
+        }
+        immutability?;
 
+        Ok(())
+    }
+
+    /// Open the transaction that commits an upload's row, behind the storage GC
+    /// commit guard (#4980, [`begin_guarded_cas_commit`]). If a GC delete
+    /// removed the object, it writes the bytes again from `rewrite` and
+    /// re-checks. Fails with a retryable 503 when the GC wait runs out or the
+    /// bytes cannot be written again.
+    ///
+    /// A repository row that could not be read (`repo` is `None`) leaves the
+    /// storage scope unknown; the transaction then opens unguarded, as before.
+    async fn begin_guarded_commit(
+        &self,
+        repo: Option<&Repository>,
+        storage_key: &str,
+        checksum_sha256: &str,
+        mut rewrite: CasRewrite,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+        let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+        let Some(repo) = repo else {
+            return self.db.begin().await.map_err(db_err);
+        };
+        let location = repo.storage_location();
+        let mut rewrites = 0;
+        loop {
+            match begin_guarded_cas_commit(&self.db, self.storage.as_ref(), &location, storage_key)
+                .await?
+            {
+                GuardedCasCommit::Ready(tx) => return Ok(tx),
+                GuardedCasCommit::Missing => {
+                    if rewrites >= 3 {
+                        return Err(cas_key_busy_error());
+                    }
+                    rewrites += 1;
+                    tracing::warn!(
+                        storage_key,
+                        "Upload's object was removed by storage GC before its row committed; writing it again"
+                    );
+                    self.rewrite_cas_object(&mut rewrite, storage_key, checksum_sha256)
+                        .await?;
+                }
+            }
+        }
+    }
+
+    /// Write an upload's bytes to `storage_key` again for
+    /// [`Self::begin_guarded_commit`].
+    async fn rewrite_cas_object(
+        &self,
+        rewrite: &mut CasRewrite,
+        storage_key: &str,
+        checksum_sha256: &str,
+    ) -> Result<()> {
+        match std::mem::replace(rewrite, CasRewrite::Unavailable) {
+            CasRewrite::Bytes(data) => {
+                self.storage.put(storage_key, data.clone()).await?;
+                *rewrite = CasRewrite::Bytes(data);
+            }
+            CasRewrite::StagedObject(staged_key) => {
+                self.storage.copy(&staged_key, storage_key).await?;
+                *rewrite = CasRewrite::StagedObject(staged_key);
+            }
+            CasRewrite::Stream(stream) => {
+                let put = self.storage.put_stream(storage_key, stream).await?;
+                if !put.checksum_sha256.eq_ignore_ascii_case(checksum_sha256) {
+                    return Err(AppError::Validation(format!(
+                        "Streamed content SHA-256 {} does not match staged digest {}",
+                        put.checksum_sha256, checksum_sha256
+                    )));
+                }
+            }
+            CasRewrite::Unavailable => return Err(cas_key_busy_error()),
+        }
         Ok(())
     }
 
@@ -861,18 +1445,23 @@ impl ArtifactService {
         uploaded_by: Option<Uuid>,
         enqueue_sync_tasks: bool,
         catalog_name: Option<&str>,
+        precondition: Option<&WritePrecondition>,
+        rewrite: CasRewrite,
     ) -> Result<Artifact> {
         // #2367: for versioning-enabled Generic/Mlmodel repos, capture the
         // pre-upsert HEAD state so the history append below can (a) stay
         // idempotent on identical-bytes re-uploads and (b) backfill the
         // pre-existing HEAD as revision 1 on the first versioned write to a
         // coordinate that predates the feature.
-        let versioning_active = self
-            .repo_service
-            .get_by_id(repository_id)
-            .await
-            .map(|r| versioning_applies(&r.format, r.versioning_enabled))
-            .unwrap_or(false);
+        let repo_for_upload = self.repo_service.get_by_id(repository_id).await.ok();
+        let versioning_active = repo_for_upload
+            .as_ref()
+            .is_some_and(|r| versioning_applies(&r.format, r.versioning_enabled));
+        // #2382: `.safetensors` uploads to Mlmodel repos get their header
+        // summarised into `artifact_metadata` once the row exists.
+        let safetensors_eligible = repo_for_upload.as_ref().is_some_and(|r| {
+            crate::formats::mlmodel::safetensors_metadata_eligible(&r.format, path)
+        });
         let prior_head = if versioning_active {
             sqlx::query_as::<_, PriorHeadRow>(
                 "SELECT name, version, size_bytes, checksum_sha256, checksum_sha1, \
@@ -897,73 +1486,163 @@ impl ArtifactService {
         // uploads can both pass it; here the second admission blocks on the
         // first's lock and, once the first's INSERT commits, observes those
         // bytes and is rejected when the quota would be exceeded.
+        //
+        // #4980: the transaction opens with the storage GC commit guard, so
+        // the bytes under `storage_key` cannot be collected between the write
+        // (or the dedup probe) above and this commit.
         let mut tx = self
-            .db
-            .begin()
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            .begin_guarded_commit(
+                repo_for_upload.as_ref(),
+                storage_key,
+                checksum_sha256,
+                rewrite,
+            )
+            .await?;
         let admission = self
             .repo_service
             .check_quota_locked(&mut tx, repository_id, path, size_bytes)
             .await?;
-        if !admission.allowed {
+        if let Some(scope) = admission.denied_by {
             // Drop `tx` (rolls back). The content blob is content-addressed;
             // if this upload orphaned it, storage GC reclaims it.
-            return Err(AppError::QuotaExceeded(
-                "Repository storage quota exceeded".to_string(),
-            ));
+            return Err(scope.into_error());
         }
 
-        // Create artifact record.
+        // #4186: a conditional write re-evaluates its precondition here, with
+        // the target row (live or tombstone) locked, so the decision and the
+        // upsert below see the same state. Of two writers racing on one ETag
+        // the second blocks on this lock, then reads the first one's commit
+        // and fails the precondition: exactly one 2xx and one 412.
         //
-        // `ON CONFLICT DO UPDATE` re-uploads must refresh sha1/md5 in
-        // lockstep with sha256 -- otherwise an artifact whose content was
-        // replaced would still expose the *old* sha1/md5 via the
-        // checksum-search endpoint, which would point dedup-by-checksum
-        // clients at the wrong artifact.
-        let artifact = sqlx::query_as!(
-            Artifact,
-            r#"
-            INSERT INTO artifacts (
-                repository_id, path, name, version, size_bytes,
-                checksum_sha256, checksum_sha1, checksum_md5,
-                content_type, storage_key, uploaded_by
+        // A path with no row at all has nothing to lock. `expect_absent`
+        // makes the upsert refuse to overwrite a live row that a concurrent
+        // writer committed after this read; the loop then re-reads (the row
+        // now exists and is locked by the refused upsert) and evaluates the
+        // precondition against it.
+        let mut attempt = 0;
+        let artifact = loop {
+            attempt += 1;
+            let mut expect_absent = false;
+            let mut replaces_current = false;
+            let mut replaced_key = None;
+            if let Some(precondition) = precondition {
+                let row = sqlx::query_as::<_, (String, String, bool)>(
+                    "SELECT checksum_sha256, storage_key, is_deleted FROM artifacts \
+                     WHERE repository_id = $1 AND path = $2 FOR UPDATE",
+                )
+                .bind(repository_id)
+                .bind(path)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+                let live = row.filter(|(_, _, deleted)| !deleted);
+                let live_checksum = live.as_ref().map(|(checksum, _, _)| checksum.trim());
+                if !precondition.holds(live_checksum) {
+                    return Err(WritePrecondition::failed(path));
+                }
+                expect_absent = live.is_none();
+                replaces_current = live.is_some() && precondition.replaces_current();
+                replaced_key = live.map(|(_, key, _)| key);
+            }
+            // Create artifact record.
+            //
+            // `ON CONFLICT DO UPDATE` re-uploads must refresh sha1/md5 in
+            // lockstep with sha256 -- otherwise an artifact whose content was
+            // replaced would still expose the *old* sha1/md5 via the
+            // checksum-search endpoint, which would point dedup-by-checksum
+            // clients at the wrong artifact.
+            //
+            // #4832: the `WHERE` on the update is the live-overwrite rule of
+            // `enforce_path_immutability` (check 1), applied atomically. That
+            // check runs in the preflight, before the bytes are stored and outside
+            // this transaction, so concurrent uploads to one path all passed it
+            // and every one answered 201 while the last upsert silently replaced
+            // the others. Here the conflicting row is locked: a live row at the
+            // same version is left untouched (no row returned) and the upload is
+            // refused with the preflight's own 409. A tombstone is resurrected
+            // and a versioning-enabled repository appends, as before.
+            let artifact = sqlx::query_as!(
+                Artifact,
+                r#"
+                INSERT INTO artifacts (
+                    repository_id, path, name, version, size_bytes,
+                    checksum_sha256, checksum_sha1, checksum_md5,
+                    content_type, storage_key, uploaded_by
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (repository_id, path) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    version = EXCLUDED.version,
+                    size_bytes = EXCLUDED.size_bytes,
+                    checksum_sha256 = EXCLUDED.checksum_sha256,
+                    checksum_sha1 = EXCLUDED.checksum_sha1,
+                    checksum_md5 = EXCLUDED.checksum_md5,
+                    content_type = EXCLUDED.content_type,
+                    storage_key = EXCLUDED.storage_key,
+                    uploaded_by = EXCLUDED.uploaded_by,
+                    is_deleted = false,
+                    updated_at = NOW()
+                WHERE (artifacts.is_deleted
+                    OR $12
+                    OR artifacts.version IS DISTINCT FROM EXCLUDED.version
+                    OR $13)
+                  AND (NOT $14 OR artifacts.is_deleted)
+                RETURNING
+                    id, repository_id, path, name, version, size_bytes,
+                    checksum_sha256, checksum_md5, checksum_sha1,
+                    content_type, storage_key, is_deleted, uploaded_by,
+                    quarantine_status, quarantine_until,
+                    created_at, updated_at
+                "#,
+                repository_id,
+                path,
+                name,
+                version,
+                size_bytes,
+                checksum_sha256,
+                checksum_sha1,
+                checksum_md5,
+                content_type,
+                storage_key,
+                uploaded_by,
+                versioning_active,
+                replaces_current,
+                expect_absent
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            ON CONFLICT (repository_id, path) DO UPDATE SET
-                name = EXCLUDED.name,
-                version = EXCLUDED.version,
-                size_bytes = EXCLUDED.size_bytes,
-                checksum_sha256 = EXCLUDED.checksum_sha256,
-                checksum_sha1 = EXCLUDED.checksum_sha1,
-                checksum_md5 = EXCLUDED.checksum_md5,
-                content_type = EXCLUDED.content_type,
-                storage_key = EXCLUDED.storage_key,
-                uploaded_by = EXCLUDED.uploaded_by,
-                is_deleted = false,
-                updated_at = NOW()
-            RETURNING
-                id, repository_id, path, name, version, size_bytes,
-                checksum_sha256, checksum_md5, checksum_sha1,
-                content_type, storage_key, is_deleted, uploaded_by,
-                quarantine_status, quarantine_until,
-                created_at, updated_at
-            "#,
-            repository_id,
-            path,
-            name,
-            version,
-            size_bytes,
-            checksum_sha256,
-            checksum_sha1,
-            checksum_md5,
-            content_type,
-            storage_key,
-            uploaded_by
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            match artifact {
+                Some(artifact) => {
+                    // #4186: an `If-Match` replace on a repository without
+                    // revision history leaves the old object with no row.
+                    // Hand its key to storage GC's candidate sweep, which
+                    // re-checks every reference before deleting, so a key
+                    // another row still shares is kept.
+                    if replaces_current && !versioning_active {
+                        if let (Some(old_key), Some(repo)) =
+                            (replaced_key.as_deref(), repo_for_upload.as_ref())
+                        {
+                            if old_key != storage_key {
+                                record_replaced_object_gc_candidate(&mut tx, repo, old_key).await?;
+                            }
+                        }
+                    }
+                    break artifact;
+                }
+                // #4186: a live row appeared under a conditional write that
+                // expected none; evaluate the precondition against it.
+                None if expect_absent && attempt == 1 => continue,
+                None => {
+                    // Drop `tx` (rolls back the quota admission). The content
+                    // blob is content-addressed; if this upload orphaned it,
+                    // storage GC reclaims it, as on the quota-deny path above.
+                    return Err(AppError::Conflict(
+                        "Artifact version already exists and is immutable".to_string(),
+                    ));
+                }
+            }
+        };
 
         // Commit the admission + INSERT together, releasing the ledger-row
         // lock. Everything below is a post-commit side effect on the pool.
@@ -1038,7 +1717,7 @@ impl ArtifactService {
             // NuGet stores the lowercased id, so deriving the name here
             // registered a second, lowercased package beside the handler's.
             let registration = match catalog_name {
-                Some(catalog_name) => Some((catalog_name.to_string(), ver.clone())),
+                Some(catalog_name) => Some((catalog_name.to_string(), ver.clone(), None)),
                 None => match self.repo_service.get_by_id(artifact.repository_id).await {
                     Ok(repo)
                         if matches!(
@@ -1061,17 +1740,22 @@ impl ArtifactService {
                                 Ok(coords) => Some((
                                     format!("{}:{}", coords.group_id, coords.artifact_id),
                                     coords.version,
+                                    // #4633: a Maven version is the sum of
+                                    // the files in its directory.
+                                    crate::api::handlers::maven::maven_version_directory(
+                                        &artifact.path,
+                                    ),
                                 )),
-                                Err(_) => Some((artifact.name.clone(), ver.clone())),
+                                Err(_) => Some((artifact.name.clone(), ver.clone(), None)),
                             }
                         }
                     }
-                    _ => Some((artifact.name.clone(), ver.clone())),
+                    _ => Some((artifact.name.clone(), ver.clone(), None)),
                 },
             };
             // A metadata/sidecar upload (None) still gets its artifact row and
             // the sync fan-out below — only catalog registration is skipped.
-            if let Some((package_name, package_version)) = registration {
+            if let Some((package_name, package_version, version_directory)) = registration {
                 let pkg_svc =
                     crate::services::package_service::PackageService::new(self.db.clone());
                 pkg_svc
@@ -1085,110 +1769,66 @@ impl ArtifactService {
                         None,
                     )
                     .await;
+                if let Some(directory) = version_directory {
+                    pkg_svc
+                        .try_set_version_size_to_directory_total(
+                            artifact.repository_id,
+                            &package_name,
+                            &package_version,
+                            directory,
+                        )
+                        .await;
+                }
             }
         }
 
         // Queue sync tasks for peer replication (non-blocking)
         if enqueue_sync_tasks {
-            let db = self.db.clone();
+            let peer_service =
+                crate::services::peer_instance_service::PeerInstanceService::new(self.db.clone());
             let artifact_id = artifact.id;
             let repository_id = artifact.repository_id;
             let artifact_path = artifact.path.clone();
             let artifact_size = artifact.size_bytes;
             let artifact_created = artifact.created_at;
             tokio::spawn(async move {
-                // Find peers with push/mirror subscriptions, including the policy's artifact_filter
-                #[derive(sqlx::FromRow)]
-                struct SubWithFilter {
-                    peer_instance_id: uuid::Uuid,
-                    artifact_filter: Option<serde_json::Value>,
-                }
-
-                let subscriptions: std::result::Result<Vec<SubWithFilter>, _> =
-                    sqlx::query_as(PUSH_MIRROR_SUBSCRIPTIONS_SQL)
-                        .bind(repository_id)
-                        .fetch_all(&db)
-                        .await;
-
-                match subscriptions {
-                    Ok(subs) if !subs.is_empty() => {
-                        let peer_service =
-                            crate::services::peer_instance_service::PeerInstanceService::new(db);
-                        let mut queued = 0usize;
-                        for sub in &subs {
-                            let filter: crate::services::sync_policy_service::ArtifactFilter = sub
-                                .artifact_filter
-                                .as_ref()
-                                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                                .unwrap_or_default();
-
-                            if !filter.matches(&artifact_path, artifact_size, artifact_created) {
-                                tracing::debug!(
-                                    "Artifact {} filtered out for peer {} by policy artifact_filter",
-                                    artifact_id,
-                                    sub.peer_instance_id,
-                                );
-                                continue;
-                            }
-
-                            if let Err(e) = peer_service
-                                .queue_sync_task(sub.peer_instance_id, artifact_id, 0)
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to queue sync task for peer {} artifact {}: {}",
-                                    sub.peer_instance_id,
-                                    artifact_id,
-                                    e
-                                );
-                            } else {
-                                queued += 1;
-                            }
-                        }
-                        if queued > 0 {
-                            tracing::info!(
-                                "Queued sync tasks for artifact {} to {} peer(s)",
-                                artifact_id,
-                                queued
-                            );
-                        }
-                    }
-                    Ok(_) => {} // No push/mirror subscriptions
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to query peer subscriptions for repo {}: {}",
+                peer_service
+                    .queue_push_sync_tasks(
+                        &crate::services::peer_instance_service::PublishedArtifact {
+                            id: artifact_id,
                             repository_id,
-                            e
-                        );
-                    }
-                }
+                            path: &artifact_path,
+                            size_bytes: artifact_size,
+                            created_at: artifact_created,
+                        },
+                    )
+                    .await;
             });
         }
 
-        // Trigger scan-on-upload if scanner service is configured
-        if let Some(ref scanner) = self.scanner_service {
-            let scanner = scanner.clone();
-            let artifact_id = artifact.id;
-            let repo_id = artifact.repository_id;
-            let db = self.db.clone();
-            tokio::spawn(async move {
-                // Check if scan_on_upload is enabled for this repository
-                let should_scan = sqlx::query_scalar!(
-                    "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
-                    repo_id
-                )
-                .fetch_optional(&db)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or(false);
+        // Trigger scan-on-upload if scanner service is configured. The same
+        // gate every format-native upload handler goes through (#4166).
+        crate::services::scanner_service::trigger_scan_on_upload(
+            &self.db,
+            self.scanner_service.clone(),
+            artifact.repository_id,
+            artifact.id,
+        )
+        .await;
 
-                if should_scan {
-                    if let Err(e) = scanner.scan_artifact(artifact_id).await {
-                        tracing::warn!("Auto-scan failed for artifact {}: {}", artifact_id, e);
-                    }
-                }
-            });
+        // #2382: summarise a `.safetensors` header into `artifact_metadata`.
+        // Placed after the quarantine hold and the scan trigger so its
+        // storage read and parse never widen the window in which a fresh row
+        // is visible without a hold.
+        if safetensors_eligible {
+            record_safetensors_metadata(
+                &self.db,
+                self.storage.as_ref(),
+                artifact.id,
+                storage_key,
+                size_bytes,
+            )
+            .await;
         }
 
         // Trigger quality checks on upload (non-blocking)
@@ -2158,6 +2798,16 @@ impl ArtifactService {
         self.delete_with_sync_options(id, true).await
     }
 
+    /// [`Self::delete`] on behalf of the authenticated request principal,
+    /// recorded as the `ARTIFACT_DELETED` actor (#5455).
+    pub async fn delete_by(
+        &self,
+        id: Uuid,
+        actor: Option<&crate::api::middleware::auth::AuthExtension>,
+    ) -> Result<()> {
+        self.delete_as(id, true, actor).await
+    }
+
     /// Soft-delete an artifact, optionally suppressing peer sync task fan-out.
     ///
     /// Thin wrapper preserving the historical single-call shape: pre-flight,
@@ -2167,6 +2817,15 @@ impl ArtifactService {
     /// [`Self::prepare_delete`] / [`Self::commit_delete_in_tx`] /
     /// [`Self::finish_delete`] directly so the whole delete is atomic.
     pub async fn delete_with_sync_options(&self, id: Uuid, enqueue_sync_tasks: bool) -> Result<()> {
+        self.delete_as(id, enqueue_sync_tasks, None).await
+    }
+
+    async fn delete_as(
+        &self,
+        id: Uuid,
+        enqueue_sync_tasks: bool,
+        actor: Option<&crate::api::middleware::auth::AuthExtension>,
+    ) -> Result<()> {
         let artifact = self.prepare_delete(id).await?;
         let mut tx = self
             .db
@@ -2177,7 +2836,8 @@ impl ArtifactService {
         tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-        self.finish_delete(&artifact, enqueue_sync_tasks).await;
+        self.finish_delete(&artifact, enqueue_sync_tasks, actor)
+            .await;
         Ok(())
     }
 
@@ -2234,7 +2894,17 @@ impl ArtifactService {
     /// never fails the delete, so this deliberately runs AFTER the caller's
     /// COMMIT: none of it may hold the transaction open, and the audit write
     /// must not be rolled back with it.
-    pub async fn finish_delete(&self, artifact: &Artifact, enqueue_sync_tasks: bool) {
+    ///
+    /// `actor` is the authenticated principal that asked for the delete, when
+    /// there is one: it becomes the audit row's actor (#5455). `None` (a
+    /// service-internal delete with no request principal) leaves the actor
+    /// unset as before.
+    pub async fn finish_delete(
+        &self,
+        artifact: &Artifact,
+        enqueue_sync_tasks: bool,
+        actor: Option<&crate::api::middleware::auth::AuthExtension>,
+    ) {
         let id = artifact.id;
 
         // A delete supersedes any upload retries for the same artifact.
@@ -2273,10 +2943,18 @@ impl ArtifactService {
             use crate::services::audit_service::{
                 audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
             };
-            // The service-layer delete does not carry the acting principal, so
-            // `user_id` (the actor) is intentionally left unset here; the
-            // original uploader is recorded in `details` for context.
-            let entry = AuditEntry::new(AuditAction::ArtifactDeleted, ResourceType::Artifact)
+            // The acting principal, when the caller has one (#5455); a
+            // service-internal delete leaves `user_id` unset. The original
+            // uploader is recorded in `details` for context.
+            let entry = match actor {
+                Some(auth) => AuditEntry::for_principal(
+                    AuditAction::ArtifactDeleted,
+                    ResourceType::Artifact,
+                    auth,
+                ),
+                None => AuditEntry::new(AuditAction::ArtifactDeleted, ResourceType::Artifact),
+            };
+            let entry = entry
                 .resource(artifact.id)
                 .resource_name(artifact.path.clone())
                 .details_typed(crate::services::audit_export::details::ArtifactDetails {
@@ -2289,6 +2967,41 @@ impl ArtifactService {
                     uploaded_by: artifact.uploaded_by,
                 });
             audit_fire_and_forget(self.db.clone(), entry).await;
+        }
+
+        // A deleted version must stop being advertised (#5604, #5632): move
+        // the catalog's Latest to the newest version still live and, for an
+        // npm repository only, drop the dist-tags that name it. The catalog
+        // lookup returns the repository format, so a non-npm delete costs no
+        // dist-tags round trip. Best-effort, as every step here.
+        let format = match crate::services::package_service::refresh_package_latest(
+            &self.db,
+            artifact.repository_id,
+            &artifact.name,
+        )
+        .await
+        {
+            Ok(refresh) => refresh.format,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to refresh catalog latest after deleting artifact {}: {}",
+                    id,
+                    e
+                );
+                None
+            }
+        };
+        if let (Some("npm"), Some(version)) = (format.as_deref(), artifact.version.clone()) {
+            if let Err(e) = crate::api::handlers::npm::drop_dist_tags_for_deleted_versions(
+                &self.db,
+                artifact.repository_id,
+                &artifact.name,
+                &[version],
+            )
+            .await
+            {
+                tracing::warn!("Failed to drop dist-tags of deleted artifact {}: {}", id, e);
+            }
         }
 
         // #3411 part 1: `artifact.deleted` is mapped by `webhook_producer` and
@@ -2341,6 +3054,34 @@ impl ArtifactService {
         metadata: serde_json::Value,
         properties: serde_json::Value,
     ) -> Result<ArtifactMetadata> {
+        Self::upsert_metadata(&self.db, artifact_id, format, metadata, properties).await
+    }
+
+    /// [`Self::set_metadata`] inside a caller-owned transaction (#5002).
+    ///
+    /// A chunked completion writes the artifact row and its format metadata in
+    /// one transaction, so a crash between the two cannot leave an indexed row
+    /// without metadata (the native Maven and npm routes already do this).
+    pub async fn set_metadata_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        artifact_id: Uuid,
+        format: &str,
+        metadata: serde_json::Value,
+        properties: serde_json::Value,
+    ) -> Result<ArtifactMetadata> {
+        Self::upsert_metadata(&mut **tx, artifact_id, format, metadata, properties).await
+    }
+
+    async fn upsert_metadata<'e, E>(
+        executor: E,
+        artifact_id: Uuid,
+        format: &str,
+        metadata: serde_json::Value,
+        properties: serde_json::Value,
+    ) -> Result<ArtifactMetadata>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         let metadata = sanitize_metadata_urls(metadata);
         let meta = sqlx::query_as!(
             ArtifactMetadata,
@@ -2358,7 +3099,7 @@ impl ArtifactService {
             metadata,
             properties
         )
-        .fetch_one(&self.db)
+        .fetch_one(executor)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -2764,10 +3505,111 @@ fn sanitize_metadata_urls(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Extract and record the safetensors header summary of a freshly stored
+/// Mlmodel or Huggingface upload (#2382, #5285) in `artifact_metadata`, under
+/// the format of the artifact's repository.
+///
+/// Shared by the service-layer finalize path (generic `PUT` / multipart) and
+/// the chunked-upload commit, so every way a `.safetensors` file reaches an
+/// Mlmodel repository surfaces the same metadata. Reads only the length
+/// prefix and the capped header through ranged storage reads
+/// (`formats::mlmodel::read_safetensors_summary`), never the tensor data.
+///
+/// Best-effort: the upload has already committed, so nothing here fails it.
+/// Every outcome replaces the row's `metadata` with server-derived data: the
+/// summary, or `safetensors_error` (the bounded rejection reason, or a fixed
+/// marker when storage could not be read). A stale summary of earlier bytes
+/// at the same path, or a client-supplied document, therefore never
+/// survives. Existing `properties` on the row are preserved.
+pub(crate) async fn record_safetensors_metadata(
+    db: &PgPool,
+    storage: &dyn StorageBackend,
+    artifact_id: Uuid,
+    storage_key: &str,
+    size_bytes: i64,
+) {
+    use crate::formats::mlmodel::{self, SafetensorsError};
+
+    let file_size = u64::try_from(size_bytes).unwrap_or(0);
+    let result = mlmodel::read_safetensors_summary(storage, storage_key, file_size).await;
+    // Both reasons are already clipped to `SAFETENSORS_MAX_REASON_CHARS`.
+    match &result {
+        Err(SafetensorsError::Unreadable(e)) => {
+            tracing::warn!(%artifact_id, error = %e, "safetensors header could not be read");
+        }
+        Err(SafetensorsError::Invalid(reason)) => {
+            tracing::info!(%artifact_id, %reason, "safetensors header rejected");
+        }
+        Ok(_) => {}
+    }
+    let metadata = sanitize_metadata_urls(mlmodel::safetensors_artifact_metadata(result));
+    let stored = sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         SELECT a.id, r.format::text, $2::jsonb \
+         FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
+         WHERE a.id = $1 \
+         ON CONFLICT (artifact_id) DO UPDATE SET \
+             format = EXCLUDED.format, metadata = EXCLUDED.metadata",
+    )
+    .bind(artifact_id)
+    .bind(metadata)
+    .execute(db)
+    .await;
+    if let Err(e) = stored {
+        tracing::warn!(%artifact_id, error = %e, "safetensors metadata could not be recorded");
+    }
+}
+
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4186: header parsing and RFC 9110 evaluation of the preconditions.
+    #[test]
+    fn write_precondition_parses_and_evaluates_4186() {
+        let c = |raw: &str| EntityTagCondition::parse(raw).expect(raw);
+        assert_eq!(c("*"), EntityTagCondition::Any);
+        assert_eq!(
+            c(r#""a", W/"b""#),
+            EntityTagCondition::Tags(vec![
+                EntityTag {
+                    weak: false,
+                    opaque: "a".into()
+                },
+                EntityTag {
+                    weak: true,
+                    opaque: "b".into()
+                },
+            ])
+        );
+        assert!(EntityTagCondition::parse("unquoted").is_none());
+        assert!(EntityTagCondition::parse("").is_none());
+        assert!(EntityTagCondition::parse(r#""a"b""#).is_none());
+
+        let if_match = |raw| WritePrecondition::new(Some(c(raw)), None).unwrap();
+        let if_none = |raw| WritePrecondition::new(None, Some(c(raw))).unwrap();
+        assert!(WritePrecondition::new(None, None).is_none());
+        assert!(if_match(r#""abc""#).holds(Some("abc")));
+        assert!(
+            if_match(r#""ABC""#).holds(Some("abc")),
+            "hex compares case-insensitively"
+        );
+        assert!(!if_match(r#""abc""#).holds(Some("def")));
+        assert!(!if_match(r#""abc""#).holds(None));
+        assert!(
+            !if_match(r#"W/"abc""#).holds(Some("abc")),
+            "strong comparison"
+        );
+        assert!(if_match("*").holds(Some("x")));
+        assert!(!if_match("*").holds(None));
+        assert!(if_none("*").holds(None));
+        assert!(!if_none("*").holds(Some("x")));
+        assert!(!if_none(r#"W/"x""#).holds(Some("x")), "weak comparison");
+        assert!(if_none(r#""y""#).holds(Some("x")));
+        assert!(if_match(r#""abc""#).replaces_current());
+        assert!(!if_none("*").replaces_current());
+    }
 
     #[test]
     fn test_calculate_sha256() {
@@ -3191,6 +4033,116 @@ mod tests {
             std::fs::read(&on_disk).expect("read the CAS object"),
             payload,
             "the deduplicated object must still hold the payload"
+        );
+    }
+
+    /// #4832: concurrent uploads to one free path must agree on a single
+    /// winner. The live-overwrite check ran before the bytes were stored and
+    /// outside the commit transaction, so every racer passed it, every one
+    /// answered 201, and the last upsert silently replaced the content the
+    /// earlier ones had been acknowledged for. Exactly one upload succeeds;
+    /// the others get the documented 409 and the stored row is the winner's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_4832_concurrent_uploads_to_one_path_have_one_winner() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = Arc::new(ArtifactService::new(pool.clone(), storage));
+
+        const RACERS: usize = 8;
+        let start = Arc::new(tokio::sync::Barrier::new(RACERS));
+        let mut racers = tokio::task::JoinSet::new();
+        for i in 0..RACERS {
+            let (svc, start) = (svc.clone(), start.clone());
+            let payload = Bytes::from(format!("racer {i} payload ").repeat(512));
+            racers.spawn(async move {
+                start.wait().await;
+                let result = svc
+                    .upload_with_sync_options(
+                        repo_id,
+                        "race/blob.bin",
+                        "blob.bin",
+                        None,
+                        "application/octet-stream",
+                        payload.clone(),
+                        Some(user_id),
+                        false,
+                    )
+                    .await;
+                (ArtifactService::calculate_sha256(&payload), result)
+            });
+        }
+        let mut winners = Vec::new();
+        let mut conflicts = 0;
+        while let Some(joined) = racers.join_next().await {
+            match joined.expect("racer task") {
+                (sha, Ok(artifact)) => winners.push((sha, artifact.checksum_sha256)),
+                (_, Err(AppError::Conflict(message))) => {
+                    assert_eq!(message, "Artifact version already exists and is immutable");
+                    conflicts += 1;
+                }
+                (_, Err(other)) => panic!("unexpected upload error: {other:?}"),
+            }
+        }
+        let stored: Vec<String> = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind("race/blob.bin")
+        .fetch_all(&pool)
+        .await
+        .expect("read the stored row");
+
+        // Control: a versioning-enabled Generic repository appends a revision
+        // for each sequential upload to one path instead of refusing (#2367).
+        let (versioned_id, _key, versioned_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET versioning_enabled = true WHERE id = $1")
+            .bind(versioned_id)
+            .execute(&pool)
+            .await
+            .expect("enable versioning");
+        let versioned = ArtifactService::new(
+            pool.clone(),
+            Arc::new(crate::storage::filesystem::FilesystemStorage::new(
+                versioned_dir.clone(),
+            )),
+        );
+        for body in ["first revision", "second revision"] {
+            versioned
+                .upload_with_sync_options(
+                    versioned_id,
+                    "tool/tool.bin",
+                    "tool.bin",
+                    None,
+                    "application/octet-stream",
+                    Bytes::from_static(body.as_bytes()),
+                    Some(user_id),
+                    false,
+                )
+                .await
+                .expect("a versioning-enabled repository accepts a second upload");
+        }
+
+        tdh::cleanup(&pool, versioned_id, user_id).await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&versioned_dir);
+
+        assert_eq!(winners.len(), 1, "exactly one upload succeeds");
+        assert_eq!(conflicts, RACERS - 1, "every other upload is refused");
+        let (winner_sha, returned_sha) = &winners[0];
+        assert_eq!(returned_sha, winner_sha);
+        assert_eq!(
+            stored,
+            vec![winner_sha.clone()],
+            "the stored row is the winner's"
         );
     }
 
@@ -4370,15 +5322,161 @@ mod tests {
         assert!(sql.contains("sync_enabled"));
         assert!(sql.contains("is_local = false"));
         assert!(sql.contains("ON CONFLICT"));
+        assert!(sql.contains("WHERE sync_tasks.status <> 'in_progress'"));
+        // Gating on peer status here is what dropped every delete made while a
+        // peer was offline; the worker already gates delivery.
+        assert!(!sql.contains("pi.status"));
     }
 
-    #[test]
-    fn test_push_mirror_subscriptions_sql_filters_enabled_push_mirror() {
-        let sql = PUSH_MIRROR_SUBSCRIPTIONS_SQL;
-        assert!(sql.contains("FROM peer_repo_subscriptions prs"));
-        assert!(sql.contains("LEFT JOIN sync_policies sp"));
-        assert!(sql.contains("prs.sync_enabled = true"));
-        assert!(sql.contains("replication_mode::text IN ('push', 'mirror')"));
+    #[tokio::test]
+    async fn delete_enqueue_queues_for_offline_peer() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::peer_instance_service::{PeerInstanceService, ReplicationMode};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let peer_id = tdh::register_test_peer(&pool, "delete-offline", "t").await;
+        PeerInstanceService::new(pool.clone())
+            .assign_repository(
+                peer_id,
+                repo_id,
+                true,
+                Some(ReplicationMode::Push),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE peer_instances SET status = 'offline' WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key, is_deleted) \
+             VALUES ($1, 'a/b/offline.bin', 'offline.bin', 1, $2, 'application/octet-stream', $2, true) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("{:064x}", 2))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(ENQUEUE_DELETE_SYNC_TASKS_SQL)
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status::TEXT FROM sync_tasks \
+             WHERE peer_instance_id = $1 AND artifact_id = $2 AND task_type = 'delete'",
+        )
+        .bind(peer_id)
+        .bind(artifact_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status.as_deref(), Some("pending"));
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn delete_enqueue_requeues_finished_delete_task() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::peer_instance_service::{PeerInstanceService, ReplicationMode};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let peer_id = tdh::register_test_peer(&pool, "delete-requeue", "t").await;
+        sqlx::query("UPDATE peer_instances SET status = 'online' WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        PeerInstanceService::new(pool.clone())
+            .assign_repository(
+                peer_id,
+                repo_id,
+                true,
+                Some(ReplicationMode::Push),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key, is_deleted) \
+             VALUES ($1, 'a/b/c.bin', 'c.bin', 1, $2, 'application/octet-stream', $2, true) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("{:064x}", 1))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let delete_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO sync_tasks (peer_instance_id, artifact_id, task_type, status, \
+             retry_count, completed_at) \
+             VALUES ($1, $2, 'delete', 'completed', 3, NOW()) RETURNING id",
+        )
+        .bind(peer_id)
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(ENQUEUE_DELETE_SYNC_TASKS_SQL)
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state: (String, i32) =
+            sqlx::query_as("SELECT status::TEXT, retry_count FROM sync_tasks WHERE id = $1")
+                .bind(delete_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, ("pending".to_string(), 0));
+
+        let token = Uuid::new_v4();
+        sqlx::query("UPDATE sync_tasks SET status = 'in_progress', claim_token = $2 WHERE id = $1")
+            .bind(delete_id)
+            .bind(token)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(ENQUEUE_DELETE_SYNC_TASKS_SQL)
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claimed: (String, Option<Uuid>) =
+            sqlx::query_as("SELECT status::TEXT, claim_token FROM sync_tasks WHERE id = $1")
+                .bind(delete_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(claimed, ("in_progress".to_string(), Some(token)));
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -4767,6 +5865,146 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // ---- #2382 safetensors header metadata on the finalize path -----------
+
+    /// A `.safetensors` upload to an Mlmodel repo records its header summary
+    /// in `artifact_metadata` (format `mlmodel`) with dangerous URLs in
+    /// `__metadata__` sanitised; a malformed re-upload at the same path
+    /// replaces the summary with the rejection reason while keeping the
+    /// row's properties; non-safetensors files and Generic repos record
+    /// nothing. Skips without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_safetensors_upload_to_mlmodel_repo_records_header_metadata() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::formats::mlmodel::safetensors_fixture;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "local", "mlmodel").await;
+        // Versioning (#2367) is what lets new bytes land at an occupied
+        // Mlmodel path, which the re-upload below relies on.
+        sqlx::query("UPDATE repositories SET versioning_enabled = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage.clone());
+
+        let header = serde_json::json!({
+            "__metadata__": {"format": "pt", "source_url": "javascript:alert(1)"},
+            "w": {"dtype": "F16", "shape": [4, 2], "data_offsets": [0, 16]}
+        });
+        let path = "models/tiny/versions/1/artifacts/model.safetensors";
+        let upload = |bytes: Vec<u8>| {
+            svc.upload(
+                repo_id,
+                path,
+                "model.safetensors",
+                Some("1"),
+                "application/octet-stream",
+                Bytes::from(bytes),
+                Some(user_id),
+            )
+        };
+        let artifact = upload(safetensors_fixture(&header, 16))
+            .await
+            .expect("safetensors upload succeeds");
+        let meta = svc
+            .get_metadata(artifact.id)
+            .await
+            .unwrap()
+            .expect("metadata recorded");
+        assert_eq!(meta.format, "mlmodel");
+        let st = &meta.metadata["safetensors"];
+        assert_eq!(st["total_parameters"], 8);
+        assert_eq!(st["tensors"]["w"]["dtype"], "F16");
+        assert_eq!(st["metadata"]["format"], "pt");
+        assert_eq!(st["metadata"]["source_url"], "", "dangerous URL sanitised");
+
+        // Properties set on the row survive a re-upload; a malformed header
+        // replaces the stale summary with the rejection reason.
+        sqlx::query(
+            "UPDATE artifact_metadata SET properties = '{\"k\":\"v\"}' WHERE artifact_id = $1",
+        )
+        .bind(artifact.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A storage read failure clears the summary rather than leaving one
+        // that may describe earlier bytes, and keeps the properties.
+        record_safetensors_metadata(&pool, storage.as_ref(), artifact.id, "no/such/key", 64).await;
+        let meta = svc.get_metadata(artifact.id).await.unwrap().unwrap();
+        assert!(meta.metadata.get("safetensors").is_none());
+        assert_eq!(
+            meta.metadata["safetensors_error"],
+            crate::formats::mlmodel::SAFETENSORS_UNREADABLE_REASON
+        );
+        assert_eq!(meta.properties["k"], "v");
+
+        let mut broken = 4u64.to_le_bytes().to_vec();
+        broken.extend_from_slice(b"nope-and-data");
+        let again = upload(broken)
+            .await
+            .expect("malformed upload still succeeds");
+        let meta = svc.get_metadata(again.id).await.unwrap().unwrap();
+        assert!(meta.metadata.get("safetensors").is_none());
+        assert!(meta.metadata["safetensors_error"]
+            .as_str()
+            .unwrap()
+            .contains("header rejected"));
+        assert_eq!(meta.properties["k"], "v");
+
+        // A non-safetensors file in the same repo records nothing.
+        let other = svc
+            .upload(
+                repo_id,
+                "models/tiny/versions/1/artifacts/config.json",
+                "config.json",
+                Some("1"),
+                "application/json",
+                Bytes::from_static(b"{}"),
+                Some(user_id),
+            )
+            .await
+            .unwrap();
+        assert!(svc.get_metadata(other.id).await.unwrap().is_none());
+
+        // The same bytes in a Generic repo record nothing either.
+        let (generic_id, _gkey, generic_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let generic_svc = ArtifactService::new(
+            pool.clone(),
+            Arc::new(crate::storage::filesystem::FilesystemStorage::new(
+                generic_dir.clone(),
+            )),
+        );
+        let generic = generic_svc
+            .upload(
+                generic_id,
+                "tiny/1/model.safetensors",
+                "model.safetensors",
+                Some("1"),
+                "application/octet-stream",
+                Bytes::from(safetensors_fixture(&header, 16)),
+                Some(user_id),
+            )
+            .await
+            .unwrap();
+        assert!(generic_svc
+            .get_metadata(generic.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        tdh::cleanup(&pool, generic_id, user_id).await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&generic_dir);
     }
 
     // ---- #2367 first-class versioning: pure helpers ------------------------
@@ -5725,6 +6963,563 @@ mod tests {
                 .await
                 .is_some(),
             "the real asset registers com.acme:widget"
+        );
+    }
+}
+
+/// #4980: an upload that deduplicates against (or writes) a content-addressed
+/// object a storage GC pass is deleting must never commit a live row without
+/// its object.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod gc_commit_guard_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::storage_gc_service::StorageGcService;
+    use crate::storage::filesystem::FilesystemStorage;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    /// A filesystem backend whose `delete` of one key parks until released,
+    /// which holds a GC pass between its pre-delete re-check and its delete.
+    struct ParkingDeleteStorage {
+        inner: FilesystemStorage,
+        park_key: String,
+        parked: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for ParkingDeleteStorage {
+        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+            self.inner.put(key, content).await
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.inner.get(key).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.inner.exists(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            if key == self.park_key {
+                self.parked.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.delete(key).await
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: BoxStream<'static, Result<Bytes>>,
+        ) -> Result<crate::storage::PutStreamResult> {
+            self.inner.put_stream(key, stream).await
+        }
+    }
+
+    const BACKEND: &str = "gc-race-4980";
+
+    struct Race {
+        // Storage GC tests age and sweep `oci_gc_candidates` cluster-wide
+        // (for example `age_oci_gc_candidates`), which would lapse or consume
+        // the journal rows these tests seed; serialize with them.
+        _serial: tokio::sync::MutexGuard<'static, ()>,
+        fx: tdh::Fixture,
+        storage: Arc<dyn StorageBackend>,
+        registry: Arc<crate::storage::StorageRegistry>,
+        data: Bytes,
+        key: String,
+        parked: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    /// A generic repository on a shared (cloud-style) backend whose storage
+    /// key for `data` is referenced only by a row trashed past retention, so a
+    /// GC pass claims and deletes it.
+    async fn setup() -> Option<Race> {
+        let serial = crate::services::storage_gc_service::storage_gc_test_guard().await;
+        let fx = tdh::Fixture::setup("local", "generic").await?;
+        let data = Bytes::from(format!("gc commit race {}", Uuid::new_v4()));
+        let key =
+            ArtifactService::storage_key_from_checksum(&ArtifactService::calculate_sha256(&data));
+        let parked = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let storage: Arc<dyn StorageBackend> = Arc::new(ParkingDeleteStorage {
+            inner: FilesystemStorage::new(&fx.storage_dir),
+            park_key: key.clone(),
+            parked: parked.clone(),
+            release: release.clone(),
+        });
+        let mut backends = std::collections::HashMap::new();
+        backends.insert(BACKEND.to_string(), storage.clone());
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            backends,
+            "filesystem".to_string(),
+        ));
+        sqlx::query("UPDATE repositories SET storage_backend = $1 WHERE id = $2")
+            .bind(BACKEND)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("shared backend");
+        let old = ArtifactService::new(fx.pool.clone(), storage.clone())
+            .upload_with_sync_options(
+                fx.repo_id,
+                "old/a.bin",
+                "a.bin",
+                None,
+                "application/octet-stream",
+                data.clone(),
+                Some(fx.user_id),
+                false,
+            )
+            .await
+            .expect("first upload");
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true, deleted_at = NOW() - INTERVAL '1 day' \
+             WHERE id = $1",
+        )
+        .bind(old.id)
+        .execute(&fx.pool)
+        .await
+        .expect("trash the first copy");
+        Some(Race {
+            _serial: serial,
+            fx,
+            storage,
+            registry,
+            data,
+            key,
+            parked,
+            release,
+        })
+    }
+
+    async fn live_rows(pool: &PgPool, repo_id: Uuid, path: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2 \
+             AND NOT is_deleted",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_one(pool)
+        .await
+        .expect("count")
+    }
+
+    /// Park a GC pass after its re-check, run `upload` (same bytes, another
+    /// path) while it is parked, release the delete, and return the upload's
+    /// result with whether the object and the new row survived.
+    async fn race<F>(r: &Race, upload: F) -> (Result<Artifact>, bool, i64)
+    where
+        F: std::future::Future<Output = Result<Artifact>> + Send + 'static,
+    {
+        let gc = StorageGcService::new(r.fx.pool.clone(), r.registry.clone())
+            .with_trash_retention_days(0);
+        let repo_id = r.fx.repo_id;
+        let gc_task = tokio::spawn(async move { gc.run_gc_for_repository(repo_id, false).await });
+        tokio::time::timeout(Duration::from_secs(20), r.parked.notified())
+            .await
+            .expect("GC claims the key and parks its delete after the re-check");
+        let mut upload = tokio::spawn(upload);
+        // Unguarded, the upload commits at once while the delete is parked.
+        let early = tokio::time::timeout(Duration::from_secs(2), &mut upload).await;
+        r.release.notify_one();
+        let result = match early {
+            Ok(joined) => joined,
+            Err(_) => upload.await,
+        }
+        .expect("upload task");
+        gc_task.await.expect("gc task").expect("gc pass");
+        let present = r.storage.exists(&r.key).await.expect("exists");
+        let rows = live_rows(&r.fx.pool, r.fx.repo_id, "new/b.bin").await;
+        (result, present, rows)
+    }
+
+    fn assert_no_row_without_object(result: &Result<Artifact>, present: bool, rows: i64) {
+        match result {
+            Ok(_) => assert!(
+                present,
+                "#4980: the upload committed a live row while storage GC deleted its object"
+            ),
+            Err(e) => assert_eq!(rows, 0, "a failed upload must leave no live row ({e})"),
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_upload_deduplicating_against_a_collected_object_keeps_it_4980() {
+        let Some(r) = setup().await else {
+            return;
+        };
+        let svc = ArtifactService::new(r.fx.pool.clone(), r.storage.clone());
+        let (repo_id, user_id, data) = (r.fx.repo_id, r.fx.user_id, r.data.clone());
+        let (result, present, rows) = race(&r, async move {
+            svc.upload_with_sync_options(
+                repo_id,
+                "new/b.bin",
+                "b.bin",
+                None,
+                "application/octet-stream",
+                data,
+                Some(user_id),
+                false,
+            )
+            .await
+        })
+        .await;
+        r.fx.teardown().await;
+        assert_no_row_without_object(&result, present, rows);
+        assert!(
+            result.is_ok(),
+            "the guard writes the bytes again: {result:?}"
+        );
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn streamed_upload_deduplicating_against_a_collected_object_keeps_it_4980() {
+        let Some(r) = setup().await else {
+            return;
+        };
+        let svc = ArtifactService::new(r.fx.pool.clone(), r.storage.clone());
+        let (repo_id, user_id, data) = (r.fx.repo_id, r.fx.user_id, r.data.clone());
+        let (result, present, rows) = race(&r, async move {
+            let mut hasher = MultiHasher::new();
+            hasher.update(&data);
+            let digests = hasher.finalize();
+            let size = data.len() as i64;
+            let stream = futures::StreamExt::boxed(futures::stream::once(async move { Ok(data) }));
+            svc.upload_stream_with_sync_options(
+                repo_id,
+                "new/b.bin",
+                "b.bin",
+                None,
+                "application/octet-stream",
+                stream,
+                digests,
+                size,
+                Some(user_id),
+                false,
+                None,
+            )
+            .await
+        })
+        .await;
+        r.fx.teardown().await;
+        assert_no_row_without_object(&result, present, rows);
+        assert!(
+            result.is_ok(),
+            "the unread body is written again: {result:?}"
+        );
+        assert_eq!(rows, 1);
+    }
+
+    /// A GC lease that does not end within the wait (here the candidate
+    /// sweep's shape: a recorded candidate whose `recorded_at` the sweep moved
+    /// to now, and no delete follows) refuses the upload with a retryable 503
+    /// and commits nothing, rather than trusting an object that may yet be
+    /// deleted.
+    #[tokio::test]
+    async fn upload_against_a_fresh_gc_lease_is_refused_retryably_4980() {
+        let Some(r) = setup().await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO oci_gc_candidates \
+                 (storage_key, storage_backend, storage_path, source_repository_id, recorded_at) \
+             VALUES ($1, $2, '', $3, NOW() - INTERVAL '2 days')",
+        )
+        .bind(&r.key)
+        .bind(BACKEND)
+        .bind(Uuid::new_v4())
+        .execute(&r.fx.pool)
+        .await
+        .expect("recorded candidate");
+        sqlx::query("UPDATE oci_gc_candidates SET recorded_at = NOW() WHERE storage_key = $1")
+            .bind(&r.key)
+            .execute(&r.fx.pool)
+            .await
+            .expect("the sweep's lease");
+        let result = ArtifactService::new(r.fx.pool.clone(), r.storage.clone())
+            .upload_with_sync_options(
+                r.fx.repo_id,
+                "new/b.bin",
+                "b.bin",
+                None,
+                "application/octet-stream",
+                r.data.clone(),
+                Some(r.fx.user_id),
+                false,
+            )
+            .await;
+        let rows = live_rows(&r.fx.pool, r.fx.repo_id, "new/b.bin").await;
+        sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = $1")
+            .bind(&r.key)
+            .execute(&r.fx.pool)
+            .await
+            .expect("cleanup");
+        r.fx.teardown().await;
+        assert!(
+            matches!(result, Err(AppError::ServiceUnavailable(_))),
+            "want a retryable 503, got {result:?}"
+        );
+        assert_eq!(rows, 0, "a refused upload commits no row");
+    }
+
+    /// CONTROL: a journal row past its lease (a failed delete the candidate
+    /// sweep will retry) does not block uploads, and stays for the sweep.
+    #[tokio::test]
+    async fn stale_gc_journal_row_does_not_block_an_upload_4980() {
+        let Some(r) = setup().await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO oci_gc_candidates (storage_key, storage_backend, storage_path, recorded_at) \
+             VALUES ($1, $2, '', NOW() - INTERVAL '8 days')",
+        )
+        .bind(&r.key)
+        .bind(BACKEND)
+        .execute(&r.fx.pool)
+        .await
+        .expect("stale journal row");
+        let result = ArtifactService::new(r.fx.pool.clone(), r.storage.clone())
+            .upload_with_sync_options(
+                r.fx.repo_id,
+                "new/b.bin",
+                "b.bin",
+                None,
+                "application/octet-stream",
+                r.data.clone(),
+                Some(r.fx.user_id),
+                false,
+            )
+            .await;
+        let journal: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_gc_candidates WHERE storage_key = $1")
+                .bind(&r.key)
+                .fetch_one(&r.fx.pool)
+                .await
+                .expect("journal count");
+        sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = $1")
+            .bind(&r.key)
+            .execute(&r.fx.pool)
+            .await
+            .expect("cleanup");
+        r.fx.teardown().await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(journal, 1, "the stale row is left for the candidate sweep");
+    }
+
+    /// CONTROL: a candidate a repository delete just recorded is only waiting
+    /// out its grace window; it is not a delete in flight and must not hold up
+    /// uploads of the same content (deleting a repository and pushing its
+    /// content again elsewhere is routine).
+    #[tokio::test]
+    async fn freshly_recorded_repo_delete_candidate_does_not_block_an_upload_4980() {
+        let Some(r) = setup().await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO oci_gc_candidates \
+                 (storage_key, storage_backend, storage_path, source_repository_id) \
+             VALUES ($1, $2, '', $3)",
+        )
+        .bind(&r.key)
+        .bind(BACKEND)
+        .bind(Uuid::new_v4())
+        .execute(&r.fx.pool)
+        .await
+        .expect("recorded candidate");
+        let started = std::time::Instant::now();
+        let result = ArtifactService::new(r.fx.pool.clone(), r.storage.clone())
+            .upload_with_sync_options(
+                r.fx.repo_id,
+                "new/b.bin",
+                "b.bin",
+                None,
+                "application/octet-stream",
+                r.data.clone(),
+                Some(r.fx.user_id),
+                false,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = $1")
+            .bind(&r.key)
+            .execute(&r.fx.pool)
+            .await
+            .expect("cleanup");
+        r.fx.teardown().await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a waiting candidate must not make the upload wait: {elapsed:?}"
+        );
+    }
+
+    /// CONTROL: an ordinary upload leaves no journal row behind.
+    #[tokio::test]
+    async fn guarded_commit_leaves_no_journal_row_4980() {
+        let Some(r) = setup().await else {
+            return;
+        };
+        let result = ArtifactService::new(r.fx.pool.clone(), r.storage.clone())
+            .upload_with_sync_options(
+                r.fx.repo_id,
+                "new/b.bin",
+                "b.bin",
+                None,
+                "application/octet-stream",
+                r.data.clone(),
+                Some(r.fx.user_id),
+                false,
+            )
+            .await;
+        let journal: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_gc_candidates WHERE storage_key = $1")
+                .bind(&r.key)
+                .fetch_one(&r.fx.pool)
+                .await
+                .expect("journal count");
+        r.fx.teardown().await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(journal, 0);
+    }
+}
+
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod uncommitted_object_journal_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use futures::StreamExt;
+
+    /// A backend that, when the upload writes its object, first commits a
+    /// competing artifact at the same path: the moment a conditional writer
+    /// loses between its unlocked pre-check and its locked check.
+    struct WinnerCommitsDuringWrite {
+        inner: Arc<tdh::MemStorage>,
+        pool: PgPool,
+        repo_id: Uuid,
+        path: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for WinnerCommitsDuringWrite {
+        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+            self.inner.put(key, content).await
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.inner.get(key).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.inner.exists(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: BoxStream<'static, Result<Bytes>>,
+        ) -> Result<crate::storage::PutStreamResult> {
+            let winner = format!("{:x}", Sha256::digest(b"the winner's bytes"));
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+                     content_type, storage_key) \
+                 VALUES ($1, $2, $2, 18, $3, 'application/json', $4)",
+            )
+            .bind(self.repo_id)
+            .bind(self.path)
+            .bind(&winner)
+            .bind(ArtifactService::storage_key_from_checksum(&winner))
+            .execute(&self.pool)
+            .await
+            .expect("winner commits");
+            self.inner.put_stream(key, stream).await
+        }
+    }
+
+    /// #3916: a conditional writer (`If-None-Match: *`) whose pre-check passed
+    /// writes its object, then loses to a writer that committed meanwhile and
+    /// gets 412. Its object has no row; it is handed to storage GC's
+    /// candidate sweep (a waiting candidate, `source_repository_id` set, no
+    /// lease). Before the change it stayed on storage with no record at all.
+    #[tokio::test]
+    async fn a_conditional_writer_that_loses_after_writing_hands_its_object_to_gc_3916() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = '' WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let path = "index/doc.json";
+        let storage: Arc<dyn StorageBackend> = Arc::new(WinnerCommitsDuringWrite {
+            inner: mem.clone(),
+            pool: pool.clone(),
+            repo_id,
+            path,
+        });
+        let service = state.create_artifact_service(storage);
+        let body = Bytes::from(format!("the loser's bytes {}", Uuid::new_v4()));
+        let mut hasher = MultiHasher::new();
+        hasher.update(&body);
+        let digests = hasher.finalize();
+        let loser_key = ArtifactService::storage_key_from_checksum(&digests.sha256);
+        let precondition = WritePrecondition::new(None, Some(EntityTagCondition::Any)).unwrap();
+        let outcome = service
+            .upload_content_with_sync_options(
+                repo_id,
+                path,
+                "doc.json",
+                None,
+                "application/json",
+                UploadContent::Stream(
+                    futures::stream::once({
+                        let body = body.clone();
+                        async move { Ok(body) }
+                    })
+                    .boxed(),
+                ),
+                digests,
+                body.len() as i64,
+                Some(user_id),
+                false,
+                None,
+                Some(&precondition),
+            )
+            .await;
+        let written = mem.objects.lock().unwrap().contains_key(&loser_key);
+        let journal: Option<(Option<Uuid>, bool)> = sqlx::query_as(
+            "SELECT source_repository_id, leased_at IS NOT NULL FROM oci_gc_candidates \
+             WHERE storage_key = $1",
+        )
+        .bind(&loser_key)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = $1")
+            .bind(&loser_key)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(outcome, Err(AppError::PreconditionFailed(_))),
+            "the late loser gets 412: {outcome:?}"
+        );
+        assert!(written, "the loser wrote its object before it lost");
+        assert_eq!(
+            journal,
+            Some((Some(repo_id), false)),
+            "the loser's object is journaled for storage GC as a waiting candidate"
         );
     }
 }

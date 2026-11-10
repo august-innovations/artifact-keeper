@@ -6,22 +6,46 @@
       {
         "ordinal": 0,
         "name": "failed_login_attempts",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "failed_login_attempts"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "locked_until",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "locked_until"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "last_failed_login_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "last_failed_login_at"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "last_login_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "last_login_at"
+          }
+        }
       }
     ],
     "parameters": {

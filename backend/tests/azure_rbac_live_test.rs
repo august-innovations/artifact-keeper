@@ -28,9 +28,11 @@ async fn test_azure_rbac_put_get_exists_delete() {
         container_name: container,
         access_key: None,
         endpoint: None,
+        public_endpoint: None,
         redirect_downloads: false,
         sas_expiry: std::time::Duration::from_secs(3600),
         path_format: artifact_keeper_backend::storage::StoragePathFormat::Native,
+        copy_timeout_floor: std::time::Duration::ZERO,
     };
 
     use artifact_keeper_backend::storage::StorageBackend;

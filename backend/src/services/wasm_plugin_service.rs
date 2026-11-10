@@ -20,6 +20,8 @@ use crate::models::plugin_manifest::{ManifestValidationError, PluginManifest};
 
 use super::plugin_registry::PluginRegistry;
 
+mod git_transport;
+
 /// Result of a plugin installation operation.
 #[derive(Debug, Clone)]
 pub struct PluginInstallResult {
@@ -886,7 +888,7 @@ impl WasmPluginService {
     ) -> Result<PluginInstallResult> {
         // Validate the URL to prevent SSRF via file://, ssh://, or git://
         // protocols targeting internal resources.
-        crate::api::validation::validate_outbound_url(url, "Plugin git URL")?;
+        Self::validate_git_source_url(url)?;
 
         info!("Installing plugin from Git: {} (ref: {:?})", url, git_ref);
 
@@ -1001,8 +1003,24 @@ impl WasmPluginService {
         })
     }
 
+    /// Refuse a plugin git source that the outbound SSRF guard rejects
+    /// (non-http(s) scheme, blocked host, private/internal address). Shared
+    /// by install and every re-fetch so both refuse with the same `400`.
+    fn validate_git_source_url(url: &str) -> Result<()> {
+        crate::api::validation::validate_outbound_url(url, "Plugin git URL")
+    }
+
     /// Clone a Git repository to the target directory.
+    ///
+    /// `http(s)` fetches go through `git_transport`, which connects only to
+    /// addresses the SSRF policy admits at connect time, so a host that
+    /// passed `validate_git_source_url` and then changed its address is not
+    /// fetched from (GHSA-p28r-8m4q-w9pg). A redirect hop the policy refuses
+    /// is refused just as firmly, and both refusals answer `400` instead of
+    /// an opaque internal error (#4869).
     async fn clone_repository(&self, url: &str, target: &Path) -> Result<git2::Repository> {
+        git_transport::ensure_registered().map_err(AppError::Internal)?;
+
         let url = url.to_string();
         let target = target.to_path_buf();
 
@@ -1013,7 +1031,18 @@ impl WasmPluginService {
 
         result.map_err(|e| {
             let msg = e.to_string();
-            if msg.contains("not found") || msg.contains("404") {
+            if crate::services::ssrf_refusal::is_ssrf_refusal(&msg) {
+                // Either refusal counts: the connect-time DNS guard (the
+                // host resolved to an address the policy blocks) and the
+                // per-hop redirect policy (a redirect target the policy
+                // refuses) are the same answer for the caller — a source
+                // the server may not fetch from (#4869).
+                AppError::Validation(format!(
+                    "Plugin git URL: the host or a redirect target points at an \
+                     address that outbound requests may not reach (see \
+                     AK_SSRF_ALLOW_PRIVATE_CIDRS): {msg}"
+                ))
+            } else if msg.contains("not found") || msg.contains("404") {
                 AppError::NotFound(format!("Git repository not found: {}", msg))
             } else if msg.contains("timeout") {
                 AppError::Internal("Git clone timed out".to_string())
@@ -1706,6 +1735,12 @@ impl WasmPluginService {
         url: &str,
         git_ref: Option<&str>,
     ) -> Result<(PluginManifest, Vec<u8>)> {
+        // The stored source was validated at install time, but its host may
+        // since resolve to an internal address (DNS rebinding, a repo moved
+        // behind a private host), so every re-fetch re-runs the same guard
+        // before any clone is attempted (#4757).
+        Self::validate_git_source_url(url)?;
+
         let temp_dir = tempfile::tempdir()
             .map_err(|e| AppError::Internal(format!("Failed to create temp directory: {}", e)))?;
 
@@ -1940,25 +1975,6 @@ impl WasmPluginService {
         };
 
         Ok((test_metadata, validation))
-    }
-
-    // =========================================================================
-    // T063: Install from Local Path (Development)
-    // =========================================================================
-
-    /// Install a plugin from a local filesystem path.
-    /// Intended for development and testing purposes.
-    ///
-    /// Note: This is a placeholder - full implementation requires additional
-    /// method implementations for local path handling.
-    pub async fn install_from_local(&self, local_path: &str) -> Result<PluginInstallResult> {
-        info!("Installing plugin from local path: {}", local_path);
-
-        // For now, return an error - local installation not yet fully implemented
-        Err(AppError::Internal(
-            "Local plugin installation not yet implemented. Use Git or ZIP installation."
-                .to_string(),
-        ))
     }
 
     // =========================================================================
@@ -3200,5 +3216,277 @@ timeout_secs = 30
         svc.sync_core_format_handlers()
             .await
             .expect("restore core rows");
+    }
+
+    // -----------------------------------------------------------------------
+    // Reload re-fetches the stored git source through the SSRF guard (#4757)
+    //
+    // `install_from_git` validated the URL, but `reload_plugin` re-cloned the
+    // stored `source_url` through `fetch_from_git` with no validation, so a
+    // source at (or later resolving to) a private address was cloned from.
+    // -----------------------------------------------------------------------
+
+    /// Insert a WASM git plugin row whose stored source is `source_url`.
+    async fn insert_git_plugin(pool: &PgPool, name: &str, source_url: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO plugins (id, name, version, display_name, status, plugin_type, \
+             source_type, source_url) \
+             VALUES ($1, $2, '1.0.0', $2, 'active', 'format_handler', 'wasm_git', $3)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(source_url)
+        .execute(pool)
+        .await
+        .expect("insert git plugin row");
+        id
+    }
+
+    #[tokio::test]
+    async fn test_reload_refuses_private_git_source_without_cloning() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let name = format!("ssrf-4757-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let id = insert_git_plugin(&pool, &name, "http://10.10.10.10/x.git").await;
+        let svc = format_sync_service(pool.clone());
+
+        // The refusal must come from validation before any clone: a clone of
+        // 10.10.10.10 would either hang on connect or fail as a git error, so
+        // a bounded wait plus the Validation variant proves none was tried.
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), svc.reload_plugin(id)).await;
+
+        sqlx::query("DELETE FROM plugins WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("delete git plugin row");
+
+        let err = outcome
+            .expect("reload attempted a network clone instead of refusing up front")
+            .expect_err("reload of a private git source must be refused");
+        match &err {
+            AppError::Validation(msg) => {
+                assert!(msg.contains("Plugin git URL"), "unexpected message: {msg}");
+                assert!(
+                    msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
+                    "refusal must name the setting that admits the host: {msg}"
+                );
+            }
+            other => panic!("expected a validation refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_git_source_validation_admits_public_https() {
+        // The clone itself is skipped; only the guard every re-fetch passes
+        // through is exercised. An IP literal keeps DNS out of the test.
+        assert!(WasmPluginService::validate_git_source_url(
+            "https://140.82.112.3/example/plugin.git"
+        )
+        .is_ok());
+        assert!(matches!(
+            WasmPluginService::validate_git_source_url("http://10.10.10.10/x.git"),
+            Err(AppError::Validation(_))
+        ));
+        assert!(matches!(
+            WasmPluginService::validate_git_source_url("file:///etc/passwd"),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Clones connect only to addresses the SSRF policy admits
+    // (GHSA-p28r-8m4q-w9pg)
+    //
+    // `validate_git_source_url` resolves the host before a clone; the clone
+    // must not resolve it again on its own and connect wherever it points by
+    // then. A host that resolves to loopback at clone time stands in for one
+    // whose address changed after the URL check.
+    // -----------------------------------------------------------------------
+
+    /// A service whose pool is never used (clone touches no table).
+    fn clone_only_service() -> WasmPluginService {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://u:p@127.0.0.1:1/none")
+            .expect("lazy pool");
+        WasmPluginService::new(
+            pool,
+            Arc::new(PluginRegistry::new().expect("plugin registry")),
+            std::env::temp_dir().join("ak-plugin-clone-tests"),
+            false,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_clone_does_not_connect_to_a_host_resolving_to_a_blocked_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+        let svc = clone_only_service();
+        let target = tempfile::tempdir().expect("tempdir");
+        let target_path = target.path().join("repo");
+
+        let url = format!("http://localhost:{port}/plugin.git");
+        let clone = tokio::spawn(async move { svc.clone_repository(&url, &target_path).await });
+
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "the clone connected to a loopback address the SSRF policy blocks"
+        );
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), clone)
+            .await
+            .expect("clone finished")
+            .expect("clone task");
+        let Err(err) = outcome else {
+            panic!("a clone of a blocked address must fail");
+        };
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("Plugin git URL")),
+            "the refusal reads like the URL check's: {err:?}"
+        );
+    }
+
+    /// A one-commit repository and the pack an upload-pack server would send
+    /// for it.
+    fn single_commit_pack(files: &[(&str, &[u8])]) -> (git2::Oid, Vec<u8>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git2::Repository::init_bare(dir.path()).expect("init");
+        let mut tree = repo.treebuilder(None).expect("treebuilder");
+        for (name, content) in files {
+            let blob = repo.blob(content).expect("blob");
+            tree.insert(name, blob, 0o100644).expect("insert");
+        }
+        let tree = repo
+            .find_tree(tree.write().expect("tree"))
+            .expect("find tree");
+        let sig = git2::Signature::now("t", "t@example.com").expect("signature");
+        let commit = repo
+            .commit(None, &sig, &sig, "plugin", &tree, &[])
+            .expect("commit");
+        let mut builder = repo.packbuilder().expect("packbuilder");
+        builder.insert_commit(commit).expect("insert commit");
+        let mut buf = git2::Buf::new();
+        builder.write_buf(&mut buf).expect("write pack");
+        (commit, buf.to_vec())
+    }
+
+    fn pkt_line(payload: &str) -> String {
+        format!("{:04x}{payload}", payload.len() + 4)
+    }
+
+    #[tokio::test]
+    async fn test_clone_over_smart_http_through_the_guarded_client() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (commit, pack) = single_commit_pack(&[("plugin.toml", b"name = \"x\"\n")]);
+        let advertisement = format!(
+            "{}0000{}{}0000",
+            pkt_line("# service=git-upload-pack\n"),
+            pkt_line(&format!("{commit} HEAD\0symref=HEAD:refs/heads/main\n")),
+            pkt_line(&format!("{commit} refs/heads/main\n")),
+        );
+        let mut result = b"0008NAK\n".to_vec();
+        result.extend_from_slice(&pack);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/plugin.git/info/refs"))
+            .and(query_param("service", "git-upload-pack"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "content-type",
+                        "application/x-git-upload-pack-advertisement",
+                    )
+                    .set_body_bytes(advertisement.into_bytes()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/plugin.git/git-upload-pack"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/x-git-upload-pack-result")
+                    .set_body_bytes(result),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = clone_only_service();
+        let target = tempfile::tempdir().expect("tempdir");
+        let target_path = target.path().join("repo");
+        // An IP literal is never re-resolved, so the loopback mock is
+        // reachable; the URL check (not exercised here) is what refuses it.
+        let url = format!("{}/plugin.git", server.uri());
+        let repo = svc
+            .clone_repository(&url, &target_path)
+            .await
+            .expect("clone over smart HTTP");
+
+        assert_eq!(repo.head().expect("head").target(), Some(commit));
+        assert_eq!(
+            std::fs::read(target_path.join("plugin.toml")).expect("checked out"),
+            b"name = \"x\"\n"
+        );
+        let requests = server.received_requests().await.expect("recorded");
+        assert!(
+            requests.iter().all(|r| r
+                .headers
+                .get("user-agent")
+                .is_some_and(|v| v == "git/2.0 (artifact-keeper)")),
+            "every git request went through the guarded client"
+        );
+    }
+
+    /// A plugin git source that redirects to an address the SSRF policy
+    /// refuses must be refused like the connect-time refusal: a bad
+    /// request, not an opaque internal error (#4869).
+    ///
+    /// The redirect is aborted before the target is contacted — the point
+    /// of the policy — so the clone fails either way. What matters is HOW
+    /// it fails: the redirect refusal travels as a different phrase than
+    /// the connect-time one ("redirect target rejected by SSRF policy" vs
+    /// "blocked by SSRF policy"), and a mapping that recognized only the
+    /// second one answered 500 where the caller is owed a 400.
+    #[tokio::test]
+    async fn test_clone_of_a_redirect_to_a_blocked_target_is_a_validation_refusal() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/plugin.git/info/refs"))
+            .and(query_param("service", "git-upload-pack"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "http://169.254.169.254/latest/meta-data"),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = clone_only_service();
+        let target = tempfile::tempdir().expect("tempdir");
+        let target_path = target.path().join("repo");
+        // The entry hop is an IP literal, so it is never re-resolved; only
+        // the redirect target is refused.
+        let url = format!("{}/plugin.git", server.uri());
+
+        let outcome = svc.clone_repository(&url, &target_path).await;
+        let Err(err) = outcome else {
+            panic!("a clone of a refused redirect must fail");
+        };
+
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("Plugin git URL")),
+            "the redirect refusal reads like the URL check's: {err:?}"
+        );
     }
 }

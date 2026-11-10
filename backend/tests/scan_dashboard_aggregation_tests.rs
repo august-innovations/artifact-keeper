@@ -23,6 +23,10 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// `policy_violations_blocked` is one global count, so the tests that
+/// measure it as a delta must not run interleaved with each other.
+static BLOCKED_COUNT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 use artifact_keeper_backend::models::security::{RawFinding, Severity};
 use artifact_keeper_backend::services::scan_result_service::ScanResultService;
 
@@ -118,6 +122,8 @@ async fn create_scans_with_findings(
                     fixed_version: Some("1.0.1".to_string()),
                     source: Some("test".to_string()),
                     source_url: None,
+                    finding_class:
+                        artifact_keeper_backend::models::security::FindingClass::Vulnerability,
                 }
             })
             .collect();
@@ -151,6 +157,7 @@ async fn create_scans_with_findings(
             Some("test-scanner-1.0"),
             chrono::Utc::now(),
             "complete",
+            None,
             None,
             None,
         )
@@ -286,4 +293,211 @@ async fn rescan_does_not_inflate_dashboard_finding_counts() {
     );
 
     cleanup(&pool, repo_id).await;
+}
+
+/// #4380: a proxied image refused by scan policy must show on the dashboard.
+/// `policy_violations_blocked` was hard-wired to 0, so an operator whose
+/// proxy repository was blocking pulls saw `0 blocked`. Seeds a Remote OCI
+/// repository with the reporter's settings (scan-on-proxy, fail-open,
+/// threshold `critical`) holding one image with a critical verdict and one
+/// with a below-threshold verdict: exactly one more item is blocked. Then
+/// flips the repository to `record_only`, which blocks nothing, and the count
+/// drops back. Measured as deltas so other rows in the shared database do not
+/// matter.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn proxied_image_blocked_by_policy_counts_on_dashboard() {
+    let _serial = BLOCKED_COUNT_LOCK.lock().await;
+    let pool = connect_db().await;
+    let svc = ScanResultService::new(pool.clone());
+
+    let repo_id = Uuid::new_v4();
+    let key = format!("scan-agg-proxy-{}", repo_id.as_simple());
+    sqlx::query(
+        "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url)
+         VALUES ($1, $2, $2, $3, 'remote', 'docker', 'https://registry-1.docker.io')",
+    )
+    .bind(repo_id)
+    .bind(&key)
+    .bind(format!("/tmp/test-artifacts/{repo_id}"))
+    .execute(&pool)
+    .await
+    .expect("insert remote repo");
+    sqlx::query(
+        "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy,
+             block_on_policy_violation, severity_threshold, proxy_scan_action)
+         VALUES ($1, true, false, true, true, 'critical', 'fail_open')",
+    )
+    .bind(repo_id)
+    .execute(&pool)
+    .await
+    .expect("insert scan config");
+
+    let before = svc
+        .get_dashboard_summary()
+        .await
+        .expect("dashboard before")
+        .policy_violations_blocked;
+
+    let blocked = format!("{:0>64}", Uuid::new_v4().as_simple());
+    let below = format!("{:0>64}", Uuid::new_v4().as_simple());
+    for (digest, max_severity) in [(&blocked, "critical"), (&below, "high")] {
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+             VALUES ($1, $2, $3, 'layer')",
+        )
+        .bind(format!("sha256:{digest}"))
+        .bind(format!("sha256:{}", "e".repeat(64)))
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("insert blob ref");
+        sqlx::query(
+            "INSERT INTO proxy_scan_results (checksum_sha256, scan_type, verdict,
+                 findings_count, critical_count, max_severity, scanner_version, repository_id)
+             VALUES ($1, 'grype', 'vulnerable', 1, 0, $2, 'grype-test', $3)",
+        )
+        .bind(digest)
+        .bind(max_severity)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("insert verdict");
+    }
+
+    let after = svc
+        .get_dashboard_summary()
+        .await
+        .expect("dashboard after")
+        .policy_violations_blocked;
+
+    sqlx::query(
+        "UPDATE scan_configs SET proxy_scan_action = 'record_only' WHERE repository_id = $1",
+    )
+    .bind(repo_id)
+    .execute(&pool)
+    .await
+    .expect("record only");
+    let record_only = svc
+        .get_dashboard_summary()
+        .await
+        .expect("dashboard record-only")
+        .policy_violations_blocked;
+
+    for digest in [&blocked, &below] {
+        let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(digest)
+            .execute(&pool)
+            .await;
+    }
+    let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await;
+    cleanup(&pool, repo_id).await;
+
+    assert_eq!(
+        after - before,
+        1,
+        "the critical image is blocked; the below-threshold one is served"
+    );
+    assert_eq!(
+        record_only, before,
+        "a record-only repository blocks nothing"
+    );
+}
+
+/// #4582: a proxied verdict counts as blocked only on a format whose proxy
+/// path runs the gate. The same high verdict, cached by a helm Remote and a
+/// conda Remote with identical blocking settings (scan-on-proxy, threshold
+/// `high`), adds one to `policy_violations_blocked` through the conda remote
+/// (gated since #4585) and nothing through the helm remote, which stores
+/// `scan_on_proxy` but serves the package unscanned.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn proxied_verdict_counts_only_on_a_gated_format_4582() {
+    let _serial = BLOCKED_COUNT_LOCK.lock().await;
+    let pool = connect_db().await;
+    let svc = ScanResultService::new(pool.clone());
+
+    async fn remote_with_cached(pool: &PgPool, format: &str, digest: &str) -> Uuid {
+        let repo_id = Uuid::new_v4();
+        let key = format!("scan-agg-4582-{}", repo_id.as_simple());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url)
+             VALUES ($1, $2, $2, $3, 'remote', $4::repository_format, 'https://upstream.invalid')",
+        )
+        .bind(repo_id)
+        .bind(&key)
+        .bind(format!("/tmp/test-artifacts/{repo_id}"))
+        .bind(format)
+        .execute(pool)
+        .await
+        .expect("insert remote repo");
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy,
+                 block_on_policy_violation, severity_threshold, proxy_scan_action)
+             VALUES ($1, true, false, true, true, 'high', 'fail_open')",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("insert scan config");
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key,
+                 size_bytes, checksum_sha256)
+             VALUES ($1, 'noarch/pkg-1.0-0.conda', 'k', 'm', 1, $2)",
+        )
+        .bind(repo_id)
+        .bind(digest)
+        .execute(pool)
+        .await
+        .expect("insert proxy cache row");
+        repo_id
+    }
+
+    let digest = format!("{:0>64}", Uuid::new_v4().as_simple());
+    sqlx::query(
+        "INSERT INTO proxy_scan_results (checksum_sha256, scan_type, verdict,
+             findings_count, high_count, max_severity, scanner_version)
+         VALUES ($1, 'grype', 'vulnerable', 1, 1, 'high', 'grype-test')",
+    )
+    .bind(&digest)
+    .execute(&pool)
+    .await
+    .expect("insert verdict");
+
+    let count = || async {
+        svc.get_dashboard_summary()
+            .await
+            .expect("dashboard")
+            .policy_violations_blocked
+    };
+    let before = count().await;
+    let helm = remote_with_cached(&pool, "helm", &digest).await;
+    let ungated = count().await;
+    let conda = remote_with_cached(&pool, "conda", &digest).await;
+    let gated = count().await;
+
+    let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+        .bind(&digest)
+        .execute(&pool)
+        .await;
+    for repo_id in [helm, conda] {
+        let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        cleanup(&pool, repo_id).await;
+    }
+
+    assert_eq!(
+        ungated, before,
+        "a helm remote serves the package unscanned, so it is not blocked"
+    );
+    assert_eq!(
+        gated - before,
+        1,
+        "the conda remote refuses the package, so the dashboard counts it"
+    );
 }

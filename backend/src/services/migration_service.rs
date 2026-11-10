@@ -16,6 +16,10 @@ use crate::services::artifactory_client::{
 };
 use crate::services::source_registry::SourceRegistry;
 
+/// Most failed items a migration report lists by path; the summary's
+/// `failed_items_omitted` counts the rest (#4778).
+pub(crate) const REPORT_FAILED_ITEMS_CAP: i64 = 100;
+
 /// Errors that can occur during migration
 #[derive(Error, Debug)]
 pub enum MigrationError {
@@ -233,16 +237,20 @@ impl MigrationService {
         // back to the dev passphrase if the env var is unset so we can
         // decrypt rows written by `migration::create_connection` under
         // the same fallback (see issue #1439 / Bug A).
-        let encryption_key = std::env::var("MIGRATION_ENCRYPTION_KEY")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
+        let encryption_key = match crate::config::secret_or_env("MIGRATION_ENCRYPTION_KEY") {
+            Ok(Some(v)) if !v.is_empty() => v,
+            Ok(_) => {
                 tracing::warn!(
                     "MIGRATION_ENCRYPTION_KEY is not set; using built-in fallback to \
                      decrypt source-connection credentials."
                 );
                 "artifact-keeper-default-migration-key-dev-only".to_string()
-            });
+            }
+            // A configured-but-unreadable file is a hard error (#4142):
+            // decrypting under the dev fallback would fail with a confusing
+            // "decryption failed" instead of naming the broken mount.
+            Err(e) => return Err(MigrationError::ConfigError(e)),
+        };
         let credentials_json =
             crate::services::encryption::decrypt_credentials(&credentials_enc, &encryption_key)
                 .map_err(|e| MigrationError::ConfigError(format!("Decryption failed: {}", e)))?;
@@ -331,6 +339,9 @@ impl MigrationService {
             "golang" => "go".to_string(),
             // RubyGems is sometimes reported as `gems` or `rubygems`
             "gems" => "rubygems".to_string(),
+            // Nexus names its R/CRAN format `r`; Artifactory and Artifact
+            // Keeper call it `cran` (#2525).
+            "r" => "cran".to_string(),
             _ => lower,
         }
     }
@@ -343,9 +354,23 @@ impl MigrationService {
     pub fn get_format_compatibility(package_type: &str) -> FormatCompatibility {
         let normalized = Self::normalize_package_type(package_type);
         match normalized.as_str() {
+            // CRAN is Full: the PACKAGES index is built at request time from
+            // the repository's `artifacts` rows (by `{name}_{version}.tar.gz`
+            // filename), so migrated source packages are installable without
+            // a re-publish (#2525).
             "maven" | "npm" | "docker" | "pypi" | "helm" | "nuget" | "cargo" | "go" | "generic"
-            | "rubygems" => FormatCompatibility::Full,
-            "conan" | "conda" | "debian" | "rpm" => FormatCompatibility::Partial,
+            | "rubygems" | "cran" => FormatCompatibility::Full,
+            // RPM is Full: repodata is rendered at request time from the
+            // repository's `.rpm` rows, and the importer records each
+            // package's header metadata (requires/provides/summary) exactly as
+            // a native or generic upload does (#3925).
+            "rpm" => FormatCompatibility::Full,
+            // Debian is Full: `Packages`/`Release` are rendered at request time
+            // from the repository's `pool/` rows, and the importer files each
+            // `.deb` under `pool/<component>/` and records its control file and
+            // catalog row exactly as a native upload does (#4657).
+            "debian" => FormatCompatibility::Full,
+            "conan" | "conda" => FormatCompatibility::Partial,
             _ => FormatCompatibility::Unsupported,
         }
     }
@@ -384,16 +409,6 @@ impl MigrationService {
                 "the Conda channel index (repodata.json) stays empty, so \
                  `conda install` resolves nothing",
                 "re-upload the packages to /conda/<repo>",
-            ),
-            "debian" => (
-                "the APT index (Packages/Release) stays empty, so \
-                 `apt-get update` sees no packages",
-                "re-upload the .deb files to /debian/<repo>",
-            ),
-            "rpm" => (
-                "the YUM/DNF metadata (repodata) stays empty, so `dnf install` \
-                 finds no packages",
-                "re-upload the .rpm files to /rpm/<repo>",
             ),
             _ => (
                 "the package index stays empty",
@@ -1341,12 +1356,22 @@ impl MigrationService {
             SELECT item_type, source_path, error_message
             FROM migration_items
             WHERE job_id = $1 AND status = 'failed'
-            LIMIT 100
+            ORDER BY source_path, id
+            LIMIT $2
             "#,
         )
         .bind(job_id)
+        .bind(REPORT_FAILED_ITEMS_CAP)
         .fetch_all(&self.db)
         .await?;
+
+        // The list above is capped, and a report that silently stops at the
+        // cap reads as if those were all the failures (#4778). Say how many
+        // were left out; `GET /api/v1/migrations/{id}/items?status=failed`
+        // pages through every one of them.
+        let failed_total: i64 = type_counts.iter().map(|(_, _, _, fail, _)| fail).sum();
+        summary["failed_items_omitted"] =
+            serde_json::json!((failed_total - errors.len() as i64).max(0));
 
         let errors_json: Vec<serde_json::Value> = errors
             .iter()
@@ -1687,7 +1712,15 @@ pub struct RepositoryAssessment {
     pub key: String,
     pub repo_type: String,
     pub package_type: String,
+    /// Artifacts in the source repository: the exact count when
+    /// `artifact_count_exact`, otherwise only a lower bound (#3928).
     pub artifact_count: i64,
+    /// Whether `artifact_count` is the repository's real size. `false` when
+    /// the bounded listing walk ran out of budget, or the listing failed.
+    /// Assessments saved before #3928 read back `false`: their count was the
+    /// size of a one-row page, not of the repository.
+    #[serde(default)]
+    pub artifact_count_exact: bool,
     pub total_size_bytes: i64,
     pub compatibility: String,
     pub warnings: Vec<String>,
@@ -1712,7 +1745,12 @@ pub struct RepositoryAssessment {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssessmentResult {
     pub repositories: Vec<RepositoryAssessment>,
+    /// Sum of the per-repository counts: exact only when
+    /// `total_artifacts_exact`, otherwise a lower bound (#3928).
     pub total_artifacts: i64,
+    /// Whether every repository was counted exactly.
+    #[serde(default)]
+    pub total_artifacts_exact: bool,
     pub total_size_bytes: i64,
     pub users_count: i64,
     pub groups_count: i64,
@@ -1731,6 +1769,7 @@ impl MigrationService {
     ) -> Result<AssessmentResult, MigrationError> {
         let mut repositories = Vec::new();
         let mut total_artifacts = 0i64;
+        let mut total_artifacts_exact = true;
         let mut total_size = 0i64;
         let mut warnings = Vec::new();
         let mut blockers = Vec::new();
@@ -1751,14 +1790,31 @@ impl MigrationService {
                 FormatCompatibility::Unsupported => "unsupported",
             };
 
-            // Get artifact counts
-            let artifacts = client.list_artifacts(&repo.key, 0, 1).await;
-            let (artifact_count, repo_size) = match artifacts {
-                Ok(aql_response) => (aql_response.range.total, 0i64),
-                Err(_) => (0, 0),
-            };
-
+            // Count by a bounded listing walk. Neither source reports a
+            // repository total; the old read of `range.total` from a one-row
+            // page reported every repository as holding one artifact (#3928).
+            let repo_size = 0i64;
             let mut repo_warnings = Vec::new();
+            let (artifact_count, artifact_count_exact) =
+                match client.count_artifacts(&repo.key).await {
+                    Ok(count) => {
+                        if !count.exact {
+                            repo_warnings.push(format!(
+                                "Holds at least {} artifacts; the exact count is \
+                                 determined while the migration job runs",
+                                count.counted
+                            ));
+                        }
+                        (count.counted, count.exact)
+                    }
+                    Err(e) => {
+                        repo_warnings.push(format!(
+                            "Could not count artifacts ({e}); the count is \
+                             determined while the migration job runs"
+                        ));
+                        (0, false)
+                    }
+                };
 
             // The limitation a user has to know BEFORE the job runs. The old
             // text here ("will be migrated as generic format") described the
@@ -1788,6 +1844,7 @@ impl MigrationService {
                 repo_type: repo.repo_type.clone(),
                 package_type: repo.package_type.clone(),
                 artifact_count,
+                artifact_count_exact,
                 total_size_bytes: repo_size,
                 compatibility: compat_str.to_string(),
                 warnings: repo_warnings,
@@ -1795,6 +1852,7 @@ impl MigrationService {
             });
 
             total_artifacts += artifact_count;
+            total_artifacts_exact &= artifact_count_exact;
             total_size += repo_size;
         }
 
@@ -1836,6 +1894,7 @@ impl MigrationService {
         Ok(AssessmentResult {
             repositories,
             total_artifacts,
+            total_artifacts_exact,
             total_size_bytes: total_size,
             users_count,
             groups_count,
@@ -1869,20 +1928,24 @@ impl MigrationService {
         sqlx::query(
             r#"
             UPDATE migration_jobs
-            SET total_items = $1,
+            SET total_items = CASE WHEN $5 THEN $1 ELSE total_items END,
                 total_bytes = $2,
                 status = 'ready',
                 config = config || $3
             WHERE id = $4
             "#,
         )
-        .bind(result.total_artifacts as i32)
+        // #3928: seed the job's denominator only from an exact count. A lower
+        // bound would publish a too-small denominator that the running job
+        // then overtakes; the worker publishes the enumerated total anyway.
+        .bind(result.total_artifacts.min(i32::MAX as i64) as i32)
         .bind(result.total_size_bytes)
         .bind(serde_json::json!({
             "assessment": summary,
             "assessed_at": chrono::Utc::now().to_rfc3339(),
         }))
         .bind(job_id)
+        .bind(result.total_artifacts_exact)
         .execute(&self.db)
         .await?;
 
@@ -2491,7 +2554,7 @@ mod tests {
 
     #[test]
     fn test_format_compatibility_all_partial() {
-        let partial_formats = ["conan", "conda", "debian", "rpm"];
+        let partial_formats = ["conan", "conda"];
         for fmt in &partial_formats {
             assert_eq!(
                 MigrationService::get_format_compatibility(fmt),
@@ -2499,6 +2562,23 @@ mod tests {
                 "Expected Partial for '{}'",
                 fmt
             );
+        }
+    }
+
+    /// #2525: R/CRAN repositories migrate from both source vocabularies —
+    /// Artifactory's `cran` and Nexus's `r` — as native CRAN repositories.
+    #[test]
+    fn test_cran_and_nexus_r_are_full_2525() {
+        assert_eq!(MigrationService::normalize_package_type("r"), "cran");
+        assert_eq!(MigrationService::normalize_package_type("R"), "cran");
+        assert_eq!(MigrationService::target_repository_format("r"), "cran");
+        for source in ["cran", "CRAN", "r", "R"] {
+            assert_eq!(
+                MigrationService::get_format_compatibility(source),
+                FormatCompatibility::Full,
+                "{source}"
+            );
+            assert_eq!(MigrationService::index_limitation(source), None, "{source}");
         }
     }
 
@@ -2567,20 +2647,20 @@ mod tests {
             FormatCompatibility::Full
         );
 
-        // Yum repositories map to AK's rpm format (partial support).
+        // Yum repositories map to AK's rpm format, indexed natively (#3925).
         assert_eq!(
             MigrationService::get_format_compatibility("yum"),
-            FormatCompatibility::Partial
+            FormatCompatibility::Full
         );
 
-        // #2784: Nexus `apt` repositories map to AK's `debian` (partial
-        // support: files copied, index not built). Before the mapping, `apt`
-        // normalized to the unknown name `apt` and was classified
-        // Unsupported, so the whole repository failed to migrate.
+        // #2784: Nexus `apt` repositories map to AK's `debian` (full support
+        // since #4657). Before the mapping, `apt` normalized to the unknown
+        // name `apt` and was classified Unsupported, so the whole repository
+        // failed to migrate.
         assert_eq!(MigrationService::normalize_package_type("apt"), "debian");
         assert_eq!(
             MigrationService::get_format_compatibility("apt"),
-            FormatCompatibility::Partial
+            FormatCompatibility::Full
         );
 
         // #2784: `golang` is an alias for AK's `go` (full support).
@@ -2598,10 +2678,10 @@ mod tests {
 
     #[test]
     fn test_prepare_repository_migration_normalizes_nexus_apt() {
-        // #2784: a Nexus `apt` repository must prepare as `debian` with
-        // Partial compatibility so it migrates (as a file copy into a native
-        // `debian` repository, see #3925) instead of being rejected as an
-        // unsupported format.
+        // #2784: a Nexus `apt` repository must prepare as `debian` so it
+        // migrates into a native `debian` repository (Full since #4657, which
+        // registers each `.deb`) instead of being rejected as an unsupported
+        // format.
         let repo = RepositoryListItem {
             key: "apt-hosted".to_string(),
             repo_type: "hosted".to_string(),
@@ -2613,7 +2693,7 @@ mod tests {
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "debian");
-        assert_eq!(config.format_compatibility, FormatCompatibility::Partial);
+        assert_eq!(config.format_compatibility, FormatCompatibility::Full);
     }
 
     #[test]
@@ -2653,7 +2733,7 @@ mod tests {
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "rpm");
-        assert_eq!(config.format_compatibility, FormatCompatibility::Partial);
+        assert_eq!(config.format_compatibility, FormatCompatibility::Full);
     }
 
     #[test]
@@ -2757,7 +2837,7 @@ mod tests {
         );
         assert_eq!(
             MigrationService::get_format_compatibility("RPM"),
-            FormatCompatibility::Partial
+            FormatCompatibility::Full
         );
     }
 
@@ -3558,6 +3638,7 @@ mod tests {
             repo_type: "local".to_string(),
             package_type: "maven".to_string(),
             artifact_count: 100,
+            artifact_count_exact: true,
             total_size_bytes: 1_000_000,
             compatibility: "full".to_string(),
             warnings: vec!["warning1".to_string()],
@@ -3575,6 +3656,7 @@ mod tests {
         let result = AssessmentResult {
             repositories: vec![],
             total_artifacts: 500,
+            total_artifacts_exact: true,
             total_size_bytes: 5_000_000,
             users_count: 10,
             groups_count: 3,
@@ -3629,12 +3711,14 @@ mod tests {
                 repo_type: "local".to_string(),
                 package_type: "maven".to_string(),
                 artifact_count: 42,
+                artifact_count_exact: true,
                 total_size_bytes: 1024000,
                 compatibility: "full".to_string(),
                 warnings: vec![],
                 index_gap: None,
             }],
             total_artifacts: 42,
+            total_artifacts_exact: true,
             total_size_bytes: 1024000,
             users_count: 5,
             groups_count: 3,
@@ -3665,6 +3749,7 @@ mod tests {
         let result = AssessmentResult {
             repositories: vec![],
             total_artifacts: 0,
+            total_artifacts_exact: true,
             total_size_bytes: 0,
             users_count: 0,
             groups_count: 0,
@@ -4044,19 +4129,16 @@ mod tests {
     // `generic` behind the operator's back.
     // -----------------------------------------------------------------------
 
-    /// The four formats the migration copies byte-for-byte without building
+    /// The formats the migration copies byte-for-byte without building
     /// their package index, paired with the AK `repository_format` each one
-    /// must be provisioned as.
-    const INDEX_GAP_FORMATS: [(&str, &str); 4] = [
-        ("conan", "conan"),
-        ("conda", "conda_native"),
-        ("debian", "debian"),
-        ("rpm", "rpm"),
-    ];
+    /// must be provisioned as. RPM left this list when the importer started
+    /// recording header metadata for the dynamically rendered repodata, and
+    /// Debian when it started registering each `.deb` (#4657).
+    const INDEX_GAP_FORMATS: [(&str, &str); 2] = [("conan", "conan"), ("conda", "conda_native")];
 
     /// The limitation text has to name the format, the index that stays
     /// empty, and the command that fills it — and must exist for exactly the
-    /// four formats that migrate as a file copy, for no others.
+    /// formats that still migrate as a file copy, for no others.
     #[test]
     fn test_index_limitation_covers_exactly_the_file_copy_formats_3925() {
         for (source_format, _) in INDEX_GAP_FORMATS {
@@ -4077,7 +4159,7 @@ mod tests {
         }
 
         // Source-specific aliases resolve to the same statement.
-        for alias in ["yum", "apt", "CONAN"] {
+        for alias in ["CONAN", "conda_native"] {
             assert!(
                 MigrationService::index_limitation(alias).is_some(),
                 "{alias} normalizes onto a file-copy-only format"
@@ -4085,7 +4167,10 @@ mod tests {
         }
 
         // Natively-indexed and unsupported formats say nothing.
-        for quiet in ["maven", "npm", "docker", "pypi", "generic", "cargo", "wat"] {
+        for quiet in [
+            "maven", "npm", "docker", "pypi", "generic", "cargo", "rpm", "yum", "debian", "apt",
+            "wat",
+        ] {
             assert!(
                 MigrationService::index_limitation(quiet).is_none(),
                 "{quiet} must not claim an index gap"
@@ -4278,8 +4363,43 @@ mod tests {
         }
     }
 
+    /// #3928: the assessment's per-repository count must come from what the
+    /// listing actually returns, not from a page's `range.total`. The mock
+    /// below lists no artifacts while its `range.total` claims 7 — the shape
+    /// of a source whose page figure describes something other than the
+    /// repository. Pre-fix the assessment reported 7 per repository (and
+    /// seeded the job's denominator from it); the walk reports 0, exactly.
+    #[tokio::test]
+    async fn test_assessment_counts_by_listing_not_range_total_3928() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let listing = vec![
+            ("libs-release".to_string(), "maven".to_string()),
+            ("npm-local".to_string(), "npm".to_string()),
+        ];
+        let svc = MigrationService::new(pool.clone());
+        let result = svc
+            .run_assessment(Uuid::new_v4(), &ListingSource(listing))
+            .await
+            .expect("assessment runs");
+
+        for repo in &result.repositories {
+            assert_eq!(repo.artifact_count, 0, "{}: counted rows", repo.key);
+            assert!(
+                repo.artifact_count_exact,
+                "{}: walk reached the end",
+                repo.key
+            );
+        }
+        assert_eq!(result.total_artifacts, 0);
+        assert!(result.total_artifacts_exact);
+    }
+
     /// The pre-migration assessment must name the limitation per repository,
-    /// in terms an operator can act on, for each of the four formats.
+    /// in terms an operator can act on, for each format that still has one.
     ///
     /// Fails-before: the only thing the assessment said was "Package type
     /// 'conan' will be migrated as generic format" — which described the
@@ -4570,8 +4690,13 @@ mod tests {
 
         // The operator pre-created the destination natively and routed the
         // migration at it; the bytes land, the index does not.
-        seed_migrated_repo(&pool, &target_key, "rpm").await;
-        seed_completed_item(&pool, job_id, &format!("{source_key}/pkg-1.0-1.x86_64.rpm")).await;
+        seed_migrated_repo(&pool, &target_key, "conan").await;
+        seed_completed_item(
+            &pool,
+            job_id,
+            &format!("{source_key}/acme/zlib/1.3/conanfile.py"),
+        )
+        .await;
 
         let warnings_text = generated_report_warnings(&pool, job_id).await.to_string();
         assert!(

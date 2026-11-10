@@ -88,7 +88,9 @@ pub async fn run_storage_gc(
     require_admin(auth.is_admin)?;
 
     let service = StorageGcService::new(state.db.clone(), state.storage_registry.clone())
-        .with_maven_flat_gc_enabled(state.config.maven_flat_gc_enabled);
+        .with_trash_retention_days(state.config.gc_trash_retention_days)
+        .with_maven_flat_gc_enabled(state.config.maven_flat_gc_enabled)
+        .with_min_blob_age_secs(state.config.blob_gc_min_age_secs);
     let result = service.run_gc(payload.dry_run).await?;
 
     // Post-GC storage-stats refresh (#2056/#2601): the *scheduled* GC pass
@@ -194,7 +196,9 @@ pub async fn run_repository_storage_gc(
     // — otherwise "GC this one repository" stays a one-click way to delete
     // hand-attributed legacy objects.
     let service = StorageGcService::new(state.db.clone(), state.storage_registry.clone())
-        .with_maven_flat_gc_enabled(state.config.maven_flat_gc_enabled);
+        .with_trash_retention_days(state.config.gc_trash_retention_days)
+        .with_maven_flat_gc_enabled(state.config.maven_flat_gc_enabled)
+        .with_min_blob_age_secs(state.config.blob_gc_min_age_secs);
     let result = service
         .run_gc_for_repository(repo.id, payload.dry_run)
         .await?;
@@ -551,6 +555,7 @@ mod tests {
             bytes_freed: 2048,
             errors: vec!["some error".to_string()],
             maven_flat_objects_gated: 0,
+            budget_exhausted: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -580,6 +585,7 @@ mod tests {
             bytes_freed: 4096,
             errors: vec![],
             maven_flat_objects_gated: 0,
+            budget_exhausted: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: StorageGcResult = serde_json::from_str(&json).unwrap();
@@ -603,6 +609,7 @@ mod tests {
                 "Failed to delete key xyz: permission denied".to_string(),
             ],
             maven_flat_objects_gated: 0,
+            budget_exhausted: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: StorageGcResult = serde_json::from_str(&json).unwrap();

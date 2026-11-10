@@ -147,7 +147,9 @@ pub struct MintedApiToken {
 /// [`refresh_tokens`] for the rotation/family-revocation logic). They are
 /// serialized as standard JWT claims when present and omitted otherwise so
 /// existing access-token consumers keep parsing the JWT unchanged. Access
-/// tokens leave both fields `None`.
+/// tokens leave `jti` `None`; an access token minted as half of a token pair
+/// carries its refresh token's `family_id` so logout can revoke the session
+/// from the access token alone (#4831).
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     /// Subject (user ID)
@@ -158,9 +160,10 @@ pub struct Claims {
     pub email: String,
     /// Is admin
     pub is_admin: bool,
-    /// Repository IDs this access token is restricted to (None = unrestricted).
+    /// Repository IDs this token is restricted to (None = unrestricted).
     ///
-    /// Access-token only. Refresh tokens leave this unset.
+    /// Stamped on refresh tokens too, so a refresh re-mints the access token
+    /// under the same restriction (#4261).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_repo_ids: Option<Vec<Uuid>>,
     /// Issued at (Unix timestamp)
@@ -185,7 +188,8 @@ pub struct Claims {
     pub jti: Option<Uuid>,
     /// Refresh-token family identifier. All tokens minted from the same login
     /// share a `family_id`; replay of a consumed token revokes the whole
-    /// family. Set on refresh tokens only.
+    /// family. Set on refresh tokens and on the access token minted with
+    /// them (#4831); `None` on access-only mints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family_id: Option<Uuid>,
     /// Repository routing key this token is authorized to *pull* from, and
@@ -224,6 +228,21 @@ impl Claims {
     }
 }
 
+/// JWT validation for tokens this server signed itself (HS256 sessions,
+/// refresh tokens, TOTP tickets), on the HTTP and gRPC paths alike.
+///
+/// No expiry leeway: the library default of 60 s exists for clock skew
+/// between an issuer and a verifier, and here both are this deployment. A
+/// leeway would extend every minted token past the `exp` it was stamped
+/// with, and chain with the leeway an exchanged credential was accepted
+/// under (#4663): a CI assertion accepted 59 s past its `exp` used to yield
+/// a token that was then accepted for another 60 s.
+pub fn self_minted_validation() -> Validation {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.leeway = 0;
+    validation
+}
+
 /// `token_type` claim of a forced-TOTP-enrollment ticket (#2805). Kept distinct
 /// from `totp_pending` so an enrollment ticket can never be redeemed at
 /// `/auth/totp/verify` for a session, and vice versa.
@@ -235,6 +254,31 @@ pub struct TokenPair {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in: u64,
+}
+
+/// An access token minted without a refresh token
+/// ([`AuthService::generate_access_token_capped`]).
+#[derive(Debug, Serialize)]
+pub struct AccessToken {
+    pub access_token: String,
+    pub expires_in: u64,
+}
+
+impl From<TokenPair> for AccessToken {
+    fn from(pair: TokenPair) -> Self {
+        Self {
+            access_token: pair.access_token,
+            expires_in: pair.expires_in,
+        }
+    }
+}
+
+/// An [`AccessToken`] plus the instants a paired refresh token must share.
+struct MintedAccess {
+    token: AccessToken,
+    now: DateTime<Utc>,
+    iat_secs: i64,
+    iat_ms: i64,
 }
 
 /// How long a validated API token result is kept in the in-memory cache before
@@ -271,6 +315,248 @@ pub(crate) fn is_api_token_revoked_in_cache(token_id: Uuid) -> bool {
         return set.contains_key(&token_id);
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// Session-family revocation (#4883)
+//
+// An access JWT minted as half of a token pair carries its refresh token's
+// `family_id` (#4831). Logout and refresh-token replay detection record that
+// family in `session_family_revocations` (migration 294), and every
+// access-token validation refuses a token whose family is recorded there.
+// This is the access-token side of a sign-out: before it, only the refresh
+// family was revoked and the access token kept working until it expired.
+//
+// Same shape as the API-token revocation cache above (`REVOKED_API_TOKENS`,
+// `API_TOKEN_CACHE_TTL_SECS`): a bounded in-process map keyed by family with a
+// DB-backed miss path.
+//   * A revoked verdict is sticky (a revocation is never undone), and a
+//     revocation handled by this replica is written to the map before the DB
+//     write, so a replayed token is refused here immediately.
+//   * A not-revoked verdict is cached for `SESSION_REVOCATION_CACHE_TTL_SECS`
+//     (default 5 s). That TTL is the cross-replica bound: a sign-out handled
+//     by replica A is seen by replica B at the latest when B's cached verdict
+//     for that family expires. 0 disables the negative cache (one indexed
+//     lookup per access-token validation).
+//   * The map is bounded; under pressure stale entries go first, then the
+//     not-revoked verdicts, and as a last resort everything. Dropping an
+//     entry only costs a DB lookup, the table is the source of truth.
+// ---------------------------------------------------------------------------
+
+/// 401 message for an access token whose session was signed out. Must not
+/// contain "expired": `AuthFailureReason::for_token_error` would then count
+/// it as an expired token.
+pub(crate) const SESSION_SIGNED_OUT_MESSAGE: &str = "Session has been signed out";
+
+/// Environment variable naming how long a "session not revoked" verdict is
+/// cached per refresh-token family, in seconds.
+pub const SESSION_REVOCATION_CACHE_TTL_ENV: &str = "SESSION_REVOCATION_CACHE_TTL_SECS";
+
+/// Default for [`SESSION_REVOCATION_CACHE_TTL_ENV`]: matches the credential
+/// watermark cache ([`CREDENTIAL_DB_CACHE_TTL_SECS`]), so a sign-out, a
+/// password change and a deactivation all reach every replica within the
+/// same 5 s.
+const DEFAULT_SESSION_REVOCATION_CACHE_TTL_SECS: u64 = 5;
+
+/// Upper bound accepted for [`SESSION_REVOCATION_CACHE_TTL_ENV`]: the
+/// API-token cache TTL. A longer window would leave a signed-out session
+/// usable on other replicas for longer than a revoked API token.
+const MAX_SESSION_REVOCATION_CACHE_TTL_SECS: u64 = API_TOKEN_CACHE_TTL_SECS;
+
+/// Entry bound of the session-family verdict cache. One entry per active
+/// session family seen by this replica; about 40 bytes each.
+const SESSION_FAMILY_CACHE_MAX_ENTRIES: usize = 65_536;
+
+/// How long a revoked verdict is kept in the map when the map is under
+/// pressure. Beyond it the DB lookup answers again.
+const SESSION_FAMILY_REVOKED_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(24 * 3600);
+
+/// Refuse to renew a CI OIDC service account's session (#5054). See
+/// [`AuthService::load_refreshable_user`].
+fn refuse_ci_session_refresh(provider: AuthProvider) -> Result<()> {
+    if provider == AuthProvider::Ci {
+        return Err(AppError::Authentication(
+            "A CI OIDC session cannot be refreshed; exchange a fresh CI token at \
+             /api/v1/auth/ci/token instead"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Extra lifetime of a `session_family_revocations` row past the longest
+/// token of its family, for clock skew between replicas.
+const SESSION_FAMILY_REVOCATION_MARGIN_MINUTES: i64 = 60;
+
+/// Parse [`SESSION_REVOCATION_CACHE_TTL_ENV`]. Unset or unparsable values
+/// fall back to the default; values above the maximum are clamped.
+fn parse_session_revocation_cache_ttl(raw: Option<&str>) -> std::time::Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SESSION_REVOCATION_CACHE_TTL_SECS)
+        .min(MAX_SESSION_REVOCATION_CACHE_TTL_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// The configured negative-cache TTL, read from the environment once.
+fn session_revocation_cache_ttl() -> std::time::Duration {
+    static TTL: OnceLock<std::time::Duration> = OnceLock::new();
+    *TTL.get_or_init(|| {
+        parse_session_revocation_cache_ttl(
+            std::env::var(SESSION_REVOCATION_CACHE_TTL_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Why a session family was revoked. Stored in
+/// `session_family_revocations.reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionRevocationReason {
+    /// `POST /api/v1/auth/logout`.
+    Logout,
+    /// A consumed refresh token of the family was presented again.
+    RefreshReplay,
+}
+
+impl SessionRevocationReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Logout => "logout",
+            Self::RefreshReplay => "refresh_replay",
+        }
+    }
+}
+
+/// Bounded verdict cache for session families: `true` = revoked (sticky),
+/// `false` = not revoked as of the recorded instant.
+#[derive(Debug)]
+struct SessionFamilyCache {
+    entries: HashMap<Uuid, (bool, Instant)>,
+    max_entries: usize,
+}
+
+impl SessionFamilyCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    /// The cached verdict, or `None` when the DB must be asked: no entry, or
+    /// a not-revoked verdict older than `ttl`.
+    fn get(&self, family_id: Uuid, now: Instant, ttl: std::time::Duration) -> Option<bool> {
+        match self.entries.get(&family_id) {
+            Some(&(true, _)) => Some(true),
+            Some(&(false, at)) if now.saturating_duration_since(at) < ttl => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Record a verdict. A not-revoked verdict never overwrites a revoked one,
+    /// so a DB read that raced a local sign-out cannot resurrect the session.
+    fn record(&mut self, family_id: Uuid, revoked: bool, now: Instant, ttl: std::time::Duration) {
+        if !revoked && ttl.is_zero() {
+            return;
+        }
+        if !self.entries.contains_key(&family_id) && self.entries.len() >= self.max_entries {
+            self.make_room(now, ttl);
+        }
+        match self.entries.get_mut(&family_id) {
+            Some(entry) if entry.0 && !revoked => {}
+            Some(entry) => *entry = (revoked, now),
+            None => {
+                self.entries.insert(family_id, (revoked, now));
+            }
+        }
+    }
+
+    /// Evict down to a low-water mark (three quarters of the bound), not just
+    /// below the bound: otherwise a map held near capacity by fresh revoked
+    /// verdicts would pay a full O(n) sweep under the write lock on every new
+    /// family instead of once per quarter of the capacity.
+    fn make_room(&mut self, now: Instant, ttl: std::time::Duration) {
+        let low_water = self.max_entries - self.max_entries / 4;
+        self.entries.retain(|_, &mut (revoked, at)| {
+            let age = now.saturating_duration_since(at);
+            if revoked {
+                age < SESSION_FAMILY_REVOKED_RETENTION
+            } else {
+                age < ttl
+            }
+        });
+        if self.entries.len() >= low_water {
+            self.entries.retain(|_, &mut (revoked, _)| revoked);
+        }
+        if self.entries.len() >= low_water {
+            self.entries.clear();
+        }
+    }
+}
+
+static SESSION_FAMILY_VERDICTS: OnceLock<RwLock<SessionFamilyCache>> = OnceLock::new();
+
+fn session_family_cache() -> &'static RwLock<SessionFamilyCache> {
+    SESSION_FAMILY_VERDICTS
+        .get_or_init(|| RwLock::new(SessionFamilyCache::new(SESSION_FAMILY_CACHE_MAX_ENTRIES)))
+}
+
+/// Record on this replica that `family_id` is revoked, so its access tokens
+/// are refused here without waiting for a DB lookup.
+pub(crate) fn mark_session_family_revoked(family_id: Uuid) {
+    if let Ok(mut cache) = session_family_cache().write() {
+        cache.record(
+            family_id,
+            true,
+            Instant::now(),
+            session_revocation_cache_ttl(),
+        );
+    }
+}
+
+/// In-memory half of the session-family check: `true` only when this replica
+/// already knows the family is revoked. Used by the sync
+/// [`AuthService::validate_access_token`], which has no DB access.
+pub(crate) fn is_session_family_revoked_in_cache(family_id: Uuid) -> bool {
+    session_family_cache()
+        .read()
+        .map(|cache| cache.entries.get(&family_id).is_some_and(|e| e.0))
+        .unwrap_or(false)
+}
+
+/// Replica-safe session-family check: the cached verdict when fresh,
+/// otherwise one primary-key lookup in `session_family_revocations`.
+pub(crate) async fn is_session_family_revoked(db: &PgPool, family_id: Uuid) -> Result<bool> {
+    is_session_family_revoked_with_ttl(db, family_id, session_revocation_cache_ttl()).await
+}
+
+async fn is_session_family_revoked_with_ttl(
+    db: &PgPool,
+    family_id: Uuid,
+    ttl: std::time::Duration,
+) -> Result<bool> {
+    if let Ok(cache) = session_family_cache().read() {
+        if let Some(revoked) = cache.get(family_id, Instant::now(), ttl) {
+            return Ok(revoked);
+        }
+    }
+    // Stamp the verdict with the instant BEFORE the read, so its TTL never
+    // extends past what the read could have observed.
+    let asked_at = Instant::now();
+    let revoked = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM session_family_revocations WHERE family_id = $1)",
+    )
+    .bind(family_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    if let Ok(mut cache) = session_family_cache().write() {
+        cache.record(family_id, revoked, asked_at, ttl);
+    }
+    Ok(revoked)
 }
 
 /// Cached API token validation entry. Extends `ApiTokenValidation` with
@@ -906,6 +1192,13 @@ pub fn install_global_auth_semaphore(sem: Option<Arc<Semaphore>>) {
     let _ = GLOBAL_AUTH_SEMAPHORE.set(sem);
 }
 
+/// The installed process-wide auth cap, so a test can tell whether the cap it
+/// asked [`install_global_auth_semaphore`] for is the one in force (#5633).
+#[cfg(test)]
+pub(crate) fn installed_global_auth_semaphore() -> Option<Arc<Semaphore>> {
+    GLOBAL_AUTH_SEMAPHORE.get().and_then(|cell| cell.clone())
+}
+
 /// How long to wait for a bcrypt-permit before giving up and shedding to
 /// 503. A short queue tolerance turns "burst of 50 concurrent basic-auth
 /// requests" (every CI package-manager invocation) into a survivable
@@ -1006,6 +1299,13 @@ fn try_acquire_permit_from(
 /// **Replica scope:** this function is per-process. See the docstring on
 /// [`API_TOKEN_USER_INVALIDATIONS`] for the multi-replica caveat.
 pub fn invalidate_user_token_cache_entries(user_id: Uuid) {
+    // 0) Drop LDAP Basic-auth passthrough cache entries for this user. Both
+    //    the positive bind cache and the negative/per-username failure cache
+    //    must stop answering before the SQL that flips `is_active` commits,
+    //    because a positive entry otherwise carries the directory password
+    //    past a deactivation (#3830).
+    crate::services::ldap_basic_auth::invalidate_user(user_id);
+
     // 1) Record the invalidation timestamp BEFORE any SQL has committed.
     if let Ok(mut map) = api_token_user_invalidation_map().write() {
         map.insert(user_id, Instant::now());
@@ -1136,10 +1436,9 @@ pub enum TimingPad {
 pub enum AuthEntry {
     /// The shared credential primitive, [`AuthService::authenticate`].
     ///
-    /// The API middleware tries it *before* the API-token path on every
-    /// Basic-auth package-manager request (`middleware/auth.rs`,
-    /// `oci_v2.rs`, `conda.rs`). A user who authenticates `cargo`/`pip` as
-    /// `username:<api-token>` therefore takes a rejection arm on **every**
+    /// Some handlers still try it *before* their API-token path
+    /// (`oci_v2.rs`, `conda.rs`). A user who authenticates as
+    /// `username:<api-token>` there takes a rejection arm on **every**
     /// request, and an SSO-only deployment takes the federated arm on every
     /// request. So this entry point neither pads (a cost-12 bcrypt in front of
     /// traffic that never reaches the login form, halving the auth-permit
@@ -1148,6 +1447,32 @@ pub enum AuthEntry {
     /// target and level, and would let any anonymous caller write
     /// attacker-chosen text to the log). `origin/main` did neither here.
     Shared,
+    /// HTTP Basic `username:password` in the auth middleware,
+    /// [`AuthService::authenticate_basic_with_reason`] (#5640).
+    ///
+    /// The middleware resolves an issued-token-shaped password (API token,
+    /// JWT) as a token and never sends it here, so with LDAP Basic-auth
+    /// passthrough off only something meant to be a local password reaches
+    /// this entry, and a wrong one is the only way it fails. That makes the
+    /// pad cheap enough to run: an unknown username, a federated account and
+    /// a hashless account each pay the same single bcrypt as a wrong password
+    /// against a real account, so the package-manager Basic surface no longer
+    /// answers an unknown username measurably faster than a known one. It is
+    /// not budgeted per IP like [`Self::Login`]: an anonymous caller can
+    /// already buy one bcrypt per request by sending any wrong password for
+    /// any real account, so the pad adds no amplification.
+    ///
+    /// The caller passes [`TimingPad::Off`] while the passthrough is enabled.
+    /// Then a directory user's correct password takes the federated (or
+    /// no-local-row) arm on **every** request on its way to the passthrough,
+    /// and padding it would put a cost-12 bcrypt and an auth permit in front
+    /// of each one, cache hits included; the directory round-trip dominates
+    /// that surface's timing anyway. Does not log, for the same reason as
+    /// [`Self::Shared`].
+    Basic {
+        /// Whether the hashless arms run the dummy-hash verify.
+        pad: TimingPad,
+    },
     /// The unauthenticated `POST /api/v1/auth/login` endpoint — the one
     /// surface where the enumeration oracle is reachable.
     ///
@@ -1165,6 +1490,7 @@ impl AuthEntry {
     fn pad(self) -> TimingPad {
         match self {
             Self::Shared => TimingPad::Off,
+            Self::Basic { pad } => pad,
             Self::Login { pad } => pad,
         }
     }
@@ -1175,6 +1501,22 @@ impl AuthEntry {
     /// the log once an attacker exhausts the budget would hide the sweep.
     fn logs_rejections(self) -> bool {
         matches!(self, Self::Login { .. })
+    }
+
+    /// Whether a wrong password for `password` counts against the account's
+    /// lockout (`failed_login_attempts` / `locked_until` /
+    /// `last_failed_login_at`).
+    ///
+    /// A secret shaped like a credential Artifact Keeper issues (an API token
+    /// or a JWT) is a token that failed, not a password guess: a Maven
+    /// `settings.xml` or `.npmrc` carrying `user:<api_token>` used to bump the
+    /// counter on every request (1793 writes in 30 min, #5640) and keep the
+    /// account flagged as locked while the token went on working. So on the
+    /// machine-to-machine entries such a secret is never recorded. The login
+    /// endpoint is unchanged: a human typing at the form keeps the policy
+    /// exactly as it was.
+    fn records_failure_for(self, password: &str) -> bool {
+        matches!(self, Self::Login { .. }) || !looks_like_issued_token(password)
     }
 }
 
@@ -1222,6 +1564,15 @@ pub struct LoginFailure {
     /// database error, shed load, token minting) and so already carries its
     /// own distinguishable response.
     pub reason: Option<&'static str>,
+}
+
+impl LoginFailure {
+    /// The `ak_auth_failures_total` reason for this failure (#4676), or
+    /// `None` when it was not a credential rejection (an outage, shed load).
+    pub fn metric_reason(&self) -> Option<crate::services::metrics_service::AuthFailureReason> {
+        self.reason
+            .map(crate::services::metrics_service::AuthFailureReason::for_login_audit_reason)
+    }
 }
 
 impl From<AppError> for LoginFailure {
@@ -1393,9 +1744,20 @@ impl AuthService {
     /// [`Self::authenticate_for_login`] for the unauthenticated login
     /// endpoint.
     pub async fn authenticate(&self, username: &str, password: &str) -> Result<(User, TokenPair)> {
-        self.authenticate_inner(username, password, AuthEntry::Shared)
+        self.authenticate_with_reason(username, password)
             .await
             .map_err(|failure| failure.error)
+    }
+
+    /// [`Self::authenticate`], keeping the server-side rejection reason so a
+    /// caller can count the failure (#4676). Same entry point: no pad, no log.
+    pub async fn authenticate_with_reason(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> std::result::Result<(User, TokenPair), LoginFailure> {
+        self.authenticate_inner(username, password, AuthEntry::Shared)
+            .await
     }
 
     /// Authenticate for `POST /api/v1/auth/login` (#3504).
@@ -1423,6 +1785,22 @@ impl AuthService {
         pad: TimingPad,
     ) -> std::result::Result<(User, TokenPair), LoginFailure> {
         self.authenticate_inner(username, password, AuthEntry::Login { pad })
+            .await
+    }
+
+    /// HTTP Basic `username:password` for the auth middleware (#5640).
+    ///
+    /// [`Self::authenticate_with_reason`] plus, with [`TimingPad::On`], the
+    /// bcrypt timing pad on every rejection arm, so an unknown username costs
+    /// the same as a wrong password against a real account. See
+    /// [`AuthEntry::Basic`] for when the caller turns it off.
+    pub async fn authenticate_basic_with_reason(
+        &self,
+        username: &str,
+        password: &str,
+        pad: TimingPad,
+    ) -> std::result::Result<(User, TokenPair), LoginFailure> {
+        self.authenticate_inner(username, password, AuthEntry::Basic { pad })
             .await
     }
 
@@ -1494,10 +1872,9 @@ impl AuthService {
         }
 
         // ONE `verify_password` for every arm that reaches here. An arm with
-        // no stored hash of its own substitutes `dummy_bcrypt_hash()` — the
-        // same substitution `validate_api_token` uses — so the code path, the
-        // error type and the status are identical by construction rather than
-        // by inspection. The shared `?` is the point: `verify_password` yields
+        // no stored hash of its own substitutes `dummy_bcrypt_hash()`, so the
+        // code path, the error type and the status are identical by
+        // construction rather than by inspection. The shared `?` is the point: `verify_password` yields
         // `ServiceUnavailable` when the auth semaphore is saturated, and
         // swallowing that on the padded arms only would answer 401 for an
         // absent username while a real account answered 503 — a one-request
@@ -1515,6 +1892,16 @@ impl AuthService {
         // `rejection` is `None`, which the match above produces only for a
         // present, active, local row that has a password hash.
         let user = user.expect("a login with no rejection has a user row");
+
+        if !password_matches && !entry.records_failure_for(password) {
+            // An issued-token-shaped secret that is not this account's
+            // password: reject without touching the lockout columns (#5640).
+            return Err(Self::reject_login(
+                username,
+                LoginRejection::InvalidPassword,
+                entry,
+            ));
+        }
 
         if !password_matches {
             // Record failed attempt
@@ -1706,6 +2093,31 @@ impl AuthService {
             scopes,
             "refresh",
             credential_exp,
+            None,
+        )
+    }
+
+    /// Like [`AuthService::generate_tokens_with_scope`], but the ACCESS token
+    /// lives exactly `access_ttl` instead of the configured
+    /// `jwt_access_token_expiry_minutes`.
+    ///
+    /// For a CI OIDC exchange (#5054), whose lifetime is set per provider and
+    /// bounded there. The caller owns the bound; this method applies no cap.
+    pub fn generate_tokens_with_scope_ttl(
+        &self,
+        user: &User,
+        scopes: Option<Vec<String>>,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        access_ttl: Duration,
+    ) -> Result<TokenPair> {
+        self.generate_token_pair_capped(
+            user,
+            Uuid::new_v4(),
+            allowed_repo_ids,
+            scopes,
+            "refresh",
+            None,
+            Some(access_ttl),
         )
     }
 
@@ -1755,12 +2167,16 @@ impl AuthService {
             scopes,
             refresh_token_type,
             None,
+            None,
         )
     }
 
     /// [`AuthService::generate_token_pair_typed`] with an optional exchange
     /// cap on the access token's expiry (see
-    /// [`AuthService::generate_tokens_with_scope_capped`]).
+    /// [`AuthService::generate_tokens_with_scope_capped`]) and an optional
+    /// access-token TTL replacing the configured one (see
+    /// [`AuthService::generate_tokens_with_scope_ttl`]).
+    #[allow(clippy::too_many_arguments)]
     fn generate_token_pair_capped(
         &self,
         user: &User,
@@ -1769,7 +2185,87 @@ impl AuthService {
         scopes: Option<Vec<String>>,
         refresh_token_type: &str,
         credential_exp: Option<DateTime<Utc>>,
+        access_ttl: Option<Duration>,
     ) -> Result<TokenPair> {
+        // The refresh claims carry the same repository allow-list and
+        // action-scope ceiling as the access token: `refresh_tokens` and
+        // `mint_access_from_registry_refresh` re-mint from them, so leaving
+        // either off would widen the grant on refresh (#4261, #2430).
+        // The access token carries the session's `family_id` too, so a
+        // logout presenting only the access token can still revoke this
+        // session's refresh-token family (#4831).
+        let access = self.mint_access_token(
+            user,
+            allowed_repo_ids.clone(),
+            scopes.clone(),
+            credential_exp,
+            access_ttl,
+            Some(family_id),
+        )?;
+        let refresh_exp = access.now + Duration::days(self.config.jwt_refresh_token_expiry_days);
+
+        let refresh_jti = Uuid::new_v4();
+        let refresh_claims = Claims {
+            sub: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            is_admin: user.is_admin,
+            allowed_repo_ids,
+            iat: access.iat_secs,
+            iat_ms: Some(access.iat_ms),
+            exp: refresh_exp.timestamp(),
+            token_type: refresh_token_type.to_string(),
+            jti: Some(refresh_jti),
+            family_id: Some(family_id),
+            scan_pull_repo: None,
+            scopes,
+        };
+
+        let refresh_token = encode(&Header::default(), &refresh_claims, &self.encoding_key)
+            .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))?;
+
+        Ok(TokenPair {
+            access_token: access.token.access_token,
+            refresh_token,
+            expires_in: access.token.expires_in,
+        })
+    }
+
+    /// Mint an ACCESS token only, with the same expiry cap and claims as the
+    /// access half of [`AuthService::generate_tokens_with_scope_capped`], and
+    /// no refresh token at all.
+    ///
+    /// For exchanges whose credential must not be renewable, such as a
+    /// Kubernetes CI OIDC exchange whose result a kubelet caches on a node:
+    /// no refresh JWT is signed, so there is nothing to persist, leak or
+    /// replay, rather than one minted and then discarded.
+    pub fn generate_access_token_capped(
+        &self,
+        user: &User,
+        scopes: Option<Vec<String>>,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        credential_exp: Option<DateTime<Utc>>,
+    ) -> Result<AccessToken> {
+        Ok(self
+            .mint_access_token(user, allowed_repo_ids, scopes, credential_exp, None, None)?
+            .token)
+    }
+
+    /// The access half of every token mint: claims, the exchange cap on
+    /// `exp`, and the `iat`/`iat_ms` anchor a paired refresh token shares.
+    ///
+    /// `family_id` is the paired refresh token's family (`None` for an
+    /// access-only mint), so logout can revoke the session from the access
+    /// token alone (#4831).
+    fn mint_access_token(
+        &self,
+        user: &User,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        scopes: Option<Vec<String>>,
+        credential_exp: Option<DateTime<Utc>>,
+        access_ttl: Option<Duration>,
+        family_id: Option<Uuid>,
+    ) -> Result<MintedAccess> {
         let now = Utc::now();
         // Capture the millisecond instant once so access and refresh tokens
         // share the exact same `iat_ms` ordering anchor.
@@ -1791,10 +2287,10 @@ impl AuthService {
         // ahead of the real millisecond stamp.
         let iat_secs = now_ms.div_euclid(1000);
         let access_exp = crate::services::token_expiry_policy::cap_access_expiry(
-            now + Duration::minutes(self.config.jwt_access_token_expiry_minutes),
+            now + access_ttl
+                .unwrap_or_else(|| Duration::minutes(self.config.jwt_access_token_expiry_minutes)),
             credential_exp,
         );
-        let refresh_exp = now + Duration::days(self.config.jwt_refresh_token_expiry_days);
 
         let access_claims = Claims {
             sub: user.id,
@@ -1807,24 +2303,7 @@ impl AuthService {
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
             jti: None,
-            family_id: None,
-            scan_pull_repo: None,
-            scopes: scopes.clone(),
-        };
-
-        let refresh_jti = Uuid::new_v4();
-        let refresh_claims = Claims {
-            sub: user.id,
-            username: user.username.clone(),
-            email: user.email.clone(),
-            is_admin: user.is_admin,
-            allowed_repo_ids: None,
-            iat: iat_secs,
-            iat_ms: Some(now_ms),
-            exp: refresh_exp.timestamp(),
-            token_type: refresh_token_type.to_string(),
-            jti: Some(refresh_jti),
-            family_id: Some(family_id),
+            family_id,
             scan_pull_repo: None,
             scopes,
         };
@@ -1832,15 +2311,16 @@ impl AuthService {
         let access_token = encode(&Header::default(), &access_claims, &self.encoding_key)
             .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))?;
 
-        let refresh_token = encode(&Header::default(), &refresh_claims, &self.encoding_key)
-            .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))?;
-
-        Ok(TokenPair {
-            access_token,
-            refresh_token,
-            // Reflect the (possibly capped) real expiry so exchange clients
-            // schedule renewal correctly.
-            expires_in: (access_exp - now).num_seconds().max(0) as u64,
+        Ok(MintedAccess {
+            token: AccessToken {
+                access_token,
+                // Reflect the (possibly capped) real expiry so exchange
+                // clients schedule renewal correctly.
+                expires_in: (access_exp - now).num_seconds().max(0) as u64,
+            },
+            now,
+            iat_secs,
+            iat_ms: now_ms,
         })
     }
 
@@ -1975,7 +2455,83 @@ impl AuthService {
             ));
         }
 
+        // Sessions signed out on this replica (#4883). The DB-backed half of
+        // the check lives in `validate_access_token_async`.
+        if token_data
+            .claims
+            .family_id
+            .is_some_and(is_session_family_revoked_in_cache)
+        {
+            return Err(AppError::Authentication(
+                SESSION_SIGNED_OUT_MESSAGE.to_string(),
+            ));
+        }
+
         Ok(token_data.claims)
+    }
+
+    /// Refuse a token whose refresh-token family was revoked by a sign-out or
+    /// by refresh-token replay detection (#4883). Tokens without a
+    /// `family_id` (API-token exchanges, access-only mints, scanner tokens,
+    /// tokens minted before #4831) are not session-bound and pass.
+    ///
+    /// Composes with [`reject_if_invalidated_replica_safe`](Self::reject_if_invalidated_replica_safe):
+    /// that one covers user-wide events (password change or reset, TOTP
+    /// toggle, privilege change, deactivation), this one covers a single
+    /// session. Costs at most one primary-key lookup per cache miss
+    /// ([`is_session_family_revoked`]).
+    async fn reject_if_session_family_revoked(&self, claims: &Claims) -> Result<()> {
+        let Some(family_id) = claims.family_id else {
+            return Ok(());
+        };
+        if is_session_family_revoked(&self.db, family_id).await? {
+            return Err(AppError::Authentication(
+                SESSION_SIGNED_OUT_MESSAGE.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record that the session `family_id` is revoked so its access tokens
+    /// are refused on every replica (#4883). Marks this replica's cache
+    /// first (fail-secure: if the insert fails, this replica still refuses),
+    /// then upserts the `session_family_revocations` row. The row outlives
+    /// the longest token the family can hold (refresh lifetime, which bounds
+    /// the access lifetime too, plus a margin) and is then pruned by
+    /// [`cleanup_expired_refresh_token_jti`](Self::cleanup_expired_refresh_token_jti).
+    async fn record_session_family_revocation(
+        &self,
+        family_id: Uuid,
+        reason: SessionRevocationReason,
+    ) -> Result<()> {
+        mark_session_family_revoked(family_id);
+        const MAX_MINUTES: i64 = 10 * 366 * 24 * 60;
+        let token_minutes = self
+            .config
+            .jwt_access_token_expiry_minutes
+            .max(
+                self.config
+                    .jwt_refresh_token_expiry_days
+                    .saturating_mul(24 * 60),
+            )
+            .clamp(0, MAX_MINUTES);
+        let expires_at = Utc::now()
+            + Duration::minutes(token_minutes + SESSION_FAMILY_REVOCATION_MARGIN_MINUTES);
+        sqlx::query(
+            r#"
+            INSERT INTO session_family_revocations (family_id, reason, expires_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (family_id) DO UPDATE
+                SET expires_at = GREATEST(session_family_revocations.expires_at, EXCLUDED.expires_at)
+            "#,
+        )
+        .bind(family_id)
+        .bind(reason.as_str())
+        .bind(expires_at)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
     }
 
     /// Shared replica-safe credential-change gate for the three DB-backed
@@ -2018,6 +2574,11 @@ impl AuthService {
         }
 
         self.reject_if_invalidated_replica_safe(&token_data.claims)
+            .await?;
+
+        // A signed-out session's access token is refused even though its
+        // signature and expiry are still good (#4883).
+        self.reject_if_session_family_revoked(&token_data.claims)
             .await?;
 
         // Re-derive `is_admin` from the live server-side role. The JWT claim is
@@ -2108,7 +2669,7 @@ impl AuthService {
                 // row insert and the parent's `superseded_by` link both run on
                 // the transaction, so the consume and the mint commit as one
                 // unit — a crash mid-rotation leaves the parent unconsumed.
-                let user = self.load_active_user(token_data.claims.sub).await?;
+                let user = self.load_refreshable_user(token_data.claims.sub).await?;
                 let tokens = self.generate_tokens_with_family_and_scope(
                     &user,
                     family_id,
@@ -2204,8 +2765,11 @@ impl AuthService {
                 // #1174) or its family row was pruned. Rotate normally in the
                 // presented family and record a fresh row so any future replay
                 // of the NEW token IS detected. Behaviour unchanged from the
-                // pre-fix legacy branch.
-                let user = self.load_active_user(token_data.claims.sub).await?;
+                // pre-fix legacy branch, except that a family signed out
+                // without any jti row (#4883) does not rotate.
+                self.reject_if_session_family_revoked(&token_data.claims)
+                    .await?;
+                let user = self.load_refreshable_user(token_data.claims.sub).await?;
                 let tokens = self.generate_tokens_with_family_and_scope(
                     &user,
                     family_id,
@@ -2265,6 +2829,24 @@ impl AuthService {
                     .await
                     .map_err(|e| AppError::Database(e.to_string()))?;
 
+                    // The family's access tokens go with it (#4883). Best
+                    // effort: the caller gets the replay 401 either way, and
+                    // this replica's cache is marked before the insert.
+                    if let Err(e) = self
+                        .record_session_family_revocation(
+                            row.family_id,
+                            SessionRevocationReason::RefreshReplay,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            user_id = %token_data.claims.sub,
+                            family_id = %row.family_id,
+                            error = %e,
+                            "Failed to record the replayed session family as revoked",
+                        );
+                    }
+
                     tracing::warn!(
                         user_id = %token_data.claims.sub,
                         jti = %jti,
@@ -2300,7 +2882,7 @@ impl AuthService {
         // Legacy path: refresh JWT has no jti (predates #1174). Rotate but
         // open a new family so subsequent rotations get replay detection.
         // Still preserve the action-scope ceiling and repo allow-list (#2430).
-        let user = self.load_active_user(token_data.claims.sub).await?;
+        let user = self.load_refreshable_user(token_data.claims.sub).await?;
         let tokens = self.generate_tokens_with_scope(
             &user,
             token_data.claims.scopes.clone(),
@@ -2392,7 +2974,7 @@ impl AuthService {
             }
         }
 
-        let user = self.load_active_user(token_data.claims.sub).await?;
+        let user = self.load_refreshable_user(token_data.claims.sub).await?;
 
         // Mint a fresh short-lived access token under the presenting token's
         // repo allow-list and action-scope ceiling (#2430). The refresh JWT
@@ -2449,10 +3031,27 @@ impl AuthService {
         Ok(pair.refresh_token)
     }
 
+    /// [`AuthService::load_active_user`] for the two refresh paths
+    /// ([`AuthService::refresh_tokens`] and
+    /// [`AuthService::mint_access_from_registry_refresh`]), refusing a CI OIDC
+    /// service account (#5054).
+    ///
+    /// A CI exchange persists a refresh JTI (so logout and the deactivation
+    /// sweep can revoke the session) but never hands the refresh JWT out. Its
+    /// session must end when the access token minted by the exchange expires,
+    /// within the provider's `token_ttl_secs` (at most one hour); a pipeline
+    /// that needs longer exchanges a fresh CI assertion. Refusing here keeps
+    /// that true even if a refresh JWT for such an account were ever exposed.
+    async fn load_refreshable_user(&self, user_id: Uuid) -> Result<User> {
+        let user = self.load_active_user(user_id).await?;
+        refuse_ci_session_refresh(user.auth_provider)?;
+        Ok(user)
+    }
+
     /// Fetch a user row by id, rejecting deactivated accounts. Shared by the
     /// refresh flow and any other path that needs the "currently-active"
     /// view of a user.
-    async fn load_active_user(&self, user_id: Uuid) -> Result<User> {
+    pub(crate) async fn load_active_user(&self, user_id: Uuid) -> Result<User> {
         sqlx::query_as!(
             User,
             r#"
@@ -2540,6 +3139,21 @@ impl AuthService {
         let Some(family_id) = token_data.claims.family_id else {
             return Ok(0);
         };
+        self.revoke_refresh_token_family(family_id).await
+    }
+
+    /// Sign out one login session: revoke every unrevoked refresh-token jti
+    /// row in `family_id` and record the family in
+    /// `session_family_revocations`, so the session's access tokens, which
+    /// carry the same `family_id` (#4831), are refused too (#4883). Used by
+    /// logout, from the presented refresh token or from the access token
+    /// alone. Returns the number of jti rows revoked; the family is recorded
+    /// even when that is 0 (no jti row, or rows already revoked by a
+    /// user-wide sweep).
+    pub async fn revoke_refresh_token_family(&self, family_id: Uuid) -> Result<u64> {
+        let recorded = self
+            .record_session_family_revocation(family_id, SessionRevocationReason::Logout)
+            .await;
         let result = sqlx::query(
             r#"
             UPDATE refresh_token_jti
@@ -2551,12 +3165,17 @@ impl AuthService {
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        recorded?;
         Ok(result.rows_affected())
     }
 
     /// Delete refresh-token jti rows whose underlying JWT expired more than
     /// `grace` ago. Called by the scheduler janitor (#1174 cleanup).
-    /// Returns the number of rows removed.
+    /// Returns the number of jti rows removed.
+    ///
+    /// Also prunes `session_family_revocations` rows past their `expires_at`
+    /// by the same grace (#4883): no token of those families can still be
+    /// valid. That count is logged, not returned.
     pub async fn cleanup_expired_refresh_token_jti(db: &PgPool, grace: Duration) -> Result<u64> {
         let cutoff = Utc::now() - grace;
         let result = sqlx::query!(
@@ -2566,6 +3185,17 @@ impl AuthService {
         .execute(db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        let families = sqlx::query("DELETE FROM session_family_revocations WHERE expires_at < $1")
+            .bind(cutoff)
+            .execute(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if families.rows_affected() > 0 {
+            tracing::debug!(
+                "Pruned {} expired session_family_revocations rows",
+                families.rows_affected()
+            );
+        }
         Ok(result.rows_affected())
     }
 
@@ -2584,8 +3214,7 @@ impl AuthService {
     }
 
     fn decode_token(&self, token: &str) -> Result<TokenData<Claims>> {
-        let validation = Validation::new(Algorithm::HS256);
-        decode::<Claims>(token, &self.decoding_key, &validation)
+        decode::<Claims>(token, &self.decoding_key, &self_minted_validation())
             .map_err(|e| AppError::Authentication(format!("Invalid token: {}", e)))
     }
 
@@ -2643,6 +3272,18 @@ impl AuthService {
         })
     }
 
+    /// The `token_prefix` lookup key of an API token: its first 8 bytes.
+    ///
+    /// `None` when the token is shorter than 8 bytes, or when byte 8 falls
+    /// inside a multibyte character (#5525). Such a token cannot match any
+    /// stored prefix, which is always 8 ASCII hex digits, so callers treat
+    /// `None` like any other malformed token. Slicing with `&token[..8]`
+    /// instead panicked on a Basic password such as `1234567é`, and that
+    /// panic dropped the connection.
+    pub fn api_token_prefix(token: &str) -> Option<&str> {
+        token.get(..8)
+    }
+
     /// Validate API token and return user with scopes and repository restrictions.
     pub async fn validate_api_token(&self, token: &str) -> Result<ApiTokenValidation> {
         // Hash the raw token before using it as cache key so plaintext tokens
@@ -2684,15 +3325,33 @@ impl AuthService {
         }
 
         // API tokens have format: prefix_secret
-        // We store hash of full token and prefix for lookup
-        let dummy = Self::dummy_bcrypt_hash();
-        if token.len() < 8 {
-            // Still must burn bcrypt time to avoid leaking token length info
-            let _ = Self::verify_password(token, dummy).await;
+        // We store hash of full token and prefix for lookup.
+        //
+        // Every rejection that can be decided without the secret is decided
+        // BEFORE the bcrypt verify, so it never takes a permit from the
+        // process-wide auth-concurrency cap (#5633). A burst of expired JWTs,
+        // garbage, or dead API tokens used to run one cost-12 bcrypt each
+        // (against `dummy_bcrypt_hash()` when nothing matched), saturate the
+        // cap, and answer `503 Authentication service is at capacity` instead
+        // of 401 — which clients retry, turning one expired credential into a
+        // retry storm.
+        //
+        // Nothing secret leaks by answering these early. The token shape is
+        // public. The `token_prefix` is a non-secret lookup key: it is shown
+        // in every token listing, and knowing that a prefix exists, or is
+        // revoked or expired, gets an attacker no closer to the 128-bit
+        // secret that follows it. Revocation was already reported before the
+        // hash comparison (`check_token_validation_result`). Only a live row
+        // whose prefix matches pays for the bcrypt, and that comparison is
+        // the one that genuinely needs the secret.
+        if !is_api_token_shape(token) {
             return Err(AppError::Authentication("Invalid API token".to_string()));
         }
-
-        let prefix = &token[..8];
+        let Some(prefix) = Self::api_token_prefix(token) else {
+            // Unreachable for a token-shaped (ASCII) credential; kept so the
+            // #5525 boundary guard stays the single slicing point.
+            return Err(AppError::Authentication("Invalid API token".to_string()));
+        };
 
         // Find token by prefix (includes revoked_at and last_used_at for
         // revocation check and debounced usage tracking).
@@ -2710,30 +3369,30 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Extract verification inputs. When no token was found, use a dummy
-        // hash so that bcrypt still runs and all code paths take equal time.
-        let (hash_to_verify, token_exists, is_revoked) = match &stored_token_opt {
-            Some(t) => (t.token_hash.clone(), true, t.revoked_at.is_some()),
-            None => (dummy.to_string(), false, false),
-        };
-
-        // Always run bcrypt verification regardless of token existence.
-        // This is the constant-time core of the fix: an attacker cannot
-        // distinguish "prefix not found" from "wrong secret" by timing.
-        let hash_matches = Self::verify_password(token, &hash_to_verify).await?;
-
-        // Check results only after bcrypt has completed
-        check_token_validation_result(token_exists, is_revoked, hash_matches)?;
-
-        // Unwrap is safe: token_exists is true only when stored_token_opt is Some
+        // Unknown prefix or revoked row: rejected without bcrypt (see above).
+        // `hash_matches = true` here only means "not yet compared"; the
+        // comparison itself runs below for a live row.
+        check_token_validation_result(
+            stored_token_opt.is_some(),
+            stored_token_opt
+                .as_ref()
+                .is_some_and(|t| t.revoked_at.is_some()),
+            true,
+        )?;
+        // Unwrap is safe: `check_token_validation_result` refused `None`.
         let stored_token = stored_token_opt.unwrap();
 
-        // Check expiration
+        // Check expiration, also before bcrypt.
         if let Some(expires_at) = stored_token.expires_at {
             if expires_at < Utc::now() {
                 return Err(AppError::Authentication("API token expired".to_string()));
             }
         }
+
+        // The only arm that needs the secret: a live, unexpired row whose
+        // prefix matches.
+        let hash_matches = Self::verify_password(token, &stored_token.token_hash).await?;
+        check_token_validation_result(true, false, hash_matches)?;
 
         // Debounced usage analytics: only update last_used_at if it has been
         // more than 5 minutes since the last recorded use (or never used).
@@ -2774,68 +3433,60 @@ impl AuthService {
         // Fetch repository restrictions for this token.
         // If a repo_selector is set, resolve it dynamically. Otherwise fall
         // back to the explicit api_token_repositories join table.
-        let allowed_repo_ids = if let Some(selector_json) = &stored_token.repo_selector {
-            use crate::services::repo_selector_service::{
-                parse_token_selector_strict, RepoSelectorService,
-            };
-            match parse_token_selector_strict(selector_json) {
-                // Fail closed (#4226): a stored selector that does not parse,
-                // or that carries a key `RepoSelector` does not know, used to
-                // become an empty selector here, i.e. unrestricted. It now
-                // grants no repository at all.
-                Err(e) => {
-                    tracing::warn!(
-                        token_id = %stored_token.id,
-                        error = %e,
-                        "API token has an unparseable repo_selector; denying all repositories"
-                    );
-                    Some(vec![])
-                }
-                // An explicitly empty selector (`{}` or only empty criteria)
-                // keeps its legacy meaning of unrestricted. Every mint now
-                // refuses one, so only rows written before that carry it.
-                Ok(selector) if RepoSelectorService::is_empty(&selector) => None,
-                Ok(selector) => {
-                    let svc = RepoSelectorService::new(self.db.clone());
-                    let ids = svc.resolve_ids(&selector).await?;
-                    if ids.is_empty() {
-                        Some(vec![]) // selector matched nothing, deny all
-                    } else {
-                        Some(ids)
-                    }
-                }
-            }
-        } else {
-            let repo_rows = sqlx::query!(
+        use crate::services::repo_selector_service::{RepoSelectorService, TokenScopeError};
+        let explicit = if stored_token.repo_selector.is_none() {
+            sqlx::query!(
                 "SELECT repo_id FROM api_token_repositories WHERE token_id = $1",
                 stored_token.id
             )
             .fetch_all(&self.db)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-            if repo_rows.is_empty() {
-                // #4228: the join rows are `ON DELETE CASCADE`, so an empty
-                // set has two meanings -- "never restricted" and "restricted
-                // at mint, every repository since deleted". The marker
-                // written at pin time tells them apart: a restricted token
-                // whose allow-list emptied out denies every repository
-                // (`Restricted(vec![])`, deny-by-default) instead of falling
-                // open to the whole instance. Deleting repositories can only
-                // ever narrow a token, never widen it.
-                if stored_token.repository_restricted {
-                    tracing::warn!(
-                        token_id = %stored_token.id,
-                        "API token's repository allow-list is empty (repositories deleted); denying all repositories"
-                    );
-                    Some(vec![])
-                } else {
-                    None // unrestricted
-                }
-            } else {
-                Some(repo_rows.into_iter().map(|r| r.repo_id).collect())
-            }
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .into_iter()
+            .map(|row| row.repo_id)
+            .collect()
+        } else {
+            Vec::new()
         };
+        // An explicitly empty selector (`{}` or only empty criteria)
+        // keeps its legacy meaning of unrestricted. Every mint now
+        // refuses one, so only rows written before that carry it.
+        let resolved = RepoSelectorService::new(self.db.clone())
+            .resolve_token_scope(
+                stored_token.repo_selector.as_ref(),
+                explicit,
+                stored_token.repository_restricted,
+            )
+            .await?;
+        match resolved.scope_error {
+            // Fail closed (#4226): a stored selector that does not parse,
+            // or that carries a key `RepoSelector` does not know, used to
+            // become an empty selector here, i.e. unrestricted. It now
+            // grants no repository at all.
+            Some(TokenScopeError::InvalidSelector) => {
+                tracing::warn!(
+                    token_id = %stored_token.id,
+                    error = %resolved.selector_error.as_deref().unwrap_or("invalid selector"),
+                    "API token has an unparseable repo_selector; denying all repositories"
+                );
+            }
+            // #4228: the join rows are `ON DELETE CASCADE`, so an empty
+            // set has two meanings -- "never restricted" and "restricted
+            // at mint, every repository since deleted". The marker
+            // written at pin time tells them apart: a restricted token
+            // whose allow-list emptied out denies every repository
+            // (`Restricted(vec![])`, deny-by-default) instead of falling
+            // open to the whole instance. Deleting repositories can only
+            // ever narrow a token, never widen it.
+            Some(TokenScopeError::DeletedPinnedRepositories) => {
+                tracing::warn!(
+                    token_id = %stored_token.id,
+                    "API token's repository allow-list is empty (repositories deleted); denying all repositories"
+                );
+            }
+            _ => {}
+        }
+        let allowed_repo_ids = resolved.allowed_repo_ids;
 
         let validation = ApiTokenValidation {
             user,
@@ -3016,142 +3667,6 @@ impl AuthService {
         }
     }
 
-    // =========================================================================
-    // T055: Federated Authentication Routing
-    // =========================================================================
-
-    /// Authenticate user by routing to the appropriate provider based on auth_provider type.
-    ///
-    /// This method looks up the user's auth_provider and delegates to the appropriate
-    /// authentication service (LDAP, OIDC, SAML) or performs local authentication.
-    ///
-    /// # Arguments
-    /// * `username` - The username to authenticate
-    /// * `password` - The password (for local/LDAP) or empty for token-based flows
-    /// * `provider_override` - Optional provider to force (useful for SSO initiation)
-    ///
-    /// # Returns
-    /// * `Ok((User, TokenPair))` - Authenticated user and JWT tokens
-    /// * `Err(AppError)` - Authentication failure
-    pub async fn authenticate_by_provider(
-        &self,
-        username: &str,
-        password: &str,
-        provider_override: Option<AuthProvider>,
-    ) -> Result<(User, TokenPair)> {
-        // First, look up the user to determine their auth provider
-        let user_lookup = sqlx::query!(
-            r#"
-            SELECT auth_provider as "auth_provider: AuthProvider"
-            FROM users
-            WHERE username = $1 AND is_active = true
-            "#,
-            username
-        )
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        // Determine which provider to use
-        let provider = provider_override.or_else(|| user_lookup.map(|u| u.auth_provider));
-
-        match provider {
-            Some(AuthProvider::Local) | None => {
-                // Use local authentication
-                self.authenticate(username, password).await
-            }
-            Some(AuthProvider::Ldap) => {
-                // Delegate to LDAP service
-                // Note: ldap_service would be injected or created here in a full implementation
-                self.authenticate_ldap(username, password).await
-            }
-            Some(AuthProvider::Oidc) => {
-                // OIDC authentication is typically handled via callback, not direct auth
-                // This path would be used for token exchange after OIDC redirect
-                Err(AppError::Authentication(
-                    "OIDC authentication requires redirect flow. Use /auth/oidc/login endpoint."
-                        .to_string(),
-                ))
-            }
-            Some(AuthProvider::Saml) => {
-                // SAML authentication is handled via SSO assertion
-                // This path would be used for SAML response processing
-                Err(AppError::Authentication(
-                    "SAML authentication requires SSO flow. Use /auth/saml/login endpoint."
-                        .to_string(),
-                ))
-            }
-            Some(AuthProvider::Ci) => {
-                // CI authentication is handled via the CI OIDC token exchange endpoint.
-                Err(AppError::Authentication(
-                    "CI authentication requires a CI-issued OIDC JWT. Use /api/v1/auth/ci/token."
-                        .to_string(),
-                ))
-            }
-        }
-    }
-
-    /// Authenticate via LDAP provider.
-    ///
-    /// This is a placeholder that would delegate to LdapService in a full implementation.
-    async fn authenticate_ldap(&self, username: &str, password: &str) -> Result<(User, TokenPair)> {
-        // In a full implementation, this would:
-        // 1. Bind to LDAP server with user credentials
-        // 2. Fetch user attributes and groups
-        // 3. Call sync_federated_user to create/update user
-        // 4. Generate JWT tokens
-
-        // For now, check if user exists with LDAP provider
-        let user = sqlx::query_as!(
-            User,
-            r#"
-            SELECT
-                id, username, email, password_hash, display_name,
-                auth_provider as "auth_provider: AuthProvider",
-                external_id, is_admin, is_active, is_service_account, must_change_password,
-                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                failed_login_attempts, locked_until, last_failed_login_at,
-                password_changed_at, last_login_at, created_at, updated_at
-            FROM users
-            WHERE username = $1 AND auth_provider = 'ldap' AND is_active = true
-            "#,
-            username
-        )
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::Authentication("LDAP user not found".to_string()))?;
-
-        // In production, LDAP bind verification would happen here
-        // For development/testing, we check password if stored (hybrid mode)
-        if let Some(ref hash) = user.password_hash {
-            if !Self::verify_password(password, hash).await? {
-                return Err(AppError::Authentication("Invalid credentials".to_string()));
-            }
-        } else {
-            // Pure LDAP mode - would verify against LDAP server
-            return Err(AppError::Authentication(
-                "LDAP server verification not configured".to_string(),
-            ));
-        }
-
-        // Update last login. Throttled to at most once per 5 minutes per user
-        // (display-only field, #2107) to avoid needless WAL churn on re-auth.
-        sqlx::query!(
-            "UPDATE users SET last_login_at = NOW() \
-             WHERE id = $1 \
-               AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes')",
-            user.id
-        )
-        .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let tokens = self.generate_tokens(&user)?;
-        self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
-        Ok((user, tokens))
-    }
-
     /// Authenticate a federated user after successful SSO (OIDC/SAML).
     ///
     /// This is called after the SSO flow completes with validated credentials.
@@ -3174,6 +3689,17 @@ impl AuthService {
     ) -> Result<(User, TokenPair)> {
         // Sync or create the user based on federated credentials
         let user = self.sync_federated_user(provider, &credentials).await?;
+
+        // No caller may receive tokens for a deactivated account. CI and LDAP
+        // keep `is_active` across a federated sync (an admin disable is a kill
+        // switch, not something a successful login may undo); the other
+        // providers still reactivate on login at their identity provider.
+        if !user.is_active {
+            return Err(AppError::Authentication(
+                "This account has been deactivated. Ask an administrator to reactivate it."
+                    .to_string(),
+            ));
+        }
 
         // Update last login. Throttled to at most once per 5 minutes per user
         // (display-only field, #2107) to avoid needless WAL churn on re-auth.
@@ -3441,11 +3967,17 @@ impl AuthService {
             // A CI service account keeps its `is_active` (#4031): it is
             // deactivated when its identity mapping is deleted, or by an
             // administrator as a kill switch, and a pipeline exchange must
-            // never switch it back on. Other federated accounts are
-            // reactivated by a successful login at their identity provider,
-            // as before.
-            sqlx::query_as!(
-                User,
+            // never switch it back on. An LDAP account keeps it for the same
+            // reason (#4933): the Basic-auth passthrough already refuses a
+            // deactivated directory user, so the web LDAP login must agree
+            // instead of quietly undoing an admin disable. Other federated
+            // accounts are reactivated by a successful login at their
+            // identity provider, as before.
+            // Runtime query (not `query_as!`) so this change does not need a
+            // `.sqlx` cache regeneration for the shared database. The column
+            // list and `sqlx::Type` mapping on `AuthProvider` keep it aligned
+            // with the other `User` reads.
+            sqlx::query_as::<_, User>(
                 r#"
                 UPDATE users
                 SET
@@ -3453,23 +3985,23 @@ impl AuthService {
                     email = $3,
                     display_name = $4,
                     is_admin = COALESCE($5, is_admin),
-                    is_active = CASE WHEN auth_provider = 'ci' THEN is_active ELSE true END,
+                    is_active = CASE WHEN auth_provider IN ('ci', 'ldap') THEN is_active ELSE true END,
                     updated_at = NOW()
                 WHERE id = $1
                 RETURNING
                     id, username, email, password_hash, display_name,
-                    auth_provider as "auth_provider: AuthProvider",
+                    auth_provider,
                     external_id, is_admin, is_active, is_service_account, must_change_password,
                     totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                     failed_login_attempts, locked_until, last_failed_login_at,
                     password_changed_at, last_login_at, created_at, updated_at
                 "#,
-                existing.id,
-                credentials.username,
-                credentials.email,
-                credentials.display_name,
-                role_mapping.is_admin
             )
+            .bind(existing.id)
+            .bind(&credentials.username)
+            .bind(&credentials.email)
+            .bind(credentials.display_name.as_deref())
+            .bind(role_mapping.is_admin)
             .fetch_one(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?
@@ -3569,7 +4101,46 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        for user_id in &deactivated_ids {
+        self.revoke_deactivated_federated_users(&deactivated_ids)
+            .await;
+        Ok(deactivated_ids.len() as u64)
+    }
+
+    /// Deactivate specific federated users the directory reconcile found
+    /// gone (#3830), with the same credential revocation as
+    /// [`Self::deactivate_missing_users`]. Only rows still active and still
+    /// owned by `provider` are touched; returns the ids actually deactivated.
+    pub async fn deactivate_federated_users(
+        &self,
+        provider: AuthProvider,
+        user_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>> {
+        if user_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let deactivated_ids: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            UPDATE users
+            SET is_active = false, updated_at = NOW()
+            WHERE id = ANY($1) AND auth_provider = $2 AND is_active = true
+            RETURNING id
+            "#,
+        )
+        .bind(user_ids)
+        .bind(provider)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        self.revoke_deactivated_federated_users(&deactivated_ids)
+            .await;
+        Ok(deactivated_ids)
+    }
+
+    /// Revoke every credential of freshly deactivated federated users: the
+    /// API-token cache, access tokens, and refresh-token families.
+    async fn revoke_deactivated_federated_users(&self, deactivated_ids: &[Uuid]) {
+        for user_id in deactivated_ids {
             invalidate_user_token_cache_entries(*user_id);
             invalidate_user_tokens(*user_id);
 
@@ -3584,8 +4155,6 @@ impl AuthService {
                 );
             }
         }
-
-        Ok(deactivated_ids.len() as u64)
     }
 
     /// Reactivate a previously deactivated federated user.
@@ -3798,6 +4367,45 @@ pub(crate) fn should_debounce_usage_update(last_used_at: Option<DateTime<Utc>>) 
     }
 }
 
+/// `<8 hex>_<32 hex>`: the shape of every API token Artifact Keeper mints
+/// (see [`AuthService::generate_api_token_with_policy`]: the first 8 hex digits
+/// of a UUID, `_`, then a dash-less UUID).
+///
+/// A pure, credential-independent check, so a caller may branch on it before
+/// any database lookup or bcrypt work without leaking anything: the shape is
+/// public (#5640).
+pub(crate) fn is_api_token_shape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 41
+        && bytes[8] == b'_'
+        && bytes[..8].iter().all(u8::is_ascii_hexdigit)
+        && bytes[9..].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Three non-empty base64url segments with a JSON header: a compact JWS.
+pub(crate) fn is_jwt_shape(value: &str) -> bool {
+    let mut segments = value.split('.');
+    let (Some(header), Some(payload), Some(signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    let base64url = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    header.starts_with("eyJ") && base64url(header) && base64url(payload) && base64url(signature)
+}
+
+/// Whether a Basic password is a credential Artifact Keeper itself issues.
+pub(crate) fn looks_like_issued_token(password: &str) -> bool {
+    is_api_token_shape(password) || is_jwt_shape(password)
+}
+
 /// Evaluate token validation state after bcrypt verification has completed.
 /// Separated from the async method so all branches can be unit-tested
 /// without a database.
@@ -3822,6 +4430,59 @@ fn check_token_validation_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // API-token prefix on a multibyte credential (#5525)
+    // -----------------------------------------------------------------------
+
+    /// `x:1234567é` as a Basic password lands the `é` across byte 8. The
+    /// prefix lookup must answer `None` there, not panic, and must still be
+    /// the plain first 8 bytes for every real token.
+    #[test]
+    fn api_token_prefix_refuses_a_non_boundary_byte_8_5525() {
+        // The issue's credential: 7 ASCII bytes then a two-byte `é`.
+        assert_eq!(AuthService::api_token_prefix("1234567é"), None);
+        // Longer password with the same boundary problem.
+        assert_eq!(AuthService::api_token_prefix("1234567éabcdef"), None);
+        // Too short.
+        assert_eq!(AuthService::api_token_prefix("1234567"), None);
+        assert_eq!(AuthService::api_token_prefix(""), None);
+        // Multibyte before the boundary is fine: byte 8 is a boundary.
+        assert_eq!(AuthService::api_token_prefix("123456é9"), Some("123456é"));
+        // A real token: `<8 hex>_<32 hex>`.
+        let token = format!("0123abcd_{}", "f".repeat(32));
+        assert_eq!(AuthService::api_token_prefix(&token), Some("0123abcd"));
+    }
+
+    /// The real path: the credential from #5485 finding 2 used to panic in
+    /// `validate_api_token` before any lookup; it is now a plain 401.
+    #[tokio::test]
+    async fn validate_api_token_rejects_a_multibyte_credential_5525() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let err = svc
+            .validate_api_token("1234567é")
+            .await
+            .expect_err("a non-boundary credential is refused, not a panic");
+        assert!(
+            matches!(err, AppError::Authentication(_)),
+            "expected Authentication, got {err:?}"
+        );
+
+        let token_svc = crate::services::token_service::TokenService::new(
+            pool,
+            Arc::new(Config::test_config()),
+        );
+        let validation = token_svc.validate_token("1234567é").await;
+        assert!(!validation.is_valid);
+        let err = token_svc
+            .has_scope("1234567é", "read")
+            .await
+            .expect_err("has_scope refuses the same credential");
+        assert!(matches!(err, AppError::Authentication(_)), "{err:?}");
+    }
 
     // -----------------------------------------------------------------------
     // last_login_at write throttling (#2107)
@@ -3908,60 +4569,6 @@ mod tests {
         assert_eq!(
             row.last_login_at, t1,
             "last_login_at still throttled inside the window"
-        );
-
-        sqlx::query!("DELETE FROM users WHERE id = $1", id)
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_standalone_login_throttles_last_login_at() {
-        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
-            return;
-        };
-        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
-
-        // LDAP hybrid mode: password_hash stored, auth_provider = 'ldap'.
-        let id = Uuid::new_v4();
-        let username = format!("throttle_ldap_{id}");
-        let password = "Correct!Horse9Battery";
-        let hash = AuthService::hash_password(password).await.unwrap();
-        sqlx::query!(
-            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, is_admin) \
-             VALUES ($1, $2, $3, $4, 'ldap', true, false)",
-            id,
-            username,
-            format!("{username}@example.com"),
-            hash
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // (1) First login sets last_login_at on the standalone path.
-        svc.authenticate_ldap(&username, password).await.unwrap();
-        let t1: Option<DateTime<Utc>> =
-            sqlx::query_scalar!("SELECT last_login_at FROM users WHERE id = $1", id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(
-            t1.is_some(),
-            "first standalone login must set last_login_at"
-        );
-
-        // (2) A repeat login within 5 minutes does NOT advance it.
-        svc.authenticate_ldap(&username, password).await.unwrap();
-        let t2: Option<DateTime<Utc>> =
-            sqlx::query_scalar!("SELECT last_login_at FROM users WHERE id = $1", id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            t1, t2,
-            "standalone last_login_at must not advance within 5 minutes"
         );
 
         sqlx::query!("DELETE FROM users WHERE id = $1", id)
@@ -4249,6 +4856,8 @@ mod tests {
             s3_endpoint: None,
             jwt_secret: "super-secret-test-key-for-unit-tests-minimum-length".to_string(),
             signature_expiry_seconds: 604_800,
+            signing_key_rotation_overlap_secs: 1_209_600,
+            signing_auto_migrate_legacy_keys: false,
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,
             jwt_refresh_token_expiry_days: 7,
@@ -4270,13 +4879,20 @@ mod tests {
             scan_workspace_path: "/tmp".to_string(),
             demo_mode: false,
             guest_access_enabled: true,
+            guest_access_env_pinned: false,
             expose_detailed_health: false,
+            readyz_require_search: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,
             swagger_enabled: false,
+            plugins_enabled: true,
+            terraform_default_repo: None,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             conda_attestation_require_verified: true,
+            conda_attestation_issuers: Vec::new(),
+            conda_attestation_identities: Vec::new(),
+            conda_attestation_public_keys: Vec::new(),
             peer_instance_name: "test".to_string(),
             peer_public_endpoint: "http://localhost:8080".to_string(),
             peer_api_key: "test-key".to_string(),
@@ -4284,11 +4900,13 @@ mod tests {
             dependency_track_enabled: false,
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "test".to_string(),
+            gc_trash_retention_days: 0,
             gc_schedule: "0 0 * * * *".to_string(),
             storage_stats_schedule: "0 0 */4 * * *".to_string(),
             blob_gc_enabled: false,
             maven_flat_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
+            blob_gc_min_age_secs: crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
@@ -4297,17 +4915,28 @@ mod tests {
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
+            device_auth: Default::default(),
+            proxy_upstream: Default::default(),
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
+            grpc_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
+            metrics_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
             database_max_connections: 20,
             database_min_connections: 5,
             database_acquire_timeout_secs: 30,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
+            database_tcp_keepalives: true,
             auth_max_concurrency: TEST_AUTH_MAX_CONCURRENCY,
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
+            proxy_scan_queue_wait_secs: 60,
+            http_header_read_timeout_secs: 10,
+            http_listen_backlog: 0,
+            upload_progress_window_secs: 60,
+            upload_min_progress_bytes: 16 * 1024,
+            upload_max_in_flight_per_principal: 64,
             rate_limit_enabled: true,
             rate_limit_auth_per_window: 120,
             rate_limit_api_per_window: 5000,
@@ -4326,6 +4955,7 @@ mod tests {
             rate_limit_exempt_service_accounts: false,
             rate_limit_trusted_cidrs: Vec::new(),
             rate_limit_trusted_proxy_cidrs: Vec::new(),
+            xff_trusted_for_authz: false,
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
             quarantine_enabled: false,
@@ -4343,9 +4973,16 @@ mod tests {
             password_min_strength: 0,
             presigned_downloads_enabled: false,
             presigned_download_expiry_secs: 300,
+            download_verify_checksums: true,
+            storage_scrub_interval_secs: 0,
+            storage_scrub_max_objects: 500,
+            storage_scrub_max_bytes: 2 << 30,
             proxy_singleflight_advisory_locks_enabled: false,
             proxy_singleflight_lock_poll_interval_ms: 200,
             proxy_singleflight_lock_wait_timeout_secs: 65,
+            proxy_stale_if_error_grace_secs:
+                crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+            audit_upstream_fetches: Default::default(),
             oci_virtual_negative_cache_ttl_ms:
                 crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             npm_virtual_negative_cache_ttl_ms:
@@ -4360,6 +4997,9 @@ mod tests {
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".to_string(),
             smtp_tls_mode: "starttls".to_string(),
+            smtp_tls_ca_cert: None,
+            smtp_tls_ca_cert_source: None,
+            smtp_tls_skip_verify: false,
             npm_packument_cache_enabled: true,
             npm_packument_cache_fresh_ttl_secs: 300,
             npm_packument_cache_stale_max_secs: 86_400,
@@ -4369,6 +5009,7 @@ mod tests {
             pypi_simple_cache_ttl_secs: 60,
             pypi_simple_cache_max_bytes: 64 * 1024 * 1024,
             npm_upstream_feed_enabled: false,
+            upstream_jobs_paused: false,
             npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
                 .into(),
             scan_token_ttl_seconds: 300,
@@ -4658,6 +5299,41 @@ mod tests {
         );
     }
 
+    /// The access half of a token pair carries its refresh token's
+    /// `family_id`, so logout can revoke the session from the access token
+    /// alone (#4831). Access-only mints carry none.
+    #[tokio::test]
+    async fn access_token_carries_family_id_matching_its_refresh_token() {
+        let auth = make_lazy_auth_service();
+        let user = make_test_user();
+        let tokens = auth.generate_tokens(&user).expect("tokens");
+        let access = auth
+            .validate_access_token(&tokens.access_token)
+            .expect("access token must validate");
+        let refresh = auth
+            .decode_token(&tokens.refresh_token)
+            .expect("refresh token must decode")
+            .claims;
+        assert!(refresh.family_id.is_some(), "refresh token has a family");
+        assert_eq!(
+            access.family_id, refresh.family_id,
+            "access token must carry its refresh token's family_id"
+        );
+        assert_eq!(access.token_type, "access");
+        assert!(access.jti.is_none(), "access tokens keep no jti");
+
+        let access_only = auth
+            .generate_access_token_capped(&user, None, None, None)
+            .expect("access-only mint");
+        let claims = auth
+            .validate_access_token(&access_only.access_token)
+            .expect("access-only token must validate");
+        assert!(
+            claims.family_id.is_none(),
+            "an access-only mint has no session family"
+        );
+    }
+
     #[test]
     fn test_generate_tokens_and_validate_access_token() {
         let config = make_test_config();
@@ -4760,7 +5436,8 @@ mod tests {
         .expect("refresh token should decode")
         .claims;
         assert_eq!(refresh_claims.token_type, "refresh");
-        assert_eq!(refresh_claims.allowed_repo_ids, None);
+        // The refresh token carries the restriction so a refresh keeps it (#4261).
+        assert_eq!(refresh_claims.allowed_repo_ids, expected_scope);
     }
 
     #[tokio::test]
@@ -4823,6 +5500,8 @@ mod tests {
         assert_eq!(refresh_claims.token_type, "refresh");
         // Ceiling rides on the refresh token so rotation cannot widen it.
         assert_eq!(refresh_claims.scopes, ceiling);
+        // So does the repository allow-list (#4261).
+        assert_eq!(refresh_claims.allowed_repo_ids, Some(vec![repo]));
     }
 
     #[tokio::test]
@@ -4907,6 +5586,47 @@ mod tests {
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
         let result = decode::<Claims>(&token, &decoding_key, &Validation::new(Algorithm::HS256));
         assert!(result.is_err());
+    }
+
+    /// #4663: a token this server minted gets no expiry leeway. With the
+    /// library's default 60 s, an access token 30 s past its `exp` was still
+    /// accepted, which is how a CI assertion accepted inside its own leeway
+    /// chained into a second leeway window.
+    #[tokio::test]
+    async fn test_self_minted_token_has_no_expiry_leeway() {
+        let config = make_test_config();
+        let service = AuthService::new(lazy_pool(), config.clone());
+        let encoding_key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+        assert_eq!(self_minted_validation().leeway, 0);
+
+        let now = Utc::now();
+        let token_expiring_at = |exp: DateTime<Utc>| {
+            let claims = Claims {
+                sub: Uuid::new_v4(),
+                username: "leeway".to_string(),
+                email: "leeway@test.com".to_string(),
+                is_admin: false,
+                allowed_repo_ids: None,
+                iat: (now - Duration::minutes(5)).timestamp(),
+                iat_ms: None,
+                exp: exp.timestamp(),
+                token_type: "access".to_string(),
+                jti: None,
+                family_id: None,
+                scan_pull_repo: None,
+                scopes: None,
+            };
+            encode(&Header::default(), &claims, &encoding_key).unwrap()
+        };
+
+        let just_expired = token_expiring_at(now - Duration::seconds(30));
+        let err = service
+            .validate_access_token(&just_expired)
+            .expect_err("a token 30 s past exp must be rejected");
+        assert!(matches!(err, AppError::Authentication(_)), "{err}");
+
+        let live = token_expiring_at(now + Duration::seconds(30));
+        assert!(service.validate_access_token(&live).is_ok());
     }
 
     #[test]
@@ -5444,8 +6164,8 @@ mod tests {
     /// The timing pad must be generated at the *same* cost as real hashes.
     ///
     /// bcrypt reads its work factor from the hash being verified, so a dummy
-    /// at a different cost would make the "token prefix not found" path take
-    /// visibly different wall-clock time from the "wrong secret" path — the
+    /// at a different cost would make the "unknown username" path take
+    /// visibly different wall-clock time from the "wrong password" path — the
     /// exact side channel `dummy_bcrypt_hash` exists to close (#3407 must not
     /// regress the constant-time property it piggybacks on).
     #[test]
@@ -5454,7 +6174,7 @@ mod tests {
             cost_of(AuthService::dummy_bcrypt_hash()),
             bcrypt_cost(),
             "dummy timing pad must track bcrypt_cost(), else the \
-             constant-time rejection path leaks token existence by timing"
+             constant-time rejection path leaks username existence by timing"
         );
     }
 
@@ -5950,8 +6670,7 @@ mod tests {
     async fn invalidation_test_service_with_db(
         user_id: Uuid,
     ) -> Option<(AuthService, Arc<Config>, sqlx::PgPool)> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = sqlx::PgPool::connect(&url).await.ok()?;
+        let pool = crate::testing::try_pool_with(5).await?;
         let username = format!("invtest_{}", &Uuid::new_v4().to_string()[..8]);
         // `privileges_changed_at` (migration 131, DEFAULT NOW()) joins the
         // watermark GREATEST; without this backdate the 120s aging of the
@@ -7064,7 +7783,8 @@ mod tests {
             .expect("decode refresh")
             .claims;
         assert_eq!(refresh_claims.token_type, "refresh");
-        assert_eq!(refresh_claims.allowed_repo_ids, None);
+        // The refresh token carries the restriction so a refresh keeps it (#4261).
+        assert_eq!(refresh_claims.allowed_repo_ids, expected_scope);
 
         let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user.id)
             .execute(&pool)
@@ -7073,6 +7793,70 @@ mod tests {
             .execute(&pool)
             .await;
         let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_ldap_web_login_keeps_admin_deactivation_4933() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+
+        let suffix = &Uuid::new_v4().to_string()[..8];
+        let username = format!("ldap_disabled_{suffix}");
+        let external_id = format!("uid={username},ou=people,dc=example,dc=com");
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, auth_provider, external_id, is_active, \
+             is_admin, is_service_account, must_change_password) \
+             VALUES ($1, $2, $3, 'ldap'::auth_provider, $4, false, false, false, false)",
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .bind(&external_id)
+        .execute(&pool)
+        .await
+        .expect("insert deactivated LDAP user");
+
+        let creds = FederatedCredentials {
+            external_id,
+            username: username.clone(),
+            email: format!("{username}@test.local"),
+            display_name: Some("Deactivated LDAP User".to_string()),
+            groups: Vec::new(),
+            required_admin_group: None,
+            auto_create_users: true,
+        };
+
+        let result = service
+            .authenticate_federated(AuthProvider::Ldap, creds)
+            .await;
+        assert!(
+            matches!(result, Err(AppError::Authentication(_))),
+            "a deactivated LDAP account must not receive web-login tokens"
+        );
+
+        let is_active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read user after login attempt");
+        assert!(
+            !is_active,
+            "a successful directory bind must not undo an admin deactivation (web login \
+             must match the Basic-auth passthrough)"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
             .execute(&pool)
             .await;
     }
@@ -8091,8 +8875,7 @@ mod tests {
     /// Connect to the throwaway test database, or signal "skip" like every
     /// other DB-backed test in this file.
     async fn login_test_service() -> Option<(sqlx::PgPool, AuthService)> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = sqlx::PgPool::connect(&url).await.ok()?;
+        let pool = crate::testing::try_pool_with(5).await?;
         let svc = AuthService::new(pool.clone(), make_test_config());
         Some((pool, svc))
     }
@@ -8287,8 +9070,8 @@ mod tests {
     ///
     /// Relies on `cargo nextest`'s process-per-test isolation, which CI and
     /// `CLAUDE.md` both mandate: the counter is a process-global, so under a
-    /// plain `cargo test` (still what `.githooks/pre-push` runs) a concurrent
-    /// test that verifies a password would inflate this delta. Not fixed here.
+    /// plain `cargo test` a concurrent test that verifies a password would
+    /// inflate this delta.
     async fn bcrypt_verifies_during<F, Fut>(f: F) -> u64
     where
         F: FnOnce() -> Fut,
@@ -8736,14 +9519,102 @@ mod tests {
         // The action-scope ceiling rides on BOTH the access and refresh claims
         // (see generate_tokens_with_family_and_scope), so it survives rotation:
         // a refresh cannot launder a read-only token up to full access (#2430).
-        // (Repository allow-lists are access-token-only and are deliberately not
-        // carried on refresh tokens, so they are out of scope for this check.)
         assert_eq!(rotated.scopes, ceiling);
 
         let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
             .execute(&pool)
             .await;
         let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #4261: a repository-restricted token keeps its restriction through
+    /// refresh. The refresh claims used to carry `allowed_repo_ids: None`, and
+    /// `refresh_tokens` re-mints from them, so the rotated access token came
+    /// back unrestricted. Rotates twice to check the successor refresh token
+    /// carries the restriction as well, and checks the registry refresh path.
+    #[tokio::test]
+    async fn test_refresh_tokens_preserves_repo_restriction() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg.clone());
+
+        let username = format!("reporot_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        let repo = Uuid::new_v4();
+        let ceiling = Some(vec!["read:artifacts".to_string()]);
+        let decoding_key = DecodingKey::from_secret(cfg.jwt_secret.as_bytes());
+        let claims_of = |token: &str| {
+            decode::<Claims>(token, &decoding_key, &Validation::new(Algorithm::HS256))
+                .expect("token should decode")
+                .claims
+        };
+
+        let t0 = service
+            .generate_tokens_with_repo_scope(&user, Some(vec![repo]))
+            .expect("repo-scoped mint");
+        service
+            .persist_refresh_jti_from_pair(&t0, user_id)
+            .await
+            .expect("persist t0");
+        assert_eq!(
+            claims_of(&t0.access_token).allowed_repo_ids,
+            Some(vec![repo])
+        );
+
+        let (_, t1) = service
+            .refresh_tokens(&t0.refresh_token)
+            .await
+            .expect("t0 -> t1");
+        assert_eq!(
+            claims_of(&t1.access_token).allowed_repo_ids,
+            Some(vec![repo]),
+            "first refresh must keep the repository restriction"
+        );
+        assert_eq!(
+            claims_of(&t1.refresh_token).allowed_repo_ids,
+            Some(vec![repo])
+        );
+
+        let (_, t2) = service
+            .refresh_tokens(&t1.refresh_token)
+            .await
+            .expect("t1 -> t2");
+        assert_eq!(
+            claims_of(&t2.access_token).allowed_repo_ids,
+            Some(vec![repo]),
+            "second refresh must keep the repository restriction"
+        );
+
+        // The registry offline token (non-rotating /v2/token refresh) carries
+        // both the restriction and the scope ceiling into the minted token.
+        let offline = service
+            .generate_registry_offline_token(&user, Some(vec![repo]), ceiling.clone())
+            .await
+            .expect("mint registry offline token");
+        let (_, minted) = service
+            .mint_access_from_registry_refresh(&offline)
+            .await
+            .expect("registry refresh");
+        let minted = claims_of(&minted.access_token);
+        assert_eq!(minted.allowed_repo_ids, Some(vec![repo]));
+        assert_eq!(minted.scopes, ceiling);
+
+        let _ = sqlx::query("DELETE FROM refresh_token_jti WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
             .execute(&pool)
             .await;
     }
@@ -9704,5 +10575,549 @@ mod tests {
             .generate_tokens_with_scope_capped(&user, None, None, Some(far))
             .expect("mint far-capped");
         assert_eq!(far_pair.expires_in as i64, base_secs);
+    }
+
+    /// The access-only mint (add-ci-oidc-kubernetes-provider 4.1): the same
+    /// expiry cap and scopes as the paired mint, and nothing to refresh
+    /// with — `AccessToken` has no refresh field, so the check left is that
+    /// the token itself is an access token capped at the credential.
+    #[tokio::test]
+    async fn test_generate_access_token_capped_signs_no_refresh_and_honours_the_cap() {
+        let svc = make_lazy_auth_service();
+        let user = make_test_user();
+        let base_secs = make_test_config().jwt_access_token_expiry_minutes * 60;
+        let scopes = vec![
+            "read:artifacts".to_string(),
+            "read:repositories".to_string(),
+        ];
+        let decode_access = |token: &str| {
+            decode::<Claims>(
+                token,
+                &DecodingKey::from_secret(make_test_config().jwt_secret.as_bytes()),
+                &Validation::new(Algorithm::HS256),
+            )
+            .expect("decode access token")
+            .claims
+        };
+
+        let cap = Utc::now() + Duration::minutes(5);
+        let token = svc
+            .generate_access_token_capped(&user, Some(scopes.clone()), None, Some(cap))
+            .expect("mint access-only");
+        let claims = decode_access(&token.access_token);
+        assert!(
+            claims.exp <= cap.timestamp(),
+            "exp must not outlive the credential"
+        );
+        assert!(
+            (295..=300).contains(&token.expires_in),
+            "{}",
+            token.expires_in
+        );
+        assert_eq!(claims.token_type, "access");
+        assert_eq!(claims.jti, None, "no refresh-token identity on it");
+        assert_eq!(claims.family_id, None);
+        assert_eq!(claims.scopes, Some(scopes));
+
+        // The same cap as the paired mint: a far credential leaves the base TTL.
+        let far = svc
+            .generate_access_token_capped(&user, None, None, Some(Utc::now() + Duration::days(30)))
+            .expect("mint far");
+        assert_eq!(far.expires_in as i64, base_secs);
+    }
+
+    // -----------------------------------------------------------------------
+    // #4883: a signed-out session's access token is refused.
+    //
+    // DB-backed; each test no-ops when DATABASE_URL is unset. They use only
+    // the public token API, so they run unchanged against a build without the
+    // session-family check (where the replay assertions fail).
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A real user row (watermark backdated by `insert_test_user`) and the
+    /// service that mints and validates its tokens.
+    async fn session_4883_fixture(pool: &sqlx::PgPool, tag: &str) -> (AuthService, User) {
+        let service = AuthService::new(pool.clone(), make_test_config());
+        let username = format!("s4883_{tag}_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+        (service, user)
+    }
+
+    /// One login session: a token pair whose refresh jti row is persisted, as
+    /// the login handler does.
+    async fn session_4883_login(service: &AuthService, user: &User) -> TokenPair {
+        let pair = service.generate_tokens(user).expect("mint pair");
+        service
+            .persist_refresh_jti_from_pair(&pair, user.id)
+            .await
+            .expect("persist refresh jti");
+        pair
+    }
+
+    fn session_4883_family(service: &AuthService, pair: &TokenPair) -> Uuid {
+        service
+            .validate_access_token(&pair.access_token)
+            .expect("fresh access token decodes")
+            .family_id
+            .expect("a pair's access token carries its family")
+    }
+
+    async fn session_4883_cleanup(pool: &sqlx::PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM refresh_token_jti WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    fn assert_refused(result: Result<Claims>, what: &str) {
+        match result {
+            Err(AppError::Authentication(_)) => {}
+            other => panic!("{what}: expected a 401 (Authentication), got {other:?}"),
+        }
+    }
+
+    /// Logout presenting only the access token (the API/CLI shape, #4831)
+    /// and logout presenting the refresh token both end the session's access
+    /// token on the async (request-path) and the sync validator.
+    #[tokio::test]
+    async fn test_4883_access_token_refused_after_logout() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (service, user) = session_4883_fixture(&pool, "logout").await;
+
+        // Logout from the access token's family.
+        let by_access = session_4883_login(&service, &user).await;
+        service
+            .validate_access_token_async(&by_access.access_token)
+            .await
+            .expect("valid before logout");
+        let family = session_4883_family(&service, &by_access);
+        service
+            .revoke_refresh_token_family(family)
+            .await
+            .expect("logout");
+        assert_refused(
+            service
+                .validate_access_token_async(&by_access.access_token)
+                .await,
+            "Bearer replay after an access-token logout",
+        );
+        assert_refused(
+            service.validate_access_token(&by_access.access_token),
+            "sync validator after an access-token logout",
+        );
+
+        // Logout from the refresh token (the browser / body shape).
+        let by_refresh = session_4883_login(&service, &user).await;
+        service
+            .validate_access_token_async(&by_refresh.access_token)
+            .await
+            .expect("valid before logout");
+        service
+            .revoke_refresh_token_family_for(&by_refresh.refresh_token)
+            .await
+            .expect("logout");
+        assert_refused(
+            service
+                .validate_access_token_async(&by_refresh.access_token)
+                .await,
+            "Bearer replay after a refresh-token logout",
+        );
+
+        session_4883_cleanup(&pool, user.id).await;
+    }
+
+    /// Refresh-token replay detection revokes the family; every access token
+    /// minted in it (the original and the rotated ones) is refused.
+    #[tokio::test]
+    async fn test_4883_access_tokens_refused_after_refresh_replay() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (service, user) = session_4883_fixture(&pool, "replay").await;
+        let first = session_4883_login(&service, &user).await;
+        let (_, second) = service
+            .refresh_tokens(&first.refresh_token)
+            .await
+            .expect("first rotation");
+        let (_, third) = service
+            .refresh_tokens(&second.refresh_token)
+            .await
+            .expect("second rotation");
+        service
+            .validate_access_token_async(&third.access_token)
+            .await
+            .expect("current access token valid before the replay");
+
+        // `first` was consumed and its successor `second` is spent too, so this
+        // is a genuine replay, not a benign double-submit.
+        let replay = service.refresh_tokens(&first.refresh_token).await;
+        assert!(replay.is_err(), "the replayed refresh token is refused");
+
+        for (label, pair) in [("first", &first), ("second", &second), ("third", &third)] {
+            assert_refused(
+                service
+                    .validate_access_token_async(&pair.access_token)
+                    .await,
+                &format!("{label} access token after refresh replay"),
+            );
+        }
+
+        session_4883_cleanup(&pool, user.id).await;
+    }
+
+    /// A password change (the change-password handler's sequence: new
+    /// `password_changed_at`, local watermark, user-wide refresh revocation)
+    /// refuses the old access token. Covered by the credential watermark; this
+    /// pins that it composes with the family check.
+    #[tokio::test]
+    async fn test_4883_access_token_refused_after_password_change() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (service, user) = session_4883_fixture(&pool, "pwchange").await;
+        let pair = session_4883_login(&service, &user).await;
+        service
+            .validate_access_token_async(&pair.access_token)
+            .await
+            .expect("valid before the password change");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        sqlx::query("UPDATE users SET password_changed_at = NOW() WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .expect("change password");
+        invalidate_user_tokens(user.id);
+        service
+            .revoke_all_refresh_token_families(user.id)
+            .await
+            .expect("revoke refresh families");
+
+        assert_refused(
+            service
+                .validate_access_token_async(&pair.access_token)
+                .await,
+            "Bearer replay after a password change",
+        );
+
+        session_4883_cleanup(&pool, user.id).await;
+    }
+
+    /// Signing out one session leaves the user's other sessions alone.
+    #[tokio::test]
+    async fn test_4883_logout_leaves_other_sessions_valid() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (service, user) = session_4883_fixture(&pool, "scope").await;
+        let signed_out = session_4883_login(&service, &user).await;
+        let other = session_4883_login(&service, &user).await;
+        assert_ne!(
+            session_4883_family(&service, &signed_out),
+            session_4883_family(&service, &other),
+            "two logins are two families"
+        );
+
+        service
+            .revoke_refresh_token_family(session_4883_family(&service, &signed_out))
+            .await
+            .expect("logout");
+
+        assert_refused(
+            service
+                .validate_access_token_async(&signed_out.access_token)
+                .await,
+            "the signed-out session",
+        );
+        service
+            .validate_access_token_async(&other.access_token)
+            .await
+            .expect("another session's access token stays valid");
+        service
+            .validate_access_token(&other.access_token)
+            .expect("and passes the sync validator");
+        service
+            .refresh_tokens(&other.refresh_token)
+            .await
+            .expect("and keeps refreshing");
+
+        session_4883_cleanup(&pool, user.id).await;
+    }
+
+    /// The user-wide refresh revocation alone (what the TOTP toggle runs after
+    /// exempting the caller, #1370) does not end the caller's access token:
+    /// only a sign-out or a replay records the family. A later logout of that
+    /// session still does, although its jti rows are already revoked.
+    #[tokio::test]
+    async fn test_4883_user_wide_revocation_keeps_access_token_until_logout() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (service, user) = session_4883_fixture(&pool, "userwide").await;
+        let pair = session_4883_login(&service, &user).await;
+
+        service
+            .revoke_all_refresh_token_families(user.id)
+            .await
+            .expect("user-wide revocation");
+        service
+            .validate_access_token_async(&pair.access_token)
+            .await
+            .expect("the access token is not ended by the user-wide sweep alone");
+
+        let revoked_rows = service
+            .revoke_refresh_token_family(session_4883_family(&service, &pair))
+            .await
+            .expect("logout");
+        assert_eq!(revoked_rows, 0, "the jti rows were already revoked");
+        assert_refused(
+            service
+                .validate_access_token_async(&pair.access_token)
+                .await,
+            "Bearer replay after logout of an already-swept family",
+        );
+
+        session_4883_cleanup(&pool, user.id).await;
+    }
+
+    /// Cross-replica bound: a sign-out recorded by another replica (a row this
+    /// process did not write) is seen on a cache miss at once, and through a
+    /// cached "not revoked" verdict once that verdict's TTL lapses.
+    #[tokio::test]
+    async fn test_4883_remote_revocation_seen_within_cache_ttl() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let insert_remote = |family: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO session_family_revocations (family_id, reason, expires_at) \
+                     VALUES ($1, 'logout', NOW() + INTERVAL '1 hour')",
+                )
+                .bind(family)
+                .execute(&pool)
+                .await
+                .expect("remote revocation row");
+            }
+        };
+
+        // Miss path: never seen here, revoked elsewhere, refused on first use.
+        let (service, user) = session_4883_fixture(&pool, "remote").await;
+        let pair = session_4883_login(&service, &user).await;
+        let family = session_4883_family(&service, &pair);
+        insert_remote(family).await;
+        assert_refused(
+            service
+                .validate_access_token_async(&pair.access_token)
+                .await,
+            "a family revoked by another replica, first lookup",
+        );
+
+        // Cached verdict: valid until the TTL lapses, refused after.
+        let ttl = std::time::Duration::from_millis(400);
+        let cached = Uuid::new_v4();
+        assert!(!is_session_family_revoked_with_ttl(&pool, cached, ttl)
+            .await
+            .unwrap());
+        insert_remote(cached).await;
+        assert!(
+            !is_session_family_revoked_with_ttl(&pool, cached, ttl)
+                .await
+                .unwrap(),
+            "inside the TTL the cached verdict answers"
+        );
+        tokio::time::sleep(ttl + std::time::Duration::from_millis(100)).await;
+        assert!(
+            is_session_family_revoked_with_ttl(&pool, cached, ttl)
+                .await
+                .unwrap(),
+            "after the TTL the DB is asked again and the revocation is seen"
+        );
+
+        // TTL 0: no negative caching, every lookup asks the DB.
+        let uncached = Uuid::new_v4();
+        let zero = std::time::Duration::ZERO;
+        assert!(!is_session_family_revoked_with_ttl(&pool, uncached, zero)
+            .await
+            .unwrap());
+        insert_remote(uncached).await;
+        assert!(is_session_family_revoked_with_ttl(&pool, uncached, zero)
+            .await
+            .unwrap());
+
+        for f in [family, cached, uncached] {
+            let _ = sqlx::query("DELETE FROM session_family_revocations WHERE family_id = $1")
+                .bind(f)
+                .execute(&pool)
+                .await;
+        }
+        session_4883_cleanup(&pool, user.id).await;
+    }
+
+    /// The revocation row outlives every token of the family and is pruned by
+    /// the refresh-token janitor once past `expires_at` plus the grace.
+    #[tokio::test]
+    async fn test_4883_revocation_row_lifetime_and_pruning() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+        let family = Uuid::new_v4();
+        service
+            .revoke_refresh_token_family(family)
+            .await
+            .expect("logout of a family with no jti rows");
+        let (reason, lifetime_secs): (String, f64) = sqlx::query_as(
+            "SELECT reason, EXTRACT(EPOCH FROM expires_at - revoked_at)::float8 \
+             FROM session_family_revocations WHERE family_id = $1",
+        )
+        .bind(family)
+        .fetch_one(&pool)
+        .await
+        .expect("the family is recorded even without jti rows");
+        assert_eq!(reason, "logout");
+        let refresh_secs = (make_test_config().jwt_refresh_token_expiry_days * 86_400) as f64;
+        assert!(
+            lifetime_secs > refresh_secs,
+            "row lifetime {lifetime_secs}s must cover the refresh lifetime {refresh_secs}s"
+        );
+
+        let stale = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO session_family_revocations (family_id, reason, revoked_at, expires_at) \
+             VALUES ($1, 'refresh_replay', NOW() - INTERVAL '10 days', NOW() - INTERVAL '2 days')",
+        )
+        .bind(stale)
+        .execute(&pool)
+        .await
+        .expect("stale row");
+        AuthService::cleanup_expired_refresh_token_jti(&pool, Duration::hours(1))
+            .await
+            .expect("janitor");
+        let left: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT family_id FROM session_family_revocations WHERE family_id = ANY($1)",
+        )
+        .bind(vec![family, stale])
+        .fetch_all(&pool)
+        .await
+        .expect("query");
+        assert_eq!(left, vec![family], "only the expired row is pruned");
+
+        let _ = sqlx::query("DELETE FROM session_family_revocations WHERE family_id = $1")
+            .bind(family)
+            .execute(&pool)
+            .await;
+    }
+
+    #[test]
+    fn test_4883_session_family_cache_semantics() {
+        let ttl = std::time::Duration::from_secs(5);
+        let t0 = Instant::now();
+        let later = |secs| t0 + std::time::Duration::from_secs(secs);
+        let mut cache = SessionFamilyCache::new(16);
+        let (live, revoked) = (Uuid::new_v4(), Uuid::new_v4());
+
+        assert_eq!(cache.get(live, t0, ttl), None, "unknown family: ask the DB");
+        cache.record(live, false, t0, ttl);
+        assert_eq!(cache.get(live, later(4), ttl), Some(false));
+        assert_eq!(
+            cache.get(live, later(5), ttl),
+            None,
+            "negative verdict expires"
+        );
+
+        cache.record(revoked, true, t0, ttl);
+        assert_eq!(
+            cache.get(revoked, later(3600), ttl),
+            Some(true),
+            "a revocation is sticky"
+        );
+        cache.record(revoked, false, later(1), ttl);
+        assert_eq!(
+            cache.get(revoked, later(2), ttl),
+            Some(true),
+            "a racing not-revoked read never resurrects a revoked family"
+        );
+        cache.record(live, true, later(1), ttl);
+        assert_eq!(
+            cache.get(live, later(2), ttl),
+            Some(true),
+            "live -> revoked"
+        );
+
+        let mut uncached = SessionFamilyCache::new(16);
+        uncached.record(live, false, t0, std::time::Duration::ZERO);
+        assert!(uncached.entries.is_empty(), "TTL 0 caches no negatives");
+    }
+
+    #[test]
+    fn test_4883_session_family_cache_is_bounded() {
+        let ttl = std::time::Duration::from_secs(5);
+        let t0 = Instant::now();
+        let mut cache = SessionFamilyCache::new(4);
+        let revoked = Uuid::new_v4();
+        cache.record(revoked, true, t0, ttl);
+        for _ in 0..3 {
+            cache.record(Uuid::new_v4(), false, t0, ttl);
+        }
+        assert_eq!(cache.entries.len(), 4);
+
+        // Full of fresh entries: the negatives go, the revocation stays.
+        let newcomer = Uuid::new_v4();
+        cache.record(newcomer, false, t0, ttl);
+        assert!(cache.entries.len() <= 4);
+        assert_eq!(cache.get(revoked, t0, ttl), Some(true));
+        assert_eq!(cache.get(newcomer, t0, ttl), Some(false));
+
+        // Full of revocations: everything is dropped rather than growing.
+        let mut full = SessionFamilyCache::new(2);
+        full.record(Uuid::new_v4(), true, t0, ttl);
+        full.record(Uuid::new_v4(), true, t0, ttl);
+        full.record(Uuid::new_v4(), true, t0, ttl);
+        assert!(full.entries.len() <= 2);
+
+        // Held near capacity by fresh revocations, one sweep frees a quarter
+        // of the bound, so the next inserts do not each sweep again.
+        let mut busy = SessionFamilyCache::new(8);
+        for _ in 0..8 {
+            busy.record(Uuid::new_v4(), true, t0, ttl);
+        }
+        busy.record(Uuid::new_v4(), true, t0, ttl);
+        assert!(
+            busy.entries.len() <= 8 - 8 / 4,
+            "one eviction leaves headroom, len {}",
+            busy.entries.len()
+        );
+    }
+
+    #[test]
+    fn test_4883_session_revocation_cache_ttl_parsing() {
+        let secs = |raw| parse_session_revocation_cache_ttl(raw).as_secs();
+        assert_eq!(secs(None), 5, "default");
+        assert_eq!(secs(Some("")), 5);
+        assert_eq!(secs(Some("abc")), 5);
+        assert_eq!(secs(Some("-1")), 5);
+        assert_eq!(secs(Some("0")), 0, "0 disables the negative cache");
+        assert_eq!(secs(Some(" 2 ")), 2);
+        assert_eq!(
+            secs(Some("86400")),
+            300,
+            "clamped to the API-token cache TTL"
+        );
+        assert!(!SESSION_SIGNED_OUT_MESSAGE
+            .to_ascii_lowercase()
+            .contains("expired"));
     }
 }

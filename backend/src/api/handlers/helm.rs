@@ -24,7 +24,7 @@
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Extension;
@@ -541,7 +541,7 @@ async fn index_yaml(
         )
         .await?;
 
-        for (_member_key, index) in remote_indexes {
+        for (_member_key, index) in remote_indexes.documents {
             merge_upstream_index_entries(&repo_key, index, &mut all_charts);
         }
 
@@ -552,7 +552,11 @@ async fn index_yaml(
             }
         }
 
-        return build_index_response(all_charts, None);
+        // A member that failed is a 502 above (#4192), unless the virtual
+        // allows partial merges: then the index is marked as such.
+        return remote_indexes
+            .partial
+            .apply(build_index_response(all_charts, None));
     }
 
     let mut charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
@@ -717,6 +721,7 @@ async fn fetch_chart_via_index(
         &fetch_url,
         &cache_path,
         RepositoryFormat::Helm,
+        ctx.is_head,
     )
     .await?;
     // #3446: count the proxied chart (or its `.prov`). `cache_path` is the
@@ -952,6 +957,7 @@ async fn upload_chart(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     // Authenticate
@@ -963,34 +969,50 @@ async fn upload_chart(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    // Spool the .tgz straight to a bounded scratch file instead of buffering
-    // the whole archive in memory. See proxy_helpers::stage_upload_field.
+    // Stage the .tgz on the repository's backend when it streams natively,
+    // else in bounded local scratch, instead of buffering the whole archive in
+    // memory. See repositories::stage_upload_field_for_repo.
     //
     // #2635: the `prov` part is staged too rather than being dropped on the
     // floor. The loop no longer breaks on `chart` because ChartMuseum clients
     // may send the parts in either order, and a part that is never read is a
     // part that gets silently discarded.
-    let mut staged: Option<proxy_helpers::StagedUpload> = None;
-    let mut staged_prov: Option<proxy_helpers::StagedUpload> = None;
+    let mut staged: Option<(
+        super::repositories::GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    )> = None;
+    let mut staged_prov: Option<(
+        super::repositories::GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    )> = None;
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         (StatusCode::BAD_REQUEST, format!("Invalid multipart: {}", e)).into_response()
     })? {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
-            "chart" => staged = Some(proxy_helpers::stage_upload_field(&state, field).await?),
-            "prov" => staged_prov = Some(proxy_helpers::stage_upload_field(&state, field).await?),
+            "chart" => {
+                staged = Some(
+                    super::repositories::stage_upload_field_for_repo(&state, &repo, field).await?,
+                )
+            }
+            "prov" => {
+                staged_prov = Some(
+                    super::repositories::stage_upload_field_for_repo(&state, &repo, field).await?,
+                )
+            }
             _ => {}
         }
     }
 
-    let staged =
+    let (staged, digests) =
         staged.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'chart' field").into_response())?;
 
     // Validate the provenance before the chart is committed, so a bad prov
     // fails the whole upload instead of leaving a chart that advertises
     // provenance it cannot serve.
-    if let Some(prov) = staged_prov.as_ref() {
-        let head = read_prov_head(prov.path()).await?;
+    if let Some((prov, _prov_digests)) = staged_prov.as_ref() {
+        let local = super::repositories::materialize_staged_for_repo(&state, &repo, prov).await?;
+        let head = read_prov_head(local.path()).await?;
         validate_prov_bytes(&head).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
@@ -1000,21 +1022,25 @@ async fn upload_chart(
         })?;
     }
 
-    // Extract and validate Chart.yaml from the staged archive on disk, reading
-    // only the Chart.yaml entry (bounded memory) rather than the whole package.
+    // Extract and validate Chart.yaml from the staged archive, reading only the
+    // Chart.yaml entry (bounded memory) rather than the whole package.
     // #2561: permit held across the blocking decode, fast-fail 503 on saturation.
-    let chart_yaml = crate::util::bounded_archive::with_ingest_extraction_async(|| {
-        extract_chart_yaml_from_staged(staged.path())
-    })
-    .await
-    .map_err(|e| e.into_response())?
-    .map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid chart package: {}", e),
-        )
-            .into_response()
-    })?;
+    let chart_yaml = {
+        let local =
+            super::repositories::materialize_staged_for_repo(&state, &repo, &staged).await?;
+        crate::util::bounded_archive::with_ingest_extraction_async(|| {
+            extract_chart_yaml_from_staged(local.path())
+        })
+        .await
+        .map_err(|e| e.into_response())?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid chart package: {}", e),
+            )
+                .into_response()
+        })?
+    };
 
     let chart_name = &chart_yaml.name;
     let chart_version = &chart_yaml.version;
@@ -1066,10 +1092,18 @@ async fn upload_chart(
     // by that retry -- the storage key is fully determined by chart name and
     // version.
 
-    // Stream the staged archive into the repo's StorageBackend via `put_stream`,
-    // which computes the SHA-256 incrementally as it copies (no re-hash pass).
+    // Stream the staged archive into the repo's StorageBackend, from local
+    // scratch or by copying the object the backend already staged (#4990).
     let storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, filename);
-    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    let put = proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
     let computed_sha256 = put.checksum_sha256;
 
     let size_bytes = put.bytes_written as i64;
@@ -1081,9 +1115,17 @@ async fn upload_chart(
     // serve.
     let prov_storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, prov_filename);
     let prov_put = match staged_prov {
-        Some(prov) => {
-            Some(proxy_helpers::put_artifact_stream(&state, &repo, &prov_storage_key, prov).await?)
-        }
+        Some((prov, prov_digests)) => Some(
+            proxy_helpers::put_staged_body(
+                &state,
+                &repo,
+                super::publish_quota::PublishAt::StorageKey(&prov_storage_key),
+                &prov_storage_key,
+                prov,
+                &prov_digests,
+            )
+            .await?,
+        ),
         None => None,
     };
 
@@ -1094,6 +1136,17 @@ async fn upload_chart(
         .await
         .map_err(|e| proxy_helpers::internal_error("Database", e))?;
 
+    // Each row is admitted against the storage quotas in this transaction
+    // right before its INSERT, so the prov is admitted against usage that
+    // already includes the chart (#4422).
+    super::publish_quota::admit_publish_in_tx(
+        &mut tx,
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = proxy_helpers::insert_artifact_row(
         &mut tx,
         proxy_helpers::NewArtifact {
@@ -1111,23 +1164,36 @@ async fn upload_chart(
     .await?;
 
     let prov_artifact_id = match prov_put.as_ref() {
-        Some(prov_put) => Some(
-            proxy_helpers::insert_artifact_row(
+        Some(prov_put) => {
+            let prov_size = prov_put.bytes_written as i64;
+            super::publish_quota::admit_publish_in_tx(
                 &mut tx,
-                proxy_helpers::NewArtifact {
-                    repository_id: repo.id,
-                    path: &prov_artifact_path,
-                    name: chart_name,
-                    version: chart_version,
-                    size_bytes: prov_put.bytes_written as i64,
-                    checksum_sha256: &prov_put.checksum_sha256,
-                    content_type: PROV_CONTENT_TYPE,
-                    storage_key: &prov_storage_key,
-                    uploaded_by: user_id,
-                },
+                &state.db,
+                repo.id,
+                &prov_artifact_path,
+                prov_size,
             )
-            .await?,
-        ),
+            .await?;
+            Some(
+                // NO-SCAN-ON-UPLOAD: the `.prov` row is the chart's provenance
+                // signature, not package content; the chart row above is scanned.
+                proxy_helpers::insert_artifact_row(
+                    &mut tx,
+                    proxy_helpers::NewArtifact {
+                        repository_id: repo.id,
+                        path: &prov_artifact_path,
+                        name: chart_name,
+                        version: chart_version,
+                        size_bytes: prov_size,
+                        checksum_sha256: &prov_put.checksum_sha256,
+                        content_type: PROV_CONTENT_TYPE,
+                        storage_key: &prov_storage_key,
+                        uploaded_by: user_id,
+                    },
+                )
+                .await?,
+            )
+        }
         None => None,
     };
 
@@ -1140,6 +1206,13 @@ async fn upload_chart(
     // through the pool, so it can only run once the rows are visible; metadata
     // recording is best-effort by contract.
     quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id).await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Build metadata JSON including the full Chart.yaml data
     let helm_metadata = serde_json::json!({
@@ -1190,6 +1263,31 @@ async fn upload_chart(
             }),
         )
         .await;
+    }
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await;
+    if let Some(prov_artifact_id) = prov_artifact_id {
+        if let Some(prov_put) = prov_put.as_ref() {
+            // #4725: fan out to subscribed push peers.
+            super::queue_push_sync_tasks_for_upload(
+                &state.db,
+                &headers,
+                repo.id,
+                prov_artifact_id,
+                &prov_artifact_path,
+                prov_put.bytes_written as i64,
+            )
+            .await;
+        }
     }
 
     let prov_stored = prov_artifact_id.is_some();
@@ -2441,6 +2539,57 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         f.teardown().await;
     }
 
+    /// #4422 review: chart and `.prov` are admitted row by row in ONE
+    /// transaction, the prov against usage that already includes the chart.
+    /// When each fits alone but not together, the push is refused with 507
+    /// and neither row lands; at exactly their sum both are admitted.
+    #[tokio::test]
+    async fn test_helm_chart_and_prov_admitted_together_against_quota_4422() {
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let tgz = signed_chart_tgz();
+        let together = (tgz.len() + REAL_PROV.len()) as i64;
+        let set_quota = |quota: i64| {
+            sqlx::query("UPDATE repositories SET quota_bytes = $2 WHERE id = $1")
+                .bind(f.repo_id)
+                .bind(quota)
+                .execute(&f.pool)
+        };
+        let parts: &[(&str, &str, &[u8])] = &[
+            ("chart", "provchart-0.1.0.tgz", &tgz),
+            ("prov", "provchart-0.1.0.tgz.prov", REAL_PROV),
+        ];
+        let rows = || {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+        };
+
+        set_quota(together - 1).await.unwrap();
+        let (status, body) = upload_parts(&f, parts).await;
+        assert_eq!(
+            status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(rows().await.unwrap(), 0, "neither row may land");
+
+        set_quota(together).await.unwrap();
+        let (status, body) = upload_parts(&f, parts).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(rows().await.unwrap(), 2);
+
+        f.teardown().await;
+    }
+
     /// The core of #2635: a `.prov` uploaded next to its chart must be
     /// PERSISTED and served back byte-for-byte at the URL helm derives.
     #[tokio::test]
@@ -2520,6 +2669,73 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         assert_eq!(version, "0.1.0");
 
         f.teardown().await;
+    }
+
+    /// #4725: a ChartMuseum upload to a hosted repository must queue a push
+    /// sync task for a subscribed push peer — one for the chart row and one for
+    /// its `.prov` row — and a push that arrives as peer replication must not
+    /// be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn helm_upload_queues_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "helm").await;
+
+        let tgz = build_tgz(
+            "replchart/Chart.yaml",
+            b"apiVersion: v2\nname: replchart\nversion: 0.1.0\n",
+        );
+        let (status, body) = upload_parts(
+            &f,
+            &[
+                ("chart", "replchart-0.1.0.tgz", &tgz),
+                ("prov", "replchart-0.1.0.tgz.prov", REAL_PROV),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "chart push must succeed: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A replicated push (as the sync worker sends it) stores the chart but
+        // must not queue another task.
+        let tgz2 = build_tgz(
+            "replchart/Chart.yaml",
+            b"apiVersion: v2\nname: replchart\nversion: 0.2.0\n",
+        );
+        let app = f.router_with_auth(super::router());
+        let mut req = tdh::post(
+            format!("/{}/api/charts", f.repo_key),
+            "multipart/form-data; boundary=BOUNDARY",
+            multipart_body("BOUNDARY", &[("chart", "replchart-0.2.0.tgz", &tgz2)]),
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "replicated chart push must succeed: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec![
+                "replchart/0.1.0/replchart-0.1.0.tgz".to_string(),
+                "replchart/0.1.0/replchart-0.1.0.tgz.prov".to_string(),
+            ],
+            "only the client push queues push tasks; the replicated one must not"
+        );
     }
 
     /// The advertised layout must resolve: take the URL out of `index.yaml`,
@@ -3003,6 +3219,88 @@ entries:
         assert!(index.entries.contains_key("trust-manager"));
     }
 
+    /// #5277: charts.rancher.io lists local subcharts (`repository: file://...`)
+    /// with no dependency `version`, which Helm accepts. The whole Remote index
+    /// answered 502 because of them, so every chart in the repository was
+    /// unreachable, including charts with no such dependency.
+    #[tokio::test]
+    async fn test_remote_index_yaml_with_versionless_dependency_5277() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let upstream = r#"apiVersion: v1
+generated: "2025-06-01T00:00:00Z"
+entries:
+  epinio:
+    - apiVersion: v2
+      appVersion: v1.10.0
+      created: "2024-06-01T00:00:00Z"
+      dependencies:
+        - condition: global.dex.enabled
+          name: dex
+          repository: file://./charts/dex
+          tags:
+            - dex
+      digest: bbbb2222
+      name: epinio
+      urls:
+        - assets/epinio/epinio-103.0.2+up1.10.0.tgz
+      version: 103.0.2+up1.10.0
+    - name: epinio
+      digest: broken-entry-without-version
+  rancher-backup:
+    - apiVersion: v2
+      created: "2024-06-01T00:00:00Z"
+      digest: cccc3333
+      name: rancher-backup
+      urls:
+        - assets/rancher-backup/rancher-backup-105.0.0+up6.0.0.tgz
+      version: 105.0.0+up6.0.0
+"#;
+
+        let Some(f) = tdh::Fixture::setup("remote", "helm").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream.as_bytes()))
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/index.yaml", f.repo_key))).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a dependency without `version` is valid Helm and must not 502 the index: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let index = parse_index(&body);
+        assert_eq!(index.entries["rancher-backup"].len(), 1);
+        let epinio = &index.entries["epinio"];
+        assert_eq!(
+            epinio.len(),
+            1,
+            "the unreadable entry is skipped, the valid one is served"
+        );
+        let dep = &epinio[0].chart.dependencies.as_ref().unwrap()[0];
+        assert_eq!(dep.name, "dex");
+        assert_eq!(dep.version, None);
+
+        let served: serde_yaml::Value = serde_yaml::from_slice(&body).unwrap();
+        assert!(
+            served["entries"]["epinio"][0]["dependencies"][0]
+                .get("version")
+                .is_none(),
+            "the proxied index must not invent a dependency version"
+        );
+    }
+
     /// The two upstream failures an operator actually hits: the upstream is
     /// down (5xx), and the upstream URL is wrong so `index.yaml` 404s — the
     /// more common misconfiguration of the two. Neither may answer 200 with an
@@ -3116,9 +3414,10 @@ entries:
     /// queued for the socket.
     #[tokio::test]
     async fn test_index_response_holds_the_budget_until_the_body_is_dropped_3448() {
-        let budget = proxy_helpers::ProxyMetadataBudget::new(4096);
-        let permit = budget.reserve(1000).await;
-        assert_eq!(budget.available_bytes(), 3096, "reservation debited");
+        const U: usize = proxy_helpers::PROXY_METADATA_BUDGET_UNIT_BYTES;
+        let budget = proxy_helpers::ProxyMetadataBudget::new(4 * U);
+        let permit = budget.reserve(U).await;
+        assert_eq!(budget.available_bytes(), 3 * U, "reservation debited");
 
         let index: HelmIndex = serde_yaml::from_str(&upstream_two_chart_index()).unwrap();
         let mut charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
@@ -3127,20 +3426,20 @@ entries:
         // The merge and the render both happen while the permit is held.
         assert_eq!(
             budget.available_bytes(),
-            3096,
+            3 * U,
             "budget must stay debited across the merge"
         );
         let resp = build_index_response(charts, Some(permit)).expect("index response");
         assert_eq!(
             budget.available_bytes(),
-            3096,
+            3 * U,
             "budget must stay debited while the rendered response body is alive"
         );
 
         drop(resp);
         assert_eq!(
             budget.available_bytes(),
-            4096,
+            4 * U,
             "budget is released once the response body is dropped"
         );
     }
@@ -3157,9 +3456,9 @@ entries:
 
     /// #3448: an upstream index is parsed as ONE document, so a single
     /// non-conforming entry must not take the whole repository's discovery with
-    /// it. `urls`, `created`, `digest` and `generated` default; `name` and
-    /// `version` remain required because there is nothing to advertise without
-    /// them.
+    /// it. `urls`, `created`, `digest` and `generated` default; an entry
+    /// without `name` or `version` has nothing to advertise and is skipped
+    /// (see `test_upstream_index_entry_without_a_name_is_skipped`).
     #[test]
     fn test_upstream_index_entry_missing_optional_fields_still_parses() {
         let yaml = r#"apiVersion: v1
@@ -3184,18 +3483,31 @@ entries:
         );
     }
 
+    /// An entry with no chart name cannot be advertised, so it is dropped;
+    /// like Helm's index loader, the rest of the index is still served
+    /// (#5277) instead of the whole document failing.
     #[test]
-    fn test_upstream_index_entry_without_a_name_is_still_rejected() {
+    fn test_upstream_index_entry_without_a_name_is_skipped() {
         let yaml = r#"apiVersion: v1
 entries:
   nameless:
     - apiVersion: v2
       version: 1.0.0
+  named:
+    - apiVersion: v2
+      name: named
+      version: 1.0.0
 "#;
-        assert!(
-            serde_yaml::from_str::<HelmIndex>(yaml).is_err(),
-            "an entry with no chart name cannot be advertised and must stay a parse error"
+        let index: HelmIndex =
+            serde_yaml::from_str(yaml).expect("one unusable entry must not fail the index");
+        let mut out: Vec<(ChartYaml, String, String, String)> = Vec::new();
+        merge_upstream_index_entries("helm-remote", index, &mut out);
+        assert_eq!(
+            out.len(),
+            1,
+            "only the named entry is advertised, got {out:?}"
         );
+        assert_eq!(out[0].1, "charts/named-1.0.0.tgz");
     }
 
     /// #3448: the proxied index rebuilds every URL from a third party's
@@ -3427,6 +3739,248 @@ entries:
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Chart URLs read from an upstream `index.yaml` that name an IP literal
+    // must pass the upstream outbound address policy in every routing mode.
+    // -----------------------------------------------------------------------
+
+    /// Fetch `mychart-1.0.0.tgz` through `fetch_chart_via_index` for
+    /// `repo_id`, with an upstream index whose chart URL is
+    /// `http://{internal_host}:{port}/charts/mychart-1.0.0.tgz` pointing at a
+    /// separate loopback listener. Returns the response status (or the error
+    /// response's status) and the number of requests the listener received.
+    ///
+    /// The index is served from the host's non-loopback address, admitted by
+    /// a narrow `AK_SSRF_ALLOW_PRIVATE_CIDRS` entry the way an operator admits
+    /// an internal mirror, so it also proves a configured exception keeps an
+    /// IP-literal upstream working. The test-build loopback allowance is
+    /// switched off entirely, so the loopback listener gets the production
+    /// policy.
+    async fn fetch_index_named_literal(
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        internal_host: &str,
+    ) -> (StatusCode, usize) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (index_server, _allowlist) = tdh::non_loopback_mock_server().await;
+        let internal = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(&b"internal-response"[..]))
+            .mount(&internal)
+            .await;
+
+        let chart_url = format!(
+            "http://{}:{}/charts/mychart-1.0.0.tgz",
+            internal_host,
+            internal.address().port()
+        );
+        let index_yaml = make_index_yaml("mychart", "1.0.0", &chart_url);
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(index_yaml.as_bytes()))
+            .mount(&index_server)
+            .await;
+
+        let tmp = proxy_tmp_dir();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        proxy.restrict_test_loopback_to_ports(&[]);
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        let status = match fetch_chart_via_index(
+            &state,
+            proxy,
+            repo_id,
+            "helm-proxy",
+            &index_server.uri(),
+            "mychart",
+            "1.0.0",
+            "mychart-1.0.0.tgz",
+            &ctx,
+        )
+        .await
+        {
+            Ok(resp) => resp.status(),
+            Err(resp) => resp.status(),
+        };
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // The index itself must have been fetched, or the test proves nothing.
+        let index_hits = index_server
+            .received_requests()
+            .await
+            .expect("request recording")
+            .len();
+        assert!(index_hits >= 1, "the upstream index must have been read");
+        let internal_hits = internal
+            .received_requests()
+            .await
+            .expect("request recording")
+            .len();
+        (status, internal_hits)
+    }
+
+    /// Loopback spellings the chart URL may use. The WHATWG parser maps the
+    /// numeric and hex IPv4 forms to `127.0.0.1`; the IPv4-mapped IPv6 form
+    /// reaches the IPv4 listener through the dual-stack socket.
+    const LOOPBACK_SPELLINGS: &[&str] = &[
+        "127.0.0.1",
+        "2130706433",
+        "0x7f.0.0.1",
+        "0177.0.0.1",
+        "[::ffff:127.0.0.1]",
+    ];
+
+    /// An inherit-routed Remote (no egress configuration: the shared client)
+    /// must not dial an IP-literal chart URL the upstream policy refuses.
+    #[tokio::test]
+    async fn test_index_chart_url_ip_literal_refused_inherited_routing() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "helm").await;
+        for host in LOOPBACK_SPELLINGS {
+            let (status, hits) = fetch_index_named_literal(&pool, repo_id, host).await;
+            assert_eq!(
+                hits, 0,
+                "inherit routing: chart URL host {host} reached the loopback listener (status {status})"
+            );
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "inherit routing: {host} must be refused by the outbound address policy"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// A Remote pinned to `direct` egress builds its own client; an
+    /// IP-literal chart URL must be refused there too.
+    #[tokio::test]
+    async fn test_index_chart_url_ip_literal_refused_direct_routing() {
+        use crate::services::egress_proxy::{
+            save_egress_proxy, EgressProxyConfig, EgressProxyMode,
+        };
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "helm").await;
+        save_egress_proxy(
+            &pool,
+            repo_id,
+            &EgressProxyConfig {
+                mode: EgressProxyMode::Direct,
+                proxy_url: None,
+                no_proxy: None,
+            },
+        )
+        .await
+        .expect("save direct");
+        for host in LOOPBACK_SPELLINGS {
+            let (status, hits) = fetch_index_named_literal(&pool, repo_id, host).await;
+            assert_eq!(
+                hits, 0,
+                "direct routing: chart URL host {host} reached the loopback listener (status {status})"
+            );
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "direct routing: {host} must be refused by the outbound address policy"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// An explicit egress proxy keeps working: an index and a chart named by
+    /// a public IP literal are fetched through the proxy, which answers for
+    /// them. The destination itself is never dialled.
+    #[tokio::test]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
+    async fn test_index_chart_url_public_literal_served_through_explicit_proxy() {
+        use crate::services::egress_proxy::{
+            save_egress_proxy, EgressProxyConfig, EgressProxyMode,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        // Documentation range (TEST-NET-3): public by the policy, never dialled.
+        let upstream = "http://203.0.113.10";
+        let chart_bytes: &[u8] = b"proxied-chart";
+        let proxy_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(
+                    make_index_yaml(
+                        "mychart",
+                        "1.0.0",
+                        &format!("{upstream}/charts/mychart-1.0.0.tgz"),
+                    )
+                    .into_bytes(),
+                ),
+            )
+            .mount(&proxy_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/charts/mychart-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(chart_bytes))
+            .mount(&proxy_server)
+            .await;
+
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "helm").await;
+        save_egress_proxy(
+            &pool,
+            repo_id,
+            &EgressProxyConfig {
+                mode: EgressProxyMode::Explicit,
+                proxy_url: Some(proxy_server.uri()),
+                no_proxy: None,
+            },
+        )
+        .await
+        .expect("save explicit");
+
+        let tmp = proxy_tmp_dir();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let result = fetch_chart_via_index(
+            &state,
+            proxy,
+            repo_id,
+            "helm-proxy",
+            upstream,
+            "mychart",
+            "1.0.0",
+            "mychart-1.0.0.tgz",
+            &ctx,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let resp = match result {
+            Ok(resp) => resp,
+            Err(resp) => panic!("explicit proxy fetch failed: {}", resp.status()),
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect streamed chart body");
+        assert_eq!(&body[..], chart_bytes);
+    }
+
     // #2192 / #1608 Phase 4c: a chart larger than the old buffered cap
     // (DEFAULT_METADATA_MAX_BYTES = 8 MiB) must now STREAM with 200 instead of
     // 502, and the second request must be served WARM from the teed proxy cache
@@ -3509,7 +4063,7 @@ entries:
         }
 
         // `.expect(1)` on the chart mock is verified on server drop.
-        drop(server);
+        tdh::drop_mock_server(server).await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4077,6 +4631,232 @@ mod virtual_member_authz_tests {
             (StatusCode::OK, Bytes::from_static(PRIVATE_BYTES)),
             "the private member's granted principal must still download its \
              chart through the virtual"
+        );
+    }
+}
+
+/// #4192 / #4508: a Remote member of a virtual Helm repository whose
+/// `index.yaml` cannot be fetched or parsed, or that does not answer within
+/// the member deadline, fails the merged index loudly (502 naming the member)
+/// instead of serving an index that silently lacks the member. A member that
+/// answers 404 publishes nothing and is not a failure; a virtual that opted
+/// into partial merges serves the rest, marked partial and uncacheable.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod virtual_member_failure_tests {
+    use axum::http::{HeaderMap, StatusCode};
+    use bytes::Bytes;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    const GOOD_INDEX: &str = "apiVersion: v1\nentries:\n  alpha:\n  - name: alpha\n    \
+                              version: 1.0.0\n    urls:\n    - charts/alpha-1.0.0.tgz\n";
+
+    /// A public virtual over one public Remote member per upstream, in
+    /// priority order.
+    struct Rig {
+        pool: sqlx::PgPool,
+        virtual_id: uuid::Uuid,
+        virtual_key: String,
+        member_keys: Vec<String>,
+        member_ids: Vec<(uuid::Uuid, std::path::PathBuf)>,
+        state: crate::api::SharedState,
+        _cache: tempfile::TempDir,
+    }
+
+    impl Rig {
+        async fn new(pool: sqlx::PgPool, upstreams: &[String]) -> Self {
+            let (virtual_id, virtual_key, _vd) = tdh::create_repo(&pool, "virtual", "helm").await;
+            tdh::publish_repo(&pool, virtual_id).await;
+            let mut member_keys = Vec::new();
+            let mut member_ids = Vec::new();
+            for (i, upstream) in upstreams.iter().enumerate() {
+                let (id, key, dir) = tdh::create_repo(&pool, "remote", "helm").await;
+                sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                    .bind(upstream)
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .expect("point member at mock upstream");
+                tdh::publish_repo(&pool, id).await;
+                tdh::link_virtual_member(&pool, virtual_id, id, i as i32 + 1).await;
+                member_keys.push(key);
+                member_ids.push((id, dir));
+            }
+            let cache = tempfile::tempdir().expect("proxy cache tempdir");
+            let root = cache.path().to_str().expect("utf8 tempdir").to_string();
+            let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &root);
+            let state = tdh::build_state_with_proxy(pool.clone(), &root, proxy);
+            Self {
+                pool,
+                virtual_id,
+                virtual_key,
+                member_keys,
+                member_ids,
+                state,
+                _cache: cache,
+            }
+        }
+
+        async fn index(&self) -> (StatusCode, Bytes, HeaderMap) {
+            let app = tdh::router_anon(super::router(), self.state.clone());
+            tdh::send_with_headers(app, tdh::get(format!("/{}/index.yaml", self.virtual_key))).await
+        }
+
+        async fn allow_partial(&self) {
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) \
+                 VALUES ($1, 'virtual_metadata_partial', 'true')",
+            )
+            .bind(self.virtual_id)
+            .execute(&self.pool)
+            .await
+            .expect("opt the virtual into partial merges");
+        }
+
+        async fn cleanup(self) {
+            for (id, dir) in &self.member_ids {
+                tdh::cleanup_member_repo(&self.pool, *id, dir).await;
+            }
+            let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+                .bind(self.virtual_id)
+                .execute(&self.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(self.virtual_id)
+                .execute(&self.pool)
+                .await;
+        }
+    }
+
+    async fn upstream(template: ResponseTemplate) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/index.yaml"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn good_upstream() -> MockServer {
+        upstream(ResponseTemplate::new(200).set_body_string(GOOD_INDEX)).await
+    }
+
+    /// #4192: a member answering 500 or a document that does not parse fails
+    /// the merged index with 502 naming that member, by default.
+    #[tokio::test]
+    async fn failed_member_fails_the_merged_index_by_default_4192() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        for bad in [
+            ResponseTemplate::new(500),
+            ResponseTemplate::new(200).set_body_string("entries: [this is: not an index"),
+        ] {
+            let good = good_upstream().await;
+            let bad = upstream(bad).await;
+            let rig = Rig::new(pool.clone(), &[good.uri(), bad.uri()]).await;
+            let (status, body, _) = rig.index().await;
+            let bad_key = rig.member_keys[1].clone();
+            rig.cleanup().await;
+
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            assert!(
+                body.contains(&bad_key),
+                "the 502 must name the member: {body}"
+            );
+        }
+    }
+
+    /// #4192: with `virtual_metadata_partial` the healthy members are served,
+    /// the missing member is named, and the response is not cacheable.
+    #[tokio::test]
+    async fn failed_member_is_served_partial_when_the_virtual_allows_it_4192() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let good = good_upstream().await;
+        let bad = upstream(ResponseTemplate::new(500)).await;
+        let rig = Rig::new(pool, &[good.uri(), bad.uri()]).await;
+        rig.allow_partial().await;
+        let (status, body, headers) = rig.index().await;
+        let bad_key = rig.member_keys[1].clone();
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("alpha"), "{body}");
+        assert_eq!(
+            headers
+                .get("x-ak-partial-members")
+                .and_then(|v| v.to_str().ok()),
+            Some(bad_key.as_str())
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(headers.get(axum::http::header::WARNING).is_some());
+    }
+
+    /// #4192: a member that answers 404 publishes no index; that is not a
+    /// failure, and the other members' entries are served.
+    #[tokio::test]
+    async fn member_without_an_index_is_not_a_failure_4192() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let good = good_upstream().await;
+        let empty = MockServer::start().await; // every path 404s
+        let rig = Rig::new(pool, &[good.uri(), empty.uri()]).await;
+        let (status, body, headers) = rig.index().await;
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("alpha"), "{body}");
+        assert!(headers.get("x-ak-partial-members").is_none());
+    }
+
+    /// #4508: a member that does not answer within the member deadline fails
+    /// the merged index with 502 naming it, promptly, instead of holding the
+    /// request for the upstream's full timeout (which outlasts a reverse
+    /// proxy's and turns into a 504).
+    #[tokio::test]
+    async fn stalled_member_fails_within_the_deadline_4508() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let good = good_upstream().await;
+        let stalled = upstream(
+            ResponseTemplate::new(200)
+                .set_body_string(GOOD_INDEX)
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .await;
+        let rig = Rig::new(pool, &[good.uri(), stalled.uri()]).await;
+        let started = std::time::Instant::now();
+        let (status, body, _) = crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
+            std::time::Duration::from_millis(300),
+            rig.index(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let stalled_key = rig.member_keys[1].clone();
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(body.contains(&stalled_key), "{body}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the deadline must bound the wait: took {elapsed:?}"
         );
     }
 }

@@ -49,6 +49,23 @@ pub const NEGATIVE_CACHE_TTL_SECS: i64 = 45;
 /// returning a hard error for a body we already hold.
 pub const STALE_IF_ERROR_GRACE_SECS: i64 = 3600;
 
+/// Upper bound for a configurable `stale-if-error` grace window (#4581):
+/// 30 days. The instance default is [`STALE_IF_ERROR_GRACE_SECS`]; a
+/// repository may override it down to `0` (which disables serving stale
+/// bodies entirely — an unreachable upstream then surfaces as a hard error).
+/// The ceiling bounds `now + grace` well inside chrono's representable range
+/// and keeps a fat-fingered override from pinning content forever.
+pub const STALE_IF_ERROR_GRACE_MAX_SECS: i64 = 2_592_000;
+
+/// The longest cache lifetime anything in the proxy cache is ever stamped with
+/// (~10 years). It is the "effectively forever" TTL written for
+/// [`Mutability::Immutable`] paths, and also the ceiling of a repository's
+/// `cache_ttl_secs` override (#2667): an operator who wants a remote's mutable
+/// paths to stop revalidating sets the override to this value, which gives them
+/// the same lifetime an immutable artifact gets. Bounding every TTL here also
+/// keeps `now + ttl` far away from chrono's representable range.
+pub const MAX_CACHE_TTL_SECS: i64 = 315_360_000;
+
 /// Whether a proxied path's content can change upstream after it is first
 /// cached. See the module docs for the immutable-vs-mutable contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,9 +102,64 @@ impl Mutability {
             // ~10 years. Immutable hits are short-circuited by `evaluate`, so
             // this is only a backstop for any code path that reads `expires_at`
             // directly; it must be large enough never to expire in practice.
-            Mutability::Immutable => 315_360_000,
+            Mutability::Immutable => MAX_CACHE_TTL_SECS,
             Mutability::Mutable { default_ttl_secs } => default_ttl_secs,
         }
+    }
+
+    /// Apply a repository's `cache_ttl_secs` override to this classification.
+    ///
+    /// The precedence rule (#3706, kept by #3658 and #3832): **an operator
+    /// override replaces the classifier's default for every mutable path** —
+    /// the conservative 5-minute default and the longer GitHub-release defaults
+    /// alike, in both directions — and **never touches an immutable path**,
+    /// which keeps caching forever whatever the override says. With no
+    /// override the classifier default stands.
+    ///
+    /// The override is bounded to `±MAX_CACHE_TTL_SECS`: the API never stores
+    /// more than the maximum, but `repository_config` is free text, and an
+    /// unbounded value would overflow `chrono` when stamped as `now + ttl`. A
+    /// non-positive value is passed through unchanged (it means "expire
+    /// immediately").
+    pub fn with_ttl_override(self, override_secs: Option<i64>) -> Self {
+        match (self, override_secs) {
+            (Mutability::Mutable { .. }, Some(secs)) => Mutability::Mutable {
+                default_ttl_secs: secs.clamp(-MAX_CACHE_TTL_SECS, MAX_CACHE_TTL_SECS),
+            },
+            (other, _) => other,
+        }
+    }
+}
+
+/// The instant a cached entry stops being fresh, under the policy in force
+/// *now* rather than the one in force when it was written (#3832).
+///
+/// The sidecar records an absolute `stamped_expires_at` computed at write (or
+/// 304-revalidation) time from the TTL that applied then. When an operator
+/// later *lowers* a repository's TTL, trusting that stamp keeps every mutable
+/// entry written under the old value fresh until its original expiry — up to
+/// the old TTL later. So for a mutable path the effective expiry is
+/// `min(stamped_expires_at, cached_at + current_ttl)`: lowering the TTL takes
+/// effect immediately, measured from when the entry was cached or last
+/// confirmed current, while raising it applies from the entry's next
+/// revalidation (the stamp still caps it).
+///
+/// Immutable entries keep their stamp: whether a path is immutable is the
+/// classifier's decision at read time, never inferred from the stamped value.
+///
+/// Every freshness gate in the proxy goes through this one function, so the
+/// buffered, streaming, presign and metadata-only paths cannot disagree about
+/// when an entry expired.
+pub fn effective_expires_at(
+    mutability: Mutability,
+    cached_at: DateTime<Utc>,
+    stamped_expires_at: DateTime<Utc>,
+) -> DateTime<Utc> {
+    match mutability {
+        Mutability::Immutable => stamped_expires_at,
+        Mutability::Mutable { default_ttl_secs } => chrono::Duration::try_seconds(default_ttl_secs)
+            .and_then(|ttl| cached_at.checked_add_signed(ttl))
+            .map_or(stamped_expires_at, |policy| policy.min(stamped_expires_at)),
     }
 }
 
@@ -179,10 +251,14 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // -- PyPI family ----------------------------------------------------
         // The simple index (`simple/`, `simple/<pkg>/`) is mutable; the wheels
         // and sdists it points at are immutable.
-        RepositoryFormat::Pypi
-        | RepositoryFormat::Poetry
-        | RepositoryFormat::Conda
-        | RepositoryFormat::Jupyter => classify_pypi(&lower, speaks_pep658(format)),
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Jupyter => {
+            classify_pypi(&lower, speaks_pep658(format))
+        }
+
+        // -- conda ----------------------------------------------------------
+        // Packages and CEP-16 shards (content-addressed) are immutable;
+        // repodata and the shard index are rewritten in place.
+        RepositoryFormat::Conda => classify_conda(&lower),
 
         // -- npm family -----------------------------------------------------
         // The packument (the metadata JSON at `<pkg>` / `@scope/<pkg>`) is
@@ -227,11 +303,48 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // forever; hosted and future metadata paths stay mutable by default.
         RepositoryFormat::Vscode => classify_vscode_gallery_asset(&lower),
 
+        // Go module proxy protocol: a canonical version under `@v/` names a
+        // `.info`/`.mod`/`.zip` the checksum database pins forever, while
+        // `@v/list`, `@latest` and a non-canonical query (`@v/master.info`)
+        // resolve afresh on every request.
+        RepositoryFormat::Go => classify_go(&lower),
+
         // GitHub release files can be replaced under the same tag and name.
         // Only the explicit mirror formats get a long, finite cache lifetime.
         RepositoryFormat::Github | RepositoryFormat::Mise | RepositoryFormat::Aqua => {
             classify_github_release(path)
         }
+
+        // Bazel module registry (#2858): `bazel_registry.json` and
+        // `modules/<name>/metadata.json` gain versions over time, while every
+        // file under `modules/<name>/<version>/` belongs to a published
+        // version, which the BCR never changes (Bazel lockfiles pin their
+        // hashes).
+        RepositoryFormat::Bazel => classify_bazel(&lower),
+
+        // MCP registry API (#5253): a Remote MCP registry's sync reads the
+        // upstream listing and per-server version lists, which change with
+        // every publish and status flip, so they always revalidate. One exact
+        // version document is stable but not immutable (an upstream
+        // administrator may edit it; the sync detects that as content drift),
+        // so it gets a longer, finite lifetime.
+        RepositoryFormat::Mcp => classify_mcp(&lower),
+
+        // Agent Plugins Remote (#5289): an archive is cached under
+        // `{name}/{version}/{sha256}/{name}-{version}.zip`, the digest the
+        // upstream index lists, so it is content-addressed. The marketplace
+        // documents and `{name}/index.json` gain versions over time.
+        RepositoryFormat::AgentPlugins => classify_agent_plugins(&lower),
+
+        // Hugging Face Hub (#5283): a file or metadata document addressed by
+        // a 40-hex commit sha (`{id}/resolve/<sha>/...`, the shape
+        // `snapshot_download` fetches every file with) can never change;
+        // branch, tag and `refs/pr/N` paths and plain model info are
+        // pointers the Hub moves.
+        RepositoryFormat::Huggingface => match classify_huggingface(&lower) {
+            HfPath::CommitPinned => Mutability::Immutable,
+            HfPath::Pointer | HfPath::Unknown => Mutability::mutable_default(),
+        },
 
         // Everything else: conservative default. Revalidate rather than risk
         // serving a stale index forever.
@@ -293,6 +406,19 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
         // is a no-op for conan (matching the conan upload handlers' intent).
         RepositoryFormat::Conan => true,
 
+        // #4889: the protobuf `_labels` index is a registry-generated pointer
+        // (label name -> commit digest) that is rewritten in place on every
+        // label move. It is the only mutable coordinate in a protobuf module;
+        // commits and their bundles remain release-immutable.
+        RepositoryFormat::Protobuf => lower == "_labels" || lower.ends_with("/_labels"),
+
+        // #5283: only the Hub's recognised pointer shapes (branch/tag
+        // resolve paths, model info, non-sha tree listings) are mutable
+        // indexes. A hosted coordinate (`{id}/{revision}/{file}`) is not one
+        // of them and stays a release coordinate, so a re-publish of the
+        // same file still answers 409.
+        RepositoryFormat::Huggingface => classify_huggingface(&lower) == HfPath::Pointer,
+
         // Default-format families (Generic, Nuget, Composer, Go,
         // Helm, ...) have no in-place index files at artifact coordinates:
         // every stored path is a release coordinate. The GitHub mirror
@@ -303,42 +429,41 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
 
 /// Whether a Maven coordinate may be REPUBLISHED in place, i.e. whether a
 /// second upload to the same `artifacts.path` legitimately replaces the first
-/// (#3839).
+/// (#3839, #4476).
 ///
-/// This is the upload-side face of [`classify_maven`] and deliberately shares
-/// its two predicates ([`has_snapshot_component`] and
-/// [`is_unique_snapshot_artifact`]) so the Maven PUT handler and the proxy
-/// cache cannot drift apart on what "SNAPSHOT" means. Before #3839 the handler
-/// re-derived the rule as `version.contains("SNAPSHOT")`, which disagreed with
-/// the classifier twice over: it let a RESOLVED unique snapshot
-/// (`app-1.0-20260827.132833-10.jar`, a filename that names exactly one
-/// deployment and which `classify` calls `Immutable`) be silently overwritten,
-/// and it read a version that merely CONTAINS the token (`1.0-SNAPSHOT-rc1`)
-/// as a snapshot where the classifier's component-wise `ends_with` reads it as
-/// a release.
+/// Republishable:
 ///
-/// Only the two genuinely in-place coordinates are republishable:
-///
-/// * `maven-metadata.xml` and its checksum/signature siblings — rewritten on
+/// * `maven-metadata.xml` and its checksum/signature siblings, rewritten on
 ///   every deploy by definition, and
-/// * a NON-unique snapshot under a `-SNAPSHOT` version directory
-///   (`app-1.0-SNAPSHOT.jar`, or an Ivy-layout `mylib.jar`), which is the
-///   #3295 behaviour this must preserve.
+/// * every file under a `-SNAPSHOT` version DIRECTORY: a non-unique snapshot
+///   (`app-1.0-SNAPSHOT.jar`, or an Ivy-layout `mylib.jar`, the #3295 case)
+///   AND a resolved unique snapshot (`app-1.0-20260827.132833-10.jar`).
 ///
-/// Everything else — every release coordinate, and a resolved unique snapshot —
-/// is answered with `409 Conflict` by the caller. Note this is intentionally
-/// NOT `!classify(..).is_immutable()`: `classify_maven` falls back to *mutable*
-/// for a leaf whose extension it does not recognise (so the proxy revalidates
-/// rather than caching an unknown file forever), and inheriting that fallback
-/// here would turn every unrecognised extension under a RELEASE version into an
-/// overwritable coordinate.
+/// The unique-snapshot half is #4476. #3839 made a timestamped snapshot file
+/// immutable on upload, because [`classify_maven`] caches it forever in a
+/// proxy. On the hosted PUT path that broke `mvn deploy` for any build that
+/// uploads the same attached artifact twice in one execution (both uploads
+/// carry the same timestamp and build number), which every release up to
+/// 1.8.0 accepted and which the Maven guide documents: snapshots "can be
+/// overwritten". A snapshot repository is mutable by contract, so the PUT
+/// path follows that contract; the proxy-cache classification is a separate
+/// question and is unchanged.
+///
+/// The SNAPSHOT test stays the classifier's path-COMPONENT test
+/// ([`has_snapshot_component`], #3554), so a version that merely CONTAINS the
+/// token (`1.0-SNAPSHOT-rc1`) is still a release, and every release
+/// coordinate is still answered `409 Conflict` by the caller. Note this is
+/// intentionally NOT `!classify(..).is_immutable()`: `classify_maven` falls
+/// back to *mutable* for a leaf whose extension it does not recognise (so the
+/// proxy revalidates rather than caching an unknown file forever), and
+/// inheriting that fallback here would turn every unrecognised extension under
+/// a RELEASE version into an overwritable coordinate.
 pub fn maven_coordinate_is_republishable(path: &str) -> bool {
     let lower = path.trim_start_matches('/').to_ascii_lowercase();
-    let leaf = leaf(&lower);
-    if leaf.starts_with("maven-metadata.xml") {
+    if leaf(&lower).starts_with("maven-metadata.xml") {
         return true;
     }
-    has_snapshot_component(&lower) && !is_unique_snapshot_artifact(leaf)
+    has_snapshot_component(&lower)
 }
 
 /// Maven §2.1: only `maven-metadata.xml*` is mutable.
@@ -469,6 +594,25 @@ fn classify_pypi(lower: &str, pep658: bool) -> Mutability {
     Mutability::mutable_default()
 }
 
+/// conda: `.conda` / `.tar.bz2` packages are immutable (they share the PyPI
+/// package-file rule, without the PEP 658 sidecar protocol, #3356), and so is
+/// a CEP-16 shard, `<sha256>.msgpack.zst`, which is addressed by the hash of
+/// its bytes (#4577). `repodata.json`, the shard index
+/// (`repodata_shards.msgpack.zst`) and every other channel document are
+/// rewritten in place and stay mutable.
+fn classify_conda(lower: &str) -> Mutability {
+    if is_conda_shard_file(leaf(lower)) {
+        return Mutability::Immutable;
+    }
+    classify_pypi(lower, false)
+}
+
+/// Whether a (lower-cased) leaf is a CEP-16 shard file name.
+fn is_conda_shard_file(leaf: &str) -> bool {
+    leaf.strip_suffix(".msgpack.zst")
+        .is_some_and(|stem| stem.len() == 64 && stem.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// npm §2.1: packument metadata is mutable; tarballs are immutable.
 fn classify_npm(lower: &str) -> Mutability {
     // Only a *real package tarball* is immutable. In the canonical npm registry
@@ -503,6 +647,66 @@ fn classify_oci(lower: &str) -> Mutability {
     Mutability::mutable_default()
 }
 
+/// Go module proxy: `<module>/@v/<version>.{info,mod,zip}` is immutable only
+/// for a canonical `vMAJOR.MINOR.PATCH[-pre][+build]` version (pseudo-versions
+/// and `+incompatible` included). `@v/list`, `@latest` and a query such as
+/// `@v/master.info` or `@v/v1.2.info` stay mutable.
+///
+/// The checksum database the Go handler caches under `sumdb/<host>/...`
+/// (#5344): see [`classify_go_sumdb`].
+fn classify_go(lower: &str) -> Mutability {
+    if let Some(rest) = lower.strip_prefix("sumdb/") {
+        return classify_go_sumdb(rest);
+    }
+    let version = lower.rsplit_once("/@v/").and_then(|(_, leaf)| {
+        [".info", ".mod", ".zip"]
+            .iter()
+            .find_map(|ext| leaf.strip_suffix(ext))
+    });
+    if version.is_some_and(is_canonical_go_version) {
+        Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
+    }
+}
+
+/// A canonical Go version, `vMAJOR.MINOR.PATCH[-pre][+build]` with no leading
+/// zeros (pseudo-versions and `+incompatible` included).
+fn is_canonical_go_version(version: &str) -> bool {
+    version
+        .strip_prefix('v')
+        .and_then(|v| v.split(['-', '+']).next())
+        .is_some_and(|core| {
+            let parts: Vec<&str> = core.split('.').collect();
+            parts.len() == 3
+                && parts.iter().all(|p| {
+                    !p.is_empty()
+                        && p.bytes().all(|b| b.is_ascii_digit())
+                        && (p.len() == 1 || !p.starts_with('0'))
+                })
+        })
+}
+
+/// The Go checksum database (`<host>/<path>` after `sumdb/`, #5344). A tile
+/// (`tile/H/L/NNN`, and a partial `tile/H/L/NNN.p/W`, which names exactly
+/// `W` hashes) is fixed by its coordinates, and the record a lookup of a
+/// canonical `module@version` returns never changes: only the signed tree
+/// head it carries ages, and the toolchain accepts an older head that is
+/// consistent with the one it knows. The signed tree head `latest` moves
+/// with every append and stays mutable, as does anything unrecognised.
+fn classify_go_sumdb(rest: &str) -> Mutability {
+    let path = rest.split_once('/').map_or("", |(_, path)| path);
+    let pinned_lookup = path
+        .strip_prefix("lookup/")
+        .and_then(|lookup| lookup.rsplit_once('@'))
+        .is_some_and(|(module, version)| !module.is_empty() && is_canonical_go_version(version));
+    if path.starts_with("tile/") || pinned_lookup {
+        Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
+    }
+}
+
 /// Cargo §2.1: the registry index is mutable; `.crate` downloads are immutable.
 fn classify_cargo(lower: &str) -> Mutability {
     // Only a version-pinned `.crate` file served from the registry's crate
@@ -535,11 +739,23 @@ fn classify_cargo(lower: &str) -> Mutability {
 ///   `.debian.tar.*`.
 /// - **dists/**: Release, InRelease, Packages, Sources, Translation, Contents,
 ///   dep11, etc. are rewritten in place by upstream on each publish.
+/// - **flat repositories** (#4619, `deb <uri> /`): there is no `pool/` or
+///   `dists/` tree; the binary packages sit wherever the `Packages`
+///   `Filename:` says (`amd64/kubectl_1.34.0-1.1_amd64.deb` on pkgs.k8s.io).
+///   They are version-pinned by the same rule as `pool/`, so a binary package
+///   outside `dists/` is immutable. Under `dists/` (#3596 vendor layouts) the
+///   classification is unchanged.
 fn classify_debian(lower: &str) -> Mutability {
-    if lower.contains("/by-hash/") {
+    if lower.contains("/by-hash/") || lower.starts_with("by-hash/") {
         return Mutability::Immutable;
     }
     if lower.starts_with("pool/") || lower.contains("/pool/") {
+        return Mutability::Immutable;
+    }
+    let leaf = leaf(lower);
+    let is_binary_package =
+        leaf.ends_with(".deb") || leaf.ends_with(".udeb") || leaf.ends_with(".ddeb");
+    if is_binary_package && !lower.starts_with("dists/") {
         return Mutability::Immutable;
     }
     Mutability::mutable_default()
@@ -596,18 +812,181 @@ pub const GITHUB_RELEASE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Release URLs name replaceable objects, not content digests. Cache assets
 /// (including checksum files) for a finite period and revalidate on expiry.
+///
+/// The same lifetime applies to the GitHub API's release-by-tag lookup,
+/// `repos/<owner>/<repo>/releases/tags/<tag>` (#3658), which mise's aqua
+/// backend calls even for an exactly pinned version. A tag's release JSON is
+/// nearly but not strictly immutable (notes get edited, assets re-uploaded), so
+/// it stays mutable and revalidates on expiry. The paginated release *list*
+/// (`repos/<owner>/<repo>/releases`) changes with every release and keeps the
+/// conservative default.
 fn classify_github_release(path: &str) -> Mutability {
     let segments: Vec<&str> = path.split('/').collect();
-    if segments.len() >= 6
-        && segments[2] == "releases"
-        && segments[3] == "download"
-        && segments.iter().all(|segment| !segment.is_empty())
-    {
+    let all_present = segments.iter().all(|segment| !segment.is_empty());
+    let is_release_asset =
+        segments.len() >= 6 && segments[2] == "releases" && segments[3] == "download";
+    let is_release_tag_lookup = segments.len() == 6
+        && segments[0] == "repos"
+        && segments[3] == "releases"
+        && segments[4] == "tags";
+    if all_present && (is_release_asset || is_release_tag_lookup) {
         Mutability::Mutable {
             default_ttl_secs: GITHUB_RELEASE_TTL_SECS,
         }
     } else {
         Mutability::mutable_default()
+    }
+}
+
+/// Bazel registry: only versioned files (`modules/<name>/<version>/<file>`)
+/// are immutable; the registry config and the per-module `metadata.json`
+/// version list are rewritten as versions are published or yanked.
+fn classify_bazel(lower: &str) -> Mutability {
+    let versioned = lower
+        .strip_prefix("modules/")
+        .map(|rest| rest.splitn(3, '/').filter(|s| !s.is_empty()).count() == 3)
+        .unwrap_or(false);
+    if versioned {
+        Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
+    }
+}
+
+/// TTL of one exact upstream MCP server version document.
+pub const MCP_VERSION_DOCUMENT_TTL_SECS: i64 = 3600;
+
+/// MCP registry API paths (`v0.1/...` or `v0/...`, query included).
+fn classify_mcp(lower: &str) -> Mutability {
+    let path = lower.split('?').next().unwrap_or(lower);
+    let rest = path
+        .strip_prefix("v0.1/")
+        .or_else(|| path.strip_prefix("v0/"));
+    let Some(rest) = rest else {
+        return Mutability::mutable_default();
+    };
+    let always_revalidate = Mutability::Mutable {
+        default_ttl_secs: 0,
+    };
+    let Some(tail) = rest.strip_prefix("servers/") else {
+        // `servers` (the listing) and anything unrecognised.
+        return always_revalidate;
+    };
+    match tail.rsplit_once("/versions/") {
+        Some((_, version))
+            if !version.is_empty() && version != "latest" && !version.contains('/') =>
+        {
+            Mutability::Mutable {
+                default_ttl_secs: MCP_VERSION_DOCUMENT_TTL_SECS,
+            }
+        }
+        _ => always_revalidate,
+    }
+}
+
+/// Agent Plugins (#5289): only a Remote's content-addressed archive cache
+/// path, `{name}/{version}/{sha256}/{name}-{version}.zip`, is immutable.
+/// The hosted artifact path (`{name}/{version}/{name}-{version}.zip`, three
+/// segments) is NOT: `classify` also drives the hosted delete guard, and a
+/// hosted plugin version stays deletable through the REST artifact delete.
+/// Documents (`marketplace.json`, `claude-marketplace.json`, ...,
+/// `{name}/index.json`) are mutable.
+fn classify_agent_plugins(lower: &str) -> Mutability {
+    let parts: Vec<&str> = lower.split('/').collect();
+    let content_addressed = match parts.as_slice() {
+        [name, version, digest, file] => {
+            !name.is_empty()
+                && !version.is_empty()
+                && digest.len() == 64
+                && digest.bytes().all(|b| b.is_ascii_hexdigit())
+                && *file == format!("{name}-{version}.zip")
+        }
+        _ => false,
+    };
+    if content_addressed {
+        Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
+    }
+}
+
+/// What a Hugging Face Hub path addresses (#5283).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HfPath {
+    /// Content pinned by a 40-hex commit sha.
+    CommitPinned,
+    /// A recognised Hub path the Hub rewrites in place: a branch, tag or
+    /// `refs/pr/N` revision, or model info without a revision.
+    Pointer,
+    /// Not a Hub API path shape.
+    Unknown,
+}
+
+/// A Hub commit sha: exactly 40 lowercase hex characters (the path is already
+/// lowercased). A branch whose name is 40 hex characters is treated as a
+/// commit, as `huggingface_hub` does.
+fn is_hf_commit_sha(segment: &str) -> bool {
+    segment.len() == 40 && segment.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Classify a Hugging Face Hub path, as the handler requests it upstream
+/// (`api/handlers/huggingface.rs`):
+///
+/// * `{id}/resolve/{rev}/{file...}`: a file download;
+/// * `api/models/{id}`: model info at the default branch;
+/// * `api/models/{id}/revision/{rev}`: model info at a revision;
+/// * `api/models/{id}/tree/{rev}[/{dir...}]`: a file listing.
+///
+/// `{id}` is one segment (`gpt2`) or two (`org/name`), so a path can parse
+/// both ways (a model literally named `resolve`). Every parse that fits is
+/// considered and the path is commit-pinned only when all of them are: the
+/// safe direction, since a mutable path cached as immutable would be served
+/// stale forever.
+fn classify_huggingface(lower: &str) -> HfPath {
+    // A tree listing carries its query (`?recursive=true&cursor=...`, #5321).
+    // The listing at a commit is as fixed as the commit, page by page, so the
+    // query does not change the verdict; it only must not be read as part of
+    // the revision segment.
+    let lower = lower.split_once('?').map_or(lower, |(path, _)| path);
+    let segments: Vec<&str> = lower.split('/').collect();
+    if segments.iter().any(|s| s.is_empty()) {
+        return HfPath::Unknown;
+    }
+    let mut verdicts = Vec::new();
+    if let ["api", "models", rest @ ..] = segments.as_slice() {
+        for id_len in [1, 2] {
+            if rest.len() < id_len {
+                continue;
+            }
+            match &rest[id_len..] {
+                [] => verdicts.push(HfPath::Pointer),
+                ["revision", rev] => verdicts.push(hf_revision_verdict(rev)),
+                ["tree", rev, ..] => verdicts.push(hf_revision_verdict(rev)),
+                _ => {}
+            }
+        }
+    }
+    // Considered for `api/models/...` paths too: a model id may begin with
+    // `api/models`, and every fitting parse must agree.
+    for id_len in [1, 2] {
+        if let ["resolve", rev, _file, ..] = segments.get(id_len..).unwrap_or(&[]) {
+            verdicts.push(hf_revision_verdict(rev));
+        }
+    }
+    if verdicts.is_empty() {
+        HfPath::Unknown
+    } else if verdicts.iter().all(|v| *v == HfPath::CommitPinned) {
+        HfPath::CommitPinned
+    } else {
+        HfPath::Pointer
+    }
+}
+
+fn hf_revision_verdict(rev: &str) -> HfPath {
+    if is_hf_commit_sha(rev) {
+        HfPath::CommitPinned
+    } else {
+        HfPath::Pointer
     }
 }
 
@@ -743,6 +1122,16 @@ mod tests {
             &Conan,
             "relib/1.0/_/_/revisions/rev1/files/conanfile.py"
         ));
+        // #4889: protobuf's `_labels` index moves with every label update;
+        // commit bundles stay immutable.
+        assert!(is_explicitly_mutable_index(
+            &Protobuf,
+            "modules/acme/widgets/_labels"
+        ));
+        assert!(!is_explicitly_mutable_index(
+            &Protobuf,
+            "modules/acme/widgets/commits/abc123"
+        ));
         // Debian: dists/ indices are mutable indexes; pool/ and by-hash/
         // artifacts are protected release coordinates.
         assert!(is_explicitly_mutable_index(
@@ -862,6 +1251,28 @@ mod tests {
                  snapshot directory from the mutable rule"
             );
         }
+    }
+
+    /// #5253: MCP registry paths are never immutable; the listing and version
+    /// lists always revalidate, one exact version document lives an hour.
+    #[test]
+    fn mcp_registry_paths_classify() {
+        use RepositoryFormat::Mcp;
+        let ttl = |p: &str| match classify(&Mcp, p) {
+            Mutability::Mutable { default_ttl_secs } => default_ttl_secs,
+            Mutability::Immutable => panic!("{p} must not be immutable"),
+        };
+        assert_eq!(ttl("v0.1/servers?limit=100&cursor=abc"), 0);
+        assert_eq!(ttl("v0.1/servers"), 0);
+        assert_eq!(ttl("v0/servers/com.acme%2Fx/versions"), 0);
+        assert_eq!(ttl("v0.1/servers/com.acme%2Fx/versions/latest"), 0);
+        assert_eq!(
+            ttl("v0.1/servers/com.acme%2Fx/versions/1.0.0"),
+            MCP_VERSION_DOCUMENT_TTL_SECS
+        );
+        assert_eq!(ttl("v0.1/ping"), 0);
+        assert_eq!(ttl("other/path"), MUTABLE_DEFAULT_TTL_SECS);
+        assert!(!is_explicitly_mutable_index(&Mcp, "v0.1/servers"));
     }
 
     /// `(format, path, expected_immutable)` rows straight from the §2.1 table.
@@ -989,6 +1400,22 @@ mod tests {
             (Conda, "linux-64/repodata.json", false),
             (Conda, "linux-64/numpy-1.26.4-py312.conda.metadata", false),
             (Conda, "linux-64/numpy-1.26.4-py312.tar.bz2.metadata", false),
+            // CEP-16 (#4577): a shard is content-addressed and immutable in
+            // both published layouts (`shards/` as prefix.dev serves it, and
+            // beside the index as conda.anaconda.org does); the shard index
+            // is rewritten in place.
+            (
+                Conda,
+                "noarch/shards/95f5d933b0b2eb6b655f89936ae28ffc2f2f4b90f0365b773d09e4562f25a233.msgpack.zst",
+                true,
+            ),
+            (
+                Conda,
+                "noarch/95f5d933b0b2eb6b655f89936ae28ffc2f2f4b90f0365b773d09e4562f25a233.msgpack.zst",
+                true,
+            ),
+            (Conda, "noarch/repodata_shards.msgpack.zst", false),
+            (Conda, "noarch/shards/not-a-hash.msgpack.zst", false),
             // npm: packument mutable, tarball immutable.
             (Npm, "lodash", false),
             (Npm, "@types/node", false),
@@ -1047,6 +1474,14 @@ mod tests {
             (Debian, "dists/bookworm/i18n/Translation-en.bz2", false),
             (Debian, "dists/bookworm/main/source/Sources.xz", false),
             (Debian, "dists/bookworm/main/Contents-amd64.gz", false),
+            // #4619 flat repository (`deb <uri> /`): the indices at the root
+            // are rewritten in place, the packages next to them are pinned.
+            (Debian, "InRelease", false),
+            (Debian, "Release.gpg", false),
+            (Debian, "Packages.gz", false),
+            (Debian, "amd64/kubectl_1.34.0-1.1_amd64.deb", true),
+            (Debian, "foo_1.0_all.deb", true),
+            (Debian, "by-hash/SHA256/abc123def456", true),
             // GitHub-shaped paths must not change generic write permissions.
             (
                 Generic,
@@ -1055,7 +1490,72 @@ mod tests {
             ),
             // Unknown / other formats: conservative mutable default.
             (Generic, "whatever/file.bin", false),
-            (Go, "github.com/foo/bar/@v/v1.0.0.zip", false),
+            // Go: canonical versions under `@v/` are pinned by the checksum
+            // database; the list, `@latest` and non-canonical queries are not.
+            (Go, "github.com/foo/bar/@v/v1.0.0.zip", true),
+            (Go, "github.com/foo/bar/@v/v1.0.0.mod", true),
+            (Go, "github.com/foo/bar/@v/v1.0.0.info", true),
+            (
+                Go,
+                "go.opencensus.io/@v/v0.1.1-0.20171103154506-982329095285.mod",
+                true,
+            ),
+            (Go, "github.com/foo/bar/@v/v2.0.0+incompatible.zip", true),
+            (Go, "github.com/!burnt!sushi/toml/@v/v1.3.2.zip", true),
+            (Go, "github.com/foo/bar/@v/list", false),
+            // Go checksum database under the Go repository (#5344): tiles and
+            // a lookup of a canonical version are pinned, the signed tree head
+            // moves.
+            (Go, "sumdb/sum.golang.org/tile/8/0/000", true),
+            (Go, "sumdb/sum.golang.org/tile/8/1/x001/234.p/17", true),
+            (Go, "sumdb/sum.golang.org/tile/8/data/x123/456", true),
+            (Go, "sumdb/sum.golang.org/lookup/golang.org/x/text@v0.14.0", true),
+            (Go, "sumdb/sum.golang.org/lookup/github.com/!azure/sdk@v1.2.3-!r!c1", true),
+            (Go, "sumdb/sum.golang.org/latest", false),
+            (Go, "sumdb/sum.golang.org/lookup/golang.org/x/text@master", false),
+            (Go, "sumdb/sum.golang.org/lookup/golang.org/x/text", false),
+            (Go, "sumdb/sum.golang.org/supported", false),
+            (Go, "sumdb/sum.golang.org", false),
+            (Go, "github.com/foo/bar/@latest", false),
+            (Go, "github.com/foo/bar/@v/master.info", false),
+            (Go, "github.com/foo/bar/@v/v1.2.info", false),
+            (Go, "github.com/foo/bar/@v/v1.02.3.mod", false),
+            (Go, "github.com/foo/bar/@v/v1.0.0.txt", false),
+            // Bazel registry (#2858): versioned files immutable, the
+            // registry config and per-module version list mutable.
+            (Bazel, "bazel_registry.json", false),
+            (Bazel, "modules/rules_cc/metadata.json", false),
+            (Bazel, "modules/rules_cc/0.1.1/MODULE.bazel", true),
+            (Bazel, "modules/rules_cc/0.1.1/source.json", true),
+            (Bazel, "modules/rules_cc/0.1.1/patches/fix.patch", true),
+            (Bazel, "modules/rules_cc", false),
+            // Agent Plugins Remote (#5289): the content-addressed archive
+            // cache path is immutable; the hosted artifact path, the documents
+            // and a malformed digest segment are not.
+            (
+                AgentPlugins,
+                "deploy-tools/1.2.0/6bfa000000000000000000000000000000000000000000000000000000000000/deploy-tools-1.2.0.zip",
+                true,
+            ),
+            (
+                AgentPlugins,
+                "deploy-tools/2.0.0-rc.1/6BFA000000000000000000000000000000000000000000000000000000000000/deploy-tools-2.0.0-rc.1.zip",
+                true,
+            ),
+            (AgentPlugins, "deploy-tools/1.2.0/deploy-tools-1.2.0.zip", false),
+            (
+                AgentPlugins,
+                "deploy-tools/1.2.0/6bfa00000000000000000000000000000000000000000000000000000000000/deploy-tools-1.2.0.zip",
+                false,
+            ),
+            (
+                AgentPlugins,
+                "deploy-tools/1.2.0/6bfa000000000000000000000000000000000000000000000000000000000000/other-1.2.0.zip",
+                false,
+            ),
+            (AgentPlugins, "marketplace.json", false),
+            (AgentPlugins, "claude-marketplace.json", false),
+            (AgentPlugins, "deploy-tools/index.json", false),
         ]
     }
 
@@ -1066,14 +1566,27 @@ mod tests {
             "/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64",
             "owner/repo/releases/download/v1/subdir/asset",
             "owner/repo/releases/download/v1/sha256sum.txt",
+            // #3658: the GitHub API release-by-tag lookup (api.github.com
+            // proxied through a `github` remote) gets the same lifetime.
+            "repos/cli/cli/releases/tags/v1",
+            "/repos/jqlang/jq/releases/tags/jq-1.7.1",
         ];
         let other = [
             "cli/cli/releases/latest/download/gh.tar.gz",
             "cli/cli/releases/download/v1",
             "cli/cli/releases/download//asset",
             "mirror/cli/cli/releases/download/v1/asset",
-            "repos/cli/cli/releases/tags/v1",
+            // #3658 negatives: the paginated list, `latest`, a missing tag,
+            // extra segments and other API shapes keep the short default.
             "repos/cli/cli/releases",
+            "repos/cli/cli/releases/latest",
+            "repos/cli/cli/releases/tags",
+            "repos/cli/cli/releases/tags/",
+            "repos/cli/cli/releases/tags/v1/assets",
+            "repos//cli/releases/tags/v1",
+            "repos/cli/cli/releases/12345",
+            "repos/cli/cli/tags/v1",
+            "orgs/cli/cli/releases/tags/v1",
             "file.bin",
         ];
         for format in [
@@ -1116,6 +1629,103 @@ mod tests {
         }
     }
 
+    /// #3658 / #3832 / #2667 precedence rule: an operator override replaces
+    /// the classifier default on every mutable path (shorter or longer than
+    /// the default, including the GitHub-release lifetime) and never touches
+    /// an immutable one.
+    #[test]
+    fn ttl_override_replaces_mutable_defaults_and_never_touches_immutable() {
+        let tag_lookup = classify(&RepositoryFormat::Github, "repos/o/r/releases/tags/v1");
+        assert_eq!(tag_lookup.write_ttl_secs(), GITHUB_RELEASE_TTL_SECS);
+        assert_eq!(tag_lookup.with_ttl_override(Some(60)).write_ttl_secs(), 60);
+        assert_eq!(tag_lookup.with_ttl_override(None), tag_lookup);
+        assert_eq!(
+            Mutability::mutable_default()
+                .with_ttl_override(Some(86_400))
+                .write_ttl_secs(),
+            86_400
+        );
+        assert_eq!(
+            Mutability::Immutable.with_ttl_override(Some(60)),
+            Mutability::Immutable
+        );
+        // Bounded so a hand-edited row cannot overflow `now + ttl`; a
+        // non-positive value (expire immediately) passes through.
+        assert_eq!(
+            Mutability::mutable_default()
+                .with_ttl_override(Some(i64::MAX))
+                .write_ttl_secs(),
+            MAX_CACHE_TTL_SECS
+        );
+        assert_eq!(
+            Mutability::mutable_default()
+                .with_ttl_override(Some(i64::MIN))
+                .write_ttl_secs(),
+            -MAX_CACHE_TTL_SECS
+        );
+        assert_eq!(
+            Mutability::mutable_default()
+                .with_ttl_override(Some(-7200))
+                .write_ttl_secs(),
+            -7200
+        );
+        // The override ceiling IS the immutable lifetime (#2667).
+        assert_eq!(Mutability::Immutable.write_ttl_secs(), MAX_CACHE_TTL_SECS);
+    }
+
+    /// #3832: lowering the TTL is retroactive for mutable entries, raising it
+    /// is not, and immutable entries keep their stamp.
+    #[test]
+    fn effective_expiry_clamps_mutable_entries_to_the_current_ttl() {
+        let cached_at = Utc::now() - chrono::Duration::hours(1);
+        let thirty_days = cached_at + chrono::Duration::days(30);
+        let ttl = |secs| Mutability::Mutable {
+            default_ttl_secs: secs,
+        };
+
+        // Written under 30 days, TTL now 300 s: expired 55 minutes ago.
+        let lowered = effective_expires_at(ttl(300), cached_at, thirty_days);
+        assert_eq!(lowered, cached_at + chrono::Duration::seconds(300));
+        let entry = CacheEntry {
+            mutability: ttl(300),
+            expires_at: lowered,
+            negative_cached_until: None,
+        };
+        assert_eq!(evaluate(Some(&entry), Utc::now()), Freshness::Stale);
+
+        // Unchanged TTL: the stamp stands.
+        assert_eq!(
+            effective_expires_at(ttl(30 * 86_400), cached_at, thirty_days),
+            thirty_days
+        );
+        // Raised TTL: still capped by the stamp until the next revalidation.
+        let short_stamp = cached_at + chrono::Duration::seconds(300);
+        assert_eq!(
+            effective_expires_at(ttl(86_400), cached_at, short_stamp),
+            short_stamp
+        );
+        // Negative override: already expired.
+        assert!(effective_expires_at(ttl(-7200), cached_at, thirty_days) < cached_at);
+        // Immutable: the stamp, whatever it is.
+        assert_eq!(
+            effective_expires_at(Mutability::Immutable, cached_at, short_stamp),
+            short_stamp
+        );
+        // A TTL chrono cannot represent falls back to the stamp, never panics.
+        assert_eq!(
+            effective_expires_at(ttl(i64::MAX), cached_at, thirty_days),
+            thirty_days
+        );
+        assert_eq!(
+            effective_expires_at(
+                ttl(MAX_CACHE_TTL_SECS),
+                DateTime::<Utc>::MAX_UTC,
+                thirty_days
+            ),
+            thirty_days
+        );
+    }
+
     #[test]
     fn classify_matches_table() {
         for (format, path, expect_immutable) in classify_cases() {
@@ -1141,6 +1751,114 @@ mod tests {
         // An unrecognized Maven leaf must NOT be misclassified immutable.
         assert!(!classify(&RepositoryFormat::Maven, "com/example/app/").is_immutable());
         assert!(!classify(&RepositoryFormat::Cargo, "weird/index/path").is_immutable());
+    }
+
+    const HF_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// #5283: `(path, expected)` for every row of the issue's table, with one-
+    /// and two-segment model ids and the `refs%2Fpr%2F1` encoding.
+    fn huggingface_cases() -> Vec<(String, HfPath)> {
+        let mut cases = Vec::new();
+        for id in ["gpt2", "sentence-transformers/all-MiniLM-L6-v2"] {
+            let pinned = [
+                format!("{id}/resolve/{HF_SHA}/model.safetensors"),
+                format!("{id}/resolve/{HF_SHA}/onnx/model.onnx"),
+                format!("api/models/{id}/revision/{HF_SHA}"),
+                format!("api/models/{id}/tree/{HF_SHA}"),
+                format!("api/models/{id}/tree/{HF_SHA}/onnx"),
+                format!("api/models/{id}/tree/{HF_SHA}?recursive=true&expand=false"),
+                format!("api/models/{id}/tree/{HF_SHA}?cursor=abc%2Fdef%3D%3D&recursive=true"),
+            ];
+            let pointers = [
+                format!("{id}/resolve/main/config.json"),
+                format!("{id}/resolve/v1.0/config.json"),
+                format!("{id}/resolve/refs%2Fpr%2F1/config.json"),
+                format!("api/models/{id}"),
+                format!("api/models/{id}/revision/main"),
+                format!("api/models/{id}/revision/refs%2Fpr%2F1"),
+                format!("api/models/{id}/tree/main"),
+                format!("api/models/{id}/tree/main/onnx"),
+                format!("api/models/{id}/tree/main?recursive=true"),
+                // 39 and 41 hex characters are not a commit.
+                format!("{id}/resolve/{}/config.json", &HF_SHA[..39]),
+                format!("{id}/resolve/{HF_SHA}0/config.json"),
+            ];
+            cases.extend(pinned.into_iter().map(|p| (p, HfPath::CommitPinned)));
+            cases.extend(pointers.into_iter().map(|p| (p, HfPath::Pointer)));
+        }
+        for unknown in [
+            "",
+            "gpt2",
+            "gpt2/resolve",
+            &format!("gpt2/resolve/{HF_SHA}"),
+            "api/models",
+            "api/models/org/name/commits/main",
+            &format!("api/datasets/org/name/revision/{HF_SHA}"),
+            // The hosted artifact layout, `{id}/{revision}/{file}`.
+            "org/name/main/config.json",
+            &format!("org/name/{HF_SHA}/config.json"),
+            "org//resolve/main/config.json",
+        ] {
+            cases.push((unknown.to_string(), HfPath::Unknown));
+        }
+        cases
+    }
+
+    #[test]
+    fn huggingface_paths_classify_per_the_table() {
+        let format = RepositoryFormat::Huggingface;
+        for (path, expected) in huggingface_cases() {
+            assert_eq!(
+                classify_huggingface(&path.to_ascii_lowercase()),
+                expected,
+                "{path}"
+            );
+            let m = classify(&format, &path);
+            assert_eq!(
+                m.is_immutable(),
+                expected == HfPath::CommitPinned,
+                "{path}: {m:?}"
+            );
+            if !m.is_immutable() {
+                assert_eq!(m, Mutability::mutable_default(), "{path}");
+            }
+            // `is_explicitly_mutable_index` agrees with `classify` on every
+            // recognised path and leaves unrecognised (hosted) ones protected.
+            assert_eq!(
+                is_explicitly_mutable_index(&format, &path),
+                expected == HfPath::Pointer,
+                "{path}"
+            );
+        }
+        // Case-insensitive like every other arm: the path is lowercased.
+        assert!(classify(
+            &format,
+            &format!("Org/Name/resolve/{}/f.bin", HF_SHA.to_uppercase())
+        )
+        .is_immutable());
+        assert!(classify(&format, &format!("/gpt2/resolve/{HF_SHA}/f.bin")).is_immutable());
+    }
+
+    /// A model id may be one or two segments, so a model named `resolve`
+    /// makes a path parse two ways. It is commit-pinned only if every parse
+    /// says so.
+    #[test]
+    fn huggingface_ambiguous_parse_is_pinned_only_when_every_parse_is() {
+        // `a` at revision `resolve`, or `a/resolve` at the sha.
+        assert_eq!(
+            classify_huggingface(&format!("a/resolve/resolve/{HF_SHA}/f")),
+            HfPath::Pointer
+        );
+        // Only one parse fits (`a` at the sha; `a/resolve` has no `resolve`
+        // segment after it), so the sha decides.
+        assert_eq!(
+            classify_huggingface(&format!("a/resolve/{HF_SHA}/resolve/main/f")),
+            HfPath::CommitPinned
+        );
+        assert_eq!(
+            classify_huggingface(&format!("api/models/resolve/{HF_SHA}/f")),
+            HfPath::CommitPinned
+        );
     }
 
     #[test]

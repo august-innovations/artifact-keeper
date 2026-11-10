@@ -188,6 +188,7 @@ async fn download_plugin(
                         upstream_url,
                         &upstream_path,
                         "application/octet-stream",
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -219,6 +220,7 @@ async fn download_plugin(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -376,26 +378,29 @@ async fn upload_plugin(
     // while computing SHA-256/SHA-1/MD5 incrementally, so a plugin is never
     // held on the heap (Core Invariant (1), #1608; same shape as the nuget push
     // and the swift publish of #3595).
-    let (staged, digests, plugin_name, plugin_version) = if content_type
-        .contains("multipart/form-data")
-    {
-        stage_plugin_from_multipart(&state, content_type, body).await?
-    } else {
-        // Raw upload - extract name/version from headers
-        let name = headers
-            .get("x-plugin-name")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string();
-        let version = headers
-            .get("x-plugin-version")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("0.0.0")
-            .to_string();
-        let (staged, digests) =
-            proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
-        (staged, digests, name, version)
-    };
+    let (staged, digests, plugin_name, plugin_version) =
+        if content_type.contains("multipart/form-data") {
+            stage_plugin_from_multipart(&state, &repo, content_type, body).await?
+        } else {
+            // Raw upload - extract name/version from headers
+            let name = headers
+                .get("x-plugin-name")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown")
+                .to_string();
+            let version = headers
+                .get("x-plugin-version")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("0.0.0")
+                .to_string();
+            let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
+                &state,
+                &repo,
+                body.into_data_stream(),
+            )
+            .await?;
+            (staged, digests, name, version)
+        };
 
     if staged.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty upload body").into_response());
@@ -414,8 +419,8 @@ async fn upload_plugin(
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
-    // The digest the staging pass already computed over the bytes on disk —
-    // the same bytes `put_artifact_stream` uploads, so the stored checksum
+    // The digest the staging pass already computed over the staged bytes —
+    // the same bytes `put_staged_body` uploads, so the stored checksum
     // cannot describe anything other than the stored object (#3848).
     let computed_sha256 = digests.sha256.clone();
 
@@ -435,12 +440,20 @@ async fn upload_plugin(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Store the file — streamed from the staged scratch file, not a heap
-    // buffer. `put_artifact_stream` performs the cross-repo write guard itself
-    // and unlinks the scratch file on every exit path.
+    // Store the file — from local scratch or by copying the object the
+    // repository's backend already staged (#4990). `put_staged_body` performs
+    // the cross-repo write guard and quota preflight itself.
     let storage_key = format!("jetbrains/{}/{}/{}", plugin_name, plugin_version, filename);
     let size_bytes = staged.size_bytes();
-    proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
 
     let metadata = serde_json::json!({
         "plugin_id": plugin_name,
@@ -448,6 +461,13 @@ async fn upload_plugin(
     });
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -467,12 +487,20 @@ async fn upload_plugin(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Store metadata
     let _ = sqlx::query!(
@@ -509,6 +537,18 @@ async fn upload_plugin(
         repo.id,
     )
     .execute(&state.db)
+    .await;
+
+    // #4725: fan out to subscribed push peers now that the row, its metadata
+    // and its catalog entry are committed.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
     .await;
 
     info!(
@@ -641,9 +681,10 @@ const MAX_PLUGIN_FIELD_BYTES: usize = 1024;
 ///
 /// Parsing is delegated to `multer` driven straight off the request-body
 /// stream — the shape `nuget.rs` and `swift.rs` (#3595 / #3847) already use —
-/// and the file part goes to a bounded scratch file through
-/// [`proxy_helpers::stage_stream_content_addressed`]. Nothing is ever converted
-/// to a string, and nothing is ever held whole in memory.
+/// and the file part is staged on the repository's backend when it streams
+/// natively, else in bounded local scratch, through
+/// [`super::repositories::GenericStagedBody::stage_for_repo`]. Nothing is ever
+/// converted to a string, and nothing is ever held whole in memory.
 ///
 /// The hand-rolled parser this replaces (#3848) converted the whole body with
 /// `String::from_utf8_lossy` and then indexed the ORIGINAL byte slice with
@@ -664,11 +705,12 @@ const MAX_PLUGIN_FIELD_BYTES: usize = 1024;
 #[allow(clippy::type_complexity)]
 async fn stage_plugin_from_multipart(
     state: &SharedState,
+    repo: &proxy_helpers::RepoInfo,
     content_type: &str,
     body: Body,
 ) -> Result<
     (
-        proxy_helpers::StagedUpload,
+        super::repositories::GenericStagedBody,
         crate::services::artifact_service::ContentDigests,
         String,
         String,
@@ -695,7 +737,7 @@ async fn stage_plugin_from_multipart(
     let bad_request = proxy_helpers::multipart_error_response;
 
     let mut archive: Option<(
-        proxy_helpers::StagedUpload,
+        super::repositories::GenericStagedBody,
         crate::services::artifact_service::ContentDigests,
     )> = None;
     let mut plugin_name = String::new();
@@ -714,7 +756,9 @@ async fn stage_plugin_from_multipart(
                 )
                     .into_response());
             }
-            archive = Some(proxy_helpers::stage_stream_content_addressed(state, field).await?);
+            archive = Some(
+                super::repositories::GenericStagedBody::stage_for_repo(state, repo, field).await?,
+            );
         } else if field_name == "name" {
             plugin_name = read_small_field(&mut field).await?;
         } else if field_name == "version" {
@@ -1130,9 +1174,31 @@ mod tests {
         (state, dir)
     }
 
+    /// The filesystem repository the staging tests upload into. `stages_on_backend`
+    /// keeps a filesystem repository on local scratch, so these tests exercise
+    /// the same path a self-hosted deployment uses.
+    fn staging_repo(dir: &std::path::Path) -> RepoInfo {
+        RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            key: "jetbrains-test".to_string(),
+            storage_path: dir.to_str().unwrap().to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "hosted".to_string(),
+            upstream_url: None,
+            format: "jetbrains".to_string(),
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn test_stage_plugin_from_multipart_valid() {
         let (state, dir) = staging_state();
+        let repo = staging_repo(&dir);
         let boundary = "myboundary";
         let content_type = format!("multipart/form-data; boundary={}", boundary);
         let body = format!(
@@ -1153,7 +1219,8 @@ mod tests {
             boundary = boundary,
         );
         let result =
-            super::stage_plugin_from_multipart(&state, &content_type, Body::from(body)).await;
+            super::stage_plugin_from_multipart(&state, &repo, &content_type, Body::from(body))
+                .await;
         let ok = result.is_ok();
         let coords = result.ok().map(|(staged, digests, name, version)| {
             (staged.size_bytes(), digests.sha256.clone(), name, version)
@@ -1171,8 +1238,10 @@ mod tests {
     #[tokio::test]
     async fn test_stage_plugin_from_multipart_missing_boundary() {
         let (state, dir) = staging_state();
+        let repo = staging_repo(&dir);
         let result = super::stage_plugin_from_multipart(
             &state,
+            &repo,
             "multipart/form-data",
             Body::from("some body"),
         )
@@ -1185,6 +1254,7 @@ mod tests {
     #[tokio::test]
     async fn test_stage_plugin_from_multipart_no_file() {
         let (state, dir) = staging_state();
+        let repo = staging_repo(&dir);
         let boundary = "boundary";
         let content_type = format!("multipart/form-data; boundary={}", boundary);
         let body = format!(
@@ -1196,7 +1266,8 @@ mod tests {
             boundary = boundary,
         );
         let result =
-            super::stage_plugin_from_multipart(&state, &content_type, Body::from(body)).await;
+            super::stage_plugin_from_multipart(&state, &repo, &content_type, Body::from(body))
+                .await;
         let is_err = result.is_err();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(is_err);
@@ -1205,6 +1276,7 @@ mod tests {
     #[tokio::test]
     async fn test_stage_plugin_from_multipart_defaults() {
         let (state, dir) = staging_state();
+        let repo = staging_repo(&dir);
         let boundary = "b123";
         let content_type = format!("multipart/form-data; boundary={}", boundary);
         // Only file, no name or version fields
@@ -1217,7 +1289,8 @@ mod tests {
             boundary = boundary,
         );
         let result =
-            super::stage_plugin_from_multipart(&state, &content_type, Body::from(body)).await;
+            super::stage_plugin_from_multipart(&state, &repo, &content_type, Body::from(body))
+                .await;
         let coords = result.ok().map(|(_, _, name, version)| (name, version));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -1229,10 +1302,11 @@ mod tests {
     #[tokio::test]
     async fn test_stage_plugin_from_multipart_quoted_boundary() {
         let (state, dir) = staging_state();
+        let repo = staging_repo(&dir);
         let content_type = "multipart/form-data; boundary=\"myboundary\"";
         let body: &[u8] = b"--myboundary\r\nContent-Disposition: form-data; name=\"plugin\"; filename=\"p.zip\"\r\n\r\nFILE\r\n--myboundary--\r\n";
         let result =
-            super::stage_plugin_from_multipart(&state, content_type, Body::from(body)).await;
+            super::stage_plugin_from_multipart(&state, &repo, content_type, Body::from(body)).await;
         let is_ok = result.is_ok();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(is_ok);
@@ -1265,23 +1339,33 @@ mod tests {
     /// The binary round trip without a database: the parser alone, fed the
     /// same invalid-UTF-8 fixture the router test uses, must stage bytes
     /// identical to the file part. The router-level check needs
-    /// `DATABASE_URL`, so this is the one that runs in the pre-push hook.
+    /// `DATABASE_URL`, so this is the one that runs without a database.
     #[tokio::test]
     async fn test_stage_plugin_from_multipart_stages_binary_zip_verbatim() {
         use sha2::Digest;
 
         let (state, dir) = staging_state();
+        let repo = staging_repo(&dir);
         let zip = binary_plugin_zip();
         let boundary = "bin3848";
         let content_type = format!("multipart/form-data; boundary={boundary}");
         let body = multipart_body(boundary, &zip, "com.example.bin", "1.0.0");
 
         let result =
-            super::stage_plugin_from_multipart(&state, &content_type, Body::from(body)).await;
-        let staged = result.ok().map(|(staged, digests, name, version)| {
-            let bytes = std::fs::read(staged.path()).expect("read the staged file");
-            (bytes, digests.sha256, name, version)
-        });
+            super::stage_plugin_from_multipart(&state, &repo, &content_type, Body::from(body))
+                .await;
+        let staged = match result {
+            Ok((staged, digests, name, version)) => {
+                let local = crate::api::handlers::repositories::materialize_staged_for_repo(
+                    &state, &repo, &staged,
+                )
+                .await
+                .expect("materialize staged body");
+                let bytes = std::fs::read(local.path()).expect("read the staged file");
+                Some((bytes, digests.sha256, name, version))
+            }
+            Err(_) => None,
+        };
         let _ = std::fs::remove_dir_all(&dir);
 
         let (bytes, sha256, name, version) = staged.expect("a binary envelope must stage");
@@ -1309,21 +1393,30 @@ mod tests {
     #[tokio::test]
     async fn test_stage_plugin_from_multipart_oversized_envelope_is_413() {
         let (state, dir) = staging_state_with_ceiling(512);
+        let repo = staging_repo(&dir);
         let zip = vec![0xABu8; 4096];
         let boundary = "b413";
         let content_type = format!("multipart/form-data; boundary={boundary}");
         let envelope = multipart_body(boundary, &zip, "com.example.big", "1.0.0");
 
-        let whole =
-            super::stage_plugin_from_multipart(&state, &content_type, Body::from(envelope.clone()))
-                .await
-                .err()
-                .map(|resp| resp.status());
-        let chunked =
-            super::stage_plugin_from_multipart(&state, &content_type, chunked_body(&envelope, 64))
-                .await
-                .err()
-                .map(|resp| resp.status());
+        let whole = super::stage_plugin_from_multipart(
+            &state,
+            &repo,
+            &content_type,
+            Body::from(envelope.clone()),
+        )
+        .await
+        .err()
+        .map(|resp| resp.status());
+        let chunked = super::stage_plugin_from_multipart(
+            &state,
+            &repo,
+            &content_type,
+            chunked_body(&envelope, 64),
+        )
+        .await
+        .err()
+        .map(|resp| resp.status());
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(
@@ -1393,6 +1486,62 @@ mod tests {
             "a raw upload -> download round trip must return the exact uploaded bytes"
         );
         assert_eq!(stored, Some((expected_sha, zip.len() as i64)));
+    }
+
+    /// #4725: a plugin upload to a hosted repository must queue a push sync
+    /// task for a subscribed push peer, and an upload that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing
+    /// queued).
+    #[tokio::test]
+    async fn jetbrains_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "jetbrains").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "jetbrains").await;
+
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/plugin/uploadPlugin", fx.repo_key))
+            .header("x-plugin-name", "com.example.pushsync")
+            .header("x-plugin-version", "1.0.0")
+            .body(axum::body::Body::from("plugin-zip-bytes"))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "plugin upload must succeed: {status} {}",
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the plugin
+        // but must not queue another task.
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/plugin/uploadPlugin", fx.repo_key))
+            .header("x-plugin-name", "com.example.pushsync")
+            .header("x-plugin-version", "2.0.0")
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from("plugin-zip-bytes-2"))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated plugin upload must succeed: {status} {}",
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["com.example.pushsync/1.0.0/com.example.pushsync-1.0.0.zip".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
     }
 
     // -----------------------------------------------------------------------

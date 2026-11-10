@@ -75,7 +75,13 @@
 //!   ```
 //!
 //!   So `-- no-transaction` buys exactly one statement, and the `DROP INDEX IF
-//!   EXISTS` that clears a leftover invalid index belongs in its own file.
+//!   EXISTS` reset migration belongs in its own file. That reset runs once
+//!   (sqlx records it), so it only clears an index left INVALID by an attempt
+//!   made outside the migrator. A build that fails part-way inside the
+//!   migrator is repaired at startup instead: `CONCURRENT_INDEX_MIGRATIONS`
+//!   in `migration_repair` names the build migration and its index, and an
+//!   INVALID index of a not-yet-recorded build is dropped before it re-runs
+//!   (#4519).
 //!
 //! See `docs/operations/online-migrations.md` for the preflight/postflight
 //! runbook a new online migration is expected to follow.
@@ -146,6 +152,10 @@ const HOT_TABLES: &[(&str, &str)] = &[
         "one row per manifest-to-manifest reference in an OCI index",
     ),
     ("oci_tags", "one row per tag across every OCI repository"),
+    (
+        "oci_manifests",
+        "one row per OCI manifest per repository (#1683), at least as large as oci_tags",
+    ),
     (
         "manifest_blob_refs",
         "one row per blob referenced by a manifest — the widest OCI fan-out",
@@ -520,6 +530,19 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
         "artifact_metadata",
         1,
         "GIN index on the PyPI trove-classifier array for XML-RPC browse (#3783)",
+    ),
+    (
+        "339_scan_findings_text_columns.sql",
+        KIND_COLUMN_REWRITE,
+        "scan_findings",
+        6,
+        "six scanner text columns VARCHAR(n) -> TEXT so one long fixed-version \
+         string cannot fail a scan's whole findings batch (#5534). Binary \
+         coercible with no USING clause and no index on any of the six, so it \
+         is catalog-only on PG 16/18 (heap, TOAST and index relfilenodes \
+         unchanged, verified); the lock is taken with a 5s lock_timeout and \
+         retried. `cve_id` was left out because its partial index would be \
+         rebuilt",
     ),
 ];
 
@@ -941,6 +964,105 @@ fn tables_created(masked: &str) -> std::collections::BTreeSet<String> {
     out
 }
 
+/// First migration the timeout rule ([`timeout_findings`]) applies to
+/// (#4153). Everything before it is history: 222-269 had already run on
+/// development and staging databases when the rule was added, and editing an
+/// applied migration breaks its sqlx checksum. Migration 270 is the follow-up
+/// that carries the timeouts those files lacked.
+const TIMEOUT_RULE_FROM: u32 = 270;
+
+/// Why a migration must bound its lock waits, or is forbidden outright
+/// (#4153); `None` when it is fine.
+///
+/// Three shapes qualify when they touch a [`HOT_TABLES`] entry outside a
+/// routine body:
+///
+/// * a backfill: any `UPDATE <hot>`, `DELETE FROM <hot>` or
+///   `INSERT INTO <hot> … SELECT`, batched or not. Row locks queue behind a
+///   long transaction like any other lock, and a batch that cannot get its
+///   rows must give up and retry rather than stall the deploy for the
+///   session's 5-minute `lock_timeout` (main.rs);
+/// * `CREATE [OR REPLACE | CONSTRAINT] TRIGGER … ON <hot>`: it takes
+///   `SHARE ROW EXCLUSIVE`, which queues behind any open transaction on the
+///   table and blocks every write behind it while it waits;
+/// * `ALTER TABLE <hot> DISABLE|ENABLE [ALWAYS|REPLICA] TRIGGER`: forbidden,
+///   timeouts or not. Besides the table lock, in a `-- no-transaction` file
+///   the disabled state commits and is visible to every session. Relax a
+///   trigger through its function instead (docs/operations/online-migrations.md).
+///
+/// The first two must contain `SET [LOCAL] lock_timeout`. The check is
+/// file-level: it cannot tell whether the SET reaches every batch, so a file
+/// that sets it once and then COMMITs inside a DO block passes; the runbook's
+/// per-batch `SET LOCAL` is the author's responsibility. `statement_timeout`
+/// is deliberately not required: set inside a DO block it does not apply to
+/// the block's statements (the timer is armed per top-level statement), so the
+/// migration session's 30-minute `statement_timeout` is the only bound there.
+fn timeout_findings(masked: &str, hot: &std::collections::BTreeSet<&str>) -> Option<String> {
+    let routines = routine_bodies(masked);
+    let outside = |at: usize| !routines.iter().any(|(s, e)| at >= *s && at < *e);
+    let is_hot = |t: &Option<String>| t.as_deref().is_some_and(|t| hot.contains(t));
+    let mut reasons: Vec<String> = Vec::new();
+    let mut forbidden: Vec<String> = Vec::new();
+    for (offset, stmt) in statements(masked) {
+        let note = |list: &mut Vec<String>, at: usize, what: &str, table: Option<String>| {
+            if is_hot(&table) && outside(offset + at) {
+                let entry = format!("{what} on `{}`", table.unwrap_or_default());
+                if !list.contains(&entry) {
+                    list.push(entry);
+                }
+            }
+        };
+        for opener in ["UPDATE", "DELETE FROM"] {
+            let mut from = 0usize;
+            while let Some((s, e)) = find_phrase(stmt, opener, from) {
+                from = e;
+                note(&mut reasons, s, "backfill", identifier_after(stmt, e));
+            }
+        }
+        let mut from = 0usize;
+        while let Some((s, e)) = find_phrase(stmt, "INSERT INTO", from) {
+            from = e;
+            if find_phrase(stmt, "SELECT", e).is_some() {
+                note(&mut reasons, s, "backfill", identifier_after(stmt, e));
+            }
+        }
+        for opener in [
+            "CREATE TRIGGER",
+            "CREATE OR REPLACE TRIGGER",
+            "CREATE CONSTRAINT TRIGGER",
+        ] {
+            let mut from = 0usize;
+            while let Some((s, e)) = find_phrase(stmt, opener, from) {
+                from = e;
+                let table =
+                    find_phrase(stmt, "ON", e).and_then(|(_, on)| identifier_after(stmt, on));
+                note(&mut reasons, s, "trigger", table);
+            }
+        }
+        for toggle in [
+            "DISABLE TRIGGER",
+            "ENABLE TRIGGER",
+            "ENABLE ALWAYS TRIGGER",
+            "ENABLE REPLICA TRIGGER",
+        ] {
+            let mut from = 0usize;
+            while let Some((s, e)) = find_phrase(stmt, toggle, from) {
+                from = e;
+                note(&mut forbidden, s, toggle, alter_target(stmt, s));
+            }
+        }
+    }
+    if !forbidden.is_empty() {
+        return Some(format!("forbidden: {}", forbidden.join(", ")));
+    }
+    let sets_lock_timeout = find_phrase(masked, "SET LOCAL lock_timeout", 0).is_some()
+        || find_phrase(masked, "SET lock_timeout", 0).is_some();
+    if reasons.is_empty() || sets_lock_timeout {
+        return None;
+    }
+    Some(format!("{} without SET lock_timeout", reasons.join(", ")))
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
@@ -1135,9 +1257,13 @@ mod tests {
              FIRST LINE is exactly `-- no-transaction`. Add that header as the very first \
              line, and read docs/operations/online-migrations.md first: a no-transaction \
              migration that fails part-way is NOT rolled back and NOT recorded, so it must \
-             be written to be safely re-runnable (drop a leftover INVALID index before \
-             rebuilding -- `CREATE INDEX CONCURRENTLY IF NOT EXISTS` will happily skip an \
-             invalid one and leave it invalid forever).",
+             be written to be safely re-runnable. For `CREATE INDEX CONCURRENTLY`, register \
+             the migration (version, index name) in `CONCURRENT_INDEX_MIGRATIONS` \
+             (migration_repair.rs): a failed build leaves an INVALID index, which \
+             `CREATE INDEX CONCURRENTLY IF NOT EXISTS` skips on the re-run and records as \
+             done, and the startup repair drops it first. A `DROP INDEX IF EXISTS` \
+             migration before the build runs only once, so it covers out-of-band attempts \
+             only.",
             broken.join(", ")
         );
     }
@@ -1170,11 +1296,110 @@ mod tests {
              sqlx sends the whole file as one simple query, and PostgreSQL runs a \
              multi-statement simple query inside an implicit transaction block — which \
              is exactly what the header was supposed to avoid. Split the file so each \
-             `-- no-transaction` migration carries a single statement; a `DROP INDEX IF \
-             EXISTS` that clears a leftover invalid index goes in its own migration \
-             before the build. See docs/operations/online-migrations.md.",
+             `-- no-transaction` migration carries a single statement. A `DROP INDEX IF \
+             EXISTS` reset goes in its own transactional migration before the build (it \
+             runs once, so it only covers out-of-band attempts); a failed in-migrator \
+             build is repaired at startup when the build migration is registered in \
+             `CONCURRENT_INDEX_MIGRATIONS` (migration_repair.rs). See \
+             docs/operations/online-migrations.md.",
             bad.join(", ")
         );
+    }
+
+    /// #4153: a migration from [`TIMEOUT_RULE_FROM`] on that backfills a hot
+    /// table or creates a trigger on one must bound its lock waits, and none
+    /// may disable or enable a trigger on one.
+    #[test]
+    fn hot_table_backfills_and_triggers_set_timeouts() {
+        let hot: std::collections::BTreeSet<&str> = HOT_TABLES.iter().map(|(t, _)| *t).collect();
+        let mut bad = Vec::new();
+        for (name, body) in migration_files() {
+            let version: u32 = name
+                .split('_')
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("{name}: no numeric version prefix"));
+            if version < TIMEOUT_RULE_FROM {
+                continue;
+            }
+            if let Some(why) = timeout_findings(&mask_sql(&body), &hot) {
+                bad.push(format!("{name}: {why}"));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "migration(s) touch a hot table without bounding their lock waits, or toggle \
+             a trigger on one (#4153): {}\n\
+             Add `SET LOCAL lock_timeout = '5s'` to every transaction that runs the \
+             statement (inside a batching DO block, once per batch, since COMMIT ends SET \
+             LOCAL), and retry a batch that hits lock_not_available instead of waiting. \
+             Never DISABLE/ENABLE TRIGGER: relax the trigger through its function. See \
+             docs/operations/online-migrations.md.",
+            bad.join("; ")
+        );
+    }
+
+    #[test]
+    fn timeout_findings_flags_only_unbounded_hot_table_work() {
+        let hot: std::collections::BTreeSet<&str> = ["artifacts"].into_iter().collect();
+        let check = |sql: &str| timeout_findings(&mask_sql(sql), &hot);
+
+        // Backfill and trigger shapes without a lock timeout are flagged.
+        let backfill = "DO $$ BEGIN LOOP UPDATE artifacts SET x = 1 WHERE id IN \
+                        (SELECT id FROM artifacts LIMIT 10); COMMIT; END LOOP; END $$;";
+        assert_eq!(
+            check(backfill).as_deref(),
+            Some("backfill on `artifacts` without SET lock_timeout")
+        );
+        for trigger in [
+            "CREATE TRIGGER t BEFORE UPDATE ON artifacts FOR EACH ROW EXECUTE FUNCTION f();",
+            "CREATE OR REPLACE TRIGGER t BEFORE UPDATE ON artifacts \
+             FOR EACH ROW EXECUTE FUNCTION f();",
+            "CREATE CONSTRAINT TRIGGER t AFTER INSERT ON artifacts \
+             FOR EACH ROW EXECUTE FUNCTION f();",
+        ] {
+            assert_eq!(
+                check(trigger).as_deref(),
+                Some("trigger on `artifacts` without SET lock_timeout"),
+                "{trigger}"
+            );
+        }
+        assert_eq!(
+            check("INSERT INTO artifacts (id) SELECT id FROM legacy;").as_deref(),
+            Some("backfill on `artifacts` without SET lock_timeout")
+        );
+        // A plain VALUES insert is not a backfill.
+        assert_eq!(check("INSERT INTO artifacts (id) VALUES (1);"), None);
+
+        // Toggling a trigger on a hot table is forbidden, timeouts or not.
+        for toggle in [
+            "DISABLE TRIGGER t",
+            "ENABLE TRIGGER t",
+            "ENABLE ALWAYS TRIGGER t",
+        ] {
+            let sql = format!("SET LOCAL lock_timeout = '5s'; ALTER TABLE artifacts {toggle};");
+            assert!(
+                check(&sql).is_some_and(|w| w.starts_with("forbidden:")),
+                "{sql}"
+            );
+        }
+
+        // Bounded, a cold table, a routine body, or a comment: not flagged.
+        let bounded = format!("SET LOCAL lock_timeout = '5s'; {backfill}");
+        assert_eq!(check(&bounded), None);
+        assert_eq!(check("UPDATE system_settings SET v = 1;"), None);
+        assert_eq!(
+            check("ALTER TABLE system_settings DISABLE TRIGGER t;"),
+            None
+        );
+        assert_eq!(
+            check(
+                "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+                 UPDATE artifacts SET x = 1; RETURN NEW; END $f$;"
+            ),
+            None
+        );
+        assert_eq!(check("-- UPDATE artifacts SET x = 1\nSELECT 1;"), None);
     }
 
     /// Every hot table named in [`HOT_TABLES`] must actually exist in the

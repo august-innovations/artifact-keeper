@@ -19,6 +19,9 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::quarantine_service;
 
 /// Create quarantine routes.
@@ -142,6 +145,11 @@ pub async fn get_quarantine_status(
         "Artifact not found",
     )
     .await?;
+    // #5253: an MCP server version readers are not served is missing for a
+    // caller who does not hold the registry. A holder (the reason gate below)
+    // passes, as on the registry surface.
+    let caller = Some(auth_ext.clone());
+    crate::api::handlers::artifacts::require_mcp_servable(&state, &caller, artifact_id).await?;
 
     let now = chrono::Utc::now();
     let is_blocked = quarantine_service::check_download_allowed(
@@ -170,20 +178,8 @@ pub async fn get_quarantine_status(
     // field was handed to any authenticated caller on any repository. The
     // comment is why the gate survived review; the predicate is now spelled out
     // instead of delegated to a name that means something else.
-    let repo_service =
-        crate::services::repository_service::RepositoryService::new(state.db.clone());
-    let holds_repository = auth_ext.can_access_repo(row.repository_id)
-        && (auth_ext.is_admin
-            || repo_service
-                .user_can_access_repo(
-                    row.repository_id,
-                    auth_ext.user_id,
-                    // CONTENT (#3331): the reason is the policy name, finding
-                    // counts and admin incident notes behind the hold — private
-                    // security detail, so `read` and not merely a grant.
-                    crate::services::repository_service::RepoAccess::READ,
-                )
-                .await?);
+    let holds_repository =
+        caller_passes_reason_gate(&state.db, &auth_ext, row.repository_id).await?;
     let quarantine_reason = if holds_repository {
         row.quarantine_reason
     } else {
@@ -197,6 +193,34 @@ pub async fn get_quarantine_status(
         quarantine_reason,
         is_blocked,
     }))
+}
+
+/// The REASON gate: whether `auth_ext` genuinely HOLDS repository
+/// `repo_id` (`in_scope AND (is_admin OR grants)`), the `is_public` arm of the
+/// visibility predicate deliberately dropped. Shared by the quarantine status
+/// endpoint (the hold reason) and the MCP registry surface (#5253: why a
+/// server version is held), so both disclose to exactly the same callers.
+pub(crate) async fn caller_passes_reason_gate(
+    db: &sqlx::PgPool,
+    auth_ext: &AuthExtension,
+    repo_id: Uuid,
+) -> Result<bool> {
+    if !auth_ext.can_access_repo(repo_id) {
+        return Ok(false);
+    }
+    if auth_ext.is_admin {
+        return Ok(true);
+    }
+    crate::services::repository_service::RepositoryService::new(db.clone())
+        .user_can_access_repo(
+            repo_id,
+            auth_ext.user_id,
+            // CONTENT (#3331): the reason is the policy name, finding counts
+            // and admin incident notes behind the hold — private security
+            // detail, so `read` and not merely a grant.
+            crate::services::repository_service::RepoAccess::READ,
+        )
+        .await
 }
 
 /// Quarantine an artifact immediately (admin only)
@@ -291,7 +315,7 @@ pub async fn release_artifact(
     auth.require_admin()?;
 
     // Verify artifact exists
-    quarantine_service::get_status(&state.db, artifact_id).await?;
+    let (previous_status, _) = quarantine_service::get_status(&state.db, artifact_id).await?;
 
     quarantine_service::transition(
         &state.db,
@@ -300,6 +324,21 @@ pub async fn release_artifact(
         None,
     )
     .await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(
+            AuditAction::QuarantineReleased,
+            ResourceType::Artifact,
+            &auth,
+        )
+        .resource(artifact_id)
+        .details(serde_json::json!({
+            "artifact_id": artifact_id,
+            "previous_status": previous_status,
+        })),
+    )
+    .await;
 
     tracing::info!(
         artifact_id = %artifact_id,
@@ -371,6 +410,23 @@ pub async fn release_proxy_cache_entry(
         .release_quarantined_cache_entry(repo.id, req.path.trim())
         .await?;
 
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(
+            AuditAction::QuarantineReleased,
+            ResourceType::Repository,
+            &auth,
+        )
+        .resource(repo.id)
+        .resource_name(repo_key.clone())
+        .details(serde_json::json!({
+            "repository": repo_key,
+            "path": req.path.trim(),
+            "proxy_cache": true,
+        })),
+    )
+    .await;
+
     tracing::info!(
         repository = %repo_key,
         path = %req.path,
@@ -417,7 +473,7 @@ pub async fn reject_artifact(
     auth.require_admin()?;
 
     // Verify artifact exists
-    quarantine_service::get_status(&state.db, artifact_id).await?;
+    let (previous_status, _) = quarantine_service::get_status(&state.db, artifact_id).await?;
 
     // Persist the admin's rejection reason rather than only logging it, so the
     // stored reason describes the rejection instead of whatever the preceding
@@ -429,6 +485,22 @@ pub async fn reject_artifact(
         req.reason.as_deref(),
     )
     .await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(
+            AuditAction::QuarantineRejected,
+            ResourceType::Artifact,
+            &auth,
+        )
+        .resource(artifact_id)
+        .details(serde_json::json!({
+            "artifact_id": artifact_id,
+            "previous_status": previous_status,
+            "reason": req.reason,
+        })),
+    )
+    .await;
 
     let reason = req.reason.as_deref().unwrap_or("No reason provided");
     tracing::info!(
@@ -811,6 +883,49 @@ mod tests {
         );
     }
 
+    /// #4710: releasing and rejecting a held artifact each write one audit
+    /// row naming the admin, the artifact and the state it left.
+    #[tokio::test]
+    async fn test_release_and_reject_are_audited() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let released = seed_artifact(&fx, Some("quarantined"), None, Some("held")).await;
+        let rejected = seed_artifact(&fx, Some("quarantined"), None, Some("held")).await;
+
+        let (release_status, _) = tdh::send(
+            admin_router(&fx),
+            tdh::post(
+                format!("/{released}/release"),
+                "application/json",
+                Bytes::new(),
+            ),
+        )
+        .await;
+        let (reject_status, _) = tdh::send(
+            admin_router(&fx),
+            tdh::post(
+                format!("/{rejected}/reject"),
+                "application/json",
+                Bytes::from_static(br#"{"reason":"typosquat"}"#),
+            ),
+        )
+        .await;
+        let release_row =
+            tdh::audit_row_eventually(&fx.pool, released, "QUARANTINE_RELEASED").await;
+        let reject_row = tdh::audit_row_eventually(&fx.pool, rejected, "QUARANTINE_REJECTED").await;
+        fx.teardown().await;
+
+        assert_eq!(release_status, StatusCode::OK);
+        assert_eq!(reject_status, StatusCode::OK);
+        assert_eq!(release_row.user_id, Some(fx.user_id));
+        assert_eq!(release_row.resource_type, "artifact");
+        assert_eq!(release_row.details["previous_status"], "quarantined");
+        assert_eq!(reject_row.user_id, Some(fx.user_id));
+        assert_eq!(reject_row.details["reason"], "typosquat");
+        assert_eq!(reject_row.details["previous_status"], "quarantined");
+    }
+
     // -----------------------------------------------------------------------
     // #3174: `can_access_repo` is TOKEN SCOPE, not repository visibility.
     // -----------------------------------------------------------------------
@@ -1076,8 +1191,16 @@ mod tests {
         .expect_err("a double release must be refused");
         assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
 
+        // #4710: the release is audited against the repository, with the path.
+        let row = tdh::audit_row_eventually(&fx.pool, fx.repo_id, "QUARANTINE_RELEASED").await;
+
         fx.teardown().await;
         let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(row.user_id, Some(fx.user_id));
+        assert_eq!(row.resource_type, "repository");
+        assert_eq!(row.details["path"], path.as_str());
+        assert_eq!(row.details["proxy_cache"], true);
     }
 
     /// Authz and lookup failures: admin-only (403), unauthenticated (401),
@@ -1161,6 +1284,48 @@ mod tests {
 
         fx.teardown().await;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #5253: the reason-gate predicate the quarantine status endpoint and
+    /// the MCP registry surface share: admin and grant holder pass, a caller
+    /// who can see the repository only because it is public does not, and a
+    /// token scoped to another repository does not.
+    #[tokio::test]
+    async fn reason_gate_predicate_admits_only_repository_holders_5253() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let member = tdh::make_auth(fx.user_id, &fx.username);
+        assert!(caller_passes_reason_gate(&fx.pool, &member, fx.repo_id)
+            .await
+            .unwrap());
+        let (other, other_name) = tdh::create_user(&fx.pool).await;
+        assert!(caller_passes_reason_gate(
+            &fx.pool,
+            &tdh::admin_auth(other, &other_name),
+            fx.repo_id
+        )
+        .await
+        .unwrap());
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        assert!(!caller_passes_reason_gate(
+            &fx.pool,
+            &tdh::make_auth(other, &other_name),
+            fx.repo_id
+        )
+        .await
+        .unwrap());
+        let scoped = AuthExtension {
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                Uuid::new_v4(),
+            ]),
+            ..member
+        };
+        assert!(!caller_passes_reason_gate(&fx.pool, &scoped, fx.repo_id)
+            .await
+            .unwrap());
+        tdh::cleanup_user(&fx.pool, other).await;
+        fx.teardown().await;
     }
 }
 

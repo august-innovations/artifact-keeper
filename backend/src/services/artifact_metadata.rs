@@ -45,6 +45,8 @@ pub fn parse_name_and_version(
         "maven" | "gradle" | "sbt" | "ivy" => parse_maven(filename, artifact_path),
         "nuget" => parse_nuget(filename, artifact_path),
         "go" | "golang" => parse_go(artifact_path, filename),
+        "cran" => parse_cran(filename, artifact_path),
+        "debian" => parse_debian(filename),
         _ => fallback(filename),
     }
 }
@@ -351,6 +353,66 @@ fn parse_npm(filename: &str, artifact_path: &str) -> ParsedArtifact {
 }
 
 // ---------------------------------------------------------------------------
+// CRAN
+// ---------------------------------------------------------------------------
+
+/// CRAN parser (#2525). Source packages are `<name>_<version>.tar.gz`,
+/// wherever the source keeps them (`src/contrib/` or
+/// `src/contrib/Archive/<name>/`). R package names cannot contain `_`, so the
+/// last `_` splits name from version, exactly as the CRAN handler's own path
+/// parser does.
+///
+/// Binary packages (`bin/<platform>/contrib/<r-version>/...`) deliberately
+/// fall back: the same `<name>_<version>.tgz` exists once per R version, so a
+/// `<name>/<version>/<file>` canonical path would collapse them into one row,
+/// and they are not source packages the `src/contrib/PACKAGES` index may
+/// advertise. They keep their source path instead.
+fn parse_cran(filename: &str, artifact_path: &str) -> ParsedArtifact {
+    if is_cran_binary_path(artifact_path) {
+        return fallback(filename);
+    }
+    let stem = filename.strip_suffix(".tar.gz");
+    if let Some((name, version)) = stem.and_then(|s| s.rsplit_once('_')) {
+        if !name.is_empty() && !version.is_empty() {
+            return ParsedArtifact {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+            };
+        }
+    }
+    fallback(filename)
+}
+
+/// Debian binary package: `{package}_{version}_{arch}.deb` (also `.udeb` /
+/// `.ddeb`), the name `dpkg-name` gives and the Debian handler requires
+/// (#4657). The package name and architecture never contain `_`; the version
+/// cannot either (Debian policy), so the split is unambiguous. Anything else
+/// in a Debian repository (source tarballs, `.dsc`) keeps the fallback.
+fn parse_debian(filename: &str) -> ParsedArtifact {
+    let stem = [".deb", ".udeb", ".ddeb"]
+        .iter()
+        .find_map(|ext| filename.strip_suffix(ext));
+    let parts: Option<Vec<&str>> = stem.map(|s| s.split('_').collect());
+    match parts.as_deref() {
+        Some([name, version, arch])
+            if !name.is_empty() && !version.is_empty() && !arch.is_empty() =>
+        {
+            ParsedArtifact {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+            }
+        }
+        _ => fallback(filename),
+    }
+}
+
+/// `bin/<platform>/contrib/...`: where CRAN mirrors keep binary packages.
+fn is_cran_binary_path(artifact_path: &str) -> bool {
+    let mut segs = artifact_path.trim_start_matches('/').split('/');
+    segs.next() == Some("bin") && segs.next().is_some() && segs.next() == Some("contrib")
+}
+
+// ---------------------------------------------------------------------------
 // Maven
 // ---------------------------------------------------------------------------
 
@@ -482,6 +544,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_debian_4657() {
+        assert_eq!(
+            parse_name_and_version(
+                "debian",
+                "hello_1.0-1_amd64.deb",
+                "pool/main/h/hello/hello_1.0-1_amd64.deb"
+            ),
+            ParsedArtifact {
+                name: "hello".into(),
+                version: Some("1.0-1".into())
+            }
+        );
+        assert_eq!(
+            parse_name_and_version("debian", "d-i_2:1.2_all.udeb", "pool/d-i_2:1.2_all.udeb")
+                .version
+                .as_deref(),
+            Some("2:1.2")
+        );
+        for not_binary in [
+            "hello_1.0.orig.tar.gz",
+            "hello_1.0-1.dsc",
+            "README",
+            "a_b.deb",
+        ] {
+            assert_eq!(
+                parse_name_and_version("debian", not_binary, not_binary),
+                fallback(not_binary),
+                "{not_binary}"
+            );
+        }
+    }
+
+    #[test]
     fn pypi_wheel() {
         let p = parse_name_and_version(
             "pypi",
@@ -610,6 +705,41 @@ mod tests {
         );
         assert_eq!(p.name, "guava");
         assert_eq!(p.version.as_deref(), Some("31.1-jre"));
+    }
+
+    #[test]
+    fn cran_source_and_binary_packages_2525() {
+        let p = parse_name_and_version(
+            "cran",
+            "dplyr_1.1.4.tar.gz",
+            "src/contrib/dplyr_1.1.4.tar.gz",
+        );
+        assert_eq!(p.name, "dplyr");
+        assert_eq!(p.version.as_deref(), Some("1.1.4"));
+
+        let archived = parse_name_and_version(
+            "CRAN",
+            "data.table_1.14.8.tar.gz",
+            "src/contrib/Archive/data.table/data.table_1.14.8.tar.gz",
+        );
+        assert_eq!(archived.name, "data.table");
+        assert_eq!(archived.version.as_deref(), Some("1.14.8"));
+
+        // A source package literally named `bin` is not a binary path.
+        let named_bin = parse_name_and_version("cran", "bin_0.1.tar.gz", "bin/0.1/bin_0.1.tar.gz");
+        assert_eq!(named_bin.name, "bin");
+        assert_eq!(named_bin.version.as_deref(), Some("0.1"));
+
+        // Binaries keep their source path (one file per R version).
+        for (file, path) in [
+            ("Rcpp_1.0.12.zip", "bin/windows/contrib/4.3/Rcpp_1.0.12.zip"),
+            ("Rcpp_1.0.12.tgz", "bin/macosx/contrib/4.4/Rcpp_1.0.12.tgz"),
+        ] {
+            assert_eq!(parse_name_and_version("cran", file, path).version, None);
+        }
+
+        let index = parse_name_and_version("cran", "PACKAGES.gz", "src/contrib/PACKAGES.gz");
+        assert_eq!(index.version, None);
     }
 
     #[test]

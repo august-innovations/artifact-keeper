@@ -1,7 +1,10 @@
 //! Guest-access guard middleware (issue #850).
 //!
 //! Enforces a server-wide policy that disables anonymous (unauthenticated)
-//! access. When `config.guest_access_enabled` is `false`, this middleware
+//! access. The policy is read at request time from the runtime
+//! [`GuestAccessPolicy`] handle (#867: `AK_GUEST_ACCESS_ENABLED` when set
+//! explicitly, else the admin-managed `system_settings` row, else `true`), so
+//! an admin flip applies without a restart. When it is `false`, this middleware
 //! returns `401 Unauthorized` for any request that does not present valid
 //! credentials, with a small allowlist for endpoints that must remain
 //! reachable so users and package clients can authenticate:
@@ -9,6 +12,10 @@
 //! * `/api/v1/auth/*`              login, refresh, logout, SSO callbacks
 //! * `/api/v1/setup/*`             initial setup wizard
 //! * `/api/v1/system/config`       web UI fetches before login
+//! * `/api/v1/banners`             active maintenance banners (#2155)
+//! * `/api/v1/webhooks/jwks`       public keys webhook receivers verify with
+//! * `/device`, `/device/app.js`,
+//!   `/device/app.css`             device authorization page (#3461)
 //! * `/health`, `/healthz`,
 //!   `/ready`, `/readyz`, `/livez`  Kubernetes / load-balancer probes
 //! * `/v2/token`                   OCI credential exchange (see below)
@@ -59,6 +66,17 @@
 //! under load — the exact regression `AuthOutcome::Overloaded` exists to prevent
 //! (a saturated auth cap is retryable; non-retrying clients such as twine abort
 //! on 401). The guard therefore returns the same 503 the inner middlewares do.
+//!
+//! ### The guard never binds against the directory (#4933)
+//!
+//! The opt-in LDAP Basic-auth passthrough (#3830) belongs to the package-route
+//! middlewares. This global layer decides only from local credentials: a
+//! directory password is invisible to it. When local resolution rejects a
+//! Basic credential on a package surface (a format route, or the generic
+//! `/api/v1/repositories/{key}/download/...` route), the guard passes the
+//! request to that route, which runs the passthrough once. On the management
+//! API and `/v2` the guard answers the rejection itself, so those requests
+//! never cause a directory bind or a package-manager `LOGIN_FAILED` row.
 
 use std::sync::Arc;
 
@@ -73,18 +91,22 @@ use serde_json::json;
 
 use crate::api::extractors::request_base_url_from_request;
 use crate::api::middleware::auth::{
-    extract_visibility_token, is_browser_request, service_unavailable_response,
-    try_resolve_auth_outcome, AuthOutcome,
+    extract_ticket_from_query, extract_visibility_token, extracted_basic_credentials,
+    is_browser_request, service_unavailable_response, try_resolve_auth_outcome, AuthOutcome,
 };
 use crate::api::middleware::oci_errors::{is_oci_v2_path, oci_unauthorized_response};
 use crate::services::auth_service::AuthService;
+use crate::services::guest_access_policy::GuestAccessPolicy;
 
 /// Shared state for the guest-access guard.
 ///
-/// Holds the policy flag and the `AuthService` needed to validate tokens.
+/// Holds the runtime policy handle and the `AuthService` needed to validate
+/// tokens. The policy is the same `Arc` the admin settings endpoint writes
+/// through (#867), so a flip is enforced on the next request without a
+/// restart: the write refreshes the handle's cache with the new value.
 #[derive(Clone)]
 pub struct GuestAccessState {
-    pub guest_access_enabled: bool,
+    pub policy: Arc<GuestAccessPolicy>,
     pub auth_service: Arc<AuthService>,
 }
 
@@ -96,6 +118,16 @@ pub struct GuestAccessState {
 /// endpoint is exempt — the OCI Distribution *content* surface included
 /// (#3854). An OCI client still learns where to authenticate, because the
 /// refusal it gets carries the token-endpoint challenge; see the module docs.
+///
+/// `/api/v1/webhooks/jwks` (#921) serves only public keys: webhook
+/// receivers hold no Artifact Keeper credentials and must still be able to
+/// verify `v2=` signatures. Exact match; the rest of `/api/v1/webhooks`
+/// stays gated.
+///
+/// `/.well-known/terraform.json` is exempt because Terraform/OpenTofu fetch
+/// host-level service discovery before they can attach credentials; it only
+/// names the registry mount point (and 404s unless `TERRAFORM_DEFAULT_REPO` is
+/// set). The registry endpoints it points at remain gated.
 ///
 /// `/v2/token` is the one OCI entry, and it is not a carve-out for anonymity:
 /// it is the endpoint by which credentials are *obtained*, the OCI analogue of
@@ -116,7 +148,13 @@ fn is_allowlisted(path: &str) -> bool {
             | "/readyz"
             | "/livez"
             | "/api/v1/system/config"
+            | "/api/v1/banners"
+            | "/api/v1/webhooks/jwks"
             | "/v2/token"
+            | "/.well-known/terraform.json"
+            | "/device"
+            | "/device/app.js"
+            | "/device/app.css"
     ) || path.starts_with("/api/v1/auth/")
         || path == "/api/v1/auth"
         || path.starts_with("/api/v1/setup/")
@@ -197,6 +235,10 @@ fn guard_short_circuit(
         // Transient bcrypt-capacity shed: retryable 503, never a 401 — on the
         // OCI surface as on every other.
         AuthOutcome::Overloaded => Some(service_unavailable_response()),
+        // The shared login limiter refused a passthrough bind (#3830).
+        AuthOutcome::RateLimited(retry_after) => {
+            Some(super::auth::rate_limited_response(*retry_after))
+        }
         // No/invalid credential presented: guest access is disabled → 401,
         // shaped for the protocol the client is speaking.
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => Some(match oci_base_url {
@@ -206,6 +248,91 @@ fn guard_short_circuit(
     }
 }
 
+/// Whether `path` is handled by a route that itself runs the LDAP Basic-auth
+/// passthrough (`repo_visibility_middleware` on the format routers, or
+/// `repository_download_auth_middleware` on the generic download route).
+///
+/// The guard uses this only to decide whether to *defer* an invalid Basic
+/// credential: on these surfaces the inner middleware owns the one bind and
+/// the one audit row. Every other surface answers the credential locally,
+/// with no directory traffic.
+///
+/// The management API (`/api/v1/*`) and the OCI Distribution API (`/v2/*`)
+/// are deliberately not passthrough surfaces. `/api/v1` authenticates with
+/// `allow_basic_api_token = false` and never runs the passthrough; OCI
+/// authenticates through its own token exchange. The generic repository
+/// download route is the one `/api/v1` path that does run it.
+///
+/// The prefixes below are exactly the mounts merged into `format_routes` in
+/// `api/routes.rs` (plus the wasm `/ext` proxy), not every non-`/api/v1` path:
+/// deferring a bad Basic credential on `/auth`, `/metrics`, `/swagger` or the
+/// host-level `/.well-known/terraform.json` would hand those surfaces a request
+/// the guest guard is supposed to refuse.
+fn defers_to_package_route(path: &str) -> bool {
+    if path.starts_with("/api/v1") {
+        return is_repository_download_path(path);
+    }
+    if is_oci_v2_path(path) {
+        return false;
+    }
+    const PACKAGE_PREFIXES: &[&str] = &[
+        "/general",
+        "/npm",
+        "/maven",
+        "/pypi",
+        "/debian",
+        "/nuget",
+        "/rpm",
+        "/cargo",
+        "/api/cargo",
+        "/gems",
+        "/lfs",
+        "/pub",
+        "/go",
+        "/helm",
+        "/api/helm",
+        "/composer",
+        "/conan",
+        "/alpine",
+        "/pacman",
+        "/conda",
+        "/conda/t",
+        "/t",
+        "/swift",
+        "/terraform",
+        "/cocoapods",
+        "/hex",
+        "/huggingface",
+        "/mcp",
+        "/jetbrains",
+        "/agentplugins",
+        "/chef",
+        "/puppet",
+        "/ansible",
+        "/cran",
+        "/bazel",
+        "/ivy",
+        "/vscode",
+        "/proto",
+        "/incus",
+        "/lxc",
+        "/ext",
+    ];
+    PACKAGE_PREFIXES.iter().any(|prefix| {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| path.len() == prefix.len() || rest.starts_with('/'))
+    })
+}
+
+/// `GET /api/v1/repositories/{key}/download/{path}` — the one management-API
+/// prefix layered with [`repository_download_auth_middleware`] instead of the
+/// ordinary `optional_auth_middleware`.
+fn is_repository_download_path(path: &str) -> bool {
+    path.strip_prefix("/api/v1/repositories/")
+        .and_then(|rest| rest.split_once("/download/"))
+        .is_some_and(|(key, _)| !key.is_empty() && !key.contains('/'))
+}
+
 /// Middleware that blocks unauthenticated requests when guest access is
 /// disabled server-wide. See module docs for behaviour and allowlist.
 pub async fn guest_access_guard(
@@ -213,7 +340,7 @@ pub async fn guest_access_guard(
     request: Request,
     next: Next,
 ) -> Response {
-    if state.guest_access_enabled {
+    if state.policy.is_enabled().await {
         return next.run(request).await;
     }
 
@@ -246,9 +373,11 @@ pub async fn guest_access_guard(
     // Inner middlewares re-resolve and populate request extensions for handlers
     // on requests that pass the guard.
     let extracted = extract_visibility_token(&request);
-    // Pass `allow_basic_api_token=true`: this global guard runs BEFORE the inner
-    // middlewares and only decides pass/block for the anonymous-disabled policy,
-    // mirroring the format extractor above. A package client pulling a format
+    // Local decision only (#4933). This global layer runs BEFORE the inner
+    // middlewares and must not bind against the directory: a Basic request to
+    // the management API or `/v2` would otherwise cause directory traffic and
+    // a package-manager audit row for a credential the inner layer never tries.
+    // Pass `allow_basic_api_token=true`: a package client pulling a format
     // endpoint with `-u any:<api_token>` must clear this gate exactly as it did
     // before the #2806 boundary fix. It does NOT grant /api/v1 access: the inner
     // `optional_auth_middleware` / `admin_middleware` re-resolve with
@@ -260,6 +389,23 @@ pub async fn guest_access_guard(
     // (#2936 / #3082). Classified from request headers only (Fetch Metadata /
     // `Accept: text/html`), so package clients are unaffected.
     let for_browser = is_browser_request(request.headers());
+    // A directory credential is invisible to the local decision above. On a
+    // package surface, hand it to the route's own auth middleware, which owns
+    // the passthrough: exactly one directory bind and one LOGIN_FAILED row per
+    // rejected request (#4933). Management and OCI requests are still answered
+    // here, so they never bind.
+    //
+    // Not when the request also carries a `?ticket=`: the route would accept
+    // the ticket in place of the rejected credential, and with guest access
+    // off a ticket alone does not open this guard. Such a request is answered
+    // here, exactly as it would be without the Basic header.
+    if matches!(outcome, AuthOutcome::InvalidCredential)
+        && defers_to_package_route(path)
+        && extracted_basic_credentials(extracted).is_some()
+        && extract_ticket_from_query(request.uri().query()).is_none()
+    {
+        return next.run(request).await;
+    }
     match guard_short_circuit(&outcome, for_browser, oci_base_url.as_deref()) {
         Some(response) => response,
         None => next.run(request).await,
@@ -286,10 +432,11 @@ pub fn startup_notice(guest_access_enabled: bool, public_repositories: i64) -> O
         "repositories are"
     };
     Some(format!(
-        "AK_GUEST_ACCESS_ENABLED is on and {public_repositories} {plural} public: anonymous \
-         clients can list and download from them. Set AK_GUEST_ACCESS_ENABLED=false to refuse \
-         anonymous access server-wide (this also coerces every repository to private), or mark \
-         the repositories private individually."
+        "Guest access is on and {public_repositories} {plural} public: anonymous clients can \
+         list and download from them. To refuse anonymous access server-wide, turn guest access \
+         off with PATCH /api/v1/admin/settings/system {{\"guest_access_enabled\": false}} \
+         (or pin it with AK_GUEST_ACCESS_ENABLED=false), or mark the repositories private \
+         individually."
     ))
 }
 
@@ -315,6 +462,19 @@ mod tests {
     }
 
     #[test]
+    fn allowlist_terraform_host_discovery_exact_only() {
+        // Registry clients fetch host-level discovery before they can send
+        // credentials; the document only names the registry mount point.
+        assert!(is_allowlisted("/.well-known/terraform.json"));
+        assert!(!is_allowlisted("/.well-known/terraform.json/"));
+        assert!(!is_allowlisted("/.well-known/terraform.jsonx"));
+        assert!(!is_allowlisted("/.well-known/other.json"));
+        assert!(!is_allowlisted(
+            "/terraform/repo/.well-known/terraform.json"
+        ));
+    }
+
+    #[test]
     fn allowlist_auth_namespace() {
         assert!(is_allowlisted("/api/v1/auth"));
         assert!(is_allowlisted("/api/v1/auth/login"));
@@ -327,6 +487,22 @@ mod tests {
     fn allowlist_setup_namespace() {
         assert!(is_allowlisted("/api/v1/setup"));
         assert!(is_allowlisted("/api/v1/setup/status"));
+    }
+
+    #[test]
+    fn allowlist_public_banners_exactly() {
+        // #2155: the login page shows maintenance banners before anyone has
+        // authenticated. Only the public list is exempt -- the admin CRUD
+        // surface and anything that merely starts with the bytes stay gated.
+        assert!(is_allowlisted("/api/v1/banners"));
+        for p in [
+            "/api/v1/banners/",
+            "/api/v1/banners/x",
+            "/api/v1/bannersX",
+            "/api/v1/admin/banners",
+        ] {
+            assert!(!is_allowlisted(p), "{p} must not be allowlisted");
+        }
     }
 
     #[test]
@@ -359,6 +535,25 @@ mod tests {
     }
 
     #[test]
+    fn allowlist_carries_the_device_page_exactly() {
+        // The RFC 8628 verification page must load with guest access off
+        // (the user signs in on it); its assets are exact entries, not a
+        // `/device` prefix that would open anything mounted beneath it.
+        for p in ["/device", "/device/app.js", "/device/app.css"] {
+            assert!(is_allowlisted(p), "{p} should be allowlisted");
+        }
+        for p in [
+            "/device/",
+            "/device/other",
+            "/devices",
+            "/device/app.js/x",
+            "/deviceX",
+        ] {
+            assert!(!is_allowlisted(p), "{p} must stay gated");
+        }
+    }
+
+    #[test]
     fn allowlist_carries_the_token_endpoint_as_its_only_oci_entry() {
         // The token endpoint is where credentials are obtained, so the guard
         // lets it through and `token()` refuses the anonymous mint instead —
@@ -383,6 +578,79 @@ mod tests {
                 "{p} must not ride the /v2/token entry into the allowlist"
             );
         }
+    }
+
+    // -- #4933: the guard defers directory credentials to package routes --
+
+    #[test]
+    fn package_surfaces_defer_while_management_and_oci_do_not() {
+        // Format routes own the LDAP Basic-auth passthrough.
+        for path in [
+            "/npm/private/pkg",
+            "/maven/private/com/acme/app/1.0/app.jar",
+            "/pypi/private/simple/pkg/",
+            "/composer/private/packages.json",
+            "/api/cargo/private/config.json",
+            "/api/helm/private/charts",
+            "/ext/plugin/resource",
+        ] {
+            assert!(defers_to_package_route(path), "{path} must defer");
+        }
+
+        // The generic repository download route is the one management-API
+        // path layered with the passthrough middleware (#4654).
+        assert!(defers_to_package_route(
+            "/api/v1/repositories/private/download/com/acme/app.jar"
+        ));
+
+        // The management API and OCI authenticate locally / through the token
+        // exchange; the guard must answer them itself and never bind.
+        for path in [
+            "/api/v1/repositories",
+            "/api/v1/users/me",
+            "/api/v1/repositories/private",
+            "/v2/",
+            "/v2/library/nginx/manifests/latest",
+            // Non-package surfaces are not passthrough routes. A broad
+            // "anything not /api/v1 or /v2" check would defer these.
+            "/auth/login",
+            "/metrics",
+            "/swagger",
+            "/.well-known/terraform.json",
+            "/terraform.json",
+            "/health",
+        ] {
+            assert!(!defers_to_package_route(path), "{path} must not defer");
+        }
+        // Prefix matching is segment-anchored, not textual.
+        assert!(!defers_to_package_route("/npmfoo/pkg"));
+        assert!(!defers_to_package_route("/tanother/pkg"));
+    }
+
+    #[test]
+    fn repository_download_path_is_anchored_to_the_route_shape() {
+        assert!(is_repository_download_path(
+            "/api/v1/repositories/key/download/a/b.bin"
+        ));
+        assert!(!is_repository_download_path("/api/v1/repositories"));
+        assert!(!is_repository_download_path("/api/v1/repositories/key"));
+        assert!(!is_repository_download_path(
+            "/api/v1/repositories/key/download"
+        ));
+        assert!(!is_repository_download_path(
+            "/api/v1/repositories/a/b/download/x"
+        ));
+    }
+
+    #[test]
+    fn allowlist_webhook_jwks_is_exact() {
+        assert!(is_allowlisted("/api/v1/webhooks/jwks"));
+        assert!(!is_allowlisted("/api/v1/webhooks"));
+        assert!(!is_allowlisted("/api/v1/webhooks/"));
+        assert!(!is_allowlisted("/api/v1/webhooks/jwks/extra"));
+        assert!(!is_allowlisted(
+            "/api/v1/webhooks/00000000-0000-0000-0000-000000000000"
+        ));
     }
 
     #[test]
@@ -594,7 +862,7 @@ mod tests {
         config.guest_access_enabled = guest_access_enabled;
         let auth_service = Arc::new(AuthService::new(lazy_pool(), Arc::new(config)));
         GuestAccessState {
-            guest_access_enabled,
+            policy: Arc::new(GuestAccessPolicy::fixed(guest_access_enabled)),
             auth_service,
         }
     }
@@ -1022,7 +1290,7 @@ mod tests {
         let _phantom: Option<AuthExtension> = None;
 
         let state = GuestAccessState {
-            guest_access_enabled: false,
+            policy: Arc::new(GuestAccessPolicy::fixed(false)),
             auth_service,
         };
         let app = make_app(state);
@@ -1071,7 +1339,7 @@ mod tests {
         config.guest_access_enabled = false;
         let auth_service = Arc::new(AuthService::new(pool, Arc::new(config)));
         let state = GuestAccessState {
-            guest_access_enabled: false,
+            policy: Arc::new(GuestAccessPolicy::fixed(false)),
             auth_service,
         };
 
@@ -1116,7 +1384,7 @@ mod tests {
         let mut config = Config::test_config();
         config.guest_access_enabled = false;
         GuestAccessState {
-            guest_access_enabled: false,
+            policy: Arc::new(GuestAccessPolicy::fixed(false)),
             auth_service: Arc::new(AuthService::new(pool, Arc::new(config))),
         }
     }
@@ -1399,8 +1667,8 @@ mod tests {
         let many = startup_notice(true, 7).expect("public repositories warn");
         assert!(many.contains("7 repositories are public"), "{many}");
         for m in [&one, &many] {
+            assert!(m.contains("PATCH /api/v1/admin/settings/system"), "{m}");
             assert!(m.contains("AK_GUEST_ACCESS_ENABLED=false"), "{m}");
-            assert!(m.contains("coerces every repository to private"), "{m}");
         }
     }
 
@@ -1411,5 +1679,46 @@ mod tests {
         };
         let n = public_repository_count(&pool).await.expect("count");
         assert!(n >= 0);
+    }
+
+    /// #4933: deferring a rejected Basic credential to a package route must
+    /// not let a `?ticket=` through the guard. With guest access off a ticket
+    /// alone is refused here; adding an unresolvable Basic header must not
+    /// change that, while the same header without a ticket is still handed to
+    /// the route (which owns the directory passthrough).
+    #[tokio::test]
+    async fn guard_answers_rejected_basic_with_ticket_itself_4933() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let app = Router::new()
+            .route("/pypi/private/simple/pkg/", get(|| async { "package" }))
+            .layer(from_fn_with_state(disabled_state(pool), guest_access_guard));
+        let username = format!("guard-ticket-{}", uuid::Uuid::new_v4().simple());
+        let send = |uri: &'static str, with_basic: bool| {
+            let app = app.clone();
+            let mut req = Request::builder().uri(uri);
+            if with_basic {
+                req = req.header(AUTHORIZATION, basic_header(&username, "not-a-password"));
+            }
+            async move { app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap() }
+        };
+
+        let ticket_only = send("/pypi/private/simple/pkg/?ticket=abc123", false).await;
+        let deferred = send("/pypi/private/simple/pkg/", true).await;
+        let basic_and_ticket = send("/pypi/private/simple/pkg/?ticket=abc123", true).await;
+
+        assert_eq!(ticket_only.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            deferred.status(),
+            StatusCode::OK,
+            "a rejected Basic credential on a package route is the route's to answer"
+        );
+        assert_eq!(
+            basic_and_ticket.status(),
+            StatusCode::UNAUTHORIZED,
+            "a rejected Basic credential must not carry a ticket past the guard"
+        );
     }
 }

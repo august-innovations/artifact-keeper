@@ -54,9 +54,9 @@ const FALLBACK_MIGRATION_ENCRYPTION_KEY: &str = "artifact-keeper-default-migrati
 /// and unit-test invocations work out of the box so `create_connection`
 /// no longer returns an unconditional 500 when the env var is unset.
 fn migration_encryption_key() -> Result<String> {
-    match std::env::var("MIGRATION_ENCRYPTION_KEY") {
-        Ok(v) if !v.is_empty() => Ok(v),
-        _ => {
+    match crate::config::secret_or_env("MIGRATION_ENCRYPTION_KEY") {
+        Ok(Some(v)) if !v.is_empty() => Ok(v),
+        Ok(_) => {
             tracing::warn!(
                 "MIGRATION_ENCRYPTION_KEY is not set; using built-in fallback. \
                  Set this environment variable in production to protect stored \
@@ -64,6 +64,7 @@ fn migration_encryption_key() -> Result<String> {
             );
             Ok(FALLBACK_MIGRATION_ENCRYPTION_KEY.to_string())
         }
+        Err(e) => Err(AppError::Config(e.to_string())),
     }
 }
 use crate::services::migration_service::MigrationService;
@@ -441,7 +442,10 @@ pub struct AssessmentResult {
     pub users_count: i64,
     pub groups_count: i64,
     pub permissions_count: i64,
+    /// Exact only when `total_artifacts_exact`; otherwise a lower bound (#3928).
     pub total_artifacts: i64,
+    /// Whether every repository was counted exactly.
+    pub total_artifacts_exact: bool,
     pub total_size_bytes: i64,
     pub estimated_duration_seconds: i64,
     pub warnings: Vec<String>,
@@ -454,7 +458,10 @@ pub struct RepositoryAssessment {
     #[serde(rename = "type")]
     pub repo_type: String,
     pub package_type: String,
+    /// Exact only when `artifact_count_exact`; otherwise a lower bound (#3928).
     pub artifact_count: i64,
+    /// Whether `artifact_count` is the repository's real size.
+    pub artifact_count_exact: bool,
     pub total_size_bytes: i64,
     pub compatibility: String,
     pub warnings: Vec<String>,
@@ -1047,53 +1054,69 @@ async fn list_migrations(
     let per_page = query.per_page.unwrap_or(20);
     let offset = (page - 1) * per_page;
 
-    // Non-admins see only jobs they created; admins see all. The
-    // `($1 OR created_by = $2)` predicate keeps both branches single-statement
-    // and the count consistent with the listed rows.
-    let jobs: Vec<MigrationJobRow> = if let Some(status) = &query.status {
-        sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
-            "SELECT {MIGRATION_JOB_COLUMNS} FROM migration_jobs \
-             WHERE ($1 OR created_by = $2) AND status = $3 \
-             ORDER BY created_at DESC LIMIT $4 OFFSET $5"
-        )))
-        .bind(auth.is_admin)
-        .bind(auth.user_id)
-        .bind(status)
-        .bind(per_page)
-        .bind(offset)
-        .fetch_all(&state.db)
-        .await?
-    } else {
-        sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
-            "SELECT {MIGRATION_JOB_COLUMNS} FROM migration_jobs \
-             WHERE ($1 OR created_by = $2) \
-             ORDER BY created_at DESC LIMIT $3 OFFSET $4"
-        )))
-        .bind(auth.is_admin)
-        .bind(auth.user_id)
-        .bind(per_page)
-        .bind(offset)
-        .fetch_all(&state.db)
-        .await?
-    };
-
-    // Get total count, scoped to the same ownership filter as the listing.
-    let total: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM migration_jobs WHERE ($1 OR created_by = $2)")
-            .bind(auth.is_admin)
-            .bind(auth.user_id)
-            .fetch_one(&state.db)
-            .await?;
+    let (jobs, total) = fetch_migration_jobs(
+        &state.db,
+        auth.is_admin,
+        auth.user_id,
+        query.status.as_deref(),
+        per_page,
+        offset,
+    )
+    .await?;
 
     Ok(Json(ListResponse {
         items: jobs.into_iter().map(Into::into).collect(),
         pagination: Some(MigrationPaginationInfo {
             page,
             per_page,
-            total: total.0,
-            total_pages: (total.0 + per_page - 1) / per_page,
+            total,
+            total_pages: (total + per_page - 1) / per_page,
         }),
     }))
+}
+
+/// One page of migration jobs plus the total matching row count.
+///
+/// Non-admins see only the jobs they created; admins see all. `status` narrows
+/// both the page and the count (#4800): the listing applied it while
+/// `COUNT(*)` did not, so `?status=failed` paged over the failed jobs while
+/// `pagination.total` — and the `total_pages` derived from it — still reported
+/// every job the caller could see. One `($n IS NULL OR col = $n)` predicate in
+/// both statements keeps them consistent, and the listing and its count share
+/// the single ownership predicate from #4778. Runtime `sqlx::query_as`, so the
+/// `.sqlx/` cache is unchanged.
+async fn fetch_migration_jobs(
+    db: &sqlx::PgPool,
+    is_admin: bool,
+    user_id: Uuid,
+    status: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<MigrationJobRow>, i64)> {
+    let jobs: Vec<MigrationJobRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
+        "SELECT {MIGRATION_JOB_COLUMNS} FROM migration_jobs \
+         WHERE ($1 OR created_by = $2) AND ($3::text IS NULL OR status = $3) \
+         ORDER BY created_at DESC LIMIT $4 OFFSET $5"
+    )))
+    .bind(is_admin)
+    .bind(user_id)
+    .bind(status)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(db)
+    .await?;
+
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM migration_jobs \
+         WHERE ($1 OR created_by = $2) AND ($3::text IS NULL OR status = $3)",
+    )
+    .bind(is_admin)
+    .bind(user_id)
+    .bind(status)
+    .fetch_one(db)
+    .await?;
+
+    Ok((jobs, total))
 }
 
 /// PostgreSQL SQLSTATE for a foreign-key violation.
@@ -1573,7 +1596,43 @@ async fn list_migration_items(
     let per_page = query.per_page.unwrap_or(50);
     let offset = (page - 1) * per_page;
 
-    // Build query based on filters
+    let (items, total) = fetch_migration_items(
+        &state.db,
+        id,
+        query.status.as_deref(),
+        query.item_type.as_deref(),
+        per_page,
+        offset,
+    )
+    .await?;
+
+    Ok(Json(ListResponse {
+        items: items.into_iter().map(Into::into).collect(),
+        pagination: Some(MigrationPaginationInfo {
+            page,
+            per_page,
+            total,
+            total_pages: (total + per_page - 1) / per_page,
+        }),
+    }))
+}
+
+/// One page of a job's migration items plus the total matching row count.
+///
+/// `status` and `item_type` narrow both the page and the count (#4778); they
+/// were accepted by the endpoint but never applied, so `status=failed` paged
+/// through every item of the job. `($n::text IS NULL OR col = $n)` keeps one
+/// statement for every filter combination. The `id` tie-breaker keeps paging
+/// stable: items that never started share `started_at IS NULL`, and without
+/// it rows could repeat or go missing across pages.
+async fn fetch_migration_items(
+    db: &sqlx::PgPool,
+    job_id: Uuid,
+    status: Option<&str>,
+    item_type: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<MigrationItemRow>, i64)> {
     let items: Vec<MigrationItemRow> = sqlx::query_as(
         r#"
         SELECT id, job_id, item_type, source_path, target_path, status, size_bytes,
@@ -1581,30 +1640,36 @@ async fn list_migration_items(
                started_at, completed_at
         FROM migration_items
         WHERE job_id = $1
-        ORDER BY started_at DESC NULLS LAST
-        LIMIT $2 OFFSET $3
+          AND ($2::text IS NULL OR status = $2)
+          AND ($3::text IS NULL OR item_type = $3)
+        ORDER BY started_at DESC NULLS LAST, id
+        LIMIT $4 OFFSET $5
         "#,
     )
-    .bind(id)
-    .bind(per_page)
+    .bind(job_id)
+    .bind(status)
+    .bind(item_type)
+    .bind(limit)
     .bind(offset)
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await?;
 
-    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM migration_items WHERE job_id = $1")
-        .bind(id)
-        .fetch_one(&state.db)
-        .await?;
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM migration_items
+        WHERE job_id = $1
+          AND ($2::text IS NULL OR status = $2)
+          AND ($3::text IS NULL OR item_type = $3)
+        "#,
+    )
+    .bind(job_id)
+    .bind(status)
+    .bind(item_type)
+    .fetch_one(db)
+    .await?;
 
-    Ok(Json(ListResponse {
-        items: items.into_iter().map(Into::into).collect(),
-        pagination: Some(MigrationPaginationInfo {
-            page,
-            per_page,
-            total: total.0,
-            total_pages: (total.0 + per_page - 1) / per_page,
-        }),
-    }))
+    Ok((items, total))
 }
 
 /// Fetch the persisted report row for a job, if one exists.
@@ -1809,6 +1874,7 @@ async fn get_assessment(
                         repo_type: r.repo_type,
                         package_type: r.package_type,
                         artifact_count: r.artifact_count,
+                        artifact_count_exact: r.artifact_count_exact,
                         total_size_bytes: r.total_size_bytes,
                         compatibility: r.compatibility,
                         warnings: r.warnings,
@@ -1818,6 +1884,7 @@ async fn get_assessment(
                 groups_count: service_result.groups_count,
                 permissions_count: service_result.permissions_count,
                 total_artifacts: service_result.total_artifacts,
+                total_artifacts_exact: service_result.total_artifacts_exact,
                 total_size_bytes: service_result.total_size_bytes,
                 estimated_duration_seconds: service_result.estimated_duration_seconds,
                 warnings: service_result.warnings,
@@ -1835,6 +1902,7 @@ async fn get_assessment(
         groups_count: 0,
         permissions_count: 0,
         total_artifacts: 0,
+        total_artifacts_exact: false,
         total_size_bytes: 0,
         estimated_duration_seconds: 0,
         warnings: vec![],
@@ -2305,6 +2373,7 @@ mod tests {
             groups_count: 0,
             permissions_count: 0,
             total_artifacts: 0,
+            total_artifacts_exact: false,
             total_size_bytes: 0,
             estimated_duration_seconds: 0,
             warnings: vec![],
@@ -2322,6 +2391,7 @@ mod tests {
             repo_type: "local".to_string(),
             package_type: "npm".to_string(),
             artifact_count: 500,
+            artifact_count_exact: true,
             total_size_bytes: 1024 * 1024 * 100,
             compatibility: "full".to_string(),
             warnings: vec!["Large repository".to_string()],
@@ -2360,7 +2430,7 @@ mod tests {
     fn test_migration_encryption_key_returns_env_value() {
         // If the env var happens to be set, it should return its value
         // (non-empty values take precedence over the dev fallback).
-        if let Ok(val) = std::env::var("MIGRATION_ENCRYPTION_KEY") {
+        if let Ok(Some(val)) = crate::config::secret_or_env("MIGRATION_ENCRYPTION_KEY") {
             if !val.is_empty() {
                 let result = migration_encryption_key();
                 assert!(result.is_ok());
@@ -2375,9 +2445,11 @@ mod tests {
         // making `POST /api/v1/migrations/connections` an unconditional 500
         // whenever `MIGRATION_ENCRYPTION_KEY` was not set. The fallback
         // keeps the handler working for dev/test deployments.
-        if std::env::var("MIGRATION_ENCRYPTION_KEY")
-            .map(|v| v.is_empty())
-            .unwrap_or(true)
+        if crate::config::secret_or_env("MIGRATION_ENCRYPTION_KEY")
+            .ok()
+            .flatten()
+            .filter(|v| !v.is_empty())
+            .is_none()
         {
             let result = migration_encryption_key();
             assert!(
@@ -2544,22 +2616,14 @@ mod tests {
     // DB-backed tests: valid create persists; unknown connection id -> 404.
     //
     // These run only when DATABASE_URL is set (a migrated throwaway Postgres);
-    // they skip cleanly otherwise so offline `cargo test` / CI without a DB do
-    // not fail. The harness verifies them against a throwaway DB on :5513.
+    // they skip otherwise so offline `cargo test` does not fail, and fail loud
+    // under AK_TESTS_REQUIRE_DB when the database is missing or unreachable
+    // (`tdh::try_pool`, #4801).
     // -----------------------------------------------------------------------
-
-    async fn test_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .ok()
-    }
 
     #[tokio::test]
     async fn test_create_migration_job_persists_with_valid_connection() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -2624,7 +2688,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_migration_job_unknown_connection_maps_to_not_found() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -2754,6 +2818,16 @@ mod tests {
         .expect("seed job")
     }
 
+    /// Move a seeded job to `status` (the `INSERT` above seeds `'pending'`).
+    async fn set_job_status(pool: &sqlx::PgPool, job: Uuid, status: &str) {
+        sqlx::query("UPDATE migration_jobs SET status = $1 WHERE id = $2")
+            .bind(status)
+            .bind(job)
+            .execute(pool)
+            .await
+            .expect("set job status");
+    }
+
     async fn cleanup_user(pool: &sqlx::PgPool, user_id: Uuid) {
         // migration_jobs/source_connections created_by FK + jobs reference
         // connections; delete jobs first, then connections, then the user.
@@ -2776,7 +2850,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cross_user_get_connection_returns_404() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -2805,7 +2879,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cross_user_delete_connection_returns_404() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -2838,7 +2912,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cross_user_get_and_start_job_returns_404() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -2891,7 +2965,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_isolates_per_user() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -2946,9 +3020,98 @@ mod tests {
         cleanup_user(&pool, marco).await;
     }
 
+    // Issue #4800: `?status=` narrowed the listed rows but the `COUNT(*)`
+    // behind `pagination.total` ignored it, so the filtered list reported the
+    // unfiltered row count (and `total_pages` derived from it).
+    #[tokio::test]
+    async fn test_list_migrations_status_filter_applies_to_total_4800() {
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let (victor, _) = tdh::create_user(&pool).await;
+        let marco_conn = seed_connection(&pool, marco).await;
+        let victor_conn = seed_connection(&pool, victor).await;
+
+        for _ in 0..3 {
+            let job = seed_job(&pool, marco_conn, marco).await;
+            set_job_status(&pool, job, "failed").await;
+        }
+        for _ in 0..2 {
+            let job = seed_job(&pool, marco_conn, marco).await;
+            set_job_status(&pool, job, "completed").await;
+        }
+        for _ in 0..2 {
+            seed_job(&pool, marco_conn, marco).await; // stays 'pending'
+        }
+        // Another user's failed job must not leak into marco's filtered count.
+        let victor_job = seed_job(&pool, victor_conn, victor).await;
+        set_job_status(&pool, victor_job, "failed").await;
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        // The filtered page and the filtered count must agree.
+        let v = get_json(
+            state.clone(),
+            marco,
+            &marco_name,
+            "/?status=failed".to_string(),
+        )
+        .await;
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3, "page lists the three failed jobs");
+        assert!(
+            items.iter().all(|job| job["status"] == "failed"),
+            "listing itself is filtered"
+        );
+        assert_eq!(
+            v["pagination"]["total"], 3,
+            "total counts only the rows the filter matched"
+        );
+        // One page at the default `per_page = 20`.
+        assert_eq!(
+            v["pagination"]["total_pages"], 1,
+            "total_pages follows the filtered total"
+        );
+
+        // The last filtered row lands on page 2 of the filtered list.
+        let v = get_json(
+            state.clone(),
+            marco,
+            &marco_name,
+            "/?status=failed&per_page=2&page=2".to_string(),
+        )
+        .await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+        assert_eq!(v["pagination"]["total"], 3);
+        assert_eq!(
+            v["pagination"]["total_pages"], 2,
+            "three filtered rows are two pages of two"
+        );
+
+        // Another status narrows to its own rows.
+        let v = get_json(
+            state.clone(),
+            marco,
+            &marco_name,
+            "/?status=completed".to_string(),
+        )
+        .await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 2);
+        assert_eq!(v["pagination"]["total"], 2);
+
+        // No filter still counts every job the caller owns — not victor's.
+        let v = get_json(state.clone(), marco, &marco_name, "/".to_string()).await;
+        assert_eq!(v["pagination"]["total"], 7, "unfiltered total is unchanged");
+
+        cleanup_user(&pool, victor).await;
+        cleanup_user(&pool, marco).await;
+    }
+
     #[tokio::test]
     async fn test_self_create_then_access_stamps_owner() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3022,7 +3185,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_admin_sees_and_gets_across_users() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3087,11 +3250,174 @@ mod tests {
             .expect("count reports")
     }
 
+    /// Seed one migration item for `job`.
+    async fn seed_item(pool: &sqlx::PgPool, job: Uuid, item_type: &str, path: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO migration_items (job_id, item_type, source_path, status) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(job)
+        .bind(item_type)
+        .bind(path)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed migration item");
+    }
+
+    /// GET `uri` on the migration router as `user` and decode the JSON body.
+    async fn get_json(
+        state: SharedState,
+        user: Uuid,
+        name: &str,
+        uri: String,
+    ) -> serde_json::Value {
+        let app = app_as(state, tdh::make_auth(user, name));
+        let (status, body) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    // Issue #4778: `status` and `item_type` were parsed and never applied, so
+    // `?status=failed` returned every item of the job and the pagination total
+    // counted all of them.
+    #[tokio::test]
+    async fn test_list_items_applies_status_and_item_type_filters_4778() {
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let conn = seed_connection(&pool, marco).await;
+        let job = seed_job(&pool, conn, marco).await;
+        seed_item(&pool, job, "artifact", "a/ok-1", "completed").await;
+        seed_item(&pool, job, "artifact", "a/ok-2", "completed").await;
+        seed_item(&pool, job, "artifact", "a/bad-1", "failed").await;
+        seed_item(&pool, job, "artifact", "a/bad-2", "failed").await;
+        seed_item(&pool, job, "repository", "repo-bad", "failed").await;
+        seed_item(&pool, job, "repository", "repo-ok", "completed").await;
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let paths = |v: &serde_json::Value| -> Vec<String> {
+            let mut p: Vec<String> = v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["source_path"].as_str().unwrap().to_string())
+                .collect();
+            p.sort();
+            p
+        };
+
+        let v = get_json(
+            state.clone(),
+            marco,
+            &marco_name,
+            format!("/{job}/items?status=failed"),
+        )
+        .await;
+        assert_eq!(paths(&v), vec!["a/bad-1", "a/bad-2", "repo-bad"]);
+        assert_eq!(v["pagination"]["total"], 3, "total counts only matches");
+
+        let v = get_json(
+            state.clone(),
+            marco,
+            &marco_name,
+            format!("/{job}/items?item_type=repository"),
+        )
+        .await;
+        assert_eq!(paths(&v), vec!["repo-bad", "repo-ok"]);
+        assert_eq!(v["pagination"]["total"], 2);
+
+        let v = get_json(
+            state.clone(),
+            marco,
+            &marco_name,
+            format!("/{job}/items?status=failed&item_type=artifact"),
+        )
+        .await;
+        assert_eq!(paths(&v), vec!["a/bad-1", "a/bad-2"]);
+        assert_eq!(v["pagination"]["total"], 2);
+
+        // No filter still lists the whole job.
+        let v = get_json(state.clone(), marco, &marco_name, format!("/{job}/items")).await;
+        assert_eq!(v["pagination"]["total"], 6);
+
+        // Pages of unstarted items (all `started_at IS NULL`) neither repeat
+        // nor drop rows: the `id` tie-breaker makes the order total.
+        let mut seen = Vec::new();
+        for page in 1..=3 {
+            let v = get_json(
+                state.clone(),
+                marco,
+                &marco_name,
+                format!("/{job}/items?per_page=2&page={page}"),
+            )
+            .await;
+            seen.extend(paths(&v));
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 6, "every item appears on exactly one page");
+
+        cleanup_user(&pool, marco).await;
+    }
+
+    // Issue #4778: the report lists at most `REPORT_FAILED_ITEMS_CAP` failed
+    // items and used to give no sign that more existed.
+    #[tokio::test]
+    async fn test_report_counts_failed_items_omitted_by_cap_4778() {
+        use crate::services::migration_service::REPORT_FAILED_ITEMS_CAP;
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let conn = seed_connection(&pool, marco).await;
+        let job = seed_job(&pool, conn, marco).await;
+        let extra = 3;
+        sqlx::query(
+            "INSERT INTO migration_items (job_id, item_type, source_path, status, error_message) \
+             SELECT $1, 'artifact', 'f/' || g, 'failed', 'boom' \
+             FROM generate_series(1, $2::int) g",
+        )
+        .bind(job)
+        .bind((REPORT_FAILED_ITEMS_CAP + extra) as i32)
+        .execute(&pool)
+        .await
+        .expect("seed failed items");
+        seed_item(&pool, job, "artifact", "ok", "completed").await;
+        mark_job_completed(&pool, job).await;
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let v = get_json(state, marco, &marco_name, format!("/{job}/report")).await;
+        assert_eq!(
+            v["errors"].as_array().map(Vec::len),
+            Some(REPORT_FAILED_ITEMS_CAP as usize),
+            "the listed failures stay capped"
+        );
+        assert_eq!(
+            v["summary"]["failed_items_omitted"], extra,
+            "the report says how many failures it left out: {}",
+            v["summary"]
+        );
+
+        cleanup_user(&pool, marco).await;
+    }
+
     // Issue #2097 Gap 1: a report must be readable after a *successful*
     // migration (previously 404), and re-reading must not duplicate the row.
     #[tokio::test]
     async fn test_completed_job_report_synthesized_and_idempotent() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3147,7 +3473,7 @@ mod tests {
     // lazy synthesis only applies to terminal jobs.
     #[tokio::test]
     async fn test_non_terminal_job_report_is_404() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3179,7 +3505,7 @@ mod tests {
     // The cancel path must still materialise a report (preserved behaviour).
     #[tokio::test]
     async fn test_cancel_then_report_available() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3220,7 +3546,7 @@ mod tests {
     // credentials) must surface as a typed 4xx, not a generic 500.
     #[tokio::test]
     async fn test_list_source_repositories_bad_config_returns_4xx() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };

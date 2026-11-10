@@ -1113,8 +1113,18 @@ pub struct InstallFromLocalRequest {
     pub path: String,
 }
 
-/// Install a plugin from local filesystem path (T063)
-/// This endpoint is intended for development use only.
+/// Message for the unimplemented local-path install (#4671).
+pub(crate) const LOCAL_INSTALL_NOT_IMPLEMENTED: &str =
+    "Installing a plugin from a local path is not implemented; use /api/v1/plugins/install/git \
+     or /api/v1/plugins/install/zip";
+
+/// Install a plugin from local filesystem path (T063).
+///
+/// **Not implemented** (#4671): always answers 501 `NOT_IMPLEMENTED`. It used
+/// to resolve the caller's path on the server's filesystem and then fail with
+/// a 500 from a placeholder service method, which both paged operators for a
+/// known gap and told the caller whether an arbitrary server path existed.
+/// The path is no longer touched.
 #[utoipa::path(
     post,
     path = "/install/local",
@@ -1123,36 +1133,18 @@ pub struct InstallFromLocalRequest {
     security(("bearer_auth" = [])),
     request_body = InstallFromLocalRequest,
     responses(
-        (status = 200, description = "Plugin installed from local path", body = PluginInstallResponse),
-        (status = 400, description = "Invalid path"),
+        (status = 401, description = "Authentication required", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+        (status = 501, description = "Local-path installation is not implemented (code `NOT_IMPLEMENTED`); use the Git or ZIP install routes", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn install_from_local(
-    State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
-    Json(request): Json<InstallFromLocalRequest>,
+    Json(_request): Json<InstallFromLocalRequest>,
 ) -> Result<Json<PluginInstallResponse>> {
-    let svc = wasm_service(&state)?;
-
-    // Validate and canonicalize the path to prevent path traversal
-    let path = std::path::Path::new(&request.path);
-    let canonical_path = path.canonicalize().map_err(|_| {
-        AppError::Validation("Path does not exist or is not accessible".to_string())
-    })?;
-    if !canonical_path.is_dir() {
-        return Err(AppError::Validation("Path is not a directory".to_string()));
-    }
-    let canonical_str = canonical_path.to_string_lossy().to_string();
-
-    let result = svc.install_from_local(&canonical_str).await?;
-
-    Ok(Json(PluginInstallResponse {
-        plugin_id: result.plugin_id,
-        name: result.name,
-        version: result.version,
-        format_key: result.format_key,
-        message: "Plugin installed from local path".to_string(),
-    }))
+    Err(AppError::NotImplemented(
+        LOCAL_INSTALL_NOT_IMPLEMENTED.to_string(),
+    ))
 }
 
 #[derive(OpenApi)]
@@ -1956,5 +1948,33 @@ mod tests {
         // Free-form config with no callback URLs is unaffected.
         let cfg = serde_json::json!({ "rules": { "max_size_bytes": 1024 } });
         assert!(validate_plugin_config_urls(&cfg).is_ok());
+    }
+
+    /// #4671: the unimplemented local-path install answered 500 (an alerting
+    /// server fault) after resolving the caller's path on the server. It is
+    /// now a 501 with the stable `NOT_IMPLEMENTED` code, whatever the path.
+    #[tokio::test]
+    async fn test_install_from_local_is_501_not_implemented() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        let auth = tdh::admin_auth(uuid::Uuid::new_v4(), "admin");
+        for path in ["/", "/definitely/not/a/real/path"] {
+            let app = Router::new()
+                .route("/install/local", post(install_from_local))
+                .layer(Extension(auth.clone()));
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/install/local")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "path": path }).to_string(),
+                ))
+                .unwrap();
+            let (status, body) = tdh::send(app, req).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "path {path}");
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["code"], "NOT_IMPLEMENTED");
+            assert_eq!(json["message"], LOCAL_INSTALL_NOT_IMPLEMENTED);
+        }
     }
 }

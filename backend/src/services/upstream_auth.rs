@@ -204,7 +204,7 @@ pub async fn load_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<Option<Ups
 fn aws_api_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        crate::services::http_client::plain_client_builder()
             .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver())
             .build()
             .unwrap_or_default()
@@ -265,6 +265,50 @@ pub(crate) fn parse_auth_credentials(
     }
 }
 
+/// Whether `a` and `b` are the same origin: scheme, host (compared
+/// case-insensitively) and port (default ports normalised). Userinfo, path,
+/// query and fragment are ignored. Anything unparseable, or without a host,
+/// is never the same origin (fail closed).
+pub fn same_origin(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            a.host_str().is_some()
+                && a.scheme() == b.scheme()
+                && a.host_str().map(str::to_ascii_lowercase)
+                    == b.host_str().map(str::to_ascii_lowercase)
+                && a.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
+/// Whether a Remote's configured upstream credentials may be sent with a
+/// request for `target`: only when `target` is on the origin of one of the
+/// URLs the administrator configured for the Remote (`configured`, its
+/// `upstream_url` and `index_upstream_url`). Index metadata can name any
+/// absolute URL (a PyPI `href`, a Helm `urls` entry, a Cargo `dl` template, a
+/// Composer `dist.url`, a Terraform `download_url`), and credentials must not
+/// follow it to another host (GHSA-24rf-2gv2-j47c).
+pub fn credentials_may_follow(target: &str, configured: &[String]) -> bool {
+    configured.iter().any(|origin| same_origin(origin, target))
+}
+
+/// The URLs an administrator configured for repository `repo_id` that its
+/// upstream credentials belong to: `upstream_url` and, when set, the
+/// `index_upstream_url` override (Cargo, Debian, Maven).
+pub async fn configured_upstream_urls(db: &PgPool, repo_id: Uuid) -> Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT upstream_url FROM repositories WHERE id = $1 AND upstream_url IS NOT NULL \
+         UNION ALL \
+         SELECT value FROM repository_config \
+         WHERE repository_id = $1 AND key = 'index_upstream_url' AND value IS NOT NULL",
+    )
+    .bind(repo_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
 /// Apply upstream auth to a reqwest RequestBuilder.
 pub fn apply_upstream_auth(builder: RequestBuilder, auth: &UpstreamAuthType) -> RequestBuilder {
     match auth {
@@ -284,6 +328,15 @@ pub async fn save_upstream_auth(
     credentials_json: &str,
 ) -> Result<()> {
     let encrypted_hex = encrypt_credentials_hex(credentials_json, &encryption_key());
+    let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+    let mut tx = db.begin().await.map_err(db_err)?;
+    // #4467: serialise with an `upstream_url` change, which holds this row
+    // FOR UPDATE while it checks whether credentials are configured.
+    sqlx::query("SELECT 1 FROM repositories WHERE id = $1 FOR SHARE")
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
 
     // Upsert auth type
     sqlx::query(
@@ -293,7 +346,7 @@ pub async fn save_upstream_auth(
     )
     .bind(repo_id)
     .bind(auth_type)
-    .execute(db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -305,9 +358,11 @@ pub async fn save_upstream_auth(
     )
     .bind(repo_id)
     .bind(&encrypted_hex)
-    .execute(db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
+
+    tx.commit().await.map_err(db_err)?;
 
     // Credentials just changed: drop any stale "no auth" cache entry so the
     // next load reflects them immediately instead of after the TTL.
@@ -332,14 +387,52 @@ pub async fn remove_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<()> {
     Ok(())
 }
 
+/// The decrypted credentials JSON currently stored for `repo_id`, when one is
+/// present.
+///
+/// A best-effort read used to decide whether a `PUT .../upstream-auth` write
+/// actually changed the credential material (the audit's `credentials_changed`
+/// flag, #4529). Unlike [`load_upstream_auth`] it neither parses the value nor
+/// resolves a dynamic AWS provider, and a decryption failure is reported as
+/// `None` rather than an error, so reading audit context can never fail the
+/// write it describes.
+pub async fn stored_credentials_json(db: &PgPool, repo_id: Uuid) -> Result<Option<String>> {
+    let encrypted_hex: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM repository_config WHERE repository_id = $1 \
+         AND key = 'upstream_auth_credentials'",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .flatten();
+
+    match encrypted_hex {
+        Some(hex) => Ok(decrypt_credentials_hex(&hex, &encryption_key()).ok()),
+        None => Ok(None),
+    }
+}
+
 /// Check whether upstream auth is configured for a repository.
 /// Returns the auth type string (e.g. "basic", "bearer") or None.
 pub async fn get_upstream_auth_type(db: &PgPool, repo_id: Uuid) -> Result<Option<String>> {
+    let mut conn = db
+        .acquire()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    get_upstream_auth_type_in(&mut conn, repo_id).await
+}
+
+/// [`get_upstream_auth_type`] on a caller's connection or transaction.
+pub(crate) async fn get_upstream_auth_type_in(
+    conn: &mut sqlx::PgConnection,
+    repo_id: Uuid,
+) -> Result<Option<String>> {
     let val: Option<String> = sqlx::query_scalar(
         "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'upstream_auth_type'",
     )
     .bind(repo_id)
-    .fetch_optional(db)
+    .fetch_optional(conn)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .flatten();
@@ -395,6 +488,54 @@ pub fn build_credentials_json(auth: &UpstreamAuthType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GHSA-24rf-2gv2-j47c: the origin rule credentials follow.
+    #[test]
+    fn same_origin_compares_scheme_host_and_port() {
+        for (a, b) in [
+            (
+                "https://pypi.example.com/simple",
+                "https://pypi.example.com/files/x.whl",
+            ),
+            ("https://PYPI.example.com", "https://pypi.example.com:443/x"),
+            ("http://10.0.0.5:8081/repo", "http://10.0.0.5:8081/other"),
+            ("https://u:p@host.example/x", "https://host.example/y"),
+        ] {
+            assert!(same_origin(a, b), "{a} vs {b}");
+        }
+        for (a, b) in [
+            ("https://pypi.example.com", "https://files.example.com/x"),
+            ("https://pypi.example.com", "http://pypi.example.com/x"),
+            ("https://host.example", "https://host.example:8443/x"),
+            ("https://host.example", "https://host.example.evil.test/x"),
+            ("https://host.example", "not a url"),
+            ("not a url", "not a url"),
+            ("file:///etc/passwd", "file:///etc/passwd"),
+        ] {
+            assert!(!same_origin(a, b), "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn credentials_follow_only_a_configured_origin() {
+        let configured = vec![
+            "https://index.example.com/simple".to_string(),
+            "https://dl.example.com".to_string(),
+        ];
+        assert!(credentials_may_follow(
+            "https://index.example.com/simple/x/",
+            &configured
+        ));
+        assert!(credentials_may_follow(
+            "https://dl.example.com/crates/x/1/download",
+            &configured
+        ));
+        assert!(!credentials_may_follow(
+            "https://attacker.example/x",
+            &configured
+        ));
+        assert!(!credentials_may_follow("https://index.example.com/x", &[]));
+    }
 
     // -----------------------------------------------------------------------
     // apply_upstream_auth
@@ -922,6 +1063,39 @@ mod aws_provider_db_tests {
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    /// GHSA-24rf-2gv2-j47c: credentials belong to the Remote's
+    /// `upstream_url` and, when set, its `index_upstream_url` override.
+    #[tokio::test]
+    async fn configured_upstream_urls_include_the_index_override() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "cargo").await;
+        set_upstream_url(&pool, repo_id, "https://dl.example.com").await;
+        assert_eq!(
+            configured_upstream_urls(&pool, repo_id).await.unwrap(),
+            vec!["https://dl.example.com".to_string()]
+        );
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'index_upstream_url', 'https://index.example.com')",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut urls = configured_upstream_urls(&pool, repo_id).await.unwrap();
+        urls.sort();
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        assert_eq!(
+            urls,
+            vec![
+                "https://dl.example.com".to_string(),
+                "https://index.example.com".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

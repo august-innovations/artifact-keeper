@@ -37,6 +37,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde::Serialize;
+use sha2::Digest as _;
 use sigstore::crypto::{CosignVerificationKey, Signature};
 use sigstore::rekor::models::checkpoint::SignedCheckpoint;
 use sigstore::rekor::models::InclusionProof;
@@ -225,4 +226,141 @@ pub fn verify_inclusion(bundle_json: &serde_json::Value, trusted_root_json: &[u8
     proof
         .verify(&te.canonicalized_body, &te.rekor_key)
         .map_err(|e| anyhow!("Rekor inclusion proof verification failed: {e}"))
+}
+
+/// Which serialization of the bundle's DSSE envelope the Rekor `dsse` entry's
+/// `spec.envelopeHash` was computed over (#4082).
+///
+/// Rekor hashes the envelope **exactly as it was submitted**, so the hash
+/// inherits the submitting tool's JSON spacing. `verify_digest` re-serializes
+/// the envelope compactly (`{"payload":...}`) and compares; PyPI's publishing
+/// tooling submitted Python's default spaced form (`{"payload": ...}`) until
+/// about 2026-05, so every attestation from that window fails the crate's
+/// consistency check although nothing about it is wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvelopeHashForm {
+    /// Not a DSSE bundle with a `dsse` v0.0.1 entry carrying a sha256
+    /// `envelopeHash` we could read. Nothing to adjust: the crate decides.
+    NotApplicable,
+    /// The hash is over the compact serialization, which is what the crate
+    /// checks.
+    Compact,
+    /// The hash is over the Python-spaced serialization of the same envelope.
+    /// `compact_sha256` is the hash the crate expects in its place.
+    Spaced { compact_sha256: String },
+    /// The hash matches neither serialization: the entry does not describe
+    /// this envelope.
+    Neither {
+        recorded: String,
+        compact: String,
+        spaced: String,
+    },
+}
+
+/// The bundle's DSSE envelope serialized exactly as `sigstore` 0.14.0's
+/// `CheckedBundle` does before hashing it (`serde_json::to_vec` of the
+/// protobuf type), or `None` for a bundle without one.
+fn compact_envelope_json(bundle_json: &serde_json::Value) -> Option<Vec<u8>> {
+    use sigstore_protobuf_specs::dev::sigstore::bundle::v1::bundle::Content;
+    let bundle: sigstore::bundle::Bundle = serde_json::from_value(bundle_json.clone()).ok()?;
+    match bundle.content? {
+        Content::DsseEnvelope(dsse) => serde_json::to_vec(&dsse).ok(),
+        Content::MessageSignature(_) => None,
+    }
+}
+
+/// Re-space compact JSON the way Python's `json.dumps` does by default: a
+/// space after every `,` and `:` that is not inside a string.
+pub fn python_spaced_json(compact: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(compact.len() + compact.len() / 8);
+    let (mut in_string, mut escaped) = (false, false);
+    for &b in compact {
+        out.push(b);
+        if in_string {
+            match (escaped, b) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+        } else if b == b'"' {
+            in_string = true;
+        } else if b == b',' || b == b':' {
+            out.push(b' ');
+        }
+    }
+    out
+}
+
+/// The `dsse` v0.0.1 body's sha256 `spec.envelopeHash.value`, if it has one.
+fn recorded_envelope_hash(body: &serde_json::Value) -> Option<String> {
+    if body.get("kind")?.as_str()? != "dsse" || body.get("apiVersion")?.as_str()? != "0.0.1" {
+        return None;
+    }
+    let hash = body.get("spec")?.get("envelopeHash")?;
+    if hash.get("algorithm")?.as_str()? != "sha256" {
+        return None;
+    }
+    Some(hash.get("value")?.as_str()?.to_ascii_lowercase())
+}
+
+/// The bundle's single tlog entry's decoded `canonicalizedBody`.
+fn tlog_body(bundle_json: &serde_json::Value) -> Option<serde_json::Value> {
+    let body_b64 = bundle_json
+        .get("verificationMaterial")?
+        .get("tlogEntries")?
+        .as_array()?
+        .first()?
+        .get("canonicalizedBody")?
+        .as_str()?;
+    serde_json::from_slice(&B64.decode(body_b64).ok()?).ok()
+}
+
+/// Classify the Rekor entry's `envelopeHash` against both serializations of
+/// the bundle's own DSSE envelope (#4082). Pure: reads only the bundle.
+pub fn dsse_envelope_hash_form(bundle_json: &serde_json::Value) -> EnvelopeHashForm {
+    let (Some(recorded), Some(compact)) = (
+        tlog_body(bundle_json)
+            .as_ref()
+            .and_then(recorded_envelope_hash),
+        compact_envelope_json(bundle_json),
+    ) else {
+        return EnvelopeHashForm::NotApplicable;
+    };
+    let compact_sha256 = hex::encode(sha2::Sha256::digest(&compact));
+    if recorded == compact_sha256 {
+        return EnvelopeHashForm::Compact;
+    }
+    let spaced_sha256 = hex::encode(sha2::Sha256::digest(python_spaced_json(&compact)));
+    if recorded == spaced_sha256 {
+        EnvelopeHashForm::Spaced { compact_sha256 }
+    } else {
+        EnvelopeHashForm::Neither {
+            recorded,
+            compact: compact_sha256,
+            spaced: spaced_sha256,
+        }
+    }
+}
+
+/// A copy of `bundle_json` whose tlog body carries `envelope_hash` as its
+/// `spec.envelopeHash.value`, for `verify_digest` only (#4082).
+///
+/// Used once [`dsse_envelope_hash_form`] has established that the recorded
+/// hash is the spaced serialization of this very envelope: the crate then
+/// re-checks everything else in the body (payloadHash, signature, verifier
+/// certificate) against the envelope it verifies. The original, unmodified
+/// body is what [`verify_signed_entry_timestamp`] and [`verify_inclusion`]
+/// check against the log, so the log still vouches for the bytes we read the
+/// spaced hash from.
+pub fn with_envelope_hash(
+    bundle_json: &serde_json::Value,
+    envelope_hash: &str,
+) -> Result<serde_json::Value> {
+    let mut body = tlog_body(bundle_json).ok_or_else(|| anyhow!("tlog body unreadable"))?;
+    body["spec"]["envelopeHash"]["value"] = serde_json::Value::String(envelope_hash.to_owned());
+    let mut out = bundle_json.clone();
+    out["verificationMaterial"]["tlogEntries"][0]["canonicalizedBody"] =
+        serde_json::Value::String(B64.encode(serde_json::to_vec(&body)?));
+    Ok(out)
 }

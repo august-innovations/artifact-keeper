@@ -6,12 +6,24 @@
       {
         "ordinal": 0,
         "name": "path",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "path"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "size_bytes",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "size_bytes"
+          }
+        }
       }
     ],
     "parameters": {

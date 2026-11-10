@@ -12,6 +12,9 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{
+    audit_fire_and_forget, changed_fields, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::sync_policy_service::{
     ArtifactFilter, CreateSyncPolicyRequest, EvaluationResult, PeerSelector, PreviewResult,
     RepoSelector, SyncPolicy, SyncPolicyService, UpdateSyncPolicyRequest,
@@ -414,6 +417,62 @@ async fn list_policies(
     Ok(Json(SyncPolicyListResponse { items, total }))
 }
 
+/// Record a sync-policy change (#4710), best-effort. `details` carries the
+/// policy name plus `extra` (the full policy on create / delete, the changed
+/// fields and before/after on update).
+async fn audit_sync_policy(
+    state: &SharedState,
+    auth: &AuthExtension,
+    action: AuditAction,
+    policy: &SyncPolicyResponse,
+    extra: serde_json::Value,
+) {
+    let mut details = serde_json::json!({ "name": policy.name });
+    if let (Some(map), serde_json::Value::Object(extra)) = (details.as_object_mut(), extra) {
+        map.extend(extra);
+    }
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(action, ResourceType::SyncPolicy, auth)
+            .resource(policy.id)
+            .resource_name(policy.name.clone())
+            .details(details),
+    )
+    .await;
+}
+
+/// The audited shape of a sync policy: the response minus its timestamps.
+fn sync_policy_snapshot(policy: &SyncPolicyResponse) -> serde_json::Value {
+    let mut value = serde_json::to_value(policy).unwrap_or_default();
+    if let Some(map) = value.as_object_mut() {
+        map.remove("created_at");
+        map.remove("updated_at");
+    }
+    value
+}
+
+/// Record an update (including a toggle) as changed fields plus before/after.
+async fn audit_sync_policy_update(
+    state: &SharedState,
+    auth: &AuthExtension,
+    before: &SyncPolicyResponse,
+    after: &SyncPolicyResponse,
+) {
+    let (before, after_value) = (sync_policy_snapshot(before), sync_policy_snapshot(after));
+    audit_sync_policy(
+        state,
+        auth,
+        AuditAction::SyncPolicyUpdated,
+        after,
+        serde_json::json!({
+            "changed_fields": changed_fields(&before, &after_value),
+            "before": before,
+            "after": after_value,
+        }),
+    )
+    .await;
+}
+
 /// Create a new sync policy
 #[utoipa::path(
     post,
@@ -454,7 +513,15 @@ async fn create_policy(
     };
 
     let service = SyncPolicyService::new(state.db.clone());
-    let policy = service.create_policy(req).await?;
+    let policy = policy_to_response(service.create_policy(req).await?);
+    audit_sync_policy(
+        &state,
+        &auth,
+        AuditAction::SyncPolicyCreated,
+        &policy,
+        serde_json::json!({ "policy": sync_policy_snapshot(&policy) }),
+    )
+    .await;
 
     // Auto-evaluate so peer_repo_subscriptions are created immediately.
     // Without this, uploads won't trigger sync tasks until a manual
@@ -463,7 +530,7 @@ async fn create_policy(
         tracing::warn!("Post-create policy evaluation failed: {e}");
     }
 
-    Ok(Json(policy_to_response(policy)))
+    Ok(Json(policy))
 }
 
 /// Get a sync policy by ID
@@ -546,13 +613,15 @@ async fn update_policy(
     };
 
     let service = SyncPolicyService::new(state.db.clone());
-    let policy = service.update_policy(id, req).await?;
+    let before = policy_to_response(service.get_policy(id).await?);
+    let policy = policy_to_response(service.update_policy(id, req).await?);
+    audit_sync_policy_update(&state, &auth, &before, &policy).await;
 
     if let Err(e) = service.evaluate_policies().await {
         tracing::warn!("Post-update policy evaluation failed: {e}");
     }
 
-    Ok(Json(policy_to_response(policy)))
+    Ok(Json(policy))
 }
 
 /// Delete a sync policy
@@ -579,7 +648,16 @@ async fn delete_policy(
 ) -> Result<axum::http::StatusCode> {
     auth.require_admin()?;
     let service = SyncPolicyService::new(state.db.clone());
+    let before = policy_to_response(service.get_policy(id).await?);
     service.delete_policy(id).await?;
+    audit_sync_policy(
+        &state,
+        &auth,
+        AuditAction::SyncPolicyDeleted,
+        &before,
+        serde_json::json!({ "policy": sync_policy_snapshot(&before) }),
+    )
+    .await;
 
     if let Err(e) = service.evaluate_policies().await {
         tracing::warn!("Post-delete policy evaluation failed: {e}");
@@ -613,13 +691,15 @@ async fn toggle_policy(
 ) -> Result<Json<SyncPolicyResponse>> {
     auth.require_admin()?;
     let service = SyncPolicyService::new(state.db.clone());
-    let policy = service.toggle_policy(id, payload.enabled).await?;
+    let before = policy_to_response(service.get_policy(id).await?);
+    let policy = policy_to_response(service.toggle_policy(id, payload.enabled).await?);
+    audit_sync_policy_update(&state, &auth, &before, &policy).await;
 
     if let Err(e) = service.evaluate_policies().await {
         tracing::warn!("Post-toggle policy evaluation failed: {e}");
     }
 
-    Ok(Json(policy_to_response(policy)))
+    Ok(Json(policy))
 }
 
 /// Force re-evaluate all sync policies
@@ -1146,5 +1226,78 @@ mod tests {
     #[test]
     fn test_policy_read_guard_allows_admin() {
         assert!(policy_auth(true).require_admin().is_ok());
+    }
+
+    /// #4710: create, update, toggle and delete of a sync policy each write
+    /// one audit row naming the admin and the policy; updates list what
+    /// changed. The peer selector names a peer that does not exist, so the
+    /// policy never matches anything and the evaluation the handlers run
+    /// creates no subscriptions.
+    #[tokio::test]
+    async fn test_sync_policy_crud_is_audited() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let ext = || Extension(tdh::admin_auth(admin_id, &admin_name));
+        let name = format!("audit4710-{}", Uuid::new_v4());
+        let create: CreateSyncPolicyPayload = serde_json::from_value(serde_json::json!({
+            "name": name,
+            "enabled": false,
+            "peer_selector": { "match_peers": [Uuid::new_v4()] }
+        }))
+        .expect("create payload");
+
+        let created = create_policy(State(state.clone()), ext(), Json(create))
+            .await
+            .expect("create policy")
+            .0;
+        let id = created.id;
+        let update: UpdateSyncPolicyPayload =
+            serde_json::from_value(serde_json::json!({ "priority": 7 })).expect("update payload");
+        let updated = update_policy(State(state.clone()), ext(), Path(id), Json(update)).await;
+        let toggled = toggle_policy(
+            State(state.clone()),
+            ext(),
+            Path(id),
+            Json(TogglePolicyPayload { enabled: true }),
+        )
+        .await;
+        let deleted = delete_policy(State(state.clone()), ext(), Path(id)).await;
+
+        let created_row = tdh::audit_row_eventually(&pool, id, "SYNC_POLICY_CREATED").await;
+        let deleted_row = tdh::audit_row_eventually(&pool, id, "SYNC_POLICY_DELETED").await;
+        tdh::audit_count_eventually(&pool, id, "SYNC_POLICY_UPDATED", 2).await;
+        let mut changes: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT details->'changed_fields' FROM audit_log \
+             WHERE resource_id = $1 AND action = 'SYNC_POLICY_UPDATED'",
+        )
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .expect("update rows");
+        changes.sort_by_key(|c| c.to_string());
+        let _ = sqlx::query("DELETE FROM sync_policies WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, admin_id).await;
+
+        assert!(updated.is_ok() && toggled.is_ok() && deleted.is_ok());
+        assert_eq!(created_row.user_id, Some(admin_id));
+        assert_eq!(created_row.resource_type, "sync_policy");
+        assert_eq!(created_row.details["name"], name.as_str());
+        assert_eq!(created_row.details["policy"]["enabled"], false);
+        assert_eq!(deleted_row.user_id, Some(admin_id));
+        assert_eq!(deleted_row.details["policy"]["priority"], 7);
+        assert_eq!(
+            changes,
+            vec![
+                serde_json::json!(["enabled"]),
+                serde_json::json!(["priority"])
+            ]
+        );
     }
 }

@@ -24,7 +24,7 @@
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
@@ -396,6 +396,12 @@ async fn download_pod(
     let repo = resolve_cocoapods_repo(&state.db, &repo_key).await?;
 
     let filename = pod_file.trim_start_matches('/');
+    // #4365 item 3 (#4109): on a proxying repository the file name is joined
+    // into the upstream path and keys the proxy cache.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[filename],
+    )?;
 
     // Parse the pod path to extract name and version
     let full_path = format!("pods/{}", filename);
@@ -425,6 +431,23 @@ async fn download_pod(
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
+            // #4109: scan-on-proxy routes the pod archive through the inline
+            // scan-and-block gate INSTEAD of the streaming paths below: the
+            // Remote arm when this repository scans, the Virtual walk when
+            // any Remote member scans. Repositories that have not opted in
+            // are unchanged.
+            if let Some(served) = serve_scanned_pod_download(
+                &state,
+                auth.as_ref(),
+                &repo,
+                filename,
+                (&path_info.name, &path_info.version),
+                &ctx,
+            )
+            .await?
+            {
+                return served;
+            }
             if repo.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
@@ -441,6 +464,7 @@ async fn download_pod(
                         upstream_url,
                         &upstream_path,
                         "application/octet-stream",
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -472,6 +496,7 @@ async fn download_pod(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -506,30 +531,39 @@ async fn download_pod(
         .await
         .map_err(|e| e.into_response())?;
 
-    let stream = storage
-        .get_stream(&artifact.storage_key)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+    // #4514: a row a scanning Remote holds goes through the scan gate.
+    let proxy_helpers::StoredRowBody { body: stream, scan } = proxy_helpers::open_stored_row(
+        &state,
+        storage.as_ref(),
+        &proxy_helpers::StoredRow {
+            repo: &repo,
+            filename,
+            storage_key: &artifact.storage_key,
+            size_bytes: artifact.size_bytes,
+        },
+        PodArchive {
+            name: &path_info.name,
+            version: &path_info.version,
+        },
+    )
+    .await?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/gzip")
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-        .body(Body::from_stream(stream))
-        .unwrap())
+    Ok(proxy_helpers::StoredRowBody::stamp(
+        scan,
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/gzip")
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"{}\"", filename),
+            )
+            .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+            .body(Body::from_stream(stream))
+            .unwrap(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +574,7 @@ async fn push_pod(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "cocoapods", "write:artifacts")?.user_id;
@@ -603,8 +638,17 @@ async fn push_pod(
         return Err((StatusCode::CONFLICT, "Pod version already exists").into_response());
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    // Refuse an over-quota upload before a soft-deleted row at this path is
+    // purged (#4422).
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        body.len() as i64,
+    )
+    .await?;
 
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
     // Store the pod archive
     let storage_key = build_cocoapods_storage_key(pod_name, pod_version);
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
@@ -642,6 +686,13 @@ async fn push_pod(
     let size_bytes = body.len() as i64;
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -661,12 +712,20 @@ async fn push_pod(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Store metadata
     let _ = sqlx::query!(
@@ -693,6 +752,17 @@ async fn push_pod(
         size_bytes,
         &computed_sha256,
         podspec.summary.as_deref().filter(|d| !d.is_empty()),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -831,6 +901,153 @@ fn build_cocoapods_metadata(podspec: &PodSpec, filename: &str) -> serde_json::Va
         "podspec": serde_json::to_value(podspec).unwrap_or_default(),
         "filename": filename,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Scan-on-proxy for pod archives (#4109, on the #4098 generic gate)
+// ---------------------------------------------------------------------------
+
+/// The canonical `(cache_key, scannable)` decision for a proxied pod archive
+/// (#4365 item 1): every file on the pod route is a package, cached under
+/// the `pods/{file}` path the streaming arm commits to.
+fn pod_serve_key(filename: &str) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(&format!("pods/{filename}"))
+}
+
+/// The CocoaPods half of the generic gate: a pod archive must be the pod
+/// version the request names (#4109).
+struct PodArchive<'a> {
+    name: &'a str,
+    version: &'a str,
+}
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for PodArchive<'_> {
+    const LABEL: &'static str = "cocoapods pod archive";
+    const CONTENT_TYPE: &'static str = "application/octet-stream";
+
+    fn requested(&self) -> String {
+        format!("{} {}", self.name, self.version)
+    }
+
+    fn identity(
+        &self,
+        _filename: &str,
+        bytes: &Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        pod_archive_identity(self.name, self.version, bytes)
+    }
+}
+
+/// What a pod archive says about itself (#4109): the pod's own
+/// `{name}.podspec.json`, at the archive root or one directory down, must
+/// declare the requested name and version. The bundled scanner has no
+/// CocoaPods advisory data, so an archive that agrees is graded on its
+/// contents (a vendored package of an ecosystem it does grade).
+fn pod_archive_identity(
+    name: &str,
+    version: &str,
+    bytes: &Bytes,
+) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+    use crate::api::handlers::proxy_scan_archive::{read_tar_gz_entry, ArchiveIdentity};
+    let spec_name = format!("{name}.podspec.json").to_ascii_lowercase();
+    let manifest = read_tar_gz_entry(bytes, |path| {
+        let path = path.strip_prefix("./").unwrap_or(path);
+        path.components().count() <= 2
+            && path
+                .file_name()
+                .is_some_and(|f| f.to_string_lossy().to_ascii_lowercase() == spec_name)
+    });
+    let body = match manifest {
+        Ok(Some(body)) => body,
+        Ok(None) => return ArchiveIdentity::Unreadable(format!("no top-level {spec_name}")),
+        Err(e) => return ArchiveIdentity::Unreadable(e),
+    };
+    let Ok(spec) = serde_json::from_slice::<PodSpec>(&body) else {
+        return ArchiveIdentity::Unreadable("podspec.json does not parse".to_string());
+    };
+    if !spec.name.eq_ignore_ascii_case(name) || spec.version.trim() != version {
+        return ArchiveIdentity::Disagrees(format!(
+            "podspec declares {} {}",
+            spec.name, spec.version
+        ));
+    }
+    ArchiveIdentity::ContentGraded
+}
+
+/// Inline scan-and-block for one pod archive from one Remote repository
+/// (#4109).
+async fn serve_scanned_pod_archive(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    filename: &str,
+    (name, version): (&str, &str),
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let serve_key = pod_serve_key(filename);
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: crate::models::repository::RepositoryFormat::Cocoapods,
+        source_path: &serve_key.cache_key,
+        cache_path: &serve_key.cache_key,
+        filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+        proxy,
+        kind: PodArchive { name, version },
+        disposition: None,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The scan-on-proxy arms of the pod route (#4109): `Ok(None)` when nothing
+/// scans, so the caller keeps its untouched path.
+async fn serve_scanned_pod_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    filename: &str,
+    (name, version): (&str, &str),
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Result<Response, Response>>, Response> {
+    use crate::api::handlers::proxy_scan_archive::{LocalLookup, ScannedRoute};
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    let serve_key = pod_serve_key(filename);
+    let route = ScannedRoute {
+        upstream_path: &serve_key.cache_key,
+        lookup: LocalLookup::NameVersion { name, version },
+        default_content_type: "application/octet-stream",
+        virtual_disposition: None,
+    };
+    crate::api::handlers::proxy_scan_archive::serve_scanned_package_download(
+        state,
+        auth,
+        repo,
+        route,
+        false,
+        ctx,
+        |(id, key, upstream_url), policy, _disposition| async move {
+            serve_scanned_pod_archive(
+                state,
+                proxy,
+                (id, &key, &upstream_url),
+                filename,
+                (name, version),
+                policy,
+                ctx,
+            )
+            .await
+        },
+    )
+    .await
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -1919,6 +2136,57 @@ mod db_cov_tests {
         assert_eq!(status, axum::http::StatusCode::OK);
         fx.teardown().await;
     }
+
+    /// #4725: a pod push to a hosted repository must queue a push sync task for
+    /// a subscribed push peer, and a push that arrives as peer replication must
+    /// not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn cocoapods_upload_queues_push_sync_task_4725() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "cocoapods").await;
+
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/pods", fx.repo_key))
+            .body(axum::body::Body::from(pod_archive("Repl4725", "1.0.0")))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "pod push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated push (as the sync worker sends it) stores the pod but
+        // must not queue another task.
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/pods", fx.repo_key))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(pod_archive("Repl4725", "2.0.0")))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated pod push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["Repl4725/1.0.0/Repl4725-1.0.0.tar.gz".to_string()],
+            "only the client push queues a push task; the replicated one must not"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1977,5 +2245,198 @@ mod catalog_registration_tests {
         assert_eq!(row.version, "5.8.0");
         assert_eq!(row.versions, vec!["5.8.0".to_string()]);
         assert_eq!(row.description.as_deref(), Some("elegant networking"));
+    }
+}
+
+/// #4109: scan-on-proxy on CocoaPods pod archives, Remote and Virtual,
+/// through the shared archive scenarios, plus the pod identity rule.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod scan_on_proxy_4109 {
+    use super::*;
+    use crate::api::handlers::proxy_scan_archive::test_support::{archive_scan_suite, ArchiveCase};
+    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+
+    const FILE: &str = "DtfScanned-1.0.0.tar.gz";
+
+    fn tar_gz(entries: &[(&str, String)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, data.as_bytes())
+                .unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn pod(name: &str, version: &str) -> Vec<u8> {
+        tar_gz(&[
+            (
+                &format!("{name}.podspec.json"),
+                serde_json::json!({
+                    "name": name,
+                    "version": version,
+                    "summary": uuid::Uuid::new_v4().to_string(),
+                })
+                .to_string(),
+            ),
+            ("Sources/Dtf.swift", "struct Dtf {}\n".to_string()),
+        ])
+    }
+
+    fn case(_mock: &str) -> ArchiveCase {
+        ArchiveCase {
+            format: "cocoapods",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/pods/{FILE}")),
+            package_path: format!("/pods/{FILE}"),
+            extra: Vec::new(),
+            body: pod("DtfScanned", "1.0.0"),
+            recorded_path: format!("pods/{FILE}"),
+            file: FILE.to_string(),
+            pin: None,
+        }
+    }
+
+    archive_scan_suite!(case);
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched or cached.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/pods/{FILE}%3Fx"),
+                format!("/{key}/pods/{FILE}%23x"),
+            ] {
+                let (status, _, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    #[test]
+    fn a_pod_whose_podspec_is_the_request_is_graded() {
+        let bytes = Bytes::from(pod("DtfScanned", "1.0.0"));
+        assert_eq!(
+            pod_archive_identity("DtfScanned", "1.0.0", &bytes),
+            ArchiveIdentity::ContentGraded
+        );
+        let wrapped = Bytes::from(tar_gz(&[(
+            "DtfScanned-1.0.0/DtfScanned.podspec.json",
+            "{\"name\":\"DtfScanned\",\"version\":\"1.0.0\"}".to_string(),
+        )]));
+        assert_eq!(
+            pod_archive_identity("DtfScanned", "1.0.0", &wrapped),
+            ArchiveIdentity::ContentGraded
+        );
+    }
+
+    #[test]
+    fn a_pod_that_is_not_the_request_is_unestablished() {
+        assert!(matches!(
+            pod_archive_identity(
+                "DtfScanned",
+                "1.0.0",
+                &Bytes::from(pod("DtfScanned", "2.0.0"))
+            ),
+            ArchiveIdentity::Disagrees(_)
+        ));
+        let deep = Bytes::from(tar_gz(&[(
+            "a/b/DtfScanned.podspec.json",
+            "{\"name\":\"DtfScanned\",\"version\":\"1.0.0\"}".to_string(),
+        )]));
+        for bytes in [
+            deep,
+            Bytes::from(pod("Other", "1.0.0")),
+            Bytes::from_static(b"not a tarball"),
+        ] {
+            assert!(matches!(
+                pod_archive_identity("DtfScanned", "1.0.0", &bytes),
+                ArchiveIdentity::Unreadable(_)
+            ));
+        }
+    }
+}
+
+/// #4365 item 1: CocoaPods decides by route (every pod archive is a
+/// package); the cache key is `pods/{file}`.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn pod_serve_key_table() {
+        let got = pod_serve_key("AFNetworking-2.5.1.tar.gz");
+        assert_eq!(got.cache_key, "pods/AFNetworking-2.5.1.tar.gz");
+        assert!(got.scannable);
+    }
+}
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+    use crate::api::handlers::proxy_scan_archive::test_support::archive_identities;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{tar_gz_with, tar_with, zip_with};
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_pod_archive_with_two_podspecs_is_not_established() {
+        let kind = || PodArchive {
+            name: "Demo",
+            version: "1.0.0",
+        };
+        let check = |bytes: &[u8]| {
+            archive_identities(kind(), DupFormat::Cocoapods, "Demo-1.0.0.tar.gz", bytes)
+        };
+        let good: &[u8] = br#"{"name":"Demo","version":"1.0.0"}"#;
+        let other: &[u8] = br#"{"name":"Demo","version":"1.0.0","dependencies":{"Other":[]}}"#;
+        let dup = tar_gz_with(&[("Demo.podspec.json", good), ("Demo.podspec.json", other)]);
+        let (own, gate) = check(&dup);
+        assert!(
+            matches!(own, ProxyScanIdentity::NotApplicable),
+            "graded on contents"
+        );
+        assert!(unestablished(&gate));
+        let single = tar_gz_with(&[("Demo.podspec.json", good)]);
+        assert!(matches!(check(&single).1, ProxyScanIdentity::NotApplicable));
     }
 }

@@ -15,7 +15,7 @@
 //! cannot see the gRPC method path, so the required scope must be selected
 //! per-method at the handler, not in the interceptor.
 
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{decode, DecodingKey};
 use sqlx::PgPool;
 use tonic::{Request, Status};
 
@@ -33,6 +33,11 @@ pub struct GrpcPrincipal {
     /// token (no scope restriction); `Some(list)` = allowlist evaluated by
     /// `token_service::scopes_grant_access` (exact match | `*` | `admin`).
     pub scopes: Option<Vec<String>>,
+    /// The token's subject.
+    pub user_id: uuid::Uuid,
+    /// The repositories the token is restricted to, from
+    /// `Claims.allowed_repo_ids`.
+    pub allowed_repo_ids: crate::models::access_scope::AccessScope,
 }
 
 /// Per-method scope authorizer for the gRPC plane. Mirrors REST's
@@ -114,7 +119,7 @@ impl AuthInterceptor {
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or_else(|| Status::unauthenticated("Missing or invalid authorization token"))?;
 
-        let validation = Validation::new(Algorithm::HS256);
+        let validation = crate::services::auth_service::self_minted_validation();
         let mut token_data = decode::<Claims>(token, &self.decoding_key, &validation)
             .map_err(|e| Status::unauthenticated(format!("Invalid token: {}", e)))?;
 
@@ -148,6 +153,26 @@ impl AuthInterceptor {
         };
         if invalidated {
             return Err(Status::unauthenticated("Token has been revoked"));
+        }
+
+        // A signed-out session's access token is refused here as on the HTTP
+        // path (#4883): the DB-backed family check when a pool is wired, the
+        // in-memory one otherwise.
+        if let Some(family_id) = token_data.claims.family_id {
+            let revoked = match &self.db {
+                Some(db) => tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        crate::services::auth_service::is_session_family_revoked(db, family_id),
+                    )
+                })
+                .map_err(|e| Status::unavailable(format!("Session lookup failed: {}", e)))?,
+                None => {
+                    crate::services::auth_service::is_session_family_revoked_in_cache(family_id)
+                }
+            };
+            if revoked {
+                return Err(Status::unauthenticated("Token has been revoked"));
+            }
         }
 
         // Re-derive `is_admin` from the live server-side role. The JWT claim is
@@ -189,6 +214,10 @@ impl AuthInterceptor {
         req.extensions_mut().insert(GrpcPrincipal {
             is_admin: token_data.claims.is_admin,
             scopes: token_data.claims.scopes.clone(),
+            user_id: token_data.claims.sub,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::from(
+                &token_data.claims.allowed_repo_ids,
+            ),
         });
 
         Ok(req)
@@ -440,6 +469,63 @@ mod tests {
             .await;
     }
 
+    /// #5153: the principal is stamped from the token itself. The service tests
+    /// insert a `GrpcPrincipal` by hand, so this is what ties them to a real request.
+    #[test]
+    fn test_intercept_stamps_the_subject_and_repository_restriction() {
+        let sub = Uuid::new_v4();
+        let repo = Uuid::new_v4();
+        let mut claims = test_claims(sub, true, "access", None);
+        claims.allowed_repo_ids = Some(vec![repo]);
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .expect("token");
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("metadata"),
+        );
+        let stamped = AuthInterceptor::new("secret", None)
+            .intercept(req)
+            .expect("a valid admin token");
+        let principal = stamped
+            .extensions()
+            .get::<GrpcPrincipal>()
+            .expect("the principal is stamped");
+        assert_eq!(principal.user_id, sub);
+        assert_eq!(
+            principal.allowed_repo_ids,
+            crate::models::access_scope::AccessScope::Restricted(vec![repo])
+        );
+
+        // No restriction on the token: none on the principal.
+        let unrestricted = encode(
+            &Header::default(),
+            &test_claims(sub, true, "access", None),
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .expect("token");
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {unrestricted}").parse().expect("metadata"),
+        );
+        let stamped = AuthInterceptor::new("secret", None)
+            .intercept(req)
+            .expect("a valid admin token");
+        assert_eq!(
+            stamped
+                .extensions()
+                .get::<GrpcPrincipal>()
+                .expect("stamped")
+                .allowed_repo_ids,
+            crate::models::access_scope::AccessScope::Admin
+        );
+    }
+
     // -----------------------------------------------------------------------
     // authorize_grpc_scope: per-method scope enforcement (mirror of REST
     // AuthExtension::has_scope). Pure, no DB.
@@ -450,6 +536,8 @@ mod tests {
         req.extensions_mut().insert(GrpcPrincipal {
             is_admin: true,
             scopes,
+            user_id: Uuid::nil(),
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
         });
         req
     }
@@ -559,5 +647,32 @@ mod tests {
             .bind(admin_id)
             .execute(&pool)
             .await;
+    }
+
+    /// A signed-out session's access token is refused on gRPC too (#4883);
+    /// another session's token is not.
+    #[test]
+    fn test_4883_signed_out_session_rejected() {
+        let interceptor = AuthInterceptor::new("secret", None);
+        let token_for = |family_id: Uuid| {
+            let mut claims = test_claims(Uuid::new_v4(), true, "access", None);
+            claims.family_id = Some(family_id);
+            encode(
+                &Header::default(),
+                &claims,
+                &EncodingKey::from_secret("secret".as_bytes()),
+            )
+            .unwrap()
+        };
+        let (signed_out, other) = (Uuid::new_v4(), Uuid::new_v4());
+        crate::services::auth_service::mark_session_family_revoked(signed_out);
+
+        let err = interceptor
+            .intercept(request_with_token(&token_for(signed_out)))
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(interceptor
+            .intercept(request_with_token(&token_for(other)))
+            .is_ok());
     }
 }

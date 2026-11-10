@@ -609,6 +609,25 @@ pub async fn claim_flat_key_for_write(
     storage_backend: &str,
     storage_key: &str,
 ) -> Result<FlatKeyWriteClaim> {
+    let mut conn = db
+        .acquire()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    claim_flat_key_for_write_on(&mut conn, repository_id, storage_backend, storage_key).await
+}
+
+/// [`claim_flat_key_for_write`] on a caller-supplied connection, so the claim
+/// can be (re)asserted inside the caller's transaction. A hosted Maven
+/// publish uses this under its per-key publish lock (#4837): a failed
+/// overlapping publish of the same key may have released the claim this
+/// request relied on, and re-inserting it in the publishing transaction
+/// makes the claim commit or roll back together with the row it attributes.
+pub async fn claim_flat_key_for_write_on(
+    conn: &mut sqlx::PgConnection,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<FlatKeyWriteClaim> {
     if storage_backend == "filesystem" {
         return Ok(FlatKeyWriteClaim::NotApplicable);
     }
@@ -625,7 +644,7 @@ pub async fn claim_flat_key_for_write(
     .bind(storage_backend)
     .bind(storage_key)
     .bind(repository_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
     if inserted.is_some() {
@@ -640,7 +659,7 @@ pub async fn claim_flat_key_for_write(
     )
     .bind(storage_backend)
     .bind(storage_key)
-    .fetch_optional(db)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
     match owner {
@@ -664,7 +683,7 @@ pub async fn claim_flat_key_for_write(
 /// filesystem backends are no-ops. Best-effort at the call site: a release
 /// failure must not mask the original write error.
 pub async fn release_flat_key_claim(
-    db: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     claim: FlatKeyWriteClaim,
     repository_id: Uuid,
     storage_backend: &str,

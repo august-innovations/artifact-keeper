@@ -1,5 +1,9 @@
 # Artifact Keeper
 
+<p align="center">
+  <img alt="Artifact Keeper" src="https://raw.githubusercontent.com/artifact-keeper/.github/main/brand/banners/github-readme_1600x600.png" width="100%">
+</p>
+
 [![CI](https://github.com/artifact-keeper/artifact-keeper/actions/workflows/ci.yml/badge.svg)](https://github.com/artifact-keeper/artifact-keeper/actions/workflows/ci.yml)
 [![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=artifact-keeper_artifact-keeper&metric=alert_status)](https://sonarcloud.io/dashboard?id=artifact-keeper_artifact-keeper)
 [![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=artifact-keeper_artifact-keeper&metric=security_rating)](https://sonarcloud.io/dashboard?id=artifact-keeper_artifact-keeper)
@@ -24,7 +28,7 @@ An enterprise-grade, open-source artifact registry supporting **45+ package form
 - **Full-Text Search** - OpenSearch-powered search across all repositories and artifacts
 - **Multi-Auth** - JWT, OpenID Connect, LDAP, SAML 2.0, and API token support
 - **Artifactory Migration** - Built-in tooling to migrate repositories, artifacts, and permissions from JFrog Artifactory
-- **Artifact Signing** - GPG and RSA signing integrated into Debian, RPM, Alpine, and Conda handlers
+- **Artifact Signing** - GPG and RSA signing integrated into Debian, RPM, Alpine, Pacman, and Conda handlers
 
 ## System Architecture
 
@@ -140,6 +144,7 @@ flowchart TD
 | **RPM** | RHEL, Fedora, CentOS |
 | **Debian** | Ubuntu, Debian |
 | **Alpine** | Alpine Linux (APK) |
+| **Pacman** | Arch Linux (hosted) |
 | **Conda** | Conda channels |
 | **OPKG** | OpenWrt, embedded Linux |
 
@@ -155,8 +160,9 @@ flowchart TD
 
 | Format | Ecosystem |
 |--------|-----------|
-| **HuggingFace** | Models, datasets |
+| **HuggingFace** | Hub models (proxy and hosted; not datasets or Spaces) |
 | **ML Model** | Generic ML artifacts |
+| **MCP Registry** | Model Context Protocol server catalog (server.json, registry API v0.1; hosted) |
 
 ### Editor Extensions
 
@@ -204,7 +210,7 @@ flowchart LR
 - **Dual scanner** - Trivy for filesystem/container analysis, Grype for dependency trees
 - **Scoring** - A through F grades based on finding severity and count
 - **Policies** - Configurable rules that block or quarantine artifacts
-- **Signing** - GPG/RSA signing for Debian, RPM, Alpine, and Conda packages
+- **Signing** - GPG/RSA signing for Debian, RPM, Alpine, Pacman, and Conda packages
 
 > **Container-image scanning (`TRIVY_ADAPTER_URL`).** The base `docker-compose.yml`
 > wires `TRIVY_URL` for the legacy trivy *server* (filesystem / incus rootfs
@@ -293,6 +299,11 @@ Get running in 5 minutes with Docker Compose: **[Quickstart Guide](https://artif
 - **[Package Formats](https://artifactkeeper.com/docs/package-formats/)** — All 45+ supported formats
 - **[Docker Deployment](https://artifactkeeper.com/docs/deployment/docker/)** — Production setup guide
 - **[mise / aqua GitHub-Releases proxy](docs/mise-aqua.md)** — Mirror GitHub release assets using the github, mise or aqua format with finite caching
+- **[MCP registry](docs/mcp-registry.md)** — Host an MCP server catalog for VS Code, Copilot and `mcp-publisher`; every package a server runs resolves to an Artifact Keeper repository and is gated like any other artifact
+- **[Hugging Face proxy](docs/huggingface.md)** — Proxy and cache huggingface.co for `huggingface_hub` / `hf download` via `HF_ENDPOINT`
+- **[Bazel module registries](docs/bazel.md)** — `--registry=` setup, and how a hosted module name hides the upstream versions in a virtual repository
+- **[Air-gapped deployments](docs/air-gapped.md)**: Seed-then-disconnect, low-side/high-side peer replication, offline Remote and scanner settings, the background jobs that reach out, and a verification checklist
+- **[Proxy cache freshness](docs/proxy-cache-freshness.md)** — How mutable metadata and immutable artifacts expire on different schedules, and why an upstream yank surfaces as a resolution failure while the artifact still serves
 
 ## Project Structure
 
@@ -435,12 +446,20 @@ Thank you to our sponsors for supporting ongoing development of Artifact Keeper.
 
 ### Backers
 
+<!-- Keep this in step with the active sponsorships: `scripts/release/sponsors.sh` prints the
+     current list (public sponsors by name; private sponsors counted, never named). -->
 <table>
   <tr>
+    <td align="center"><a href="https://github.com/advailo"><img src="https://github.com/advailo.png" width="60" /><br /><sub><b>Advailo, SIA</b></sub></a></td>
+    <td align="center"><a href="https://github.com/StringKe"><img src="https://github.com/StringKe.png" width="60" /><br /><sub><b>stringke</b></sub></a></td>
     <td align="center"><a href="https://github.com/dragonpaw"><img src="https://github.com/dragonpaw.png" width="60" /><br /><sub><b>Ash A.</b></sub></a></td>
+    <td align="center"><a href="https://github.com/huylv95"><img src="https://github.com/huylv95.png" width="60" /><br /><sub><b>Mike</b></sub></a></td>
     <td align="center"><a href="https://github.com/injectedfusion"><img src="https://github.com/injectedfusion.png" width="60" /><br /><sub><b>Gabriel Rodriguez</b></sub></a></td>
+    <td align="center"><a href="https://github.com/narek01"><img src="https://github.com/narek01.png" width="60" /><br /><sub><b>Narek Engibaryan</b></sub></a></td>
   </tr>
 </table>
+
+And one sponsor who chose to stay private. Thank you.
 
 [Become a sponsor](https://github.com/sponsors/artifact-keeper) to support the project and get your name listed here.
 

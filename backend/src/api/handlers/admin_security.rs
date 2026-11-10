@@ -292,9 +292,11 @@ pub struct ProxyBlastRadius {
     /// it is what tells a reader whether a zero below means "searched, nothing
     /// found" or "not searched".
     pub coverage: String,
-    /// Distinct proxy-cached digests carrying this CVE.
+    /// Distinct digests carrying this CVE that a proxy cache holds, or that
+    /// were pulled through one (#4542).
     pub affected_digest_count: i64,
-    /// Repositories whose proxy cache holds one of those digests.
+    /// Repositories whose proxy cache holds one of those digests, or that
+    /// served one before it was evicted or purged (#4542).
     pub affected_repo_count: i64,
     /// Proxy download events of affected digests in the window.
     pub download_count: i64,
@@ -370,7 +372,8 @@ fn db_err(e: sqlx::Error) -> AppError {
 ///
 /// The chain is `proxy_scan_findings` (digest -> CVE, #3395) ->
 /// `proxy_cache_artifacts` (digest -> which repository cached it at which path)
-/// -> `proxy_download_statistics` (who pulled that catalog row). Deliberately
+/// and `proxy_download_statistics` (who pulled that digest, recorded on the
+/// row since #4542, or through the catalog row for older rows). Deliberately
 /// NOT folded into the hosted aggregate: the two have no join key in common
 /// (`artifacts.id` vs `checksum_sha256`), and merging their counts would make
 /// `affected_artifact_count` mean two different things at once.
@@ -392,37 +395,58 @@ async fn proxy_blast_radius(
         return Ok(ProxyBlastRadius::not_applicable());
     };
 
+    // #4542: pulls are attributed by the digest recorded on the statistics
+    // row, so they survive the eviction or purge of the cache entry they were
+    // served from (a remediation purge is exactly when this report is read).
+    // Rows recorded before that column existed carry no digest and are still
+    // reached through their live catalog row, as before.
+    //
+    // Exposure (digests, repositories) is everything that holds or held an
+    // affected digest: still cached, or pulled at some point. It is computed
+    // WITHOUT the download window, as before: a digest sitting in a cache is
+    // exposure whether or not anyone pulled it inside the window. Only the
+    // download figures are windowed.
     let mut builder = sqlx::QueryBuilder::new(
-        "SELECT COUNT(DISTINCT pca.checksum_sha256) AS affected_digest_count, \
-         COUNT(DISTINCT pca.repository_id) AS affected_repo_count, \
-         COUNT(pd.id) AS download_count, \
-         COUNT(DISTINCT pd.user_id) AS downloader_user_count, \
-         bool_or(pd.id IS NOT NULL AND pd.user_id IS NULL) \
-             AS anonymous_download_present \
-         FROM (SELECT DISTINCT checksum_sha256 FROM proxy_scan_findings WHERE cve_id = ",
+        "WITH pf AS (SELECT DISTINCT checksum_sha256 FROM proxy_scan_findings WHERE cve_id = ",
     );
     builder.push_bind(cve_id.as_str());
     builder.push(
-        ") pf \
-         JOIN proxy_cache_artifacts pca ON pca.checksum_sha256 = pf.checksum_sha256 \
-         LEFT JOIN proxy_download_statistics pd ON pd.proxy_cache_id = pca.id",
+        "), cached AS ( \
+             SELECT pca.id, pca.repository_id, pca.checksum_sha256 \
+               FROM proxy_cache_artifacts pca \
+               JOIN pf ON pca.checksum_sha256 = pf.checksum_sha256 \
+         ), pulls AS ( \
+             SELECT pd.id, pd.user_id, pd.repository_id, pd.checksum_sha256 AS digest, \
+                    pd.downloaded_at \
+               FROM proxy_download_statistics pd \
+               JOIN pf ON pd.checksum_sha256 = pf.checksum_sha256 \
+             UNION ALL \
+             SELECT pd.id, pd.user_id, pd.repository_id, c.checksum_sha256, pd.downloaded_at \
+               FROM proxy_download_statistics pd \
+               JOIN cached c ON pd.proxy_cache_id = c.id \
+              WHERE pd.checksum_sha256 IS NULL \
+         ), windowed AS (SELECT * FROM pulls WHERE TRUE",
     );
-    // The window bounds the DOWNLOAD side only, so it must live on the LEFT
-    // JOIN rather than in a WHERE clause — a WHERE on the nullable side of an
-    // outer join would silently drop every cached-but-never-pulled digest and
-    // undercount exposure.
-    //
-    // The `pd.id IS NOT NULL` guard on the anonymous flag above is the price of
-    // that choice: on an unmatched outer-join row every `pd` column is NULL, so
-    // a bare `bool_or(pd.user_id IS NULL)` reports "an anonymous user pulled
-    // this" for a digest nobody pulled at all. The counts are immune (`COUNT`
-    // skips NULLs); only the boolean needed pinning down.
     if let Some(from) = from {
-        builder.push(" AND pd.downloaded_at >= ").push_bind(from);
+        builder.push(" AND downloaded_at >= ").push_bind(from);
     }
     if let Some(to) = to {
-        builder.push(" AND pd.downloaded_at <= ").push_bind(to);
+        builder.push(" AND downloaded_at <= ").push_bind(to);
     }
+    // `bool_or` over an empty `windowed` is NULL, read as false below, so a
+    // digest nobody pulled never reports an anonymous pull.
+    builder.push(
+        ") SELECT \
+             (SELECT COUNT(DISTINCT d) FROM ( \
+                 SELECT checksum_sha256 AS d FROM cached \
+                 UNION SELECT digest FROM pulls) ds) AS affected_digest_count, \
+             (SELECT COUNT(DISTINCT r) FROM ( \
+                 SELECT repository_id AS r FROM cached \
+                 UNION SELECT repository_id FROM pulls) rs) AS affected_repo_count, \
+             (SELECT COUNT(*) FROM windowed) AS download_count, \
+             (SELECT COUNT(DISTINCT user_id) FROM windowed) AS downloader_user_count, \
+             (SELECT bool_or(user_id IS NULL) FROM windowed) AS anonymous_download_present",
+    );
 
     let row: ProxySummaryRow = builder
         .build_query_as()
@@ -1316,6 +1340,90 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("seed proxy_cache_artifacts")
+    }
+
+    /// #4542: proxy pulls stay attributed to their digest after the cache
+    /// entry they were served from is purged. Before, the report joined the
+    /// statistics rows to the live catalog row, so purging the compromised
+    /// object (the remediation) also erased who had pulled it.
+    #[tokio::test]
+    async fn test_blast_radius_keeps_proxy_pulls_after_the_entry_is_purged_4542() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let cve = format!("CVE-4542-{}", &Uuid::new_v4().to_string()[..8]);
+        let digest = format!("{:0>64}", Uuid::new_v4().simple());
+        let (user1, _n1) = tdh::create_user(&pool).await;
+        let (repo, _key, _dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let cache_id = seed_proxy_cache_row(&pool, repo, &digest).await;
+        let (path, storage_key, metadata_key): (String, String, String) = sqlx::query_as(
+            "SELECT path, storage_key, metadata_key FROM proxy_cache_artifacts WHERE id = $1",
+        )
+        .bind(cache_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+            .record_findings(
+                &digest,
+                "grype",
+                &[crate::models::security::ProxyFinding {
+                    cve_id: cve.clone(),
+                    severity: "critical".to_string(),
+                    package_name: Some("werkzeug".to_string()),
+                    package_version: Some("0.15.0".to_string()),
+                    fixed_version: Some("0.15.3".to_string()),
+                    title: None,
+                }],
+            )
+            .await
+            .expect("record proxy finding");
+        // Two cache-hit serves, recorded the way the serve path records them.
+        for user in [Some(user1), None] {
+            crate::services::proxy_catalog::record_proxy_download(
+                &pool,
+                repo,
+                &path,
+                &storage_key,
+                &metadata_key,
+                user,
+                Some("203.0.113.42"),
+                Some("blast/4542"),
+            )
+            .await
+            .expect("record proxy download");
+        }
+
+        // Remediation: purge the compromised entry.
+        sqlx::query("DELETE FROM proxy_cache_artifacts WHERE id = $1")
+            .bind(cache_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = blast_radius_core(
+            &pool,
+            BlastRadiusTarget::Cve(cve.clone()),
+            &BlastRadiusQuery::default(),
+        )
+        .await
+        .expect("cve blast radius");
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            resp.proxy_exposure.download_count, 2,
+            "both pulls of the purged digest stay attributed"
+        );
+        assert_eq!(resp.proxy_exposure.downloader_user_count, 1);
+        assert!(resp.proxy_exposure.anonymous_download_present);
+        assert_eq!(resp.proxy_exposure.affected_digest_count, 1);
+        assert_eq!(
+            resp.proxy_exposure.affected_repo_count, 1,
+            "the repository that served the digest is still exposed"
+        );
     }
 
     /// The bug #3397 names, reproduced and then fixed.

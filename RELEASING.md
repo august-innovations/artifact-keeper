@@ -153,6 +153,22 @@ names the same commit.
    When a commit is refused, each gate names the rule it failed and, for a
    near miss, the path that put it outside the set.
 
+   Check 6 refuses curated notes that are not finished: if
+   `.github/release-notes/<version>.md` exists for the version `Cargo.toml`
+   names, any uppercase `TODO` or `DRAFT` word in it is blocking. Notes may be
+   drafted on `main` before the cut (1.11.0's were, #4468) and their open
+   items are usually HTML comments, which GitHub does not render, so a
+   forgotten draft would otherwise publish with the gaps invisible. Resolve or
+   delete every marker in the prep PR.
+
+   **Cut checklist, beyond the preflight.** Before dispatching the candidate,
+   also confirm the secrets the post-release jobs need (step 8): the
+   `DISCORD_RELEASE_WEBHOOK` webhook is live (rotate it if the last
+   announcement failed with 404), and `AWS_AMI_BUILDER_ROLE_ARN` names a role
+   whose OIDC trust admits this repository. Neither is visible to the
+   preflight, and a missing one turns a published release's announcement or
+   AMI job red.
+
 2. **Bump the version set.** The version is displayed or pinned in several
    decoupled places; a partial bump ships a stale version string. Update
    all of them in one PR (or one PR per repo):
@@ -185,14 +201,22 @@ names the same commit.
    there through verbatim, leaves `## [Unreleased]` holding only its pointer
    line, and deletes the fragments it rendered. Then add the Sponsors and
    Thank You recognition sections to the new section per the "Changelog and
-   Release Notes" policy in [CLAUDE.md](CLAUDE.md), and edit the order or
+   Release Notes" policy in [CLAUDE.md](CLAUDE.md) (`scripts/release/sponsors.sh`
+   prints the Sponsors block from the active GitHub sponsorships, and
+   `scripts/release/sponsors.sh --check .github/release-notes/<version>.md`
+   confirms the notes name every public sponsor), and edit the order or
    wording if the release wants it — the assembler writes a first draft of
    the section, not a verdict on it.
 
    If PRs merge after the prep and before the tag, their fragments are not in
    the section; preflight check 5 says so. Fold them in with
    `scripts/release/assemble-changelog.sh --append` in a
-   `docs(changelog):` commit (exempt, see the table above). Without
+   `docs(changelog):` commit (exempt, see the table above). That commit is
+   its own PR, opened after the fragment is on `main`: the CHANGELOG
+   placement gate (`check-changelog-placement.sh`) recognises a fold-in by
+   the fragment the diff deletes and the section's version having no tag
+   yet, so a fix PR that adds its fragment and folds it in the same diff is
+   refused as a stranded bullet. Without
    `--append` the assembler refuses a version that already has a section,
    because a `Cargo.toml` nobody bumped names the version that already
    shipped; `--append` itself is refused once the tag exists.
@@ -249,8 +273,13 @@ names the same commit.
    backport, before you get as far as preflight.
 
 6. **Dispatch the Release Candidate on the prep commit.** Once the prep PR
-   (steps 2–3, plus the curated notes file) is the tip of `main` and its
-   Docker Publish run is green:
+   (steps 2–3, plus the curated notes file) is the tip of `main`. You need
+   not wait for its Docker Publish run: the candidate's `publish` job waits
+   for that run to succeed (up to 130 minutes) and only then dispatches the
+   preflight, whose check 3 audits the same run. Until #4372 the preflight
+   started beside that wait, so a candidate dispatched right after the prep
+   PR merged failed on "Docker Publish for HEAD is still 'pending'" (run
+   36862392025, v1.10.2).
 
    ```bash
    gh workflow run release-candidate.yml --repo artifact-keeper/artifact-keeper \
@@ -285,9 +314,50 @@ names the same commit.
    Publish already built for the commit, pinned by digest. Nothing is
    rebuilt and nothing gets a name.
 
+   The candidate also warms the CLI binary build caches on `main`: its
+   `warm-cli-caches` job dispatches `release-cli-caches.yml` on `main`, which
+   compiles main's tip for the five release targets and saves the
+   `rust-cache` entries the tag run's `build-binaries` restores (#4927); let
+   that run finish before the promote. The key follows `Cargo.lock` and the
+   workspace manifests rather than the commit, with package versions
+   normalised, so a tag with the same dependencies as main's tip logs
+   `full match: true`. One whose dependencies differ logs `full match: false`
+   and recompiles only the difference. That is the normal case for a patch
+   from a `release/X.Y.x` line, whose tag runs the line's own `release.yml`,
+   which restores anything only once that copy carries the
+   `shared-key: cli-<target>` `Cache Cargo` step. `No cache found.` means the
+   caches were evicted (7-day GitHub retention) or the run never finished, and
+   the build will be cold.
+
    On green it records a **certification**: a signed attestation
    (`actions/attest`, Sigstore via GitHub OIDC) on each image's digest whose
-   predicate names the commit, the version, the run and every digest. A
+   predicate names the commit, the version, the run and every digest.
+   The scanner-adapter is certified at the digest the release ships
+   (#4076): this commit's `sha-<sha>` rebuild when its
+   `docker/scanner-adapter/VERSION` is new, but the already-published
+   `:<adapter VERSION>` digest when that version stays (published from an
+   earlier commit with unchanged sources). The predicate records which
+   (`scanner_adapter_decision`: `new`/`stays`, the owning revision, the
+   tag), the verifier anchors the adapter at that tag, and the promote's tag
+   message and summary print the certified adapter digest and decision.
+
+   Until artifact-keeper-test#380 lands (tracked here as #4439), the
+   adapter's attestation is **provenance of what ships, not proof that the
+   gate exercised those bytes**: the Release Gate takes no adapter input and deploys the chart's
+   pinned adapter, for "new" and "stays" alike. The candidate exposes the
+   value to pass (`needs.images.outputs.adapter_image_ref`) for when it can.
+
+   **Maintenance lines need the #4076 verifier before their next cut.**
+   `release.yml` runs the *tagged* commit's copy of
+   `scripts/ci/assert-candidate-certified.sh`, and a copy older than #4076
+   cannot read a "stays" certification: it would refuse the release after
+   the tag already exists. So the candidate (and, again, the promote, before
+   anything is named) refuses to certify "stays" on a commit whose verifier
+   predates #4076, with an error naming the line. To cut a patch on a
+   `release/X.Y.x` whose adapter version is already published, first backport
+   #4076 to that line (`scripts/ci/assert-candidate-certified.sh`, its
+   self-test, and main's current `release-candidate.yml`, which the line
+   needs byte-identical anyway), then certify the backport commit. A
    `release-candidate-<sha>` artifact and a `release-candidate/certified`
    status on the commit are written for humans; the release path verifies
    the attestation (`scripts/ci/assert-candidate-certified.sh`, pinned to
@@ -318,7 +388,9 @@ names the same commit.
    ```
 
    In order: it verifies the certification for the commit and that the
-   registry still serves the certified digests for `sha-<sha>`; re-checks the
+   registry still serves the certified digests for `sha-<sha>` (the scanner
+   adapter at its exact `:<adapter VERSION>` tag when its version stays, and
+   then that the commit's own verifier can read that certification); re-checks the
    preflight evidence; applies `:X.Y.Z` to the certified digests through
    Docker Publish's PROMOTE mode (`promote_version=X.Y.Z
    promote_source_sha=<sha>` — no rebuild, the digest-aware guard still runs,
@@ -373,6 +445,55 @@ names the same commit.
    A backport moves only its series alias: promoting `1.7.9` while `1.8.2`
    is the newest release advances `:1.7` and leaves `:latest` alone.
 
+   **What runs after the Release is published.** The Release is created
+   with `GITHUB_TOKEN`, and an event caused by `GITHUB_TOKEN` never starts
+   another workflow, so nothing that listens for `release: published` runs
+   for it (#3789, #3896, #3897). `release.yml` therefore dispatches each
+   post-release workflow itself, on the tag, once the `release` job has
+   succeeded, and follows each run to a verdict with
+   `scripts/ci/follow-dispatched-run.sh`. A red follow job means the release
+   IS published and the images are correct; only that side effect is
+   missing. Re-run the job, or dispatch the workflow by hand:
+
+   | `release.yml` job | dispatches | runs for | by hand |
+   |---|---|---|---|
+   | `sync-openapi-spec` | `sync-openapi-spec.yml` | every release | `gh workflow run sync-openapi-spec.yml --ref vX.Y.Z -f dry_run=false` |
+   | `release-announce` | `release-announce.yml` (Discord `#announcements`, secret `DISCORD_RELEASE_WEBHOOK`) | every release; a prerelease gets the amber "pre-release" embed | `gh workflow run release-announce.yml --ref vX.Y.Z -f tag=vX.Y.Z` |
+   | `ami-build` | `ami-build.yml` (Packer, AWS OIDC role secret `AWS_AMI_BUILDER_ROLE_ARN`) | **stable releases only**: an AMI costs money and an `-rc.N` AMI has no consumer | `gh workflow run ami-build.yml --ref vX.Y.Z -f version=X.Y.Z` |
+
+   For a tag whose own workflow files predate the dispatch inputs (anything
+   released before this chain landed), dispatch on `main` instead, e.g.
+   `--ref main -f tag=v1.9.0`. Both inputs are validated: the version or tag
+   must be well-formed, must name a **published** GitHub Release (a draft or
+   a missing Release is refused), and, when dispatched on a version tag, must
+   name that same tag. Each announcement run posts again; there is no
+   de-duplication, so re-run it only if the post did not happen. All three
+   keep their `release: published` trigger for a Release published by hand,
+   whose event does fire (`ami-build.yml` skips a hand-published prerelease
+   there too). No PAT or App token is involved: `workflow_dispatch` is the
+   documented exception to the rule above, and the dispatching jobs use
+   `GITHUB_TOKEN` with `actions: write`.
+   `scripts/ci/check-release-downstream-dispatch.sh` (Shell Tests) fails CI
+   if any dispatch, follow, manual trigger or prerelease rule is dropped.
+
+   Re-running a failed `ami-build` job (or `ami-build.yml` itself) builds a
+   **second** AMI for the same version; there is no de-duplication, so check
+   the AMI build run's summary for an AMI ID before re-running it.
+
+   **Release prerequisites for these jobs.** They fail until two secrets are
+   in place:
+
+   - `DISCORD_RELEASE_WEBHOOK` must be a live webhook. The last two announce
+     runs (v1.7.0, v1.7.3) got HTTP 404 from Discord, so it needs rotating
+     (channel → Integrations → Webhooks → new webhook → update the secret).
+   - `AWS_AMI_BUILDER_ROLE_ARN` (repo or org secret) must name an IAM role
+     whose OIDC trust policy admits this repository's runs on `refs/tags/v*`
+     (the dispatch runs on the tag) and on `refs/heads/main` (manual runs for
+     older tags). No AMI build has ever succeeded. Until one does, the
+     `ami-build` job in `release.yml` is `continue-on-error: true`: a red AMI
+     build shows as a failed job without failing the release run. Remove that
+     line (TODO in the job) once a tagged build succeeds.
+
 9. **Post-release checks.** Confirm the GitHub Release is published (not
    draft), release notes are the curated per-version body (see "Release-notes
    style" below), not the raw auto-generated PR list, `:latest` and `:X.Y`
@@ -418,16 +539,50 @@ one step in this document that a `git push` cannot do. The supported procedure
 is:
 
 ```bash
-# check every precondition and print the plan; changes nothing
-scripts/release/create-release-line.sh --dry-run 1.10
+# the Release Candidate run that certified v1.10.0 (its run id, from the
+# Actions UI or the certification record's candidate_run_id)
+RUN=<id>
 
-# then do it (needs gh authenticated as a repository admin)
-scripts/release/create-release-line.sh 1.10
+# check every precondition and print the plan; changes nothing
+scripts/release/create-release-line.sh --dry-run --tests-from-run "$RUN" 1.10
+
+# then do it (needs gh authenticated as a repository admin, with push access
+# to artifact-keeper-test)
+scripts/release/create-release-line.sh --tests-from-run "$RUN" 1.10
 ```
 
 Paste the audit summary it prints into the release PR, or into the issue that
 asked for the line. An **existing** line needs none of this — only creating
 one, and deleting one, do.
+
+**A line is created in both repositories (#4372).** The Release Gate is
+`artifact-keeper-test`'s `release-gate.yml@main`, and every job in it runs
+that repository's `scripts/switch-tests-ref.sh` (artifact-keeper-test#420):
+when `artifact-keeper-test` has a `release/X.Y.x` for the candidate's
+version, the suite runs from that branch, otherwise from `main`. Without it,
+a maintenance candidate is gated by `main`'s suite, which keeps gaining
+companion tests for features the line never receives; that failed ten suites
+on the v1.10.2 candidate (#4350). So the script also creates
+`release/X.Y.x` in `artifact-keeper-test`, at the suite commit that
+certified the line's first release:
+
+- `--tests-from-run <id>`: the successful Release Candidate run that
+  certified `vX.Y.0`. The commit is the `release-gate.yml` sha GitHub recorded
+  for that run (`referenced_workflows` in the run's API record). The gate's
+  jobs check the suite out at `main` when each starts, so a suite merge
+  landing mid-run can make them differ; if that happened, pass the commit the
+  gate jobs' checkout step logged with `--tests-sha`.
+- `--tests-sha <40-hex>`: that commit, given directly. It must be on
+  `artifact-keeper-test`'s `main`.
+
+`artifact-keeper-test` has no ruleset on `release/*`, so its branch is a plain
+ref creation after the backend window has closed, and nothing has to be
+dispatched there: the gate reads the branch each time a candidate runs. It is
+idempotent. A test branch that already exists is left where it is, because its
+tip legitimately moves (see "Patch releases" below). Running the script for a
+line whose backend branch already exists, with a `--tests-*` option, creates
+only the test branch and never touches the ruleset; that is how a failed
+test-branch creation is retried and how an older line gets one.
 
 ### Why the push is refused, and why that is not a bug
 
@@ -490,12 +645,18 @@ same toggle every time, rather than a hand-typed improvisation during a cut.
    repos/…/rules/branches/release%2F<X.Y>.x` must report all four rules
    (`pull_request`, `required_status_checks`, `non_fast_forward`, `deletion`),
    and `git ls-remote` must show the branch at the sha it was asked for.
-6. Prints the audit summary — actor, UTC window, sha, branch, and how many
-   seconds the ruleset spent in `evaluate`.
+6. Creates `release/<X.Y>.x` in `artifact-keeper-test` (above), resolved and
+   checked with the other preconditions before anything is relaxed: push
+   access, a successful Release Candidate run or an explicit sha, and that
+   commit on the suite's `main`. Then it reads the branch back.
+7. Prints the audit summary — actor, UTC window, sha, branch, how many
+   seconds the ruleset spent in `evaluate`, and the test branch.
 
 `scripts/ci/test-create-release-line.sh` (in the `shell-tests` job) pins the
-refusals, the "`--dry-run` issues no PUT/POST" property and the restore-on-
-failure trap, because none of them is exercised by a normal CI run.
+refusals, the "`--dry-run` issues no PUT/POST" property, the restore-on-
+failure trap and the test-branch cases (created at the run's gate commit,
+left alone when it exists, created alone for an existing line), because none
+of them is exercised by a normal CI run.
 
 ### `release/1.9.1-prep` is not a release line
 
@@ -549,8 +710,14 @@ same way: **both workflows are dispatched on `main`**, and you name the commit.
 #    dispatchable release.yml / promotable docker-publish.yml; the candidate
 #    refuses the commit by name if any is missing.
 
+#    It also needs the matching release/1.9.x in artifact-keeper-test, which
+#    the script creates; the gate runs the line's suite from it (#4372).
+
 # 1. land the fixes on main first, then cherry-pick onto release/1.9.x
-#    (Release Branch Gate enforces this)
+#    (Release Branch Gate enforces this). In the same cycle, cherry-pick the
+#    fixes' companion tests onto artifact-keeper-test's release/1.9.x, or the
+#    line's gate does not exercise the line's own fixes
+#    (artifact-keeper-test#424).
 
 # 2. the release prep commit on release/1.9.x sets Cargo.toml to 1.9.1 and
 #    runs scripts/release/assemble-changelog.sh, exactly as on main (the
@@ -646,6 +813,15 @@ over the API, and the images themselves are pinned by digest. `resolve`'s
 about what the *promote* runs later at the tag, not about this run. A self-test
 (`scripts/ci/test-resolve-certified-ref.sh`) pins all of this structurally, so
 a future checkout of the certified sha fails CI.
+
+The CLI build cache warm-up (`release-cli-caches.yml`, #4927) is not given the
+certified commit at all. Its caches land in main's scope and the tag run
+restores them into the binaries it signs, and `cargo build` executes the tree's
+build scripts and proc macros in a run that can write any key in that scope,
+whatever its `permissions:` say. So it has no input and no checkout `ref:`: a
+dispatch on `main` builds main's tip, the same code and the same cache scope as
+`ci.yml` on a push to main. A self-test
+(`scripts/ci/test-resolve-certified-ref.sh`) fails CI if that changes.
 
 **Downstream of the tag is a different story, deliberately.** The promote
 dispatches `release.yml` and `docker-publish.yml` on the tag, which runs the
@@ -931,7 +1107,10 @@ section**:
 
 Mechanics: author the body as `.github/release-notes/<version>.md` and
 commit it in the same PR as the CHANGELOG assembly (step 3). `release.yml`'s
-"Resolve release notes" step uses that file as the Release `body_path`.
+"Resolve release notes" step uses that file as the Release `body_path`. A
+long release may land a draft earlier, with its open items marked `TODO`;
+preflight check 6 refuses the cut until no `TODO` or `DRAFT` marker is left
+in the notes for the version being released.
 
 For a stable `vX.Y.Z` the file is **required**: with no curated file the
 release-preflight job refuses the tag, and the "Resolve release notes" step

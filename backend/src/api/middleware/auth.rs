@@ -30,9 +30,14 @@ use crate::api::{
 };
 use crate::error::AppError;
 use crate::models::access_scope::AccessScope;
-use crate::models::repository::RepositoryVisibility;
+use crate::models::repository::{is_deleting_key, RepositoryVisibility};
 use crate::models::user::User;
-use crate::services::auth_service::{AuthService, Claims};
+use crate::services::auth_service::{
+    is_api_token_shape, is_jwt_shape, AuthService, Claims, TimingPad,
+};
+use crate::services::metrics_service::{
+    record_auth_failure, AuthFailureReason, AuthFailureSurface,
+};
 use crate::services::permission_service::PermissionService;
 
 /// Custom header name for API key
@@ -92,6 +97,14 @@ pub struct AuthExtension {
     /// `TokenIat` extension) so the single `From<Claims>` source stamps it
     /// uniformly alongside the live re-derived `is_admin` (#1166, #1394).
     pub iat_ms: Option<i64>,
+}
+
+/// Note the authenticated principal for the `user` field of the per-request
+/// `Request completed` log line (#4674). A no-op for an anonymous request.
+fn record_request_user(auth: Option<&AuthExtension>) {
+    if let Some(ext) = auth {
+        crate::api::middleware::request_span::record_user(&ext.username);
+    }
 }
 
 /// Marker request extension inserted alongside [`AuthExtension`] when the
@@ -296,6 +309,23 @@ impl AuthExtension {
         } else {
             Err(AppError::Authorization("Admin access required".to_string()))
         }
+    }
+
+    /// Admin gate for instance-wide listings that span every repository
+    /// (hold queues, download attribution, system stats). On top of
+    /// [`require_admin`](Self::require_admin), refuses a repository-scoped
+    /// token (API token or JWT) with 403: token scope binds ahead of admin
+    /// (#3901, #3174), and such a token must not read rows of repositories
+    /// outside its allow-list (#4273, #4550). `what` names the listing in
+    /// the error message.
+    pub fn require_unscoped_admin(&self, what: &str) -> crate::error::Result<()> {
+        self.require_admin()?;
+        if matches!(self.allowed_repo_ids, AccessScope::Restricted(_)) {
+            return Err(AppError::Authorization(format!(
+                "Repository-scoped tokens cannot read {what}"
+            )));
+        }
+        Ok(())
     }
 
     /// Self-or-admin gate: allow the call when the caller is acting on their
@@ -512,48 +542,7 @@ pub async fn require_auth_with_bearer_fallback(
 
 /// bcrypt semaphore shed or a pool-acquire timeout: retryable, not a bad password.
 fn auth_capacity_failure(err: &AppError) -> bool {
-    matches!(err, AppError::ServiceUnavailable(_)) || err.is_pool_timeout()
-}
-
-/// Username/password credential shared by Basic auth and Bearer-encoded basic.
-///
-/// When `allow_basic_api_token` is set (format and registry routes), the
-/// password is tried as an API token first. `validate_api_token` checks the
-/// in-memory cache, then bcrypt, then inserts a hit. A cache hit never takes
-/// a bcrypt permit. A capacity shed is [`AuthOutcome::Overloaded`] and does
-/// not fall through into `authenticate`, which would turn it into a 401.
-/// A real password still takes the bcrypt path. When the flag is false the
-/// token probe is skipped, so the management API still refuses an API token
-/// presented as a Basic password.
-async fn resolve_username_password(
-    auth_service: &AuthService,
-    username: &str,
-    password: &str,
-    allow_basic_api_token: bool,
-) -> AuthOutcome {
-    if allow_basic_api_token {
-        match validate_api_token_with_scopes(auth_service, password).await {
-            Ok(ext) => return AuthOutcome::Resolved(ext),
-            Err(TokenAuthError::Overloaded) => return AuthOutcome::Overloaded,
-            Err(TokenAuthError::Invalid) => {}
-        }
-    }
-    match auth_service.authenticate(username, password).await {
-        Ok((user, _)) => return AuthOutcome::Resolved(AuthExtension::from(user)),
-        // A transient bcrypt-capacity shed must surface as 503, not a 401.
-        // Without this, twine (which sends standard Basic auth) gets a
-        // spurious 401 under parallel-suite load and aborts, while a single
-        // curl -u upload with the same credentials succeeds.
-        Err(e) if auth_capacity_failure(&e) => return AuthOutcome::Overloaded,
-        Err(_) => {}
-    }
-    // Short-lived JWT access token as the password. CI/CD keyless flows
-    // (OIDC token exchange) send the AK access token as the Basic password
-    // for Maven, pip/twine, and Helm.
-    if let Ok(claims) = auth_service.validate_access_token_async(password).await {
-        return AuthOutcome::Resolved(AuthExtension::from(claims));
-    }
-    AuthOutcome::InvalidCredential
+    matches!(err, AppError::ServiceUnavailable(_)) || err.is_db_unavailable()
 }
 
 /// Token extraction result
@@ -830,6 +819,23 @@ fn decode_basic_credentials(encoded: &str) -> Option<(String, String)> {
     Some((user.to_owned(), pass.to_owned()))
 }
 
+/// Decode the `username:password` carried by a credential that can reach the
+/// LDAP Basic-auth passthrough: an HTTP `Basic` header, or the base64 form
+/// npm/cargo/goproxy sometimes put under `Bearer`.
+///
+/// Shared with the guest-access guard so its "is this a directory credential
+/// the package route should answer?" decision cannot drift from the
+/// passthrough's own decoding.
+pub(crate) fn extracted_basic_credentials(
+    extracted: ExtractedToken<'_>,
+) -> Option<(String, String)> {
+    match extracted {
+        ExtractedToken::Basic(encoded) => decode_basic_credentials(encoded),
+        ExtractedToken::Bearer(token) => decode_basic_credentials(token),
+        ExtractedToken::ApiKey(_) | ExtractedToken::None | ExtractedToken::Invalid => None,
+    }
+}
+
 /// Whether `path` is reachable by a principal flagged `must_change_password`.
 ///
 /// A forced-rotation user is otherwise blocked from every route (see
@@ -921,7 +927,9 @@ pub async fn auth_middleware(
     // invalidation (TOTP, password) to exempt the calling session's own token
     // now travels as `AuthExtension::iat_ms`, stamped at the single
     // `From<Claims>` source; it is `None` for non-JWT principals (#1394).
-    let header_result: Result<AuthExtension, &'static str> = match extracted {
+    // A failure carries the 401 message and, when a credential was presented,
+    // what `ak_auth_failures_total` counts it as (#4676).
+    let header_result: HeaderAuthResult = match extracted {
         // Replica-safe access-token validation. The async variant consults the
         // DB credential-change watermark (#1173) so a password reset, TOTP
         // change, or deactivation on a peer replica is honoured here on the
@@ -932,89 +940,78 @@ pub async fn auth_middleware(
         ExtractedToken::Bearer(token) => {
             match auth_service.validate_access_token_async(token).await {
                 Ok(claims) => Ok(AuthExtension::from(claims)),
-                Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
-                    Ok(ext) => Ok(ext),
-                    // Same transient bcrypt-capacity shed as the Basic branch
-                    // below: a saturated cap is "retry shortly", not "wrong
-                    // token". See `TokenAuthError::Overloaded`.
-                    Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
-                    Err(TokenAuthError::Invalid) => Err("Invalid or expired token"),
-                },
+                // The JWT's signature already verified (the DB is only reached
+                // after `decode_token`), so a DB failure in the live-user /
+                // credential-watermark lookup is infrastructure, not a bad
+                // token: retryable 503, never a fall-through to 401 (#4750).
+                Err(ref e) if e.is_db_unavailable() => return service_unavailable_response(),
+                Err(jwt_err) => {
+                    match validate_api_token_with_scopes(&auth_service, token).await {
+                        Ok(ext) => Ok(ext),
+                        // Same transient bcrypt-capacity shed as the Basic branch
+                        // below: a saturated cap is "retry shortly", not "wrong
+                        // token". See `TokenAuthError::Overloaded`.
+                        Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
+                        Err(TokenAuthError::Invalid(reason)) => Err((
+                            "Invalid or expired token",
+                            Some(bearer_failure(&jwt_err, reason)),
+                        )),
+                    }
+                }
             }
         }
         ExtractedToken::ApiKey(token) => {
             match validate_api_token_with_scopes(&auth_service, token).await {
                 Ok(ext) => Ok(ext),
                 Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
-                Err(TokenAuthError::Invalid) => Err("Invalid or expired API token"),
+                Err(TokenAuthError::Invalid(reason)) => Err((
+                    "Invalid or expired API token",
+                    Some((AuthFailureSurface::Api, reason)),
+                )),
             }
         }
         ExtractedToken::Basic(encoded) => match decode_basic_credentials(encoded) {
-            None => Err("Invalid Basic auth credentials"),
+            None => Err((
+                "Invalid Basic auth credentials",
+                Some((AuthFailureSurface::Basic, AuthFailureReason::InvalidToken)),
+            )),
+            // Same token-first resolution as the optional-auth paths, with
+            // API tokens refused as the Basic password on this management
+            // surface (#2806): an issued-token-shaped password is never
+            // bcrypt-verified, and a real password pays exactly one bcrypt
+            // (#5640). A JWT access token as the password still works for the
+            // CI/CD keyless flows (OIDC token exchange) where Maven, twine and
+            // Helm send it there.
             Some((username, password)) => {
-                match auth_service.authenticate(&username, &password).await {
-                    Ok((user, _token_pair)) => Ok(AuthExtension::from(user)),
-                    // A transient bcrypt-capacity shed must NOT be collapsed
-                    // into a 401. `authenticate()` runs bcrypt(cost=12) under a
-                    // process-wide concurrency cap (see
-                    // `auth_service::acquire_auth_permit_for_bcrypt`); when that
-                    // cap saturates under a burst of concurrent Basic-auth
-                    // requests it returns `AppError::ServiceUnavailable`, which
-                    // is a retryable 503, not "wrong password". Collapsing it to
-                    // 401 "Invalid credentials" is what made `twine upload` fail
-                    // in the release gate (a curl -u upload with byte-identical
-                    // credentials passed because it didn't coincide with a
-                    // saturated cap): twine does not retry on 401 but does on
-                    // 503. Surface the shed as 503 + Retry-After so well-behaved
-                    // clients back off and retry instead of aborting.
-                    Err(AppError::ServiceUnavailable(msg)) => {
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            [(axum::http::header::RETRY_AFTER, "1")],
-                            msg,
-                        )
-                            .into_response();
-                    }
-                    // A pool-acquire timeout during the credential DB lookup is
-                    // a transient capacity problem (POOL_EXHAUSTED), not "wrong
-                    // password": surface the same retryable 503 the #2101/#2102
-                    // handlers return rather than flattening it to a spurious
-                    // 401 (#2125). Clients retry on 503 but abort on 401.
-                    Err(ref e) if e.is_pool_timeout() => {
+                let mut failure = None;
+                match resolve_basic_pair(&auth_service, &username, &password, false, &mut failure)
+                    .await
+                {
+                    AuthOutcome::Resolved(ext) => Ok(ext),
+                    // A transient bcrypt-capacity shed or a pool-acquire
+                    // timeout is a retryable 503, never a 401: twine does not
+                    // retry on 401 but does on 503 (#2125).
+                    AuthOutcome::Overloaded | AuthOutcome::RateLimited(_) => {
                         return service_unavailable_response();
                     }
-                    Err(_) => {
-                        // Try treating the password as a short-lived JWT access
-                        // token. This enables CI/CD keyless flows (e.g. OIDC
-                        // token exchange) where package managers like Maven,
-                        // pip/twine, and Helm send the AK access token as the
-                        // Basic-auth password. `From<Claims>` stamps `iat_ms` so
-                        // credential-change invalidation can exempt the calling
-                        // session.
-                        //
-                        // An API token is deliberately NOT accepted as the Basic
-                        // password here: this is the hard-auth middleware for the
-                        // management API (/api/v1/auth, /profile, /signing, …).
-                        // Per the openapi.rs contract, an API token is only ever
-                        // valid as a `Bearer`/`X-Api-Key` credential or the Basic
-                        // password on the FORMAT/registry endpoints (handled by
-                        // `repo_visibility_middleware` → `try_resolve_auth_outcome`
-                        // with `allow_basic_api_token=true`). Accepting it here
-                        // (added by #2798) over-reached the #2786 need; #2806
-                        // restores the /api/v1 Basic-auth boundary.
-                        match auth_service.validate_access_token_async(&password).await {
-                            Ok(claims) => Ok(AuthExtension::from(claims)),
-                            Err(_) => Err("Invalid credentials"),
-                        }
-                    }
+                    AuthOutcome::InvalidCredential | AuthOutcome::NoCredential => Err((
+                        "Invalid credentials",
+                        Some(failure.unwrap_or((
+                            AuthFailureSurface::Basic,
+                            AuthFailureReason::BadPassword,
+                        ))),
+                    )),
                 }
             }
         },
-        ExtractedToken::None => Err("Missing authorization header"),
-        ExtractedToken::Invalid => Err("Invalid authorization header format"),
+        ExtractedToken::None => Err(("Missing authorization header", None)),
+        ExtractedToken::Invalid => Err((
+            "Invalid authorization header format",
+            Some((AuthFailureSurface::Api, AuthFailureReason::InvalidToken)),
+        )),
     };
 
-    let header_error = match header_result {
+    let (header_error, header_failure) = match header_result {
         Ok(ext) => {
             // Enforce a forced password rotation (`must_change_password`).
             //
@@ -1058,6 +1055,7 @@ pub async fn auth_middleware(
             // That surfaced as a 500 instead of the canonical 403 for a
             // read-scope service-account token on POST /api/v1/permissions.
             // See #1438 (B10).
+            record_request_user(Some(&ext));
             request.extensions_mut().insert(Some(ext.clone()));
             request.extensions_mut().insert(ext);
             return next.run(request).await;
@@ -1074,6 +1072,7 @@ pub async fn auth_middleware(
             // Same dual-shape insertion as the header-auth path above so
             // `Extension<Option<AuthExtension>>` handlers resolve under a
             // ticket-authenticated request too (#1438 / B10).
+            record_request_user(Some(&ext));
             request.extensions_mut().insert(Some(ext.clone()));
             request.extensions_mut().insert(ext);
             request.extensions_mut().insert(DownloadTicketAuth);
@@ -1096,7 +1095,34 @@ pub async fn auth_middleware(
     } else {
         header_error
     };
+    // Count the rejected credential (#4676). A rejected download ticket is a
+    // presented credential too; a request that presented nothing is not.
+    let failure = header_failure.or_else(|| {
+        ticket_parts
+            .is_some()
+            .then_some((AuthFailureSurface::Api, AuthFailureReason::InvalidToken))
+    });
+    if let Some((surface, reason)) = failure {
+        record_auth_failure(surface, reason);
+    }
     (StatusCode::UNAUTHORIZED, message).into_response()
+}
+
+/// `(surface, reason)` of one rejected credential for `ak_auth_failures_total`.
+type AuthFailureLabels = (AuthFailureSurface, AuthFailureReason);
+
+/// `auth_middleware`'s header-credential result: the principal, or the 401
+/// message plus the labels of the rejected credential (none when nothing was
+/// presented).
+type HeaderAuthResult = Result<AuthExtension, (&'static str, Option<AuthFailureLabels>)>;
+
+/// The labels for a Bearer credential that failed as a JWT and then as an API
+/// token: `expired` if either validator said so, else `invalid_token`.
+fn bearer_failure(jwt_err: &AppError, api_token_reason: AuthFailureReason) -> AuthFailureLabels {
+    (
+        AuthFailureSurface::Api,
+        AuthFailureReason::for_token_error(jwt_err, api_token_reason),
+    )
 }
 
 /// Why an API-token validation attempt did not produce an [`AuthExtension`].
@@ -1112,7 +1138,9 @@ pub async fn auth_middleware(
 #[derive(Debug, PartialEq, Eq)]
 enum TokenAuthError {
     /// The credential failed validation; the caller owes the client a 401.
-    Invalid,
+    /// Carries the `ak_auth_failures_total` reason (`expired` or
+    /// `invalid_token`, #4676).
+    Invalid(AuthFailureReason),
     /// The bcrypt-bound auth-concurrency cap is saturated; the caller must
     /// surface a retryable 503 (see [`service_unavailable_response`]), never
     /// a 401.
@@ -1133,9 +1161,14 @@ fn classify_token_validation_err(err: AppError) -> TokenAuthError {
         // (POOL_EXHAUSTED) exactly like the #2101/#2102 handler path instead of
         // flattening it to a spurious 401 (#2125). Reuses the shared
         // `AppError::is_pool_timeout` predicate so the classification stays
-        // consistent all the way up the stack.
-        ref e if e.is_pool_timeout() => TokenAuthError::Overloaded,
-        _ => TokenAuthError::Invalid,
+        // consistent all the way up the stack. Widened to every
+        // database-unavailable failure (closed pool, lost connection,
+        // statement / lock timeout) by #4750.
+        ref e if e.is_db_unavailable() => TokenAuthError::Overloaded,
+        ref e => TokenAuthError::Invalid(AuthFailureReason::for_token_error(
+            e,
+            AuthFailureReason::InvalidToken,
+        )),
     }
 }
 
@@ -1200,6 +1233,9 @@ pub(crate) enum AuthOutcome {
     /// it did not coincide with a saturated cap); twine does not retry on
     /// 401 but does on 503.
     Overloaded,
+    /// The shared login limiter refused an LDAP Basic-auth passthrough bind
+    /// (#3830). Carries the `Retry-After` seconds.
+    RateLimited(u64),
 }
 
 /// Resolve a possibly-missing credential into an [`AuthOutcome`].
@@ -1240,36 +1276,134 @@ pub(crate) enum AuthOutcome {
 /// `username:password` logins are unaffected in BOTH modes. The discrimination is
 /// per-middleware (structural), never request-path string matching — axum's
 /// nest-prefix stripping makes path matching unreliable here.
+///
+/// Runs in an `INTERNAL` `authenticate` span (#4455), so a trace shows how
+/// much of a request went to credential validation (JWT, API-token lookup,
+/// bcrypt). The span records no credential material.
+///
+/// Every [`AuthOutcome::InvalidCredential`] is counted in
+/// `ak_auth_failures_total` (#4676): each request resolves its credential
+/// through here once on the path that answers it (the guest-access guard
+/// answers an invalid credential itself, before any inner middleware runs).
+#[tracing::instrument(name = "authenticate", level = "info", skip_all)]
 pub(crate) async fn try_resolve_auth_outcome(
     auth_service: &AuthService,
     extracted: ExtractedToken<'_>,
     allow_basic_api_token: bool,
+) -> AuthOutcome {
+    let mut failure = None;
+    let outcome =
+        resolve_auth_outcome(auth_service, extracted, allow_basic_api_token, &mut failure).await;
+    if matches!(outcome, AuthOutcome::InvalidCredential) {
+        let (surface, reason) =
+            failure.unwrap_or((AuthFailureSurface::Api, AuthFailureReason::InvalidToken));
+        record_auth_failure(surface, reason);
+    }
+    outcome
+}
+
+/// Resolve a credential with the opt-in LDAP Basic-auth passthrough (#3830).
+///
+/// Identical to [`try_resolve_auth_outcome`] for every credential form that
+/// already worked, with one addition: on the format/registry surfaces
+/// (`allow_basic_api_token = true`) a Basic `username:password` — or the
+/// base64 `username:password` that some clients put in a `Bearer` header —
+/// that failed bcrypt, JWT-as-password, and API-token-as-password is finally
+/// tried against the configured LDAP/AD provider.
+///
+/// The ordering is load-bearing: a directory bind is the most expensive and
+/// the only path that spends an AD account's failed-password budget, so it
+/// must run last. The passthrough itself is disabled unless
+/// `LDAP_BASIC_AUTH_PASSTHROUGH=true`, rate-limited through the shared
+/// `/v2/token` limiter, and cached per credential (see
+/// `services::ldap_basic_auth`).
+#[tracing::instrument(name = "authenticate", level = "info", skip_all)]
+pub(crate) async fn try_resolve_auth_outcome_with_passthrough(
+    auth_service: &AuthService,
+    extracted: ExtractedToken<'_>,
+    allow_basic_api_token: bool,
+    path: &str,
+    method: &str,
+) -> AuthOutcome {
+    let mut failure = None;
+    let outcome =
+        resolve_auth_outcome(auth_service, extracted, allow_basic_api_token, &mut failure).await;
+
+    if matches!(outcome, AuthOutcome::InvalidCredential) && allow_basic_api_token {
+        // `resolve_auth_outcome` already tried the same decoded pair as
+        // bcrypt (and the Bearer form as a JWT/API token), so this only
+        // reaches the directory after every cheaper form has failed.
+        if let Some((username, password)) = extracted_basic_credentials(extracted) {
+            match crate::services::ldap_basic_auth::try_authenticate(
+                auth_service,
+                &username,
+                &password,
+                path,
+                method,
+            )
+            .await
+            {
+                crate::services::ldap_basic_auth::Outcome::Resolved(user) => {
+                    return AuthOutcome::Resolved(AuthExtension::from(*user));
+                }
+                crate::services::ldap_basic_auth::Outcome::RateLimited(retry_after) => {
+                    return AuthOutcome::RateLimited(retry_after);
+                }
+                crate::services::ldap_basic_auth::Outcome::Unavailable => {
+                    return AuthOutcome::Overloaded;
+                }
+                crate::services::ldap_basic_auth::Outcome::Invalid => {}
+            }
+        }
+    }
+
+    if matches!(outcome, AuthOutcome::InvalidCredential) {
+        let (surface, reason) =
+            failure.unwrap_or((AuthFailureSurface::Api, AuthFailureReason::InvalidToken));
+        record_auth_failure(surface, reason);
+    }
+    outcome
+}
+
+/// [`try_resolve_auth_outcome`]'s decision tree. Sets `failure` to the
+/// `ak_auth_failures_total` labels before answering `InvalidCredential`.
+async fn resolve_auth_outcome(
+    auth_service: &AuthService,
+    extracted: ExtractedToken<'_>,
+    allow_basic_api_token: bool,
+    failure: &mut Option<AuthFailureLabels>,
 ) -> AuthOutcome {
     match extracted {
         ExtractedToken::Bearer(token) => {
             // See `auth_middleware` for why this is the async variant. Same
             // rationale: optional-auth routes still need to reject pre-change
             // tokens across replicas (#1173).
-            if let Ok(claims) = auth_service.validate_access_token_async(token).await {
-                return AuthOutcome::Resolved(AuthExtension::from(claims));
-            }
+            let jwt_err = match auth_service.validate_access_token_async(token).await {
+                Ok(claims) => return AuthOutcome::Resolved(AuthExtension::from(claims)),
+                // Signature verified, DB lookup failed: retryable 503 (#4750).
+                Err(ref e) if e.is_db_unavailable() => return AuthOutcome::Overloaded,
+                Err(e) => e,
+            };
             match validate_api_token_with_scopes(auth_service, token).await {
                 Ok(ext) => return AuthOutcome::Resolved(ext),
                 // A transient bcrypt-capacity shed must surface as 503, not
                 // 401. See `AuthOutcome::Overloaded`.
                 Err(TokenAuthError::Overloaded) => return AuthOutcome::Overloaded,
-                Err(TokenAuthError::Invalid) => {}
+                Err(TokenAuthError::Invalid(reason)) => {
+                    *failure = Some(bearer_failure(&jwt_err, reason));
+                }
             }
             // Some package managers (npm, cargo, goproxy) send Bearer tokens
             // that are base64-encoded `username:password` rather than JWTs or
             // API keys. The password may itself be an API token; resolve that
             // (cache, then bcrypt) before a password verify.
             if let Some((username, password)) = decode_basic_credentials(token) {
-                return resolve_username_password(
+                return resolve_basic_pair(
                     auth_service,
                     &username,
                     &password,
                     allow_basic_api_token,
+                    failure,
                 )
                 .await;
             }
@@ -1281,24 +1415,148 @@ pub(crate) async fn try_resolve_auth_outcome(
                 // See `AuthOutcome::Overloaded`: saturated bcrypt cap is a
                 // retryable 503, never a 401.
                 Err(TokenAuthError::Overloaded) => AuthOutcome::Overloaded,
-                Err(TokenAuthError::Invalid) => AuthOutcome::InvalidCredential,
+                Err(TokenAuthError::Invalid(reason)) => {
+                    *failure = Some((AuthFailureSurface::Api, reason));
+                    AuthOutcome::InvalidCredential
+                }
             }
         }
         ExtractedToken::Basic(encoded) => {
             let Some((username, password)) = decode_basic_credentials(encoded) else {
+                *failure = Some((AuthFailureSurface::Basic, AuthFailureReason::InvalidToken));
                 return AuthOutcome::InvalidCredential;
             };
-            resolve_username_password(auth_service, &username, &password, allow_basic_api_token)
-                .await
+            resolve_basic_pair(
+                auth_service,
+                &username,
+                &password,
+                allow_basic_api_token,
+                failure,
+            )
+            .await
         }
         ExtractedToken::None => AuthOutcome::NoCredential,
-        ExtractedToken::Invalid => AuthOutcome::InvalidCredential,
+        ExtractedToken::Invalid => {
+            *failure = Some((AuthFailureSurface::Api, AuthFailureReason::InvalidToken));
+            AuthOutcome::InvalidCredential
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Download ticket auth (?ticket= query param)
 // ---------------------------------------------------------------------------
+
+/// Resolve a decoded HTTP Basic `username:password` pair (#5640, #5633).
+///
+/// Order is by cost, cheapest first, and is shaped so a token never pays for
+/// a password check:
+///
+/// 1. **JWT-shaped password** (`eyJ…` compact JWS): validated as an AK access
+///    token (HMAC, no bcrypt) — the keyless CI/OIDC flow where Maven, twine
+///    or Helm send the access token as the password. Never bcrypt-verified.
+/// 2. **API-token-shaped password** (`<8 hex>_<32 hex>`): validated as an API
+///    token, which answers from the token cache after the first request and
+///    rejects an unknown, revoked or expired token before any bcrypt (see
+///    `AuthService::validate_api_token`). On the /api/v1 management surfaces
+///    (`allow_basic_api_token = false`) a token is not an accepted Basic
+///    password (#2806), so it is refused outright. Never bcrypt-verified as a
+///    password either: that is what cost every `user:<api_token>` request a
+///    cost-12 bcrypt (0.34 s) before the token was even tried, saturated the
+///    auth-concurrency cap into `503 Authentication service is at capacity`,
+///    and bumped the account's failed-login counter on every request.
+/// 3. **Anything else** is a password: one bcrypt via
+///    `AuthService::authenticate_basic_with_reason`, which pads the
+///    unknown-username, federated and hashless arms with the same bcrypt so
+///    an unknown username is not answered measurably faster than a known one.
+///    The pad is off while the LDAP Basic-auth passthrough is enabled: a
+///    directory user's password then takes the federated or no-local-row arm
+///    on every request on its way to the passthrough (cache hits included),
+///    and must not pay a bcrypt and an auth permit for it (see
+///    `AuthEntry::Basic`).
+///
+/// Consequence, deliberate: a local account whose password happens to be
+/// shaped exactly like an AK-issued token cannot use it as a Basic password
+/// on these surfaces (it still logs in at `POST /api/v1/auth/login`).
+/// Falling back to bcrypt for such a secret would put every invalid token
+/// back in front of the auth-capacity cap.
+///
+/// Sets `failure` to the `ak_auth_failures_total` labels before answering
+/// [`AuthOutcome::InvalidCredential`].
+async fn resolve_basic_pair(
+    auth_service: &AuthService,
+    username: &str,
+    password: &str,
+    allow_basic_api_token: bool,
+    failure: &mut Option<AuthFailureLabels>,
+) -> AuthOutcome {
+    if is_jwt_shape(password) {
+        return match auth_service.validate_access_token_async(password).await {
+            Ok(claims) => AuthOutcome::Resolved(AuthExtension::from(claims)),
+            // Signature verified, DB lookup failed: retryable 503 (#4750).
+            Err(ref e) if e.is_db_unavailable() => AuthOutcome::Overloaded,
+            Err(e) => {
+                *failure = Some((
+                    AuthFailureSurface::Basic,
+                    AuthFailureReason::for_token_error(&e, AuthFailureReason::InvalidToken),
+                ));
+                AuthOutcome::InvalidCredential
+            }
+        };
+    }
+
+    if is_api_token_shape(password) {
+        // The /api/v1 management callers (`optional_auth_middleware`,
+        // `admin_middleware`, `auth_middleware`) pass `false`: an API token
+        // presented as a Basic password there is refused, honouring the
+        // openapi.rs contract (#2806). Only the format/registry endpoints
+        // (`repo_visibility_middleware`) accept the pip-netrc /
+        // Artifactory-style `user:<api_token>` form (#2786). The username is
+        // not checked against the token owner: `__token__:` / `token:` clients
+        // rely on the token alone identifying the user.
+        if !allow_basic_api_token {
+            *failure = Some((AuthFailureSurface::Basic, AuthFailureReason::InvalidToken));
+            return AuthOutcome::InvalidCredential;
+        }
+        return match validate_api_token_with_scopes(auth_service, password).await {
+            Ok(ext) => AuthOutcome::Resolved(ext),
+            // A live token's first (uncached) verify runs bcrypt under the
+            // process-wide cap; a shed there is a retryable 503, not a 401.
+            Err(TokenAuthError::Overloaded) => AuthOutcome::Overloaded,
+            Err(TokenAuthError::Invalid(reason)) => {
+                *failure = Some((AuthFailureSurface::Basic, reason));
+                AuthOutcome::InvalidCredential
+            }
+        };
+    }
+
+    let pad = if crate::services::ldap_basic_auth::passthrough_enabled() {
+        TimingPad::Off
+    } else {
+        TimingPad::On
+    };
+    match auth_service
+        .authenticate_basic_with_reason(username, password, pad)
+        .await
+    {
+        Ok((user, _)) => AuthOutcome::Resolved(AuthExtension::from(user)),
+        // A transient bcrypt-capacity shed must surface as 503, not a 401.
+        // Without this, twine (which sends standard Basic auth) gets a
+        // spurious 401 under parallel-suite load and aborts, while a single
+        // curl -u upload with the same credentials succeeds. See
+        // `AuthOutcome::Overloaded`.
+        Err(ref f) if matches!(f.error, AppError::ServiceUnavailable(_)) => AuthOutcome::Overloaded,
+        // A pool-acquire timeout is a retryable 503, never a 401 (#2125).
+        Err(ref f) if f.error.is_db_unavailable() => AuthOutcome::Overloaded,
+        Err(f) => {
+            *failure = Some((
+                AuthFailureSurface::Basic,
+                f.metric_reason().unwrap_or(AuthFailureReason::BadPassword),
+            ));
+            AuthOutcome::InvalidCredential
+        }
+    }
+}
 
 /// Extract the value of a `ticket` query parameter from a URI's query string.
 ///
@@ -1356,7 +1614,8 @@ pub(crate) fn extract_ticket_from_query(query: Option<&str>) -> Option<String> {
 /// Tickets are minted for downloads/streams only. Any write operation
 /// (POST, PUT, PATCH, DELETE) authenticated by a ticket must be rejected
 /// even when the underlying user has write permission, because the ticket
-/// embeds no scope information and the calling client may be a browser
+/// carries no action scope (only the minter's repository restriction)
+/// and the calling client may be a browser
 /// `<a href>` or `EventSource` that the user did not consent to use for
 /// mutations.
 fn ticket_method_allowed(method: &Method) -> bool {
@@ -1395,14 +1654,14 @@ async fn try_resolve_ticket_auth(
         return None;
     }
 
-    let (user_id, _purpose, resource_path) =
+    let redeemed =
         crate::services::auth_config_service::AuthConfigService::validate_download_ticket(
             db, ticket,
         )
         .await
         .ok()?;
 
-    if !ticket_path_allowed(resource_path.as_deref(), request_path) {
+    if !ticket_path_allowed(redeemed.resource_path.as_deref(), request_path) {
         // Ticket has been consumed by validate_download_ticket; treat the
         // mismatch as an authentication failure so the client cannot reuse
         // the same ticket against a different path.
@@ -1421,31 +1680,28 @@ async fn try_resolve_ticket_auth(
         return None;
     }
 
+    // A ticket minted before its repository scope was recorded carries no
+    // restriction we could restore, so it authenticates nothing (fail
+    // closed, GHSA-2mfv-xg68-gq4p). Such tickets expire within minutes.
+    let repo_scope = redeemed.repo_scope?;
+
     // Load the owning user. We block deactivated users so a revoked account
     // cannot keep downloading via outstanding tickets, but we honour service
     // accounts and not-yet-rotated passwords because the ticket itself is
     // the proof of intent: the JWT session that minted it had whatever
     // rights the user had at mint time.
     //
-    // Uses `sqlx::query_as::<_, User>` rather than the `query_as!` macro so
-    // adding the ticket-consumer middleware does not require regenerating
-    // the offline SQLx query cache.
-    let user: User = sqlx::query_as::<_, User>(
-        r#"
-        SELECT
-            id, username, email, password_hash, display_name,
-            auth_provider, external_id, is_admin, is_active,
-            is_service_account, must_change_password,
-            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-            last_login_at, created_at, updated_at
-        FROM users
-        WHERE id = $1 AND is_active = true
-        "#,
-    )
-    .bind(user_id)
-    .fetch_optional(db)
-    .await
-    .ok()??;
+    // `SELECT *` rather than a hand-written column list: the list this
+    // replaced had drifted behind `User` (it lacked the lockout and
+    // password-change columns), so every decode failed and no ticket ever
+    // authenticated (GHSA-2mfv-xg68-gq4p). `query_as::<_, User>` rather than
+    // the `query_as!` macro keeps this out of the offline SQLx query cache.
+    let user: User =
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1 AND is_active = true")
+            .bind(redeemed.user_id)
+            .fetch_optional(db)
+            .await
+            .ok()??;
 
     let mut ext = AuthExtension::from(user);
     // Tickets are read-only. Drop admin elevation so a ticket minted by an
@@ -1469,6 +1725,11 @@ async fn try_resolve_ticket_auth(
     // intentionally minted a download URL.
     ext.is_api_token = true;
     ext.scopes = Some(vec![]);
+    // The minting credential's repository restriction, not the owner's full
+    // reach: `From<User>` grants every repository the user can access, which
+    // would let a repository-restricted token mint its way out of its
+    // restriction (GHSA-2mfv-xg68-gq4p).
+    ext.allowed_repo_ids = repo_scope;
     Some(ext)
 }
 
@@ -1486,10 +1747,22 @@ struct TicketRequestParts {
 
 fn extract_ticket_request_parts(request: &Request) -> Option<TicketRequestParts> {
     let ticket = extract_ticket_from_query(request.uri().query())?;
+    // A ticket is bound to the path the client will request, which is the
+    // FULL path. Inside a nest (`/api/v1/repositories`, ...) axum has already
+    // stripped `request.uri()` down to a suffix, so compare against
+    // `OriginalUri` (populated by the outer router), falling back to the
+    // request URI for a flat router with no nest. Without this a path-bound
+    // ticket never matched on a nested route (GHSA-2mfv-xg68-gq4p follow-on:
+    // the web UI and Terraform mirror ticket flows).
+    let path = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|o| o.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
     Some(TicketRequestParts {
         ticket,
         method: request.method().clone(),
-        path: request.uri().path().to_string(),
+        path,
     })
 }
 
@@ -1553,6 +1826,8 @@ pub async fn optional_auth_middleware(
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
         // Handled above with an early 503 return.
         AuthOutcome::Overloaded => None,
+        // `try_resolve_auth_outcome` cannot produce this.
+        AuthOutcome::RateLimited(_) => None,
     };
 
     // If header-based auth produced no identity, fall back to a `?ticket=`
@@ -1580,11 +1855,163 @@ pub async fn optional_auth_middleware(
         return unauthorized_response_for(request.headers());
     }
 
+    record_request_user(auth_ext.as_ref());
     request.extensions_mut().insert(auth_ext);
     if authed_via_ticket {
         request.extensions_mut().insert(DownloadTicketAuth);
     }
     next.run(request).await
+}
+
+/// Authentication for the generic repository download route,
+/// `GET /api/v1/repositories/{key}/download/{path}` (#4654).
+///
+/// This route is the REST spelling of the same bytes the format routes
+/// serve, from the same store, through the same `require_visible` gate, so
+/// it takes the format routes' authentication contract rather than the
+/// management API's:
+///
+/// * an API token is accepted as the HTTP Basic *password* (any username),
+///   exactly as `repo_visibility_middleware` accepts it for `/maven`, `/npm`
+///   and the other package-manager routes (#2786). The rest of `/api/v1/*`
+///   keeps the #2806/#2809 boundary: `optional_auth_middleware` and
+///   `admin_middleware` still refuse it;
+/// * a request carrying **no credential** is answered with the
+///   `401 + WWW-Authenticate` challenge unless the repository is readable
+///   anonymously, so clients that only send credentials after a challenge
+///   (wget, curl without pre-auth, Maven) get to send them. Before this the
+///   route answered the existence-hiding 404 and no challenge, so such a
+///   client gave up without ever presenting the token it was given (#4593).
+///   A key that names no repository gets the same 401, so the status cannot
+///   be used as an existence oracle (#1808). A public repository, or one an
+///   anonymous read rule (#1849) opens to this caller, passes through as
+///   before and the handler serves it;
+/// * everything else is unchanged: a presented credential that fails to
+///   validate is a 401 (#1371), a `?ticket=` rescues a read (download
+///   tickets are this route's main credential for browser downloads), a
+///   transient auth-capacity shed is a 503, and a VALID credential that is
+///   not entitled still gets the handler's existence-hiding 404
+///   (`require_visible`, #4498).
+///
+/// The challenge is header-aware (`unauthorized_response_for`): a browser
+/// navigation gets the `Bearer` challenge only, so a logged-out user who
+/// follows a private download link sees the web UI's login flow rather
+/// than the native Basic dialog (#2936/#3082).
+///
+/// Layered on `download_router()` ONLY (see `routes.rs`), as a separate
+/// middleware rather than a flag on `optional_auth_middleware`: the
+/// discrimination is structural, like #2809's, because axum's nest-prefix
+/// stripping makes path matching unreliable. It reuses
+/// [`RepoVisibilityState`] so the token-validation cache it consults is the
+/// one the format routes use, and is flushed with it on deactivation (#931).
+pub async fn repository_download_auth_middleware(
+    State(vis_state): State<RepoVisibilityState>,
+    axum::extract::Path((repo_key, _path)): axum::extract::Path<(String, String)>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    // See `auth_middleware`: the CSRF contract applies wherever a session
+    // cookie can authenticate a mutation (#3065).
+    if let Some(refusal) = csrf_guard(&request) {
+        return refusal;
+    }
+
+    let extracted = extract_token(&request);
+    // Download route: an API token IS accepted as the Basic password
+    // (`allow_basic_api_token=true`), the format-route contract (#2786,
+    // #4654). The management API keeps `false` (#2809).
+    let path = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|uri| uri.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let method = request.method().as_str().to_string();
+    let outcome = try_resolve_auth_outcome_with_passthrough(
+        &vis_state.auth_service,
+        extracted,
+        true,
+        &path,
+        &method,
+    )
+    .await;
+    // Transient bcrypt-capacity shed -> retryable 503 (see
+    // `AuthOutcome::Overloaded`), never a 401.
+    if matches!(outcome, AuthOutcome::Overloaded) {
+        return service_unavailable_response();
+    }
+    if let AuthOutcome::RateLimited(retry_after) = outcome {
+        return rate_limited_response(retry_after);
+    }
+    let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
+    let no_credential = matches!(outcome, AuthOutcome::NoCredential);
+    let mut auth_ext: Option<AuthExtension> = match outcome {
+        AuthOutcome::Resolved(ext) => Some(ext),
+        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
+        // Handled above with an early 503 return.
+        AuthOutcome::Overloaded => None,
+        // Handled above with an early 429 return.
+        AuthOutcome::RateLimited(_) => None,
+    };
+
+    // A `?ticket=` stands in for headers on this read-only route, exactly as
+    // in `optional_auth_middleware` (browser <a href> downloads).
+    let mut authed_via_ticket = false;
+    if auth_ext.is_none() {
+        if let Some(parts) = extract_ticket_request_parts(&request) {
+            if let Some(ext) = try_resolve_ticket_for_parts(&vis_state.db, &parts).await {
+                auth_ext = Some(ext);
+                authed_via_ticket = true;
+            }
+        }
+    }
+
+    // Off-boarding (#1371): an explicitly-presented credential that failed
+    // validation is a 401 unless a ticket rescued the request.
+    if credential_invalid && auth_ext.is_none() {
+        return unauthorized_response_for(request.headers());
+    }
+    // #4654: no credential at all. Challenge unless an anonymous caller may
+    // read this repository, so a reactive client sends its credential on the
+    // retry. The handler's `require_visible` still runs for the pass-through
+    // case; this only decides whether to challenge first.
+    if no_credential && auth_ext.is_none() {
+        match download_anonymously_readable(&vis_state.db, &repo_key).await {
+            Some(true) => {}
+            Some(false) => return unauthorized_response_for(request.headers()),
+            None => return service_unavailable_response(),
+        }
+    }
+
+    record_request_user(auth_ext.as_ref());
+    request.extensions_mut().insert(auth_ext);
+    if authed_via_ticket {
+        request.extensions_mut().insert(DownloadTicketAuth);
+    }
+    next.run(request).await
+}
+
+/// Whether an anonymous caller may read `repo_key` on the download route:
+/// the repository exists and is public, or an anonymous read rule (#1849)
+/// admits this request's client IP. A key that names no repository, and a
+/// lookup error, both answer `false`: fail closed, and byte-identical to the
+/// private case so the resulting 401 is not an existence oracle (#1808).
+/// `None` means the database could not answer: a retryable 503, not a 401
+/// that Bazel and cargo treat as fatal.
+async fn download_anonymously_readable(db: &sqlx::PgPool, repo_key: &str) -> Option<bool> {
+    let repo_service = crate::services::repository_service::RepositoryService::new(db.clone());
+    let repo = match repo_service.get_by_key(repo_key).await {
+        Ok(repo) => repo,
+        Err(e) if e.is_db_unavailable() => return None,
+        Err(_) => return Some(false),
+    };
+    if repo.visibility.allows_anonymous_read() {
+        return Some(true);
+    }
+    match repo_service.anonymous_can_read_repo(repo.id).await {
+        Ok(readable) => Some(readable),
+        Err(e) if e.is_db_unavailable() => None,
+        Err(_) => Some(false),
+    }
 }
 
 /// Admin-only middleware - requires authenticated admin user
@@ -1620,6 +2047,10 @@ pub async fn admin_middleware(
     let auth_ext = match try_resolve_auth_outcome(&auth_service, extracted, false).await {
         AuthOutcome::Resolved(ext) => ext,
         AuthOutcome::Overloaded => return service_unavailable_response(),
+        // `try_resolve_auth_outcome` cannot produce this.
+        AuthOutcome::RateLimited(retry_after) => {
+            return rate_limited_response(retry_after);
+        }
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => {
             let msg = match extracted {
                 ExtractedToken::Bearer(_) => "Invalid or expired token",
@@ -1674,6 +2105,7 @@ pub async fn admin_middleware(
         return must_change_password_response();
     }
 
+    record_request_user(Some(&auth_ext));
     request.extensions_mut().insert(auth_ext);
     next.run(request).await
 }
@@ -1758,6 +2190,13 @@ fn percent_decode_path_segment(segment: &str) -> Option<Cow<'_, str>> {
 pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
     let trimmed = path.trim_start_matches('/');
     let mut segments = trimmed.split('/');
+    // rattler's conda token layout puts the credential in front of the whole
+    // path: `/t/<TOKEN>/conda/<repo_key>/...`. Drop the `t/<TOKEN>` pair so
+    // the rest is the ordinary `/conda/<repo_key>/...` shape below.
+    if rattler_conda_token_rest(trimmed).is_some() {
+        segments.next(); // "t"
+        segments.next(); // "<TOKEN>"
+    }
     // Format prefix (pypi, npm, maven, ...).
     let format = segments.next().unwrap_or("");
     // Conda token channels embed the credential in the URL path:
@@ -1782,6 +2221,14 @@ pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
             segments.next(); // "t"
             segments.next(); // "<TOKEN>"
         }
+    }
+    // Agent Plugins token-in-path routes (#5251, D8) put the credential in
+    // front of the repository key: `/agentplugins/t/<TOKEN>/<repo_key>/...`.
+    // The format refuses `t` as a repository key, so the pair is skipped only
+    // when a repository key and a document follow the token.
+    if format == "agentplugins" && agentplugins_url_token(trimmed).is_some() {
+        segments.next(); // "t"
+        segments.next(); // "<TOKEN>"
     }
     // WASM plugin proxy routes are nested as
     //   /ext/<format_key>/<repo_key>/...
@@ -1832,6 +2279,9 @@ pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
 /// token segment.
 pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
     let trimmed = path.trim_start_matches('/');
+    if let Some((token, _rest)) = rattler_conda_token_rest(trimmed) {
+        return Some(token);
+    }
     let mut segments = trimmed.split('/');
     if segments.next()? != "conda" {
         return None;
@@ -1852,6 +2302,37 @@ pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
     // Same shape test `extract_repo_key` applies to the matching skip.
     segments.next()?;
     Some(token)
+}
+
+/// Extract the credential from an Agent Plugins token-in-path URL,
+/// `agentplugins/t/<TOKEN>/<repo_key>/<document...>` (leading `/` already
+/// trimmed, #5251). Claude Code cannot attach a header to a marketplace it
+/// adds from a URL, so a private repository is read with a repository-scoped
+/// token in the path, the pattern conda's token channels use. `None` unless
+/// the token, the repository key and at least one more segment are present.
+pub(crate) fn agentplugins_url_token(trimmed: &str) -> Option<&str> {
+    let rest = trimmed.strip_prefix("agentplugins/t/")?;
+    let (token, rest) = rest.split_once('/')?;
+    let (repo_key, document) = rest.split_once('/')?;
+    if token.is_empty() || repo_key.is_empty() || document.is_empty() {
+        return None;
+    }
+    Some(token)
+}
+
+/// Split rattler's conda token layout, `t/<TOKEN>/conda/<repo_key>/...`
+/// (leading `/` already trimmed), into the token and the path after it.
+/// `None` unless the token is non-empty and a repository key follows `conda`,
+/// so no other `/t/...` path is mistaken for a credential.
+fn rattler_conda_token_rest(trimmed: &str) -> Option<(&str, &str)> {
+    let rest = trimmed.strip_prefix("t/")?;
+    let (token, rest) = rest.split_once('/')?;
+    let after = rest.strip_prefix("conda/")?;
+    let repo_key = after.split('/').next().unwrap_or("");
+    if token.is_empty() || repo_key.is_empty() {
+        return None;
+    }
+    Some((token, rest))
 }
 
 /// Is `path` the NuGet package-push route (`/nuget/<repo_key>/api/v2/package`)?
@@ -1925,6 +2406,9 @@ pub(crate) fn extract_visibility_token(request: &Request) -> ExtractedToken<'_> 
     if let Some(token) = extract_conda_url_token(request.uri().path()) {
         return ExtractedToken::ApiKey(token);
     }
+    if let Some(token) = agentplugins_url_token(request.uri().path().trim_start_matches('/')) {
+        return ExtractedToken::ApiKey(token);
+    }
     if let Some(token) = extract_nuget_push_api_key(request) {
         return ExtractedToken::ApiKey(token);
     }
@@ -1987,6 +2471,12 @@ fn is_write_method(method: &Method) -> bool {
 ///   issues it with no credential, so a public index must serve it like a
 ///   `GET`. It is distinct from the twine upload at `POST /pypi/<repo_key>/`,
 ///   which stays a write.
+/// * **npm audit** — `POST /npm/<repo_key>/-/npm/v1/security/advisories/bulk`
+///   and `POST /npm/<repo_key>/-/npm/v1/security/audits/quick` send a
+///   dependency list and get advisories back (#4317). They only query
+///   advisory data (proxied upstream for a Remote) and never change AK state;
+///   `npm install` and `npm audit` issue them with whatever credential the
+///   client has for reads, which on a public registry is none.
 ///
 /// These paths are classified as reads for the *permission* check only. The
 /// `#508` write-auth requirement (writes require authentication; anonymous
@@ -2026,8 +2516,24 @@ fn is_non_mutating_format_post(path: &str) -> bool {
         }
         // /pypi/<repo_key>/pypi (XML-RPC, #3783)
         Some("pypi") => is_pypi_xmlrpc_tail(segments),
+        // /npm/<repo_key>/-/npm/v1/security/{advisories/bulk,audits/quick} (#4317)
+        Some("npm") => is_npm_audit_tail(segments),
+        // /mcp/<repo_key>/{v0,v0.1}/validate (#5253)
+        Some("mcp") => is_mcp_validate_tail(segments),
         _ => false,
     }
+}
+
+/// `<repo_key>/v0/validate` or `<repo_key>/v0.1/validate` — the remaining
+/// segments of the MCP registry's dry-run validation path after the leading
+/// `mcp` (#5253). `mcp-publisher validate` posts a server.json there with no
+/// credential; the handler writes nothing and scopes what it checks to what
+/// the caller may read. Exact match only.
+fn is_mcp_validate_tail<'a>(mut segments: impl Iterator<Item = &'a str>) -> bool {
+    matches!(segments.next(), Some(k) if !k.is_empty())
+        && matches!(segments.next(), Some("v0" | "v0.1"))
+        && segments.next() == Some("validate")
+        && segments.next().is_none()
 }
 
 /// The strict subset of [`is_non_mutating_format_post`] that a **public**
@@ -2044,6 +2550,21 @@ fn is_non_mutating_format_post(path: &str) -> bool {
 ///   metadata (#3783). JupyterLab's `PyPIExtensionManager` calls it through
 ///   `xmlrpc.client.ServerProxy` with no credential, exactly as pip reads
 ///   `/simple/` anonymously from a public index.
+///
+/// * **npm audit** — `POST /npm/<repo_key>/-/npm/v1/security/advisories/bulk`
+///   and `POST /npm/<repo_key>/-/npm/v1/security/audits/quick` (#4317). `npm
+///   install` and `npm audit` post the dependency tree here with the same
+///   (absent) credential they use for the anonymous metadata and tarball
+///   `GET`s, so a public npm registry answered every audit with 401. The
+///   handlers only look up advisories and never change AK state. Publish,
+///   dist-tag and unpublish stay writes (they are `PUT`/`DELETE`).
+///
+/// * **MCP validate** — `POST /mcp/<repo_key>/{v0,v0.1}/validate` (#5253), the
+///   registry's dry run. `mcp-publisher validate` sends no credential; the
+///   handler writes nothing, and checks that depend on what the caller may
+///   read (version taken, package resolution) are skipped for an anonymous
+///   caller. A private registry still answers an anonymous caller 401, as
+///   every read does.
 ///
 /// git-lfs `objects/batch` and conan `users/authenticate` are deliberately NOT
 /// here. `batch` is an upload *and* download negotiation whose upload arm mints
@@ -2064,6 +2585,23 @@ fn is_pypi_xmlrpc_tail<'a>(mut segments: impl Iterator<Item = &'a str>) -> bool 
         && segments.next().is_none()
 }
 
+/// `<repo_key>/-/npm/v1/security/advisories/bulk` or
+/// `<repo_key>/-/npm/v1/security/audits/quick` — the remaining segments of an
+/// npm audit path after the leading `npm` (#4317). Exact match only: nothing
+/// deeper and no trailing slash, matching the two routes in `handlers::npm`.
+fn is_npm_audit_tail<'a>(mut segments: impl Iterator<Item = &'a str>) -> bool {
+    matches!(segments.next(), Some(k) if !k.is_empty())
+        && segments.next() == Some("-")
+        && segments.next() == Some("npm")
+        && segments.next() == Some("v1")
+        && segments.next() == Some("security")
+        && matches!(
+            (segments.next(), segments.next()),
+            (Some("advisories"), Some("bulk")) | (Some("audits"), Some("quick"))
+        )
+        && segments.next().is_none()
+}
+
 fn is_anonymous_readable_format_post(path: &str) -> bool {
     let trimmed = path.strip_prefix('/').unwrap_or(path);
     let mut segments = trimmed.split('/');
@@ -2077,6 +2615,10 @@ fn is_anonymous_readable_format_post(path: &str) -> bool {
         }
         // /pypi/<repo_key>/pypi (XML-RPC, #3783)
         Some("pypi") => is_pypi_xmlrpc_tail(segments),
+        // /npm/<repo_key>/-/npm/v1/security/{advisories/bulk,audits/quick} (#4317)
+        Some("npm") => is_npm_audit_tail(segments),
+        // /mcp/<repo_key>/{v0,v0.1}/validate (#5253)
+        Some("mcp") => is_mcp_validate_tail(segments),
         _ => false,
     }
 }
@@ -2176,6 +2718,21 @@ pub(super) fn service_unavailable_response() -> Response {
         .unwrap()
 }
 
+/// Build a 429 for a passthrough bind refused by the shared login limiter
+/// (`AuthOutcome::RateLimited`, #3830). The hint is the limiter's remaining
+/// window, so a package client can back off instead of hammering the
+/// directory.
+pub(super) fn rate_limited_response(retry_after: u64) -> Response {
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(axum::http::header::RETRY_AFTER, retry_after.to_string())
+        .header(axum::http::header::CONTENT_TYPE, "text/plain")
+        .body(axum::body::Body::from(
+            "Too many authentication attempts, retry later",
+        ))
+        .unwrap()
+}
+
 /// Build a 403 response for API tokens that lack access to the requested
 /// repository.
 fn forbidden_repo_response() -> Response {
@@ -2209,6 +2766,80 @@ fn not_found_response() -> Response {
         .header(axum::http::header::CONTENT_TYPE, "text/plain")
         .body(axum::body::Body::from("Repository not found"))
         .unwrap()
+}
+
+/// A request on the MCP registry surface (`/mcp/{key}/...`) of an MCP
+/// repository.
+fn is_mcp_surface(format: &str, path: &str) -> bool {
+    format == "mcp" && path.starts_with("/mcp/")
+}
+
+/// A retryable 503 for a permission lookup that could not run (the
+/// database is unreachable). Neutral on purpose: unlike
+/// [`service_unavailable_response`] it does not blame authentication
+/// capacity.
+fn permission_unavailable_response() -> Response {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(axum::http::header::RETRY_AFTER, "1")
+        .header(axum::http::header::CONTENT_TYPE, "text/plain")
+        .body(axum::body::Body::from(
+            "permission service temporarily unavailable",
+        ))
+        .unwrap()
+}
+
+/// The answer to a write or delete the caller may not make (#5458).
+///
+/// A caller who cannot even READ the repository gets the existence-hiding
+/// [`not_found_response`], byte for byte what a key naming no repository
+/// answers (the no-repository branch of [`repo_visibility_middleware`]), so
+/// an owner of some other repository cannot tell an existing private key from
+/// an unknown one by trying to publish to it on any format route. "Can read"
+/// is the REST visibility gate's own predicate (`require_visible`): an
+/// `internal` or `public` repository is readable by every resolved principal,
+/// a `private` one needs a grant carrying `read` (`RepoAccess::READ`). A
+/// caller who CAN read keeps the 403 (#3524): it already knows the repository
+/// exists, and the refusal says why. A lookup error fails closed with a
+/// retryable 503, never a 403 that would re-open the oracle.
+async fn write_denial(
+    db: &sqlx::PgPool,
+    ext: &AuthExtension,
+    repo_id: Uuid,
+    visibility: RepositoryVisibility,
+    action: &str,
+) -> Response {
+    if visibility.allows_authenticated_read() {
+        return forbidden_permission_response();
+    }
+    let readable = crate::services::repository_service::RepositoryService::new(db.clone())
+        .user_can_access_repo(
+            repo_id,
+            ext.user_id,
+            crate::services::repository_service::RepoAccess::READ,
+        )
+        .await;
+    match readable {
+        Ok(true) => forbidden_permission_response(),
+        Ok(false) => {
+            tracing::warn!(
+                repository_id = %repo_id,
+                user_id = %ext.user_id,
+                action,
+                "repository write denied to a caller who cannot read the repository; \
+                 answering the existence-hiding 404"
+            );
+            not_found_response()
+        }
+        Err(_) => {
+            tracing::error!(
+                repository_id = %repo_id,
+                user_id = %ext.user_id,
+                "repo access check failed: database unreachable"
+            );
+            permission_unavailable_response()
+        }
+    }
 }
 
 /// Map an HTTP method to a permission action string.
@@ -2337,6 +2968,15 @@ pub async fn repo_visibility_middleware(
         return not_found_response();
     }
 
+    // A repository whose delete job renamed it to `~deleting~<job id>` is
+    // being torn down. Answer the same existence-hiding 404 as a key that
+    // names no repository, without a DB query, so the temporary key is
+    // unreachable on every format route during the job. The lookup below also
+    // excludes the prefix as defense in depth (#5002).
+    if is_deleting_key(&repo_key) {
+        return not_found_response();
+    }
+
     // Check the shared repo cache first to avoid a DB round-trip on every
     // request.  The cache is populated with full repo metadata so that
     // format-handler resolvers (e.g. resolve_cargo_repo) can reuse it
@@ -2384,7 +3024,7 @@ pub async fn repo_visibility_middleware(
                  (SELECT value FROM repository_config \
                   WHERE repository_id = repositories.id \
                   AND key = 'index_upstream_url') AS index_upstream_url \
-                 FROM repositories WHERE key = $1",
+                 FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
             )
             .bind(&*repo_key)
             .fetch_optional(&vis_state.db)
@@ -2392,9 +3032,13 @@ pub async fn repo_visibility_middleware(
             // A query ERROR is not evidence that the key names no repository,
             // so it must not be negative-cached (#3750): otherwise one
             // database blip would pin a real repository out of sight for a
-            // whole TTL. `.ok().flatten()` keeps the pre-existing answer for
-            // this request (an error falls into the no-repo branch below);
-            // only a genuine `Ok(None)` earns a tombstone.
+            // whole TTL. Only a genuine `Ok(None)` earns a tombstone.
+            // An unavailable database answers a retryable 503 once the sweep
+            // below has run: the no-repo branch turned a pool timeout into a
+            // 401 for anonymous pulls, which Bazel treats as fatal.
+            let db_unavailable = row
+                .as_ref()
+                .is_err_and(|e| AppError::Database(e.to_string()).is_db_unavailable());
             let query_succeeded = row.is_ok();
             let row = row.ok().flatten();
 
@@ -2460,6 +3104,9 @@ pub async fn repo_visibility_middleware(
                         miss_cache.insert(repo_key.to_string(), Instant::now());
                     }
                 }
+                if db_unavailable {
+                    return service_unavailable_response();
+                }
                 None
             }
         }
@@ -2506,6 +3153,9 @@ pub async fn repo_visibility_middleware(
             AuthOutcome::Resolved(ext) => Some(ext),
             AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
             AuthOutcome::Overloaded => None,
+            // `try_resolve_auth_outcome` cannot produce this, but the enum is
+            // shared with the passthrough-aware call above.
+            AuthOutcome::RateLimited(_) => None,
         };
         if credential_invalid && auth_ext.is_none() {
             return unauthorized_response();
@@ -2526,6 +3176,10 @@ pub async fn repo_visibility_middleware(
         return not_found_response();
     };
 
+    // The key names a real repository: tag the request's trace with it so
+    // traces can be filtered per repository (#4455). Span attribute only.
+    crate::api::middleware::request_span::record_repository_key(&repo_key);
+
     let visibility = repo.visibility;
     // The VS Code gallery query is a protocol-mandated POST that is purely a
     // metadata search, so it must be reachable anonymously on a public repo.
@@ -2544,17 +3198,30 @@ pub async fn repo_visibility_middleware(
     let extracted = extract_visibility_token(&request);
     // Format/registry endpoint: preserve pip-netrc / Artifactory-style
     // `username:<api_token>` Basic auth (`allow_basic_api_token=true`, #2786).
-    let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted, true).await;
+    let method = request.method().as_str().to_string();
+    let outcome = try_resolve_auth_outcome_with_passthrough(
+        &vis_state.auth_service,
+        extracted,
+        true,
+        &path,
+        &method,
+    )
+    .await;
     // Transient bcrypt-capacity shed -> retryable 503 (see
     // `AuthOutcome::Overloaded`), never a 401.
     if matches!(outcome, AuthOutcome::Overloaded) {
         return service_unavailable_response();
+    }
+    if let AuthOutcome::RateLimited(retry_after) = outcome {
+        return rate_limited_response(retry_after);
     }
     let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
     let mut auth_ext: Option<AuthExtension> = match outcome {
         AuthOutcome::Resolved(ext) => Some(ext),
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
         AuthOutcome::Overloaded => None,
+        // Handled above with an early 429 return.
+        AuthOutcome::RateLimited(_) => None,
     };
     // `credential_invalid` was captured before the match consumed `outcome`.
 
@@ -2579,6 +3246,7 @@ pub async fn repo_visibility_middleware(
     }
 
     // Insert auth extension for downstream handlers.
+    record_request_user(auth_ext.as_ref());
     request.extensions_mut().insert(auth_ext.clone());
     if authed_via_ticket {
         request.extensions_mut().insert(DownloadTicketAuth);
@@ -2673,7 +3341,7 @@ pub async fn repo_visibility_middleware(
             // Repository-scoped tokens are self-service, so a 403 here handed
             // any user holding a token to a repository of their own a
             // 200/403/404 existence oracle over every other private key.
-            // Writes keep the 403, matching #3524's decision for the ACL arm.
+            // Writes and deletes take the same 404 since #5458 (below).
             //
             // "Read" here is the set the ACL arm below calls a read: the
             // method-derived action plus the `non_mutating_post` routes
@@ -2686,15 +3354,22 @@ pub async fn repo_visibility_middleware(
             // public repository (the short-circuit above), but the two POSTs
             // do, and a public repository has no existence to hide: they keep
             // the 403 there, as `test_3648` pins.
-            if !visibility.allows_anonymous_read()
-                && (scope_gate_action == "read" || non_mutating_post)
-            {
+            //
+            // #5458: a WRITE (or delete) outside the token's scope is refused
+            // the same way on such a repository. The token cannot read it, so
+            // a 403 here, against the no-repository 404, told an existing
+            // private key from an unknown one on every format route. A public
+            // repository has no existence to hide and keeps the 403.
+            if !visibility.allows_anonymous_read() {
                 // Same fields and level as the two ACL read denials below, so
                 // the operator can still tell this from a missing repository.
-                tracing::info!(
+                let read = scope_gate_action == "read" || non_mutating_post;
+                tracing::warn!(
                     repository_id = %repo.id,
                     user_id = %ext.user_id,
-                    "token repository scope denied read; answering the existence-hiding 404"
+                    action = if read { "read" } else { scope_gate_action },
+                    "token repository scope denied the request; answering the \
+                     existence-hiding 404"
                 );
                 return not_found_response();
             }
@@ -2732,13 +3407,27 @@ pub async fn repo_visibility_middleware(
                 // public-repo write hole (any authed caller could PUT/DELETE)
                 // and the rules-less private-repo case (a read-only `viewer`
                 // member could write/delete). DB error fails closed (503).
-                match vis_state
-                    .permission_service
-                    .check_repository_action(ext.user_id, repo.id, action, false)
-                    .await
-                {
+                // #5253: on the MCP registry surface a namespace-conditioned
+                // rule counts here; the MCP write handler then decides the
+                // server name (`services::mcp_namespaces`). Anywhere else
+                // such a rule grants nothing.
+                let mcp_surface = is_mcp_surface(&repo.format, &path);
+                let decision = if mcp_surface {
+                    vis_state
+                        .permission_service
+                        .check_mcp_surface_action(ext.user_id, repo.id, action, false)
+                        .await
+                } else {
+                    vis_state
+                        .permission_service
+                        .check_repository_action(ext.user_id, repo.id, action, false)
+                        .await
+                };
+                match decision {
                     Ok(true) => {}
-                    Ok(false) => return forbidden_permission_response(),
+                    Ok(false) => {
+                        return write_denial(&vis_state.db, ext, repo.id, visibility, action).await
+                    }
                     Err(_) => {
                         tracing::error!("permission check failed: database unreachable");
                         return service_unavailable_response();
@@ -2905,9 +3594,9 @@ pub async fn repo_visibility_middleware(
                             // answered `not_found_response()`. All three are now
                             // byte-identical, matching REST `require_visible`,
                             // which returns `NotFound` for every denial. Writes
-                            // are deliberately unchanged: a caller doing a PUT
-                            // has generally already read the repository, and 403
-                            // is the more useful answer there.
+                            // follow the same rule since #5458 (`write_denial`):
+                            // a caller who cannot read gets this 404, and only a
+                            // caller who CAN read keeps the more useful 403.
                             return not_found_response();
                         }
                     }
@@ -3078,6 +3767,43 @@ mod tests {
             .unwrap();
         let result = extract_token(&request);
         assert!(matches!(result, ExtractedToken::ApiKey("token-xyz")));
+    }
+
+    #[test]
+    fn agentplugins_token_path_resolves_repo_and_token_5251() {
+        let p = "/agentplugins/t/ak_tok/plugins/claude-marketplace.json";
+        assert_eq!(extract_repo_key(p), "plugins");
+        assert_eq!(
+            agentplugins_url_token(p.trim_start_matches('/')),
+            Some("ak_tok")
+        );
+        assert_eq!(
+            extract_repo_key("/agentplugins/t/tok/plugins/p/1.0.0/p-1.0.0.zip"),
+            "plugins"
+        );
+        // The plain routes keep the second segment.
+        assert_eq!(
+            extract_repo_key("/agentplugins/plugins/marketplace.json"),
+            "plugins"
+        );
+        for not_token in [
+            "agentplugins/t/tok/plugins",
+            "agentplugins/t/tok/plugins/",
+            "agentplugins/t//plugins/x",
+            "agentplugins/t/tok//x",
+            "agentplugins/plugins/x/y",
+            "conda/t/tok/plugins/x",
+        ] {
+            assert_eq!(agentplugins_url_token(not_token), None, "{not_token}");
+        }
+        let request = Request::builder()
+            .uri("/agentplugins/t/url-token-9/plugins/marketplace.json")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(matches!(
+            extract_visibility_token(&request),
+            ExtractedToken::ApiKey("url-token-9")
+        ));
     }
 
     #[test]
@@ -4335,6 +5061,22 @@ mod tests {
         assert_eq!(extract_repo_key("/maven/privat%"), "privat%");
         // `%ff` decodes to a byte that is not valid UTF-8 on its own.
         assert_eq!(extract_repo_key("/maven/privat%ff/com/acme"), "privat%ff");
+    }
+
+    #[test]
+    fn test_rattler_conda_token_layout() {
+        let path = "/t/abc123token/conda/my-channel/noarch/repodata.json";
+        assert_eq!(extract_conda_url_token(path), Some("abc123token"));
+        assert_eq!(extract_repo_key(path), "my-channel");
+        assert_eq!(
+            extract_repo_key("/t/tok/conda/my-channel/channeldata.json"),
+            "my-channel"
+        );
+        // Not the rattler layout: no token, no `conda`, or no repository key.
+        assert_eq!(extract_conda_url_token("/t//conda/my-channel/x"), None);
+        assert_eq!(extract_conda_url_token("/t/tok/pypi/my-repo/simple"), None);
+        assert_eq!(extract_conda_url_token("/t/tok/conda/"), None);
+        assert_eq!(extract_conda_url_token("/t/tok/conda"), None);
     }
 
     #[test]
@@ -6703,6 +7445,364 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // #4654: the generic download route takes the format routes' contract.
+    //
+    // `repository_download_auth_middleware` is driven through a router shaped
+    // like `download_router()` (`/:key/download/*path`), backed by a real
+    // pool so token validation and the repository lookup are exercised. The
+    // probe handler reports what the middleware resolved; entitlement is the
+    // handler's job (`require_visible`) and is not under test here.
+    // -----------------------------------------------------------------------
+
+    fn download_probe_router(pool: &sqlx::PgPool) -> axum::Router {
+        use axum::{middleware, routing::get, Extension, Router};
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(crate::config::Config::default()),
+        ));
+        let vis_state = RepoVisibilityState {
+            auth_service,
+            db: pool.clone(),
+            repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+        Router::new()
+            .route(
+                "/:key/download/*path",
+                get(
+                    |Extension(auth): Extension<Option<AuthExtension>>| async move {
+                        match auth {
+                            Some(ext) => (
+                                StatusCode::OK,
+                                format!("resolved api_token={}", ext.is_api_token),
+                            ),
+                            None => (StatusCode::OK, "anonymous".to_string()),
+                        }
+                    },
+                ),
+            )
+            .layer(middleware::from_fn_with_state(
+                vis_state,
+                repository_download_auth_middleware,
+            ))
+    }
+
+    async fn download_get(
+        app: axum::Router,
+        key: &str,
+        headers: &[(&str, String)],
+    ) -> (StatusCode, Vec<String>, String) {
+        use tower::ServiceExt;
+        let mut builder = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri(format!("/{key}/download/folder/file.log"));
+        for (name, value) in headers {
+            builder = builder.header(*name, value);
+        }
+        let response = app
+            .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let challenges: Vec<String> = response
+            .headers()
+            .get_all("www-authenticate")
+            .iter()
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .collect();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            challenges,
+            String::from_utf8_lossy(&body).to_string(),
+        )
+    }
+
+    fn basic_header(username: &str, password: &str) -> (&'static str, String) {
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", username, password));
+        ("authorization", format!("Basic {encoded}"))
+    }
+
+    async fn cleanup_download_fixture(pool: &sqlx::PgPool, repo_id: Uuid, user_id: Option<Uuid>) {
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .ok();
+        if let Some(uid) = user_id {
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_4654_download_route_challenges_anonymous_on_private_repo() {
+        // The #4593 shape: no credential, private repository. Before #4654 the
+        // route answered the existence-hiding 404 and no challenge, so wget
+        // never sent the token it was given. It must now answer 401 with the
+        // Basic and Bearer challenges, like the format routes (#1808).
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let (status, challenges, body) =
+            download_get(download_probe_router(&pool), &key, &[]).await;
+
+        cleanup_download_fixture(&pool, repo_id, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+        assert!(
+            challenges.iter().any(|c| c.starts_with("Basic ")),
+            "anonymous private download must carry the Basic challenge: {challenges:?}"
+        );
+        assert!(
+            challenges.iter().any(|c| c.starts_with("Bearer ")),
+            "anonymous private download must carry the Bearer challenge: {challenges:?}"
+        );
+        assert_eq!(body, "Authentication required");
+    }
+
+    #[tokio::test]
+    async fn test_4654_download_route_nonexistent_key_matches_private_answer() {
+        // #1808 on this route: a key that names no repository must be
+        // byte-identical to the private case for an anonymous caller, so the
+        // 401 cannot be used to enumerate repository keys.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let missing = format!("{key}-does-not-exist");
+
+        let private = download_get(download_probe_router(&pool), &key, &[]).await;
+        let nonexistent = download_get(download_probe_router(&pool), &missing, &[]).await;
+
+        cleanup_download_fixture(&pool, repo_id, None).await;
+        assert_eq!(private.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            private, nonexistent,
+            "private and nonexistent keys must answer identically to an anonymous caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_4654_download_route_passes_anonymous_on_public_repo() {
+        // A public repository is served anonymously exactly as before: the
+        // middleware passes `None` through and the handler decides.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET visibility = 'public', is_public = true WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("publish repo");
+
+        let (status, challenges, body) =
+            download_get(download_probe_router(&pool), &key, &[]).await;
+
+        cleanup_download_fixture(&pool, repo_id, None).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(
+            challenges.is_empty(),
+            "no challenge on a public read: {challenges:?}"
+        );
+        assert_eq!(body, "anonymous");
+    }
+
+    #[tokio::test]
+    async fn test_4654_download_route_accepts_api_token_as_basic_password() {
+        // The #2786 format-route contract now applies here: `any:<api_token>`
+        // resolves to the token owner. The same header is still refused by
+        // `optional_auth_middleware`, so the #2809 boundary holds for the
+        // rest of /api/v1 (asserted in the companion test below).
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (user_id, _username) = insert_oidc_service_account(&pool).await;
+        let auth_service =
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()));
+        let (token, _tid) = auth_service
+            .generate_api_token(user_id, "ci", vec!["read:artifacts".into()], None)
+            .await
+            .expect("generate api token");
+
+        let (status, challenges, body) = download_get(
+            download_probe_router(&pool),
+            &key,
+            &[basic_header("svc-test", &token)],
+        )
+        .await;
+
+        cleanup_download_fixture(&pool, repo_id, Some(user_id)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(challenges.is_empty(), "{challenges:?}");
+        assert_eq!(
+            body, "resolved api_token=true",
+            "username:<api_token> Basic auth must resolve to the token owner on the download route"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_4654_api_v1_boundary_still_refuses_token_as_basic_password() {
+        // The loosening is for the download route only. The same
+        // `any:<api_token>` header through `optional_auth_middleware`, which
+        // every other /api/v1 read route rides, is still a 401 (#2809).
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::{middleware, routing::get, Router};
+        use tower::ServiceExt;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = insert_oidc_service_account(&pool).await;
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(crate::config::Config::default()),
+        ));
+        let (token, _tid) = auth_service
+            .generate_api_token(user_id, "ci", vec!["read:artifacts".into()], None)
+            .await
+            .expect("generate api token");
+        let app: Router = Router::new()
+            .route(
+                "/probe",
+                get(|| async { (StatusCode::OK, "handler-reached") }),
+            )
+            .layer(middleware::from_fn_with_state(
+                auth_service,
+                optional_auth_middleware,
+            ));
+        let (name, value) = basic_header("svc-test", &token);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri("/probe")
+                    .header(name, value)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "/api/v1 optional-auth routes must keep refusing the token-as-Basic-password"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_4654_download_route_accepts_bearer_token() {
+        // Bearer stays the canonical shape and keeps working unchanged.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (user_id, _username) = insert_oidc_service_account(&pool).await;
+        let auth_service =
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()));
+        let (token, _tid) = auth_service
+            .generate_api_token(user_id, "ci", vec!["read:artifacts".into()], None)
+            .await
+            .expect("generate api token");
+
+        let (status, _challenges, body) = download_get(
+            download_probe_router(&pool),
+            &key,
+            &[("authorization", format!("Bearer {token}"))],
+        )
+        .await;
+
+        cleanup_download_fixture(&pool, repo_id, Some(user_id)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body, "resolved api_token=true");
+    }
+
+    #[tokio::test]
+    async fn test_4654_download_route_rejects_invalid_credential_even_on_public_repo() {
+        // Off-boarding (#1371): a presented credential that fails validation
+        // is a 401, never a silent downgrade to anonymous, even where
+        // anonymous would have been served.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET visibility = 'public', is_public = true WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("publish repo");
+
+        let (status, challenges, _body) = download_get(
+            download_probe_router(&pool),
+            &key,
+            &[basic_header("svc-test", "not-a-valid-token")],
+        )
+        .await;
+
+        cleanup_download_fixture(&pool, repo_id, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            challenges.iter().any(|c| c.starts_with("Basic ")),
+            "{challenges:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_4654_download_route_browser_challenge_omits_basic() {
+        // #2936/#3082: a browser navigation to a private download link gets
+        // the Bearer challenge only, so the web UI's login flow appears
+        // instead of the native Basic dialog.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let (status, challenges, _body) = download_get(
+            download_probe_router(&pool),
+            &key,
+            &[("sec-fetch-mode", "navigate".to_string())],
+        )
+        .await;
+
+        cleanup_download_fixture(&pool, repo_id, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            !challenges.iter().any(|c| c.starts_with("Basic ")),
+            "browser request must not receive the Basic challenge: {challenges:?}"
+        );
+        assert!(
+            challenges.iter().any(|c| c.starts_with("Bearer ")),
+            "browser request keeps the Bearer challenge: {challenges:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_2786_basic_api_token_refused_when_disallowed_api_v1_boundary() {
         // /api/v1 optional/admin path (`allow_basic_api_token=false`): the SAME
@@ -7163,17 +8263,38 @@ mod tests {
 
     #[test]
     fn test_classify_token_validation_err_genuine_failures_stay_invalid() {
-        // Genuinely bad tokens (unknown, expired, revoked, deactivated owner)
-        // and infrastructure errors must keep producing 401 from the token
-        // call sites — only the transient capacity shed maps to Overloaded.
+        // Genuinely bad tokens (unknown, expired, revoked, deactivated owner),
+        // internal faults, and database errors caused by the request's own
+        // bytes keep producing 401 from the token call sites. A database that
+        // could not answer is NOT in this list any more: since #4750 it is
+        // Overloaded (503), see the test below.
         for err in [
             AppError::Authentication("Invalid API token".to_string()),
             AppError::Authentication("API token expired".to_string()),
             AppError::Unauthorized("Token has been revoked".to_string()),
-            AppError::Database("connection refused".to_string()),
+            AppError::Database(
+                "error returned from database: invalid byte sequence for encoding \"UTF8\": 0x00"
+                    .to_string(),
+            ),
             AppError::Internal("bcrypt failure".to_string()),
         ] {
-            assert_eq!(classify_token_validation_err(err), TokenAuthError::Invalid);
+            assert!(matches!(
+                classify_token_validation_err(err),
+                TokenAuthError::Invalid(_)
+            ));
+        }
+        // #4750: an unreachable or failing database is infrastructure.
+        for err in [
+            AppError::Database("connection refused".to_string()),
+            AppError::Sqlx(sqlx::Error::PoolClosed),
+            AppError::Database(
+                "error returned from database: canceling statement due to lock timeout".to_string(),
+            ),
+        ] {
+            assert_eq!(
+                classify_token_validation_err(err),
+                TokenAuthError::Overloaded
+            );
         }
     }
 
@@ -7194,6 +8315,160 @@ mod tests {
                 sqlx::Error::PoolTimedOut.to_string()
             )),
             TokenAuthError::Overloaded
+        );
+    }
+
+    /// #4676: every credential `try_resolve_auth_outcome` rejects is counted
+    /// in `ak_auth_failures_total` by surface and reason; a request with no
+    /// credential is not. These shapes are all rejected before any DB lookup.
+    #[test]
+    fn test_try_resolve_auth_outcome_counts_rejected_credentials_4676() {
+        use crate::services::metrics_service::capture_counters_async;
+        let ((), counted) = capture_counters_async(|| async {
+            let auth_service = make_test_auth_service();
+            for extracted in [
+                ExtractedToken::Invalid,
+                ExtractedToken::ApiKey("badtok"),
+                ExtractedToken::Bearer("badtok"),
+                ExtractedToken::Basic("not-base64-at-all"),
+            ] {
+                let outcome = try_resolve_auth_outcome(&auth_service, extracted, true).await;
+                assert!(matches!(outcome, AuthOutcome::InvalidCredential));
+            }
+            let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::None, true).await;
+            assert!(matches!(outcome, AuthOutcome::NoCredential));
+        });
+        let get = |surface: &str, reason: &str| {
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", surface), ("reason", reason)],
+            )
+        };
+        assert_eq!(get("api", "invalid_token"), 3);
+        assert_eq!(get("basic", "invalid_token"), 1);
+        assert_eq!(counted.get("ak_auth_failures_total", &[]), 4);
+    }
+
+    /// #4676: a Bearer credential is `expired` when either validator said so.
+    #[test]
+    fn test_bearer_failure_reason_prefers_expired_4676() {
+        let expired_jwt = AppError::Authentication("Invalid token: ExpiredSignature".into());
+        let bad_jwt = AppError::Authentication("Invalid token: InvalidToken".into());
+        assert_eq!(
+            bearer_failure(&expired_jwt, AuthFailureReason::InvalidToken),
+            (AuthFailureSurface::Api, AuthFailureReason::Expired)
+        );
+        assert_eq!(
+            bearer_failure(&bad_jwt, AuthFailureReason::Expired),
+            (AuthFailureSurface::Api, AuthFailureReason::Expired)
+        );
+        assert_eq!(
+            bearer_failure(&bad_jwt, AuthFailureReason::InvalidToken),
+            (AuthFailureSurface::Api, AuthFailureReason::InvalidToken)
+        );
+    }
+
+    /// #4676: the management API's `auth_middleware` counts the credentials it
+    /// answers 401 for, with the password reason for Basic auth, and never a
+    /// request that presented nothing.
+    #[test]
+    fn test_auth_middleware_counts_rejected_credentials_4676() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::metrics_service::capture_counters_async;
+        let (ran, counted) = capture_counters_async(|| async {
+            let Some(pool) = tdh::try_pool().await else {
+                return false;
+            };
+            let secret = "test-secret-at-least-32-bytes-long-for-testing";
+            let cfg = crate::config::Config {
+                jwt_secret: secret.to_string(),
+                ..crate::config::Config::default()
+            };
+            let auth_service = Arc::new(AuthService::new(pool.clone(), Arc::new(cfg)));
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let hash = AuthService::hash_password("right-password").await.unwrap();
+            sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+                .bind(user_id)
+                .bind(&hash)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let unknown = run_auth_middleware_with_service(
+                auth_service.clone(),
+                basic_get(&format!("no-such-user-{}", Uuid::new_v4()), "x"),
+            )
+            .await;
+            let wrong = run_auth_middleware_with_service(
+                auth_service.clone(),
+                basic_get(&username, "wrong-password"),
+            )
+            .await;
+            let mut expired_claims = Claims {
+                sub: user_id,
+                username: username.clone(),
+                email: format!("{username}@test.local"),
+                is_admin: false,
+                allowed_repo_ids: None,
+                iat: Utc::now().timestamp() - 7200,
+                iat_ms: None,
+                exp: Utc::now().timestamp() - 3600,
+                token_type: "access".to_string(),
+                jti: None,
+                family_id: None,
+                scan_pull_repo: None,
+                scopes: None,
+            };
+            expired_claims.iat_ms = Some(expired_claims.iat * 1000);
+            let expired_jwt = encode(
+                &Header::default(),
+                &expired_claims,
+                &EncodingKey::from_secret(secret.as_bytes()),
+            )
+            .unwrap();
+            let expired = run_auth_middleware_with_service(
+                auth_service.clone(),
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", format!("Bearer {expired_jwt}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            let anonymous = run_auth_middleware_with_service(
+                auth_service.clone(),
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            for resp in [&unknown, &wrong, &expired, &anonymous] {
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            }
+            true
+        });
+        if !ran {
+            return;
+        }
+        let get = |surface: &str, reason: &str| {
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", surface), ("reason", reason)],
+            )
+        };
+        assert_eq!(get("basic", "unknown_user"), 1);
+        assert_eq!(get("basic", "bad_password"), 1);
+        assert_eq!(get("api", "expired"), 1);
+        assert_eq!(
+            counted.get("ak_auth_failures_total", &[]),
+            3,
+            "the anonymous request is not an auth failure"
         );
     }
 
@@ -7284,7 +8559,8 @@ mod tests {
                 AuthOutcome::Resolved(ext) => Some(ext),
                 AuthOutcome::NoCredential
                 | AuthOutcome::InvalidCredential
-                | AuthOutcome::Overloaded => None,
+                | AuthOutcome::Overloaded
+                | AuthOutcome::RateLimited(_) => None,
             }
         };
         assert!(flatten(AuthOutcome::NoCredential).is_none());
@@ -7350,7 +8626,12 @@ mod tests {
         let req = axum::http::Request::builder()
             .method(Method::GET)
             .uri("/probe")
-            .header("Authorization", "Bearer deadbeefdead")
+            // API-token-shaped, so it passes the pre-DB shape check (#5633)
+            // and actually reaches the timing-out prefix lookup.
+            .header(
+                "Authorization",
+                "Bearer deadbeef_0123456789abcdef0123456789abcdef",
+            )
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = run_through_optional_auth(req).await;
@@ -7439,6 +8720,251 @@ mod tests {
                 repo_visibility_middleware,
             ));
         app.oneshot(request).await.unwrap()
+    }
+
+    /// A pool timeout or a closed pool while resolving the repository row
+    /// is an outage, not "no such repository": an anonymous pull must get a
+    /// retryable 503, not the 401 that Bazel and cargo treat as fatal.
+    #[tokio::test]
+    async fn format_route_db_outage_answers_503_not_401() {
+        let state = make_vis_state(None).await;
+        state.db.close().await;
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/pypi/some-repo/simple/requests/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_visibility(state, req).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    /// Same outage on the generic download route
+    /// (`/repositories/{key}/download/*path`).
+    #[tokio::test]
+    async fn download_route_db_outage_answers_503_not_401() {
+        use axum::{middleware, routing::get, Router};
+        use tower::ServiceExt;
+
+        let state = make_vis_state(None).await;
+        state.db.close().await;
+        let app: Router = Router::new()
+            .route(
+                "/repositories/:key/download/*path",
+                get(|| async { (StatusCode::OK, "handler-reached") }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state,
+                repository_download_auth_middleware,
+            ));
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/repositories/some-repo/download/a/b.tar.gz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn genuine_miss_with_a_reachable_db_still_answers_401_and_is_tombstoned() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let mut state = make_vis_state(None).await;
+        state.db = pool;
+        let key = format!("db-outage-miss-{}", Uuid::new_v4());
+        let (status, _) =
+            anon_get_status_and_body(state.clone(), &format!("/pypi/{key}/simple/")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            state.repo_miss_cache.read().await.contains_key(&key),
+            "a query that found no row must still earn a tombstone"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-2mfv-xg68-gq4p: a download ticket carries the repository
+    // restriction of the credential that minted it, and a valid ticket
+    // actually redeems. Production router, real database.
+    // -----------------------------------------------------------------------
+
+    /// Mint a ticket bound to `path` with `bearer` through the production
+    /// router. Returns the status and, on 200, the ticket.
+    async fn mint_ticket_via_router(
+        state: &crate::api::SharedState,
+        bearer: &str,
+        path: &str,
+    ) -> (StatusCode, String) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let app = crate::api::routes::create_router(state.clone());
+        let body = serde_json::json!({ "purpose": "download", "resource_path": path });
+        let mut req = tdh::post(
+            "/api/v1/auth/ticket".to_string(),
+            "application/json",
+            axum::body::Bytes::from(body.to_string()),
+        );
+        req.headers_mut().insert(
+            "authorization",
+            bearer.parse::<axum::http::HeaderValue>().expect("bearer"),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        (
+            status,
+            json["ticket"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// Redeem `ticket` on `path` with no other credential.
+    async fn redeem_ticket_via_router(
+        state: &crate::api::SharedState,
+        path: &str,
+        ticket: &str,
+    ) -> (StatusCode, axum::body::Bytes) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let app = crate::api::routes::create_router(state.clone());
+        tdh::send(app, tdh::get(format!("{path}?ticket={ticket}"))).await
+    }
+
+    #[tokio::test]
+    async fn download_ticket_keeps_the_minting_credentials_repository_restriction() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        // A second private repository the same user can also read.
+        let (other_id, other_key, other_dir) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        tdh::grant_repo_access(&fx.pool, other_id, fx.user_id).await;
+        let seed = |id: Uuid, key: &str, dir: &std::path::Path, body: &'static [u8]| {
+            let info = tdh::make_repo_info(id, key, dir, "local", None);
+            let state = fx.state.clone();
+            let pool = fx.pool.clone();
+            let user = fx.user_id;
+            async move {
+                tdh::seed_artifact(
+                    &state,
+                    &pool,
+                    &info,
+                    "ticket/file.bin",
+                    "ticket/file.bin",
+                    "file.bin",
+                    "1",
+                    "application/octet-stream",
+                    axum::body::Bytes::from_static(body),
+                    user,
+                )
+                .await
+            }
+        };
+        seed(fx.repo_id, &fx.repo_key, &fx.storage_dir, b"allowed-bytes").await;
+        seed(other_id, &other_key, &other_dir, b"other-bytes").await;
+        let allowed_path = format!(
+            "/api/v1/repositories/{}/download/ticket/file.bin",
+            fx.repo_key
+        );
+        let other_path = format!("/api/v1/repositories/{other_key}/download/ticket/file.bin");
+
+        let auth_service = crate::services::auth_service::AuthService::new(
+            fx.state.db.clone(),
+            std::sync::Arc::new(fx.state.config.clone()),
+        );
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(fx.user_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("load user");
+        let bearer_with = |scopes: Option<Vec<String>>, repos: Option<Vec<Uuid>>| {
+            let pair = auth_service
+                .generate_tokens_with_scope(&user, scopes, repos)
+                .expect("mint access token");
+            format!("Bearer {}", pair.access_token)
+        };
+        // The advisory's credential: read:artifacts, restricted to one repository.
+        let restricted = bearer_with(
+            Some(vec!["read:artifacts".to_string()]),
+            Some(vec![fx.repo_id]),
+        );
+        let unrestricted = tdh::bearer_for(&fx.state, fx.user_id).await;
+
+        // Baseline: the restricted credential cannot read the other repository.
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let mut req = tdh::get(other_path.clone());
+        req.headers_mut().insert(
+            "authorization",
+            restricted
+                .parse::<axum::http::HeaderValue>()
+                .expect("bearer"),
+        );
+        let (direct, _) = tdh::send(app, req).await;
+
+        // 1) An unrestricted session's ticket redeems (the User lookup works).
+        let (minted, ticket) = mint_ticket_via_router(&fx.state, &unrestricted, &other_path).await;
+        let (session_ticket, session_body) =
+            redeem_ticket_via_router(&fx.state, &other_path, &ticket).await;
+
+        // 2) The restricted credential's ticket redeems inside its scope.
+        let (_, ticket) = mint_ticket_via_router(&fx.state, &restricted, &allowed_path).await;
+        let (in_scope, in_scope_body) =
+            redeem_ticket_via_router(&fx.state, &allowed_path, &ticket).await;
+
+        // 3) ...and does NOT read the other repository.
+        let (_, ticket) = mint_ticket_via_router(&fx.state, &restricted, &other_path).await;
+        let (out_of_scope, _) = redeem_ticket_via_router(&fx.state, &other_path, &ticket).await;
+
+        // 4) A credential without read:artifacts cannot mint a ticket.
+        let write_only = bearer_with(Some(vec!["write:artifacts".to_string()]), None);
+        let (write_only_mint, _) =
+            mint_ticket_via_router(&fx.state, &write_only, &allowed_path).await;
+
+        let _ = sqlx::query("DELETE FROM download_tickets WHERE user_id = $1")
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_member_repo(&fx.pool, other_id, &other_dir).await;
+        let _ = std::fs::remove_dir_all(&other_dir);
+        fx.teardown().await;
+
+        assert_eq!(
+            direct,
+            StatusCode::NOT_FOUND,
+            "precondition: the token is restricted"
+        );
+        assert_eq!(
+            minted,
+            StatusCode::OK,
+            "an unrestricted session mints a ticket"
+        );
+        assert_eq!(
+            session_ticket,
+            StatusCode::OK,
+            "a valid ticket must redeem: {}",
+            String::from_utf8_lossy(&session_body)
+        );
+        assert_eq!(&session_body[..], b"other-bytes");
+        assert_eq!(
+            in_scope,
+            StatusCode::OK,
+            "a restricted credential's ticket must redeem inside its scope: {}",
+            String::from_utf8_lossy(&in_scope_body)
+        );
+        assert_eq!(&in_scope_body[..], b"allowed-bytes");
+        assert_eq!(
+            out_of_scope,
+            StatusCode::NOT_FOUND,
+            "a ticket must not read a repository its minting credential could not"
+        );
+        assert_eq!(
+            write_only_mint,
+            StatusCode::FORBIDDEN,
+            "minting a download ticket needs read:artifacts"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7589,6 +9115,44 @@ mod tests {
         let state = make_vis_state(Some((key.to_string(), cached))).await;
         let resp = run_through_visibility(state, empty_get("/pypi/myrepo/simple/")).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// #4455: the visibility middleware tags the request span with the
+    /// repository it resolved, and credential resolution runs in an
+    /// `authenticate` child span that carries no credential material.
+    #[tokio::test]
+    async fn test_repo_visibility_records_repository_key_and_authenticate_span() {
+        use crate::api::middleware::request_span::{with_request_span, REPOSITORY_KEY_FIELD};
+        use crate::testing::otel::{attr, otel_subscriber, ExportedSpans};
+        use tracing::Instrument;
+
+        let exported = ExportedSpans::default();
+        let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some(("myrepo".to_string(), cached))).await;
+        let request = empty_get("/pypi/myrepo/simple/");
+        let span = crate::api::middleware::tracing::make_http_request_span(&request, &[]);
+        let resp = with_request_span(span.clone(), run_through_visibility(state, request))
+            .instrument(span)
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let root = exported.one("http_request");
+        assert_eq!(
+            attr(&root, REPOSITORY_KEY_FIELD),
+            Some(opentelemetry::Value::from("myrepo"))
+        );
+        let authenticate = exported.one("authenticate");
+        assert_eq!(authenticate.parent_span_id, root.span_context.span_id());
+        for kv in &authenticate.attributes {
+            let key = kv.key.as_str();
+            assert!(
+                key.starts_with("code.")
+                    || key.starts_with("thread.")
+                    || matches!(key, "target" | "level" | "busy_ns" | "idle_ns"),
+                "unexpected attribute on the authenticate span: {key}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7802,6 +9366,150 @@ mod tests {
         }
     }
 
+    const NPM_AUDIT_TAILS: [&str; 2] = [
+        "-/npm/v1/security/advisories/bulk",
+        "-/npm/v1/security/audits/quick",
+    ];
+
+    fn npm_cached_repo(is_public: bool) -> CachedRepo {
+        CachedRepo {
+            format: "npm".to_string(),
+            ..make_cached_repo(is_public)
+        }
+    }
+
+    #[test]
+    fn test_4317_npm_audit_post_is_anonymous_readable_and_non_mutating() {
+        for tail in NPM_AUDIT_TAILS {
+            let path = format!("/npm/pubnpm/{tail}");
+            assert!(is_anonymous_readable_format_post(&path), "{path}");
+            assert!(is_non_mutating_format_post(&path), "{path}");
+        }
+        // Near misses and the other npm write shapes stay writes.
+        for path in [
+            "/npm/pubnpm/-/npm/v1/security/advisories/bulk/",
+            "/npm/pubnpm/-/npm/v1/security/advisories/bulk/extra",
+            "/npm/pubnpm/-/npm/v1/security/advisories",
+            "/npm/pubnpm/-/npm/v1/security/audits",
+            "/npm/pubnpm/-/npm/v1/security/audits/bulk",
+            "/npm//-/npm/v1/security/advisories/bulk",
+            "/npm/pubnpm/left-pad",
+            "/npm/pubnpm/@scope/pkg",
+            "/npm/pubnpm/-/package/left-pad/dist-tags/latest",
+            "/pypi/pubnpm/-/npm/v1/security/advisories/bulk",
+        ] {
+            assert!(!is_anonymous_readable_format_post(path), "{path}");
+            assert!(!is_non_mutating_format_post(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_5253_mcp_validate_post_is_anonymous_readable_and_non_mutating() {
+        for path in ["/mcp/reg/v0/validate", "/mcp/reg/v0.1/validate"] {
+            assert!(is_anonymous_readable_format_post(path), "{path}");
+            assert!(is_non_mutating_format_post(path), "{path}");
+        }
+        for path in [
+            "/mcp/reg/v0.1/publish",
+            "/mcp/reg/v0.1/validate/",
+            "/mcp/reg/v0.2/validate",
+            "/mcp//v0.1/validate",
+            "/mcp/reg/validate",
+            "/mcp/reg/v0.1/servers/a/validate",
+            "/npm/reg/v0.1/validate",
+        ] {
+            assert!(!is_anonymous_readable_format_post(path), "{path}");
+            assert!(!is_non_mutating_format_post(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_5253_mcp_validate_post_no_auth_passes_public_and_401s_private() {
+        let mcp = |is_public| CachedRepo {
+            format: "mcp".to_string(),
+            ..make_cached_repo(is_public)
+        };
+        for (key, public, want) in [
+            ("pubmcp", true, StatusCode::OK),
+            ("privmcp", false, StatusCode::UNAUTHORIZED),
+        ] {
+            let state = make_vis_state(Some((key.to_string(), mcp(public)))).await;
+            for v in ["v0", "v0.1"] {
+                let req = axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/mcp/{key}/{v}/validate"))
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap();
+                let resp = run_through_visibility(state.clone(), req).await;
+                assert_eq!(resp.status(), want, "{key} {v}");
+            }
+            // Publish stays an anonymous-write 401 on either.
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("/mcp/{key}/v0.1/publish"))
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{key} publish");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_4317_npm_audit_post_no_auth_passes_on_public_repo() {
+        let state = make_vis_state(Some(("pubnpm".to_string(), npm_cached_repo(true)))).await;
+        for tail in NPM_AUDIT_TAILS {
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("/npm/pubnpm/{tail}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{tail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_4317_npm_audit_post_no_auth_returns_401_on_private_repo() {
+        let state = make_vis_state(Some(("privnpm".to_string(), npm_cached_repo(false)))).await;
+        for tail in NPM_AUDIT_TAILS {
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("/npm/privnpm/{tail}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{tail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_4317_npm_publish_no_auth_still_returns_401_on_public_repo() {
+        // The audit exemption must not widen into a general `/npm/...` write
+        // exemption: publish (PUT) and any other npm POST stay #508-gated.
+        let state = make_vis_state(Some(("pubnpm".to_string(), npm_cached_repo(true)))).await;
+        for (method, uri) in [
+            (Method::PUT, "/npm/pubnpm/left-pad"),
+            (Method::PUT, "/npm/pubnpm/@scope%2fpkg"),
+            (Method::POST, "/npm/pubnpm/left-pad"),
+            (
+                Method::POST,
+                "/npm/pubnpm/-/npm/v1/security/advisories/bulk/extra",
+            ),
+            (Method::PUT, "/npm/pubnpm/-/npm/v1/security/advisories/bulk"),
+            (Method::DELETE, "/npm/pubnpm/-/npm/v1/security/audits/quick"),
+        ] {
+            let req = axum::http::Request::builder()
+                .method(method.clone())
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+    }
+
     #[tokio::test]
     async fn test_repo_visibility_public_vscode_gallery_non_post_writes_require_auth() {
         let key = "openvsx";
@@ -7882,9 +9590,16 @@ mod tests {
         let (private_status, private_body) =
             anon_get_status_and_body(private_state, "/pypi/acme-internal-core/simple/").await;
 
-        // NONEXISTENT repo: nothing in the cache; the cache-miss DB lookup
-        // against the lazy pool finds no row, exercising the no-repo branch.
+        // NONEXISTENT repo: a tombstone takes the same no-repo branch as a
+        // lookup that finds no row, without a database (the lazy pool is
+        // unreachable, and an unreachable database answers 503)
         let missing_state = make_vis_state(None).await;
+        seed_repo_miss(
+            &missing_state,
+            "zzz-nonexistent-repo-9",
+            std::time::Instant::now(),
+        )
+        .await;
         let (missing_status, missing_body) =
             anon_get_status_and_body(missing_state, "/pypi/zzz-nonexistent-repo-9/simple/").await;
 
@@ -7938,22 +9653,31 @@ mod tests {
         let (cached_status, cached_body) =
             anon_get_status_and_body(tombstoned, "/pypi/nope/simple/").await;
 
+        let private = make_vis_state(Some((
+            "nope".to_string(),
+            make_cached_repo(/* is_public */ false),
+        )))
+        .await;
+        let (private_status, private_body) =
+            anon_get_status_and_body(private, "/pypi/nope/simple/").await;
+
         let uncached = make_vis_state(None).await;
-        let (fresh_status, fresh_body) =
-            anon_get_status_and_body(uncached, "/pypi/nope/simple/").await;
+        let (fresh_status, _) = anon_get_status_and_body(uncached, "/pypi/nope/simple/").await;
 
         assert_eq!(
             cached_status,
             StatusCode::UNAUTHORIZED,
-            "a negative-cached key must answer with the same 401 challenge as a fresh miss"
+            "a negative-cached key must answer with the 401 challenge of a miss"
         );
         assert_eq!(
-            cached_status, fresh_status,
-            "the negative-cache path must not change the status of a miss"
+            (cached_status, cached_body),
+            (private_status, private_body),
+            "a negative-cached key must answer exactly like an existing private repo"
         );
         assert_eq!(
-            cached_body, fresh_body,
-            "the negative-cache path must not change the body of a miss"
+            fresh_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "without the tombstone the lookup hits the unreachable pool, so the 401 above made no query"
         );
     }
 
@@ -7963,7 +9687,8 @@ mod tests {
         // to the lookup, and the stale entry is dropped by the `retain` sweep
         // on the write that follows. The lazy pool makes the lookup fail, so
         // nothing is re-inserted (an error is not evidence the key is free) —
-        // which is exactly what leaves the map empty to assert on.
+        // which is exactly what leaves the map empty to assert on. The failed
+        // lookup answers 503, which also shows the tombstone was not used.
         let state = make_vis_state(None).await;
         let expired_at =
             std::time::Instant::now() - std::time::Duration::from_secs(REPO_CACHE_TTL_SECS + 1);
@@ -7972,8 +9697,8 @@ mod tests {
         let resp = run_through_visibility(state.clone(), empty_get("/pypi/stale/simple/")).await;
         assert_eq!(
             resp.status(),
-            StatusCode::UNAUTHORIZED,
-            "an expired tombstone must not change the answer for an anonymous caller"
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an expired tombstone must be ignored, so the lookup runs and hits the unreachable pool"
         );
         assert!(
             !state.repo_miss_cache.read().await.contains_key("stale"),
@@ -8280,9 +10005,11 @@ mod tests {
         let status = run_through_visibility(state, req).await.status();
 
         api_alias_scoped_token_cleanup(&pool, user_id, decoy_id).await;
+        // Refused, and (#5458) with the existence-hiding 404: the token
+        // cannot read the private `othercrates` either.
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "a token scoped to the repository `cargo` must not publish into \
              another repository through /api/cargo"
         );
@@ -8308,11 +10035,195 @@ mod tests {
         let status = run_through_visibility(state, req).await.status();
 
         api_alias_scoped_token_cleanup(&pool, user_id, decoy_id).await;
+        // Refused, and (#5458) with the existence-hiding 404: the token
+        // cannot read the private `helm-priv` either.
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "a token scoped to the repository `helm` must not delete a chart \
              in another repository through /api/helm"
+        );
+    }
+
+    /// #5458: a write with a token scoped to another repository answers an
+    /// existing private key exactly as it answers an unknown one (the
+    /// existence-hiding 404), on the MCP surface and on every other format
+    /// route alike.
+    #[tokio::test]
+    async fn test_5458_write_outside_token_scope_matches_an_unknown_key() {
+        let decoy = format!("ak5458-decoy-{}", Uuid::new_v4());
+        let victim = format!("ak5458-victim-{}", Uuid::new_v4());
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let Some((pool, state, bearer, user_id, decoy_id)) =
+            api_alias_scoped_token_fixture(&decoy, &victim, &["read", "write"]).await
+        else {
+            return;
+        };
+        {
+            let mut cache = state.repo_cache.write().await;
+            for key in [&decoy, &victim] {
+                cache.get_mut(key.as_str()).unwrap().0.format = "mcp".to_string();
+            }
+        }
+        let send = |method: Method, path: String| {
+            let state = state.clone();
+            let bearer = bearer.clone();
+            async move {
+                let req = axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", bearer)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = run_through_visibility(state, req).await;
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, headers, body)
+            }
+        };
+        let mut answers = Vec::new();
+        for (method, tail) in [
+            (Method::POST, "/mcp/{key}/v0.1/publish"),
+            (Method::POST, "/pypi/{key}/"),
+            (Method::PUT, "/npm/{key}/pkg"),
+            (Method::DELETE, "/npm/{key}/pkg/-/pkg-1.0.0.tgz"),
+        ] {
+            let existing = send(method.clone(), tail.replace("{key}", &victim)).await;
+            let missing = send(method.clone(), tail.replace("{key}", &unknown)).await;
+            answers.push((tail, existing, missing));
+        }
+        api_alias_scoped_token_cleanup(&pool, user_id, decoy_id).await;
+
+        for (tail, existing, missing) in answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{tail}");
+            assert_eq!(existing, missing, "{tail}: existing private vs unknown key");
+            assert_eq!(&existing.2[..], b"Repository not found", "{tail}");
+        }
+    }
+
+    /// #5458: through the real middleware, a write by an owner of ANOTHER
+    /// repository (no token scope involved) answers an existing private
+    /// pypi / npm key exactly (status, headers, body) as an unknown key; a
+    /// member who can read but not write keeps the 403; an `internal`
+    /// repository, readable by every authenticated caller, keeps the 403.
+    #[tokio::test]
+    async fn test_5458_write_denial_to_a_non_reader_matches_an_unknown_key() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (pypi_id, pypi_key, pypi_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (npm_id, npm_key, npm_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (int_id, int_key, int_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(int_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (own_id, _, own_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (foreign, _) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, own_id, foreign, "repository-owner").await;
+        let (reader, _) = tdh::create_user(&pool).await;
+        for id in [pypi_id, npm_id] {
+            tdh::grant_repo_role(&pool, id, reader, "reader").await;
+        }
+        let tstate = tdh::build_state(pool.clone(), &own_dir.to_string_lossy());
+        let foreign_bearer = tdh::bearer_for(&tstate, foreign).await;
+        let reader_bearer = tdh::bearer_for(&tstate, reader).await;
+        let vis = RepoVisibilityState {
+            auth_service: Arc::new(AuthService::new(
+                pool.clone(),
+                Arc::new(tstate.config.clone()),
+            )),
+            db: pool.clone(),
+            repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+        let send = |method: Method, path: String, bearer: String| {
+            let vis = vis.clone();
+            async move {
+                let req = axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", bearer)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = run_through_visibility(vis, req).await;
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, headers, body)
+            }
+        };
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let cases = [
+            (Method::POST, format!("/pypi/{pypi_key}/"), "/pypi/{u}/"),
+            (Method::PUT, format!("/npm/{npm_key}/pkg"), "/npm/{u}/pkg"),
+            (
+                Method::DELETE,
+                format!("/npm/{npm_key}/pkg/-/pkg-1.0.0.tgz"),
+                "/npm/{u}/pkg/-/pkg-1.0.0.tgz",
+            ),
+        ];
+        let mut answers = Vec::new();
+        for (method, existing_path, unknown_path) in &cases {
+            let existing = send(
+                method.clone(),
+                existing_path.clone(),
+                foreign_bearer.clone(),
+            )
+            .await;
+            let missing = send(
+                method.clone(),
+                unknown_path.replace("{u}", &unknown),
+                foreign_bearer.clone(),
+            )
+            .await;
+            let as_reader = send(method.clone(), existing_path.clone(), reader_bearer.clone())
+                .await
+                .0;
+            answers.push((existing_path.clone(), existing, missing, as_reader));
+        }
+        let internal = send(
+            Method::PUT,
+            format!("/npm/{int_key}/pkg"),
+            foreign_bearer.clone(),
+        )
+        .await
+        .0;
+        for (id, dir) in [
+            (pypi_id, &pypi_dir),
+            (npm_id, &npm_dir),
+            (int_id, &int_dir),
+            (own_id, &own_dir),
+        ] {
+            tdh::cleanup_member_repo(&pool, id, dir).await;
+        }
+        tdh::cleanup_user(&pool, foreign).await;
+        tdh::cleanup_user(&pool, reader).await;
+
+        for (path, existing, missing, as_reader) in answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(existing, missing, "{path}: existing private vs unknown key");
+            assert_eq!(&existing.2[..], b"Repository not found", "{path}");
+            assert_eq!(
+                as_reader,
+                StatusCode::FORBIDDEN,
+                "{path}: a reader keeps the 403"
+            );
+        }
+        assert_eq!(
+            internal,
+            StatusCode::FORBIDDEN,
+            "an internal repository is readable by every authenticated caller"
         );
     }
 
@@ -8327,7 +10238,8 @@ mod tests {
     /// `test_extract_repo_key_conda_t_route_is_not_a_token_channel`), so it is
     /// answered by the no-repo branch with the #1808 401 challenge rather than
     /// by the empty-key branch. Either way the body is never read, which is
-    /// what the third column pins.
+    /// what the third column pins. Both tests seed its tombstone, so the
+    /// no-repo branch is reached without a database.
     const EMPTY_REPO_KEY_PROBES: &[(Method, &str, StatusCode)] = &[
         (Method::PUT, "/npm//pkg", StatusCode::NOT_FOUND),
         (
@@ -8370,6 +10282,11 @@ mod tests {
             StatusCode::NOT_FOUND,
         ),
         (Method::POST, "/alpine//upload", StatusCode::NOT_FOUND),
+        (
+            Method::PUT,
+            "/pacman//x-1-1-any.pkg.tar.zst",
+            StatusCode::NOT_FOUND,
+        ),
         (Method::POST, "/conda//upload", StatusCode::NOT_FOUND),
         (Method::POST, "/conda/t/upload", StatusCode::UNAUTHORIZED),
         (
@@ -8389,6 +10306,7 @@ mod tests {
             "/huggingface//api/models/m/upload/main",
             StatusCode::NOT_FOUND,
         ),
+        (Method::POST, "/mcp//v0.1/publish", StatusCode::NOT_FOUND),
         (
             Method::POST,
             "/jetbrains//plugin/uploadPlugin",
@@ -8434,6 +10352,13 @@ mod tests {
         (Method::PUT, "/ext/wasmfmt//x", StatusCode::NOT_FOUND),
         (Method::GET, "/general//x", StatusCode::NOT_FOUND),
     ];
+
+    async fn seed_probe_miss(state: &RepoVisibilityState, uri: &str) {
+        let key = extract_repo_key(uri);
+        if !key.is_empty() {
+            seed_repo_miss(state, &key, std::time::Instant::now()).await;
+        }
+    }
 
     /// A request body that records whether anything ever polled it.
     ///
@@ -8490,6 +10415,7 @@ mod tests {
         // handler — and its strict extractor — never runs.
         for (method, uri, expected) in EMPTY_REPO_KEY_PROBES {
             let state = make_vis_state(None).await;
+            seed_probe_miss(&state, uri).await;
             let req = axum::http::Request::builder()
                 .method(method.clone())
                 .uri(*uri)
@@ -8530,6 +10456,7 @@ mod tests {
         for (method, uri, expected) in EMPTY_REPO_KEY_PROBES {
             let read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let state = make_vis_state(None).await;
+            seed_probe_miss(&state, uri).await;
             let req = axum::http::Request::builder()
                 .method(method.clone())
                 .uri(*uri)
@@ -10369,8 +12296,9 @@ mod tests {
         );
         assert_eq!(
             private_put,
-            scope_denied(),
-            "#3648: private + out of scope + write stays refused by the scope gate"
+            not_found(),
+            "#3648: private + out of scope + write stays refused by the scope gate; since \
+             #5458 as the existence-hiding 404, like the read"
         );
         assert_eq!(
             vscode_private,
@@ -10408,8 +12336,8 @@ mod tests {
     /// compares the ACL branches. The caller is GRANTED on C so the scope gate
     /// is the only thing that can refuse it (drop the gate and it answers 200),
     /// and the in-scope control reads a PRIVATE repository through the same
-    /// rules-less branch. Writes are deliberately unchanged (#3524): the PUT on
-    /// C still answers the scope gate's 403.
+    /// rules-less branch. Since #5458 writes are unified too: the PUT on C
+    /// answers the same existence-hiding 404 as a key naming no repository.
     #[tokio::test]
     async fn test_3717_private_repo_scope_denial_matches_the_no_repo_answer() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -10505,6 +12433,7 @@ mod tests {
         let private_head = probe(&state, Method::HEAD, &key_c, &bearer).await;
         let missing_get = probe(&state, Method::GET, &key_missing, &bearer).await;
         let private_put = probe(&state, Method::PUT, &key_c, &bearer).await;
+        let missing_put = probe(&state, Method::PUT, &key_missing, &bearer).await;
 
         // The two `non_mutating_post` routes: POSTs the ACL arm reclassifies as
         // reads (git-lfs `objects/batch` is how an LFS client READS; conan
@@ -10594,15 +12523,589 @@ mod tests {
             "and that shared answer is the existence-hiding 404, not a shared 403"
         );
 
-        // The security half: writes are NOT unified (#3524).
+        // #5458: writes are unified too. A PUT to a private repository outside
+        // the token's scope is still refused by the scope gate, now with the
+        // same existence-hiding 404 a key naming no repository gets.
         assert_eq!(
             private_put,
-            (
-                StatusCode::FORBIDDEN,
-                "Token does not have access to this repository".to_string(),
-            ),
-            "#3717 must not touch writes: a PUT to a private repository outside the token's \
-             scope stays refused BY THE SCOPE GATE with 403"
+            (StatusCode::NOT_FOUND, "Repository not found".to_string()),
+            "#5458: a PUT to a private repository outside the token's scope is the \
+             existence-hiding 404"
         );
+        assert_eq!(
+            private_put, missing_put,
+            "#5458: identical to an unknown key"
+        );
+    }
+
+    /// #4750: an auth service whose pool is CLOSED, the shape of a database
+    /// that went away mid-request (failover, restart). Every query fails with
+    /// `PoolClosed`, which is not a pool-acquire timeout, so before #4750 none
+    /// of the 503 classifications (#2125) caught it.
+    async fn closed_pool_auth_service(secret: &str) -> AuthService {
+        let pool = lazy_pool();
+        pool.close().await;
+        let cfg = crate::config::Config {
+            jwt_secret: secret.to_string(),
+            ..crate::config::Config::default()
+        };
+        AuthService::new(pool, Arc::new(cfg))
+    }
+
+    /// #4750: a correctly signed JWT whose live-user / credential-watermark
+    /// lookup fails because the database is unavailable must answer a
+    /// retryable 503. Before the fix the error was ignored, the token fell
+    /// through to the API-token lookup, and the request got a 401 "Invalid or
+    /// expired token" that makes docker and CI clients give up.
+    #[tokio::test]
+    async fn test_auth_middleware_jwt_db_unavailable_returns_503_not_401_4750() {
+        use axum::{middleware, routing::any, Router};
+        use tower::ServiceExt;
+
+        let secret = "test-secret-at-least-32-bytes-long-for-4750";
+        let auth_service = Arc::new(closed_pool_auth_service(secret).await);
+        let jwt = mint_access_jwt(secret, Uuid::new_v4(), "ci-user");
+        let app: Router = Router::new()
+            .route(
+                "/probe",
+                any(|| async { (StatusCode::OK, "handler-reached") }),
+            )
+            .layer(middleware::from_fn_with_state(
+                auth_service,
+                auth_middleware,
+            ));
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .header("Authorization", format!("Bearer {jwt}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    /// #4750: the same outage on the optional-auth / format-endpoint resolver
+    /// (Bearer JWT and JWT-as-Basic-password) is `Overloaded` (503), not
+    /// `InvalidCredential` (401).
+    #[tokio::test]
+    async fn test_try_resolve_auth_outcome_jwt_db_unavailable_is_overloaded_4750() {
+        let secret = "test-secret-at-least-32-bytes-long-for-4750";
+        let auth_service = closed_pool_auth_service(secret).await;
+        let jwt = mint_access_jwt(secret, Uuid::new_v4(), "ci-user");
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Bearer(&jwt), true).await;
+        assert!(
+            matches!(outcome, AuthOutcome::Overloaded),
+            "Bearer JWT during a DB outage: {outcome:?}"
+        );
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("ci-user:{jwt}"));
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), true).await;
+        assert!(
+            matches!(outcome, AuthOutcome::Overloaded),
+            "JWT as Basic password during a DB outage: {outcome:?}"
+        );
+    }
+
+    /// #4750 control: a credential that is rejected before the database is
+    /// consulted (a JWT signed with the wrong key, then too short to be an API
+    /// token) is still a 401 while the database is down.
+    #[tokio::test]
+    async fn test_auth_middleware_invalid_credential_still_401_during_db_outage_4750() {
+        let auth_service =
+            closed_pool_auth_service("test-secret-at-least-32-bytes-long-for-4750").await;
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::ApiKey("short"), true).await;
+        assert!(
+            matches!(outcome, AuthOutcome::InvalidCredential),
+            "{outcome:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #4883: the issue's replay end to end through the real routes. Login
+    // pair, GET /me 200, POST /logout with only the Bearer access token, then
+    // the same Bearer on GET /me is 401 and another session of the user is
+    // still 200. The logout route is mounted behind `optional_auth_middleware`
+    // and /me behind `auth_middleware`, as routes.rs mounts them.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_4883_bearer_replay_after_logout_is_401() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request as HttpRequest, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mw-4883-{}", uuid::Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(state.config.clone()),
+        ));
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch user");
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let pair = auth_service.generate_tokens(&user).expect("mint pair");
+            auth_service
+                .persist_refresh_jti_from_pair(&pair, user_id)
+                .await
+                .expect("persist jti");
+            sessions.push(pair);
+        }
+        let (signed_out, other) = (&sessions[0], &sessions[1]);
+
+        let app = axum::Router::new()
+            .merge(crate::api::handlers::auth::protected_router().layer(
+                axum::middleware::from_fn_with_state(auth_service.clone(), auth_middleware),
+            ))
+            .merge(crate::api::handlers::auth::logout_router().layer(
+                axum::middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
+                ),
+            ))
+            .with_state(state);
+        let me = |token: &str| {
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/me")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let (status, _) = tdh::send(app.clone(), me(&signed_out.access_token)).await;
+        assert_eq!(status, StatusCode::OK, "before logout");
+
+        let logout = HttpRequest::builder()
+            .method("POST")
+            .uri("/logout")
+            .header(
+                "authorization",
+                format!("Bearer {}", signed_out.access_token),
+            )
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, body) = tdh::send(app.clone(), logout).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "logout: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let (status, _) = tdh::send(app.clone(), me(&signed_out.access_token)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a Bearer replay of the signed-out access token must be refused"
+        );
+        let (status, _) = tdh::send(app.clone(), me(&other.access_token)).await;
+        assert_eq!(status, StatusCode::OK, "another session is unaffected");
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #5640 / #5633: Basic `user:<api_token>` is resolved token-first, and an
+    // invalid credential is refused before it can take an auth-capacity
+    // permit.
+    //
+    // Counted, not timed: `bcrypt_verify_counter` counts every
+    // `AuthService::verify_password` call, and `verify_password` is the only
+    // place the auth-capacity permit is taken, so "zero verifies" is "zero
+    // permits". The count is a process-global, which `cargo nextest`'s
+    // process-per-test isolation (mandated by CLAUDE.md and CI) keeps private
+    // to each test.
+    // -----------------------------------------------------------------------
+    mod basic_token_first_5640 {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::auth_service::bcrypt_verify_counter;
+        use std::sync::atomic::Ordering;
+
+        const PASSWORD: &str = "Correct-Horse-Battery-5640";
+
+        fn verifies() -> u64 {
+            bcrypt_verify_counter().load(Ordering::Relaxed)
+        }
+
+        fn basic(username: &str, password: &str) -> String {
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+        }
+
+        /// A token-shaped secret no token was ever minted for.
+        fn unknown_token() -> String {
+            format!("deadbeef_{}", Uuid::new_v4().simple())
+        }
+
+        /// A local account with a real (cost-4) password hash. Hashed with
+        /// `bcrypt::hash` directly so seeding takes no permit and no count.
+        async fn local_user(pool: &sqlx::PgPool) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let username = format!("ph-5640-{id}");
+            let hash = bcrypt::hash(PASSWORD, 4).expect("hash password");
+            sqlx::query(
+                r#"INSERT INTO users
+                   (id, username, email, password_hash, auth_provider,
+                    is_admin, is_active, is_service_account)
+                   VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+            )
+            .bind(id)
+            .bind(&username)
+            .bind(format!("{username}@test.local"))
+            .bind(&hash)
+            .execute(pool)
+            .await
+            .expect("insert local user");
+            (id, username)
+        }
+
+        /// `(failed_login_attempts, last_failed_login_at IS NOT NULL,
+        /// locked_until IS NOT NULL)`.
+        async fn lockout_state(pool: &sqlx::PgPool, user_id: Uuid) -> (i32, bool, bool) {
+            sqlx::query_as(
+                "SELECT failed_login_attempts, last_failed_login_at IS NOT NULL, \
+                 locked_until IS NOT NULL FROM users WHERE id = $1",
+            )
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .expect("read lockout state")
+        }
+
+        async fn drop_user(pool: &sqlx::PgPool, user_id: Uuid) {
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+
+        fn service(pool: &sqlx::PgPool) -> AuthService {
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()))
+        }
+
+        /// The issue's shape: `user:<api_token>` on a format route, N times.
+        /// Before the fix every request bcrypt-verified the token as the
+        /// user's password and wrote a failed login.
+        #[tokio::test]
+        async fn basic_user_token_runs_no_bcrypt_and_writes_no_failed_login() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (user_id, username) = local_user(&pool).await;
+            let svc = service(&pool);
+            let (token, _) = svc
+                .generate_api_token(user_id, "maven", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+            let header = basic(&username, &token);
+
+            // The first request verifies the token itself once (uncached) —
+            // that is the token's own check, not a password check.
+            let before = verifies();
+            let first = try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), true).await;
+            assert!(
+                matches!(first, AuthOutcome::Resolved(ref e) if e.is_api_token && e.user_id == user_id),
+                "user:<api_token> must resolve to the token owner, got {first:?}"
+            );
+            assert_eq!(verifies() - before, 1, "only the token's own verify");
+
+            const N: u64 = 20;
+            let before = verifies();
+            for _ in 0..N {
+                let outcome =
+                    try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), true).await;
+                assert!(matches!(outcome, AuthOutcome::Resolved(_)), "{outcome:?}");
+            }
+            let ran = verifies() - before;
+            let state = lockout_state(&pool, user_id).await;
+            drop_user(&pool, user_id).await;
+
+            assert_eq!(
+                ran, 0,
+                "{N} cached Basic user:<api_token> requests ran {ran} bcrypt verifies: the \
+                 token was tried as a password first (#5640)"
+            );
+            assert_eq!(
+                state,
+                (0, false, false),
+                "user:<api_token> must never write the lockout columns (#5640)"
+            );
+        }
+
+        /// A token-shaped secret that is not a live token — never minted,
+        /// revoked, or expired — is a 401 with no bcrypt (no permit) and no
+        /// failed-login write, on both the format and the management path.
+        #[tokio::test]
+        async fn basic_user_bad_token_is_refused_without_bcrypt_or_failed_login() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (user_id, username) = local_user(&pool).await;
+            let svc = Arc::new(service(&pool));
+            let (revoked, revoked_id) = svc
+                .generate_api_token(user_id, "revoked", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+            let (expired, expired_id) = svc
+                .generate_api_token(user_id, "expired", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+            sqlx::query("UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1")
+                .bind(revoked_id)
+                .execute(&pool)
+                .await
+                .expect("revoke");
+            sqlx::query(
+                "UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+            )
+            .bind(expired_id)
+            .execute(&pool)
+            .await
+            .expect("expire");
+
+            let before = verifies();
+            let mut format_outcomes = Vec::new();
+            for secret in [unknown_token(), revoked, expired] {
+                let header = basic(&username, &secret);
+                format_outcomes.push(
+                    try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), true).await,
+                );
+                format_outcomes.push(
+                    try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), false).await,
+                );
+            }
+            let mgmt = run_auth_middleware_with_service(
+                svc.clone(),
+                basic_get(&username, &unknown_token()),
+            )
+            .await
+            .status();
+            let ran = verifies() - before;
+            let state = lockout_state(&pool, user_id).await;
+            drop_user(&pool, user_id).await;
+
+            for outcome in &format_outcomes {
+                assert!(
+                    matches!(outcome, AuthOutcome::InvalidCredential),
+                    "a dead token as the Basic password must be InvalidCredential, got {outcome:?}"
+                );
+            }
+            assert_eq!(mgmt, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                ran, 0,
+                "a dead token as the Basic password ran {ran} bcrypt verifies (each one takes \
+                 an auth-capacity permit, #5633)"
+            );
+            assert_eq!(state, (0, false, false), "no failed-login write (#5640)");
+        }
+
+        /// Ordinary `user:password` Basic auth is unchanged: the right
+        /// password authenticates, and a wrong one still counts toward the
+        /// lockout. Lockout policy is not part of this fix.
+        #[tokio::test]
+        async fn basic_user_password_still_works_and_a_wrong_one_still_counts() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (user_id, username) = local_user(&pool).await;
+            let svc = Arc::new(service(&pool));
+
+            let good = basic(&username, PASSWORD);
+            let resolved = try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&good), true).await;
+            let mgmt_ok =
+                run_auth_middleware_with_service(svc.clone(), basic_get(&username, PASSWORD))
+                    .await
+                    .status();
+
+            let bad = basic(&username, "wrong-password");
+            let before = verifies();
+            let rejected = try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&bad), true).await;
+            let wrong_verifies = verifies() - before;
+            let mgmt_bad =
+                run_auth_middleware_with_service(svc.clone(), basic_get(&username, "also-wrong"))
+                    .await
+                    .status();
+            let state = lockout_state(&pool, user_id).await;
+            drop_user(&pool, user_id).await;
+
+            assert!(
+                matches!(resolved, AuthOutcome::Resolved(ref e) if !e.is_api_token && e.user_id == user_id),
+                "{resolved:?}"
+            );
+            assert_eq!(mgmt_ok, StatusCode::OK);
+            assert!(
+                matches!(rejected, AuthOutcome::InvalidCredential),
+                "{rejected:?}"
+            );
+            assert_eq!(mgmt_bad, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                wrong_verifies, 1,
+                "a wrong password pays exactly one bcrypt (no second, token-shaped dummy verify)"
+            );
+            assert_eq!(state.0, 2, "both wrong passwords count toward the lockout");
+            assert!(
+                state.1,
+                "last_failed_login_at is recorded for a wrong password"
+            );
+        }
+
+        /// The timing oracle (#5640: 0.67 s for a wrong password on an
+        /// existing account vs 0.32 s for an unknown one): a wrong Basic
+        /// password costs the same single bcrypt whether or not the username
+        /// exists, on both surfaces. Pinned by code path (the dummy-hash
+        /// verify on the unknown-username arm), not wall time.
+        #[tokio::test]
+        async fn basic_wrong_password_costs_one_bcrypt_for_known_and_unknown_users() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (user_id, username) = local_user(&pool).await;
+            let svc = service(&pool);
+            let ghost = format!("ph-5640-ghost-{}", Uuid::new_v4());
+
+            let mut costs = Vec::new();
+            for allow in [true, false] {
+                for who in [username.as_str(), ghost.as_str()] {
+                    let header = basic(who, "wrong-password");
+                    let before = verifies();
+                    let outcome =
+                        try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), allow).await;
+                    assert!(
+                        matches!(outcome, AuthOutcome::InvalidCredential),
+                        "{outcome:?}"
+                    );
+                    costs.push((allow, who == ghost, verifies() - before));
+                }
+            }
+            drop_user(&pool, user_id).await;
+
+            for (allow, unknown, cost) in costs {
+                assert_eq!(
+                    cost, 1,
+                    "wrong Basic password (allow_basic_api_token={allow}, unknown_user={unknown}) \
+                     ran {cost} bcrypt verifies; known and unknown usernames must both pay \
+                     exactly one so they take comparable time"
+                );
+            }
+        }
+
+        /// #5633: a burst of invalid credentials — a JWT that does not verify, garbage, a
+        /// never-minted and an expired API token as Bearer, and a dead token
+        /// as the Basic password — answers 401, never 503, even with the
+        /// auth-capacity cap fully held. Before the fix each of them ran a
+        /// bcrypt (the dummy-hash pad) under the cap.
+        #[tokio::test]
+        async fn invalid_credential_burst_never_sheds_to_503() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            // Under nextest this process installs the cap itself, so it can
+            // hold the only permit: any request that reached bcrypt would then
+            // wait out the 3 s queue and shed to 503. Outside nextest the cap
+            // is process-wide and shared with other tests, so it is left
+            // alone and the zero-verify count below carries the assertion.
+            let ours = if std::env::var_os("NEXTEST").is_some() {
+                let sem = Arc::new(tokio::sync::Semaphore::new(1));
+                crate::services::auth_service::install_global_auth_semaphore(Some(sem.clone()));
+                crate::services::auth_service::installed_global_auth_semaphore()
+                    .filter(|installed| Arc::ptr_eq(installed, &sem))
+            } else {
+                None
+            };
+
+            let (user_id, username) = local_user(&pool).await;
+            let svc = Arc::new(service(&pool));
+            let (expired, expired_id) = svc
+                .generate_api_token(user_id, "expired", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+            sqlx::query(
+                "UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+            )
+            .bind(expired_id)
+            .execute(&pool)
+            .await
+            .expect("expire");
+            // JWT-shaped, but signed with a key this service does not hold
+            // (an expired or foreign session token behaves the same way).
+            let bad_jwt = mint_access_jwt(
+                "some-other-secret-at-least-32-bytes-long",
+                user_id,
+                &username,
+            );
+
+            let headers = [
+                format!("Bearer {bad_jwt}"),
+                "Bearer not-a-real-credential".to_string(),
+                format!("Bearer {}", unknown_token()),
+                format!("Bearer {expired}"),
+                format!("Basic {}", basic(&username, &unknown_token())),
+                format!("Basic {}", basic(&username, &expired)),
+            ];
+
+            // Seeding (the token mint hashes under the cap) is done; now hold
+            // the only permit for the whole burst.
+            let held = ours.map(|sem| sem.try_acquire_owned().expect("hold the only permit"));
+
+            let before = verifies();
+            let started = std::time::Instant::now();
+            let mut tasks = tokio::task::JoinSet::new();
+            for i in 0..64 {
+                let header = headers[i % headers.len()].clone();
+                let svc = svc.clone();
+                tasks.spawn(async move {
+                    let request = axum::http::Request::builder()
+                        .method(Method::GET)
+                        .uri("/probe")
+                        .header("Authorization", header)
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                    run_auth_middleware_with_service(svc, request)
+                        .await
+                        .status()
+                });
+            }
+            let mut statuses = Vec::new();
+            while let Some(status) = tasks.join_next().await {
+                statuses.push(status.expect("burst task"));
+            }
+            let elapsed = started.elapsed();
+            let ran = verifies() - before;
+            drop(held);
+            drop_user(&pool, user_id).await;
+
+            assert!(
+                statuses.iter().all(|s| *s == StatusCode::UNAUTHORIZED),
+                "every invalid credential must answer 401, never a retryable 503: {statuses:?}"
+            );
+            assert_eq!(
+                ran, 0,
+                "the burst ran {ran} bcrypt verifies (permits) (#5633)"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(3),
+                "the burst queued on the auth cap ({elapsed:?})"
+            );
+        }
     }
 }

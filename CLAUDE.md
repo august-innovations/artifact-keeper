@@ -353,9 +353,9 @@ Every CHANGELOG entry and GitHub Release must include recognition sections. This
 1. Look at all PRs/commits since the last tag
 2. For each fix, check the linked issue(s) to find who reported it
 3. Check `gh pr list --state merged` for external PR authors (not `brandonrc` or bots)
-4. Check the Sponsors section in README.md for current backers
+4. Run `scripts/release/sponsors.sh` (needs `gh` logged in as an org admin): it prints the `### Sponsors` block from the ACTIVE GitHub sponsorships, naming public sponsors and only counting private ones. `--level 2` prints the release-notes form; `--check FILE` fails if FILE omits a public sponsor. Do not copy the list from README.md or an older section; both have drifted before
 5. Add a `### Thank You` section crediting external contributors who filed issues, reported bugs, or submitted PRs
-6. Add a `### Sponsors` section thanking current backers by name and GitHub handle
+6. Paste the `### Sponsors` block the script printed; never name a sponsor whose sponsorship is private (the script never prints them)
 7. **Do NOT include maintainer `brandonrc`** in the thank you section, only external contributors
 8. If no external contributors reported issues for this release, omit the Thank You section
 9. The Sponsors section is always included if there are active sponsors

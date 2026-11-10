@@ -722,11 +722,25 @@ mod qc_metadata_leak_2437 {
 //         per-repo access, no admin — so ANY authenticated read-scope caller
 //         (e.g. a read-only API token) could read gate posture
 //         (`enabled` + `min_age_days`) for every repository. The PUT and all
-//         four /admin review endpoints were already admin-only; the GET now
-//         matches them with `require_admin()`.
-// Asserts: a read-scope API token and a plain non-admin user both get 403
-//         with no config fields in the body; an admin still gets 200 with the
-//         config row (migration-146 defaults for a fresh repo).
+//         four /admin review endpoints were already admin-only; the GET was
+//         brought up to the same tier.
+//         Since #4238 that tier is repository administration rather than
+//         instance administration — `require_repo_write_access` +
+//         `require_repo_admin`, the chain every other repository-configuration
+//         subresource uses — so a repository's own admins qualify. Neither
+//         caller below holds any grant on the repository, so what this pin
+//         asserts is unchanged: reaching gate posture still takes an
+//         administrative grant, and merely being authenticated (or holding a
+//         read scope) is still not one.
+//         Since #5458 the refusal depends on whether the caller can READ the
+//         (private) repository: a caller with no grant gets the unknown-key
+//         404, so the refusal does not confirm the key exists; a caller who
+//         can read it keeps the 403.
+// Asserts: a read-scope API token and a plain non-admin user with no grant
+//         both get 404; the same two callers holding a `read` grant on the
+//         repository get 403; no refusal body carries config fields; an admin
+//         still gets 200 with the config row (migration-146 defaults for a
+//         fresh repo).
 //
 // DB-gated; run with:
 //   DATABASE_URL="postgresql://.../artifact_registry" \
@@ -772,8 +786,13 @@ mod age_gate_config_2264 {
     /// A non-admin caller. `scopes` distinguishes the read-only API token
     /// (the exact pre-fix caller) from a plain session user (scopes = None).
     fn non_admin(scopes: Option<Vec<String>>) -> AuthExtension {
+        non_admin_as(Uuid::new_v4(), scopes)
+    }
+
+    /// [`non_admin`] for a known principal, so a grant can be attached to it.
+    fn non_admin_as(user_id: Uuid, scopes: Option<Vec<String>>) -> AuthExtension {
         AuthExtension {
-            user_id: Uuid::new_v4(),
+            user_id,
             username: "ag2264-caller".to_string(),
             email: "ag2264@test.local".to_string(),
             is_admin: false,
@@ -812,6 +831,42 @@ mod age_gate_config_2264 {
         (id, key, dir.to_string_lossy().to_string())
     }
 
+    /// Insert a non-admin user holding exactly the repository `read` action on
+    /// `repo_id`: a caller who can read the repository but not administer it.
+    async fn create_reader(pool: &PgPool, repo_id: Uuid) -> Uuid {
+        let user_id = Uuid::new_v4();
+        let username = format!("ag2264-reader-{}", &user_id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+             VALUES ($1, $2, $3, 'unused', 'local', false, true)",
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .execute(pool)
+        .await
+        .expect("insert reader user");
+        sqlx::query(
+            "INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions) \
+             VALUES ('user', $1, 'repository', $2, ARRAY['read'])",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("grant repository read");
+        user_id
+    }
+
+    fn assert_no_config_leak(body: &str) {
+        for needle in ["min_age_days", "enabled"] {
+            assert!(
+                !body.contains(needle),
+                "refusal body must not leak `{needle}`: {body}"
+            );
+        }
+    }
+
     /// GET `uri` as `caller` through the real repo-config router. The age-gate
     /// handlers extract `Extension<Option<AuthExtension>>`, so inject the
     /// Option form (as the production `auth_middleware` does).
@@ -841,25 +896,48 @@ mod age_gate_config_2264 {
         let uri = format!("/{key}/age-gate");
 
         // The exact disclosure: a read-only API token (passed the old
-        // `require_scope("read")` gate) must now get 403 with no config leak.
+        // `require_scope("read")` gate) is refused with no config leak. It
+        // holds no grant on this private repository, so since #5458 the
+        // refusal is the unknown-key 404, not a 403 that confirms the key.
         let (status, body) = get_as(
             state.clone(),
             non_admin(Some(vec!["read".to_string()])),
             &uri,
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "read-scope token must 403");
-        for needle in ["min_age_days", "enabled"] {
-            assert!(
-                !body.contains(needle),
-                "403 body must not leak `{needle}`: {body}"
-            );
-        }
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "read-scope token without a grant must get the unknown-key 404"
+        );
+        assert_no_config_leak(&body);
 
         // A plain non-admin session user is equally rejected — repo-access
         // bits do not grant config reads.
-        let (status, _body) = get_as(state.clone(), non_admin(None), &uri).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "non-admin user must 403");
+        let (status, body) = get_as(state.clone(), non_admin(None), &uri).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "non-admin user without a grant must get the unknown-key 404"
+        );
+        assert_no_config_leak(&body);
+
+        // A caller who CAN read the repository already knows it exists, so it
+        // keeps the 403 (#5458) — and reading is still not administering, so
+        // the config stays hidden (#2264). Both the read-scope token and the
+        // session form of that reader.
+        let reader_id = create_reader(&pool, repo_id).await;
+        for (scopes, what) in [
+            (
+                Some(vec!["read".to_string()]),
+                "read-scope token of a reader",
+            ),
+            (None, "non-admin reader"),
+        ] {
+            let (status, body) = get_as(state.clone(), non_admin_as(reader_id, scopes), &uri).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{what} must 403");
+            assert_no_config_leak(&body);
+        }
 
         // Admin parity with the PUT: still 200 with the config row.
         let (status, body) = get_as(state.clone(), admin(), &uri).await;
@@ -869,6 +947,14 @@ mod age_gate_config_2264 {
         assert_eq!(v["enabled"], false);
         assert_eq!(v["min_age_days"], 7);
 
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(reader_id)
+            .execute(&pool)
+            .await;
         let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(repo_id)
             .execute(&pool)
@@ -1670,7 +1756,11 @@ mod guest_access_oci_3854 {
             ..Default::default()
         };
         GuestAccessState {
-            guest_access_enabled,
+            policy: Arc::new(
+                artifact_keeper_backend::services::guest_access_policy::GuestAccessPolicy::fixed(
+                    guest_access_enabled,
+                ),
+            ),
             auth_service: Arc::new(AuthService::new(pool, Arc::new(config))),
         }
     }
@@ -1834,6 +1924,9 @@ mod guest_access_oci_3854 {
             jwt_secret: JWT_SECRET.into(),
             setup_password_hint: None,
             guest_access_enabled,
+            // As if AK_GUEST_ACCESS_ENABLED were set: the value is pinned and
+            // never depends on a stored row in the shared test DB (#867).
+            guest_access_env_pinned: true,
             ..Default::default()
         };
         let storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = Arc::new(
@@ -1848,9 +1941,11 @@ mod guest_access_oci_3854 {
 
     /// The production shape: the OCI routes nested under `/v2`, with the
     /// guest-access guard as the global outer layer in front of them.
-    fn real_app(shared: SharedState, guest_access_enabled: bool) -> Router {
+    /// The guard shares `shared.guest_access_policy`, exactly as
+    /// `create_router` wires it (#867).
+    fn real_app(shared: SharedState) -> Router {
         let guard_state = GuestAccessState {
-            guest_access_enabled,
+            policy: shared.guest_access_policy.clone(),
             auth_service: Arc::new(AuthService::new(
                 shared.db.clone(),
                 Arc::new(shared.config.clone()),
@@ -1899,7 +1994,7 @@ mod guest_access_oci_3854 {
         std::fs::create_dir_all(&dir).expect("create storage dir");
         let path = dir.to_string_lossy().to_string();
 
-        let refused = real_app(real_state(pool.clone(), &path, false), false)
+        let refused = real_app(real_state(pool.clone(), &path, false))
             .oneshot(anonymous_request("/v2/token?service=artifact-keeper"))
             .await
             .expect("router is infallible");
@@ -1917,7 +2012,7 @@ mod guest_access_oci_3854 {
 
         // With the flag on, the very same request mints the anonymous token —
         // the default configuration is untouched by this change.
-        let minted = real_app(real_state(pool, &path, true), true)
+        let minted = real_app(real_state(pool, &path, true))
             .oneshot(anonymous_request("/v2/token?service=artifact-keeper"))
             .await
             .expect("router is infallible");
@@ -2012,7 +2107,7 @@ mod guest_access_oci_3854 {
         let shared = real_state(pool.clone(), &path, false);
 
         // 1. `docker login` — the password grant asking for an offline token.
-        let login = real_app(shared.clone(), false)
+        let login = real_app(shared.clone())
             .oneshot(form_post(
                 "/v2/token",
                 format!(
@@ -2031,7 +2126,7 @@ mod guest_access_oci_3854 {
         let exchanged = match refresh.as_deref() {
             Some(rt) => Some(
                 status_and_body(
-                    real_app(shared.clone(), false)
+                    real_app(shared.clone())
                         .oneshot(form_post(
                             "/v2/token",
                             format!("grant_type=refresh_token&refresh_token={rt}"),
@@ -2053,7 +2148,7 @@ mod guest_access_oci_3854 {
         let pulled = match access.as_deref() {
             Some(token) => Some(
                 status_and_body(
-                    real_app(shared, false)
+                    real_app(shared)
                         .oneshot(
                             Request::builder()
                                 .uri(format!("/v2/{key}/manifests/latest"))

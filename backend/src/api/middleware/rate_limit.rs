@@ -234,7 +234,18 @@ fn tag_exempt(mut response: Response, tag: &str) -> Response {
 
 /// Attach the `X-RateLimit-Limit` / `X-RateLimit-Remaining` headers to an
 /// allowed response.
+///
+/// Limiters nest: the general API limiter wraps every route, including ones
+/// that carry their own tighter limiter (login, presigned download). When an
+/// INNER limiter refused the request, the response is its 429 with its own
+/// bucket's headers, and this outer limiter -- which allowed the request --
+/// must not overwrite them: otherwise a login 429 (10 per 900 s) reported the
+/// general bucket's `X-RateLimit-Limit: 10000` beside the login bucket's
+/// `Retry-After`, telling clients the wrong limiter fired (#4664).
 fn tag_allowed(mut response: Response, max_requests: u32, remaining: u32) -> Response {
+    if inner_limiter_refused(&response) {
+        return response;
+    }
     let headers = response.headers_mut();
     if let Ok(value) = HeaderValue::from_str(&max_requests.to_string()) {
         headers.insert("X-RateLimit-Limit", value);
@@ -243,6 +254,13 @@ fn tag_allowed(mut response: Response, max_requests: u32, remaining: u32) -> Res
         headers.insert("X-RateLimit-Remaining", value);
     }
     response
+}
+
+/// Whether `response` is a 429 already describing the limiter that refused it
+/// (see [`tag_allowed`], #4664).
+fn inner_limiter_refused(response: &Response) -> bool {
+    response.status() == StatusCode::TOO_MANY_REQUESTS
+        && response.headers().contains_key("X-RateLimit-Limit")
 }
 
 /// Per-instance, in-memory rate limiter that tracks requests per key (IP or user ID).
@@ -266,6 +284,8 @@ pub struct RateLimiter {
     pub(crate) max_requests: u32,
     /// Duration of the rate limiting window
     window: Duration,
+    /// Fixed name for `ak_rate_limit_rejections_total{limiter}` (#4676).
+    name: &'static str,
 }
 
 impl RateLimiter {
@@ -279,7 +299,20 @@ impl RateLimiter {
             requests: Arc::new(Mutex::new(HashMap::new())),
             max_requests,
             window: Duration::from_secs(window_secs),
+            name: "other",
         }
+    }
+
+    /// Name this limiter for `ak_rate_limit_rejections_total{limiter}`
+    /// (#4676). Unnamed limiters report `other`.
+    pub fn named(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
+    }
+
+    /// The `limiter` label this limiter's refusals are counted under.
+    pub fn name(&self) -> &'static str {
+        self.name
     }
 
     /// Check if a request should be rate limited.
@@ -358,6 +391,27 @@ impl RateLimiter {
         entry.0 = entry.0.saturating_add(1);
     }
 
+    /// Give back one unit [`Self::check_rate_limit`] took from `key`, for a
+    /// budget that reserves up front and charges only failures (the device
+    /// user-code throttle, #3461). Reserving atomically and refunding
+    /// successes, rather than peeking and charging failures afterwards, means
+    /// N concurrent attempts cannot all pass the check before any is charged.
+    /// A no-op once the window has rolled over or nothing is left to give back.
+    pub fn refund_attempt(&self, key: &str) {
+        let now = Instant::now();
+        let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = requests.get_mut(key) {
+            if now.duration_since(entry.1) < self.window {
+                entry.0 = entry.0.saturating_sub(1);
+            }
+        }
+    }
+
+    /// The length of this limiter's window.
+    pub(crate) fn window(&self) -> Duration {
+        self.window
+    }
+
     /// Clean up expired entries from the rate limiter.
     /// Call this periodically to prevent memory bloat.
     pub async fn cleanup_expired(&self) {
@@ -416,7 +470,7 @@ pub async fn rate_limit_middleware(
         ),
         Err(retry_after) => {
             tracing::debug!(key = %key, retry_after, "rate limit exceeded");
-            too_many_requests(retry_after, state.limiter.max_requests)
+            too_many_requests(retry_after, &state.limiter)
         }
     }
 }
@@ -469,7 +523,7 @@ pub async fn rate_limit_by_ip_middleware(
         ),
         Err(retry_after) => {
             tracing::debug!(key = %key, retry_after, "presign-mint rate limit exceeded");
-            too_many_requests(retry_after, state.limiter.max_requests)
+            too_many_requests(retry_after, &state.limiter)
         }
     }
 }
@@ -502,6 +556,173 @@ pub struct LoginRateLimitState {
     /// success. It never sheds a request — see [`LoginPadBudget`].
     /// `max_requests == 0` disables it (the pad always runs).
     pub failed_by_ip: Arc<RateLimiter>,
+    /// Audit trail for refused logins (#4677): one `LOGIN_RATE_LIMITED` row
+    /// per source IP per limiter window. `None` (unit tests, hand-built
+    /// routers without a database) records nothing.
+    pub audit: Option<Arc<LoginRateLimitAudit>>,
+}
+
+/// Which login limiter refused a request (#4677). The label is what the
+/// `LOGIN_RATE_LIMITED` row records in `details.reason` and what the
+/// `security` log line names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LoginLimiter {
+    /// The per-`(username, IP)` bucket (`login_rate_limit_key`).
+    PerAccount,
+    /// The global login backstop.
+    GlobalBackstop,
+}
+
+impl LoginLimiter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoginLimiter::PerAccount => "login_per_account",
+            LoginLimiter::GlobalBackstop => "login_global_backstop",
+        }
+    }
+}
+
+/// Most `(limiter, source)` pairs [`LoginRateLimitAudit`] remembers at once.
+/// Past this, expired pairs are dropped first; if the map is still full the
+/// refusal is not audited (the `security` debug line still fires). Each pair
+/// costs one audit row per window, so this is also the per-window ceiling
+/// on rows the limiter can write.
+const LOGIN_AUDIT_MAX_TRACKED: usize = 10_000;
+
+/// Records login rate-limit refusals in the audit trail (#4677) without
+/// letting the limiter become an audit-table DoS.
+///
+/// A flood of refused logins is exactly what the limiter exists for, so
+/// writing one row per 429 would turn every throttled brute-force burst into
+/// an unbounded insert stream. Instead at most one row is written per source
+/// IP per limiter window: the first refusal of a window is audited, the rest
+/// of that window is not. The global backstop is not per-client, so its
+/// refusals are audited once per backstop window in total, whatever IP they
+/// came from; otherwise a caller rotating source addresses (an IPv6 /64)
+/// would mint one row per address.
+#[derive(Debug)]
+pub struct LoginRateLimitAudit {
+    db: sqlx::PgPool,
+    /// `(limiter, source key)` -> when the last audited refusal was written.
+    last_recorded: Mutex<HashMap<(LoginLimiter, String), Instant>>,
+}
+
+impl LoginRateLimitAudit {
+    pub fn new(db: sqlx::PgPool) -> Self {
+        Self {
+            db,
+            last_recorded: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// A fresh audit memory over the same database, for another surface
+    /// that shares these limiters (`/v2/token`).
+    pub fn for_another_surface(&self) -> Self {
+        Self::new(self.db.clone())
+    }
+
+    /// Whether a refusal by `limiter` for `source` should be audited now,
+    /// given the limiter's `window`. Marks the pair as recorded when it
+    /// returns `true`.
+    fn should_record(&self, limiter: LoginLimiter, source: &str, window: Duration) -> bool {
+        login_audit_should_record(
+            &mut self.last_recorded.lock().unwrap_or_else(|e| e.into_inner()),
+            limiter,
+            source,
+            window,
+            Instant::now(),
+        )
+    }
+}
+
+/// Pure core of [`LoginRateLimitAudit::should_record`], over an explicit
+/// map and clock so the once-per-window contract is unit-testable.
+fn login_audit_should_record(
+    seen: &mut HashMap<(LoginLimiter, String), Instant>,
+    limiter: LoginLimiter,
+    source: &str,
+    window: Duration,
+    now: Instant,
+) -> bool {
+    let source = match limiter {
+        LoginLimiter::PerAccount => source,
+        // One bucket for the whole deployment, so one row per window.
+        LoginLimiter::GlobalBackstop => "*",
+    };
+    let key = (limiter, source.to_string());
+    if let Some(last) = seen.get(&key) {
+        if now.duration_since(*last) < window {
+            return false;
+        }
+    }
+    if !seen.contains_key(&key) && seen.len() >= LOGIN_AUDIT_MAX_TRACKED {
+        seen.retain(|_, last| now.duration_since(*last) < window);
+        if seen.len() >= LOGIN_AUDIT_MAX_TRACKED {
+            return false;
+        }
+    }
+    seen.insert(key, now);
+    true
+}
+
+/// What a refused login request looked like, for the audit row and the
+/// `security` log line (#4677). Never carries the password.
+struct RefusedLogin<'a> {
+    limiter: LoginLimiter,
+    window: Duration,
+    /// The best-effort client key the limiter keyed on (`ip:...`).
+    client_ip: &'a str,
+    username: Option<&'a str>,
+    path: &'a str,
+    method: &'a str,
+    retry_after: u64,
+}
+
+/// Log and (at most once per source per window) audit a login the limiter
+/// refused (#4677). The audit row carries the VERIFIED client IP
+/// (`with_request_client_ip`, as `LOGIN_FAILED` does) and the request's
+/// correlation ID; both are captured here, before the write is detached.
+async fn record_refused_login(audit: Option<&LoginRateLimitAudit>, refused: RefusedLogin<'_>) {
+    let Some(audit) = audit else {
+        tracing::debug!(
+            target: "security",
+            limiter = refused.limiter.as_str(),
+            client_ip = %refused.client_ip,
+            retry_after = refused.retry_after,
+            "login refused by rate limiter"
+        );
+        return;
+    };
+    if !audit.should_record(refused.limiter, refused.client_ip, refused.window) {
+        tracing::debug!(
+            target: "security",
+            limiter = refused.limiter.as_str(),
+            client_ip = %refused.client_ip,
+            retry_after = refused.retry_after,
+            "login refused by rate limiter (already audited this window)"
+        );
+        return;
+    }
+    tracing::warn!(
+        target: "security",
+        limiter = refused.limiter.as_str(),
+        client_ip = %refused.client_ip,
+        path = refused.path,
+        retry_after = refused.retry_after,
+        "login refused by rate limiter"
+    );
+    use crate::services::audit_service::{AuditAction, AuditEntry, ResourceType};
+    let entry = AuditEntry::new(AuditAction::LoginRateLimited, ResourceType::User)
+        .with_request_client_ip()
+        .details_typed(
+            crate::services::audit_export::details::AuthDetails::rate_limited(
+                refused.username,
+                refused.path,
+                refused.method,
+                refused.limiter.as_str(),
+            ),
+        );
+    crate::services::audit_service::audit_fire_and_forget(audit.db.clone(), entry).await;
 }
 
 /// Build the login rate-limit key from a username and the request's client IP.
@@ -611,7 +832,7 @@ pub async fn login_rate_limit_middleware(
             // Body too large or unreadable: not a legitimate login. Reconstruct
             // an empty-bodied request keyed by IP and let the handler reject it.
             let request = Request::from_parts(parts, Body::empty());
-            return run_login_with_key(&state, &client_ip, &client_ip, request, next).await;
+            return run_login_with_key(&state, &client_ip, &client_ip, None, request, next).await;
         }
     };
 
@@ -625,15 +846,15 @@ pub async fn login_rate_limit_middleware(
                 .map(|s| s.to_string())
         });
 
-    let key = match username {
-        Some(name) => login_rate_limit_key(&name, &client_ip),
+    let key = match &username {
+        Some(name) => login_rate_limit_key(name, &client_ip),
         None => client_ip.clone(),
     };
 
     // Reattach the buffered body unchanged (Content-Type/headers in `parts`
     // are preserved) so the login handler's extractor sees the original body.
     let request = Request::from_parts(parts, Body::from(bytes));
-    run_login_with_key(&state, &key, &client_ip, request, next).await
+    run_login_with_key(&state, &key, &client_ip, username.as_deref(), request, next).await
 }
 
 /// Apply the global backstop, then the per-key login limiter, then run the
@@ -643,13 +864,42 @@ async fn run_login_with_key(
     state: &LoginRateLimitState,
     key: &str,
     client_ip: &str,
+    username: Option<&str>,
     mut request: Request,
     next: Next,
 ) -> Response {
+    // The full request path (`OriginalUri` survives `nest`), for the
+    // refusal's audit row: `/api/v1/auth/login` and `/v2/token` share this
+    // limiter.
+    let path = request
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let method = request.method().to_string();
+    let refused = |limiter: LoginLimiter, window: Duration, retry_after: u64| RefusedLogin {
+        limiter,
+        window,
+        client_ip,
+        username,
+        path: &path,
+        method: &method,
+        retry_after,
+    };
+
     // Global backstop first: sheds (rather than starves) once total login
     // volume per window exceeds its high ceiling.
     if let Err(retry_after) = state.backstop.check_rate_limit("login:global").await {
-        return too_many_requests(retry_after, state.backstop.max_requests);
+        record_refused_login(
+            state.audit.as_deref(),
+            refused(
+                LoginLimiter::GlobalBackstop,
+                state.backstop.window(),
+                retry_after,
+            ),
+        )
+        .await;
+        return too_many_requests(retry_after, &state.backstop);
     }
 
     // Per-IP failed-login budget (#3504). This gates the bcrypt timing pad,
@@ -697,7 +947,16 @@ async fn run_login_with_key(
         }
         Err(retry_after) => {
             tracing::debug!(key = %key, retry_after, "login rate limit exceeded");
-            too_many_requests(retry_after, state.inner.limiter.max_requests)
+            record_refused_login(
+                state.audit.as_deref(),
+                refused(
+                    LoginLimiter::PerAccount,
+                    state.inner.limiter.window(),
+                    retry_after,
+                ),
+            )
+            .await;
+            too_many_requests(retry_after, &state.inner.limiter)
         }
     }
 }
@@ -796,11 +1055,20 @@ pub async fn token_rate_limit_middleware(
             return next.run(request).await;
         }
         if authorization.starts_with("Basic ") || authorization.starts_with("basic ") {
-            let key = match basic_auth_username(authorization) {
-                Some(username) => login_rate_limit_key(&username, &client_ip),
+            let username = basic_auth_username(authorization);
+            let key = match &username {
+                Some(username) => login_rate_limit_key(username, &client_ip),
                 None => client_ip.clone(),
             };
-            return run_login_with_key(&state, &key, &client_ip, request, next).await;
+            return run_login_with_key(
+                &state,
+                &key,
+                &client_ip,
+                username.as_deref(),
+                request,
+                next,
+            )
+            .await;
         }
     }
 
@@ -843,8 +1111,9 @@ pub async fn token_rate_limit_middleware(
         }
     }
 
-    let key = match peek.and_then(|f| f.username).filter(|u| !u.is_empty()) {
-        Some(username) => login_rate_limit_key(&username, &client_ip),
+    let username = peek.and_then(|f| f.username).filter(|u| !u.is_empty());
+    let key = match &username {
+        Some(username) => login_rate_limit_key(username, &client_ip),
         // A form carrying no username (or one that does not parse) still
         // reaches the password path only via the Basic header, which was
         // handled above; key it by IP so it stays bounded.
@@ -852,7 +1121,7 @@ pub async fn token_rate_limit_middleware(
     };
 
     let request = Request::from_parts(parts, Body::from(bytes));
-    run_login_with_key(&state, &key, &client_ip, request, next).await
+    run_login_with_key(&state, &key, &client_ip, username.as_deref(), request, next).await
 }
 
 /// 413 answer for a token form body that exceeds the peek limit. The route's
@@ -867,8 +1136,11 @@ fn token_form_body_too_large() -> Response {
         .into_response()
 }
 
-/// Build a 429 response with `Retry-After` and `X-RateLimit-*` headers.
-fn too_many_requests(retry_after: u64, max_requests: u32) -> Response {
+/// Build a 429 response with `Retry-After` and `X-RateLimit-*` headers, and
+/// count the refusal against `limiter`'s name (#4676).
+fn too_many_requests(retry_after: u64, limiter: &RateLimiter) -> Response {
+    crate::services::metrics_service::record_rate_limit_rejection(limiter.name);
+    let max_requests = limiter.max_requests;
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
         "Rate limit exceeded. Please try again later.",
@@ -906,6 +1178,19 @@ fn first_xff_token_in(headers: &axum::http::HeaderMap) -> Option<&str> {
 
 /// Rightmost `X-Forwarded-For` token that is NOT itself a trusted proxy —
 /// the right-side-aware client-IP selection for GHSA-8jm4-4x6c-6787.
+///
+/// ⚠️ This walk is sound ONLY when every trusted proxy APPENDS the
+/// downstream peer it observed (Caddy in the default compose deployment
+/// does). Behind a proxy that passes client-supplied XFF through untouched
+/// — or a SNAT that destroyed the real peer before the proxy saw it — the
+/// selected token is attacker-controlled, and nothing in the request can
+/// detect that. The result therefore feeds availability/attribution
+/// consumers ONLY (rate-limit keying, upload guard, telemetry). It MUST
+/// NOT feed authorization (permission `allowed_cidrs`, #1849) or
+/// auth-audit IP attribution: those consume
+/// [`super::client_ip::current_verified_client_ip`], which fails closed
+/// unless the operator asserts the appending topology via
+/// `XFF_TRUSTED_FOR_AUTHZ`.
 ///
 /// Trusted appending proxies (Caddy in the default compose deployment)
 /// preserve any client-supplied `XFF` prefix and append the address they
@@ -1053,6 +1338,16 @@ fn extract_client_ip_addr(request: &Request, trusted_proxies: &[CidrRange]) -> O
 /// at all (test harness / pre-`ConnectInfo` topology), a parseable `XFF`
 /// first token is a last-resort fallback. Returns `None` when nothing
 /// resolves — callers must record "unknown", never a sentinel.
+///
+/// ⚠️ The XFF walk is sound ONLY behind proxies confirmed to APPEND the
+/// downstream peer they observed; otherwise the result can be
+/// attacker-controlled (see [`rightmost_untrusted_xff_token`]). This
+/// function feeds availability/attribution consumers (rate-limit keying,
+/// upload guard, telemetry) and MUST NOT feed authorization (permission
+/// `allowed_cidrs`, #1849) or auth-audit IP attribution — use
+/// [`super::client_ip::current_verified_client_ip`] there, which fails
+/// closed behind trusted proxies unless the operator sets
+/// `XFF_TRUSTED_FOR_AUTHZ`.
 pub(crate) fn resolve_client_ip_addr(
     headers: &axum::http::HeaderMap,
     peer: Option<IpAddr>,
@@ -2222,6 +2517,7 @@ mod tests {
             // Generous: this helper's handler always answers 200, so the
             // #3504 failed-login cap is never charged here.
             failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
+            audit: None,
         };
         axum::Router::new()
             .route("/login", post(|| async { "ok" }))
@@ -2285,6 +2581,114 @@ mod tests {
         );
     }
 
+    /// #4664: the login limiter sits INSIDE the general API limiter. When the
+    /// login bucket refuses, the 429 must keep the login bucket's
+    /// `X-RateLimit-*` headers; the outer limiter, which allowed the request,
+    /// used to overwrite them with its own (`X-RateLimit-Limit: 10000`).
+    #[tokio::test]
+    async fn test_4664_login_429_reports_the_login_bucket_not_the_api_bucket() {
+        use tower::ServiceExt;
+        let api_state = RateLimitState {
+            limiter: Arc::new(RateLimiter::new(10_000, 60)),
+            exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+            enabled: true,
+            trusted_proxies: Arc::new(Vec::new()),
+        };
+        let app = login_app(2, 10_000).layer(axum::middleware::from_fn_with_state(
+            api_state,
+            rate_limit_middleware,
+        ));
+        let attempt = || {
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("X-Forwarded-For", "10.0.0.1")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"username":"x","password":"x"}"#))
+                .unwrap()
+        };
+        for _ in 0..2 {
+            let resp = app.clone().oneshot(attempt()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let resp = app.clone().oneshot(attempt()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            header("X-RateLimit-Limit").as_deref(),
+            Some("2"),
+            "a login 429 must report the login bucket's limit, not the API bucket's"
+        );
+        assert_eq!(header("X-RateLimit-Remaining").as_deref(), Some("0"));
+        let retry_after: u64 = header("Retry-After")
+            .expect("Retry-After present")
+            .parse()
+            .expect("numeric Retry-After");
+        assert!(
+            (1..=60).contains(&retry_after),
+            "Retry-After must come from the login window"
+        );
+    }
+
+    /// #4676: every 429 a limiter answers is counted in
+    /// `ak_rate_limit_rejections_total` under that limiter's name, and only
+    /// the refused requests are counted.
+    #[test]
+    fn test_rejections_are_counted_by_limiter_name_4676() {
+        use crate::services::metrics_service::capture_counters_async;
+        let ((), counted) = capture_counters_async(|| async {
+            // Per-(user, IP) login bucket of 1: the second attempt is refused.
+            let login = LoginRateLimitState {
+                inner: RateLimitState {
+                    limiter: Arc::new(RateLimiter::new(1, 60).named("login")),
+                    exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                    enabled: true,
+                    trusted_proxies: Arc::new(Vec::new()),
+                },
+                backstop: Arc::new(RateLimiter::new(2, 60).named("login_global")),
+                failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
+                audit: None,
+            };
+            let app = axum::Router::new()
+                .route("/login", axum::routing::post(|| async { "ok" }))
+                .layer(axum::middleware::from_fn_with_state(
+                    login,
+                    login_rate_limit_middleware,
+                ));
+            assert_eq!(login_once(&app, "x", "10.0.0.1").await, StatusCode::OK);
+            assert_eq!(
+                login_once(&app, "x", "10.0.0.1").await,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            // The backstop (2) is spent by now: a fresh identity is shed by it.
+            assert_eq!(
+                login_once(&app, "y", "10.0.0.2").await,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+
+            let mut api = state_with(true);
+            api.limiter = Arc::new(RateLimiter::new(1, 60).named("api"));
+            let api_app = axum::Router::new()
+                .route("/", axum::routing::get(|| async { "ok" }))
+                .layer(axum::middleware::from_fn_with_state(
+                    api,
+                    rate_limit_middleware,
+                ));
+            assert_eq!(count_429s(api_app, 3).await, 2);
+        });
+        let get =
+            |limiter: &str| counted.get("ak_rate_limit_rejections_total", &[("limiter", limiter)]);
+        assert_eq!(get("login"), 1);
+        assert_eq!(get("login_global"), 1);
+        assert_eq!(get("api"), 2);
+        assert_eq!(counted.get("ak_rate_limit_rejections_total", &[]), 4);
+    }
+
     #[tokio::test]
     async fn test_login_global_backstop_sheds_with_retry_after() {
         // Backstop capacity 2, huge per-key cap: distinct (user, ip) keys never
@@ -2335,6 +2739,7 @@ mod tests {
             },
             backstop: Arc::new(RateLimiter::new(10_000, 60)),
             failed_by_ip: Arc::new(RateLimiter::new(failed_per_ip, 60)),
+            audit: None,
         };
         axum::Router::new()
             .route(
@@ -2549,6 +2954,7 @@ mod tests {
             // Generous: these tests exercise the per-key and backstop
             // buckets, not the #3504 failed-login cap.
             failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
+            audit: None,
         };
         let app = axum::Router::new()
             .route(
@@ -2602,6 +3008,7 @@ mod tests {
             // Generous: these tests exercise the per-key and backstop
             // buckets, not the #3504 failed-login cap.
             failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
+            audit: None,
         };
         let app = axum::Router::new()
             .route("/login", post(|| async { "ok" }))
@@ -2630,6 +3037,7 @@ mod tests {
             // Generous: these tests exercise the per-key and backstop
             // buckets, not the #3504 failed-login cap.
             failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
+            audit: None,
         };
         let app = axum::Router::new()
             .route("/login", post(|| async { "ok" }))
@@ -2791,6 +3199,7 @@ mod tests {
             backstop: Arc::new(RateLimiter::new(backstop, 60)),
             // Generous: the pad budget never gates a request (#3504).
             failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
+            audit: None,
         };
         axum::Router::new()
             .route(
@@ -3026,5 +3435,228 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "the login global backstop must bound total token-exchange volume"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #4677: a login refused by a login limiter leaves an audit trace, at
+    // most once per source IP per limiter window.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_login_audit_records_once_per_source_per_window() {
+        let mut seen = HashMap::new();
+        let window = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let per = LoginLimiter::PerAccount;
+        assert!(login_audit_should_record(
+            &mut seen,
+            per,
+            "ip:10.0.0.1",
+            window,
+            t0
+        ));
+        assert!(
+            !login_audit_should_record(&mut seen, per, "ip:10.0.0.1", window, t0),
+            "a second refusal in the same window must not write another row"
+        );
+        assert!(
+            login_audit_should_record(&mut seen, per, "ip:10.0.0.2", window, t0),
+            "another source IP is its own pair"
+        );
+        assert!(
+            login_audit_should_record(&mut seen, per, "ip:10.0.0.1", window, t0 + window),
+            "the next window audits again"
+        );
+    }
+
+    #[test]
+    fn test_login_audit_backstop_is_one_row_per_window_whatever_the_source() {
+        let mut seen = HashMap::new();
+        let window = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let back = LoginLimiter::GlobalBackstop;
+        assert!(login_audit_should_record(
+            &mut seen,
+            back,
+            "ip:10.0.0.1",
+            window,
+            t0
+        ));
+        assert!(
+            !login_audit_should_record(&mut seen, back, "ip:10.0.0.2", window, t0),
+            "rotating the source address must not mint a backstop row per address"
+        );
+        assert!(
+            login_audit_should_record(
+                &mut seen,
+                LoginLimiter::PerAccount,
+                "ip:10.0.0.1",
+                window,
+                t0
+            ),
+            "the per-account limiter is tracked separately from the backstop"
+        );
+    }
+
+    #[test]
+    fn test_login_audit_memory_is_bounded() {
+        let mut seen = HashMap::new();
+        let window = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let per = LoginLimiter::PerAccount;
+        for i in 0..LOGIN_AUDIT_MAX_TRACKED {
+            assert!(login_audit_should_record(
+                &mut seen,
+                per,
+                &format!("ip:{i}"),
+                window,
+                t0
+            ));
+        }
+        assert!(
+            !login_audit_should_record(&mut seen, per, "ip:one-too-many", window, t0),
+            "a full map of live pairs must refuse new ones, not grow"
+        );
+        assert_eq!(seen.len(), LOGIN_AUDIT_MAX_TRACKED);
+        // Once the window has passed the stale pairs make room.
+        assert!(login_audit_should_record(
+            &mut seen,
+            per,
+            "ip:late",
+            window,
+            t0 + window
+        ));
+        assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    fn test_login_limiter_labels() {
+        assert_eq!(LoginLimiter::PerAccount.as_str(), "login_per_account");
+        assert_eq!(
+            LoginLimiter::GlobalBackstop.as_str(),
+            "login_global_backstop"
+        );
+    }
+
+    /// The real middleware with an audit memory over `pool`: a per-account
+    /// budget of one, so the second and later attempts are refused.
+    fn audited_login_app(pool: sqlx::PgPool, per_key: u32, backstop: u32) -> axum::Router {
+        use axum::routing::post;
+        let state = LoginRateLimitState {
+            inner: RateLimitState {
+                limiter: Arc::new(RateLimiter::new(per_key, 60)),
+                exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                enabled: true,
+                trusted_proxies: Arc::new(Vec::new()),
+            },
+            backstop: Arc::new(RateLimiter::new(backstop, 60)),
+            failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
+            audit: Some(Arc::new(LoginRateLimitAudit::new(pool))),
+        };
+        axum::Router::new()
+            .route("/login", post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                login_rate_limit_middleware,
+            ))
+    }
+
+    /// `LOGIN_RATE_LIMITED` rows whose attempted username is `username`,
+    /// polled briefly because the write is detached.
+    async fn rate_limited_rows(
+        pool: &sqlx::PgPool,
+        username: &str,
+        expected: usize,
+    ) -> Vec<(Option<String>, serde_json::Value)> {
+        let mut rows = Vec::new();
+        for _ in 0..100 {
+            rows = sqlx::query_as::<_, (Option<String>, serde_json::Value)>(
+                "SELECT ip_address, details FROM audit_log \
+                 WHERE action = 'LOGIN_RATE_LIMITED' AND details->>'username' = $1",
+            )
+            .bind(username)
+            .fetch_all(pool)
+            .await
+            .expect("query audit_log");
+            if rows.len() >= expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_login_writes_one_audit_row_per_window() {
+        let Some(pool) = crate::testing::try_pool_with(3).await else {
+            return;
+        };
+        let app = audited_login_app(pool.clone(), 1, 10_000);
+        let username = format!("rl-4677-{}", uuid::Uuid::new_v4());
+        let verified: IpAddr = "198.51.100.77".parse().unwrap();
+
+        let statuses =
+            crate::api::middleware::client_ip::with_client_ip_scope(Some(verified), async {
+                let mut statuses = Vec::new();
+                for _ in 0..4 {
+                    statuses.push(login_once(&app, &username, "198.51.100.77").await);
+                }
+                statuses
+            })
+            .await;
+        assert_eq!(statuses[0], StatusCode::OK);
+        assert!(
+            statuses[1..]
+                .iter()
+                .all(|s| *s == StatusCode::TOO_MANY_REQUESTS),
+            "attempts past the budget must be refused: {statuses:?}"
+        );
+
+        let rows = rate_limited_rows(&pool, &username, 1).await;
+        // Give a (wrong) second write the same chance to land before
+        // asserting there is only one.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let rows_after = rate_limited_rows(&pool, &username, 1).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "three refusals from one IP in one window must write exactly one row"
+        );
+        assert_eq!(rows_after.len(), 1);
+        let (ip, details) = &rows[0];
+        assert_eq!(
+            ip.as_deref(),
+            Some("198.51.100.77"),
+            "the verified client IP"
+        );
+        assert_eq!(details["reason"], "login_per_account");
+        assert_eq!(details["path"], "/login");
+        assert_eq!(details["method"], "POST");
+        assert!(
+            details.get("password").is_none(),
+            "the typed password must never be recorded: {details}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backstop_refusal_is_audited_with_its_limiter() {
+        let Some(pool) = crate::testing::try_pool_with(3).await else {
+            return;
+        };
+        // Backstop of one: the second login of any name is shed by it.
+        let app = audited_login_app(pool.clone(), 10_000, 1);
+        let first = format!("rl-4677-a-{}", uuid::Uuid::new_v4());
+        let second = format!("rl-4677-b-{}", uuid::Uuid::new_v4());
+        assert_eq!(
+            login_once(&app, &first, "198.51.100.78").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            login_once(&app, &second, "198.51.100.78").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let rows = rate_limited_rows(&pool, &second, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1["reason"], "login_global_backstop");
     }
 }

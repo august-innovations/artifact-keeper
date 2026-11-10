@@ -18,6 +18,38 @@ pub enum FormatHandlerType {
     Wasm,
 }
 
+/// Whether scan-on-proxy is enforced for a format's proxied downloads (#4099).
+///
+/// `scan_configs.scan_on_proxy` is accepted for any repository, but only some
+/// handlers gate their Remote/Virtual downloads on the inline scan. Clients
+/// read this instead of hand-maintaining the gated-format list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanOnProxySupport {
+    /// Proxied package bytes are scanned inline and blocked per the policy.
+    Enforced,
+    /// The setting is stored but proxied downloads are served unscanned.
+    Accepted,
+    /// The handler has no core proxy serve path the setting could apply to
+    /// (a WASM plugin handler).
+    Unsupported,
+}
+
+impl ScanOnProxySupport {
+    /// The support level of the handler `format_key` of type `handler_type`.
+    pub fn for_handler(handler_type: &FormatHandlerType, format_key: &str) -> Self {
+        match handler_type {
+            FormatHandlerType::Wasm => Self::Unsupported,
+            FormatHandlerType::Core
+                if crate::formats::handler_enforces_scan_on_proxy(format_key) =>
+            {
+                Self::Enforced
+            }
+            FormatHandlerType::Core => Self::Accepted,
+        }
+    }
+}
+
 /// Format handler entity.
 ///
 /// Tracks all registered format handlers in the system, both core (compiled-in)
@@ -85,12 +117,28 @@ pub struct FormatHandlerResponse {
     /// Plugin capabilities if this is a WASM handler
     #[schema(value_type = Option<Object>)]
     pub capabilities: Option<serde_json::Value>,
+    /// Whether scan-on-proxy is enforced for this format's proxied downloads
+    /// (#4099): `enforced` = proxied package bytes are scanned inline and
+    /// withheld per the repository's policy; `accepted` = the setting is
+    /// stored but proxied downloads are served unscanned; `unsupported` = a
+    /// WASM plugin handler, which has no core proxy serve path the setting
+    /// could apply to.
+    pub scan_on_proxy: ScanOnProxySupport,
+    /// The repository types a repository of this format can be created as
+    /// (`local`, `staging`, `remote`, `virtual`), e.g. all four for `mcp`.
+    pub repository_types: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 impl From<FormatHandlerRecord> for FormatHandlerResponse {
     fn from(record: FormatHandlerRecord) -> Self {
+        let scan_on_proxy =
+            ScanOnProxySupport::for_handler(&record.handler_type, &record.format_key);
+        let repository_types = crate::formats::supported_repo_types(&record.format_key)
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
         Self {
             id: record.id,
             format_key: record.format_key,
@@ -103,6 +151,8 @@ impl From<FormatHandlerRecord> for FormatHandlerResponse {
             priority: record.priority,
             repository_count: None,
             capabilities: None,
+            scan_on_proxy,
+            repository_types,
             created_at: record.created_at,
             updated_at: record.updated_at,
         }
@@ -155,9 +205,15 @@ mod tests {
         assert_eq!(response.extensions.len(), 2);
         assert!(response.is_enabled);
         assert_eq!(response.priority, 10);
+        assert_eq!(
+            response.repository_types,
+            ["local", "staging", "remote", "virtual"]
+        );
         // Computed fields should be None
         assert!(response.repository_count.is_none());
         assert!(response.capabilities.is_none());
+        // A WASM plugin handler has no core proxy serve path (#4099).
+        assert_eq!(response.scan_on_proxy, ScanOnProxySupport::Unsupported);
     }
 
     #[test]
@@ -181,6 +237,146 @@ mod tests {
         assert_eq!(response.handler_type, FormatHandlerType::Core);
         assert!(response.plugin_id.is_none());
         assert!(response.description.is_none());
+        // Maven gates its proxied package archives since #4100.
+        assert_eq!(response.scan_on_proxy, ScanOnProxySupport::Enforced);
+    }
+
+    /// #4099: the per-format capability, serialized the way
+    /// `GET /api/v1/formats` returns it.
+    #[test]
+    fn test_scan_on_proxy_support_per_handler() {
+        use ScanOnProxySupport::*;
+        for key in [
+            "npm",
+            "pypi",
+            "oci",
+            "vscode",
+            "cargo",
+            "maven",
+            "sbt",
+            "nuget",
+            "conda",
+            "conda_native",
+            "go",
+            "rubygems",
+            "composer",
+            "pub",
+            "conan",
+            "cocoapods",
+            "swift",
+            "debian",
+            "rpm",
+            "alpine",
+        ] {
+            assert_eq!(
+                ScanOnProxySupport::for_handler(&FormatHandlerType::Core, key),
+                Enforced,
+                "{key} gates its proxied downloads"
+            );
+        }
+        for key in ["helm", "generic", "cran"] {
+            assert_eq!(
+                ScanOnProxySupport::for_handler(&FormatHandlerType::Core, key),
+                Accepted,
+                "{key} stores scan_on_proxy but does not gate"
+            );
+        }
+        assert_eq!(
+            ScanOnProxySupport::for_handler(&FormatHandlerType::Wasm, "unity-assetbundle"),
+            Unsupported
+        );
+        assert_eq!(serde_json::to_value(Enforced).unwrap(), "enforced");
+        assert_eq!(serde_json::to_value(Accepted).unwrap(), "accepted");
+        assert_eq!(serde_json::to_value(Unsupported).unwrap(), "unsupported");
+    }
+
+    /// #4114: the coverage table in `docs/security/scan-on-proxy.md` is the
+    /// user-facing statement of which formats scan on proxy. It must list
+    /// every core handler exactly once, with the repository formats it serves,
+    /// and say `enforced` for exactly the handlers `GET /api/v1/formats`
+    /// reports enforced (and `accepted` for the rest), so adopting the gate in
+    /// a format, or dropping it, cannot leave the document behind.
+    #[test]
+    fn scan_on_proxy_coverage_doc_matches_the_capability() {
+        const DOC: &str = include_str!("../../../docs/security/scan-on-proxy.md");
+        let rows = scan_on_proxy_coverage_rows(DOC);
+
+        let mut expected = std::collections::BTreeMap::new();
+        for format in crate::models::repository::RepositoryFormat::ALL {
+            expected
+                .entry(format.handler_key().to_string())
+                .or_insert_with(std::collections::BTreeSet::new)
+                .insert(format.as_key().to_string());
+        }
+        let documented: std::collections::BTreeMap<_, _> = rows
+            .iter()
+            .map(|(handler, formats, _)| (handler.clone(), formats.clone()))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            documented.len(),
+            "a handler is listed twice in the coverage table"
+        );
+        assert_eq!(
+            documented, expected,
+            "the coverage table must list every core handler with the formats it serves"
+        );
+        for (handler, _, status) in &rows {
+            let want = match ScanOnProxySupport::for_handler(&FormatHandlerType::Core, handler) {
+                ScanOnProxySupport::Enforced => "enforced",
+                _ => "accepted",
+            };
+            assert_eq!(
+                status, want,
+                "docs/security/scan-on-proxy.md says `{handler}` is {status}, \
+                 the formats capability says {want}"
+            );
+        }
+    }
+
+    /// `(handler, formats, status)` for each row between the doc's
+    /// `coverage-table` markers, cells stripped of backticks.
+    fn scan_on_proxy_coverage_rows(
+        doc: &str,
+    ) -> Vec<(String, std::collections::BTreeSet<String>, String)> {
+        let table = doc
+            .split("<!-- coverage-table:start -->")
+            .nth(1)
+            .and_then(|rest| rest.split("<!-- coverage-table:end -->").next())
+            .expect("coverage-table markers");
+        let clean = |cell: &str| cell.trim().replace('`', "");
+        table
+            .lines()
+            .filter(|line| line.trim_start().starts_with('|'))
+            .skip(2) // header and separator
+            .map(|line| {
+                let cells: Vec<&str> = line.trim().trim_matches('|').split('|').collect();
+                assert!(cells.len() >= 3, "malformed coverage row: {line}");
+                let formats = cells[1]
+                    .split(',')
+                    .map(clean)
+                    .filter(|f| !f.is_empty())
+                    .collect();
+                (clean(cells[0]), formats, clean(cells[2]))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scan_on_proxy_coverage_rows_parse_the_table() {
+        let doc = "intro | not a row\n<!-- coverage-table:start -->\n\
+                   | Handler | Formats | Status | Notes |\n| --- | --- | --- | --- |\n\
+                   | `maven` | `maven`, `gradle` | enforced | a, b |\n\
+                   | `go` | `go` | accepted | |\n<!-- coverage-table:end -->\n| `x` | `x` | y | |";
+        let rows = scan_on_proxy_coverage_rows(doc);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "maven");
+        assert_eq!(
+            rows[0].1,
+            ["gradle", "maven"].iter().map(|s| s.to_string()).collect()
+        );
+        assert_eq!(rows[0].2, "enforced");
+        assert_eq!(rows[1].2, "accepted");
     }
 
     #[test]

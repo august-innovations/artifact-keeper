@@ -82,30 +82,36 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 #
 # github.com/docker/docker v28.5.2 (CVE-2026-34040) is a dependency rather than
 # the toolchain and stays suppressed in /.trivyignore — see Dockerfile.backend
-# for why no override version exists to point at. Still true at v0.118.0: the
-# pin is unchanged and the override still fails to resolve (#3655).
+# for why no override version exists to point at. Still true at v0.118.0 (#3655) and
+# at v0.120.1 (#3698): the pin is unchanged and the override still fails to
+# resolve. No longer true at v0.121.3 (#5565): upstream dropped docker/docker
+# for github.com/moby/moby/client, and the five .trivyignore tokens are
+# tombstoned.
 #
 # The golang.org/x/mod override #3465 added here is GONE at #3655: grype
 # v0.118.0 pins x/mod v0.40.0 itself, so the tag bump replaced it.
 #
-# google.golang.org/grpc IS overridden here (#3655, #3790). CVE-2026-84304
-# (HIGH, fixed in grpc v1.83.1) and then CVE-2026-84445 (HIGH, fixed in
-# v1.83.2, published against the v1.83.1 the first override moved to) each
-# failed the Docker Publish Security Scan on main; v0.118.0 is still the newest
-# grype release and pins v1.83.0, while anchore/grype `main` already carries
-# v1.83.2 (27c95c96, anchore/grype#3695). So this is an override rather than a
-# tag bump, with the removal condition enforced by the guard below. The full
-# justification, the reachability finding and the MVS consequences are in
+# google.golang.org/grpc WAS overridden here from #3655 to #3698 (CVE-2026-84304,
+# CVE-2026-84445). The v0.118.0 -> v0.120.1 bump at #3698 retired it: v0.120.1
+# pins grpc v1.83.2 itself, and the same tag brings golang.org/x/crypto v0.57.0,
+# which carries the CVE-2026-56855 / CVE-2026-78662 fixes. What remains is the
+# golang.org/x/net override (re-based on v0.120.1's v0.59.0) and an x/crypto
+# floor asserted on the compiled binary. The full justification lives in
 # Dockerfile.backend — read it there rather than duplicating a second copy
 # that can drift.
+#
+# The v0.120.1 -> v0.121.3 bump at #5565 retired both remaining overrides:
+# v0.121.3 pins golang.org/x/net v0.62.0 and github.com/go-jose/go-jose/v4
+# v4.1.6 itself (and brotli v1.2.8 / klauspost/compress v1.20.3, the GO-2026-6888
+# / GO-2026-6865 fixes). What remains is the x/crypto floor; this stage now
+# builds upstream's module graph unmodified.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS grype-bin
 ARG TARGETOS
 ARG TARGETARCH
-ARG GRYPE_VERSION=0.118.0
-ARG GRYPE_COMMIT=756eb9a24f7beeafb6871a24e943e8a3ae210695
-ARG GO_MIN_PATCH=1.27.1
-ARG GRPC_FROM=v1.83.0
-ARG GRPC_TO=v1.83.2
+ARG GRYPE_VERSION=0.121.3
+ARG GRYPE_COMMIT=cd1f23eb50dfb52647090158f453c7359172591f
+ARG GO_MIN_PATCH=1.27.3
+ARG XCRYPTO_MIN=v0.56.0
 
 RUN apk add --no-cache git ca-certificates
 
@@ -129,35 +135,10 @@ RUN set -eu; \
       exit 1; \
     fi
 
-# Dependency override — see Dockerfile.backend for the full note (#3655).
-RUN set -eu; \
-    grpc_pin() { sed -n 's|^[[:space:]]*google\.golang\.org/grpc \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
-    have="$(grpc_pin)"; \
-    if [ "${have}" != "${GRPC_FROM}" ]; then \
-      echo "ERROR: grype v${GRYPE_VERSION} pins google.golang.org/grpc ${have}, not ${GRPC_FROM}." >&2; \
-      echo "       This override was written against ${GRPC_FROM}. If upstream now" >&2; \
-      echo "       ships >= ${GRPC_TO}, DELETE the override block in this stage." >&2; \
-      echo "       If it moved to some other version, re-review it. See #3655." >&2; \
-      exit 1; \
-    fi; \
-    go get "google.golang.org/grpc@${GRPC_TO}"; \
-    got="$(grpc_pin)"; \
-    if [ "${got}" != "${GRPC_TO}" ]; then \
-      echo "ERROR: override did not take: go.mod pins google.golang.org/grpc ${got}." >&2; \
-      exit 1; \
-    fi; \
-    moved="$(git --no-pager diff --unified=0 go.mod \
-             | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
-    expected="google.golang.org/grpc "; \
-    if [ "${moved}" != "${expected}" ]; then \
-      echo "ERROR: go get moved an undeclared set of modules." >&2; \
-      echo "       expected: ${expected}" >&2; \
-      echo "       actual:   ${moved}" >&2; \
-      echo "       Re-review the override and update the declared set (#3655)." >&2; \
-      exit 1; \
-    fi; \
-    go mod verify; \
-    echo "grype build: override applied — google.golang.org/grpc ${GRPC_FROM} -> ${GRPC_TO}"
+# RETIRED: golang.org/x/net override (CVE-2026-78669; removed at #5565, v0.121.3
+# pins v0.62.0) and github.com/go-jose/go-jose/v4 override (CVE-2026-116587,
+# #5041; removed at #5565, v0.121.3 pins v4.1.6). See the tombstones in
+# Dockerfile.backend.
 
 RUN set -eu; \
     build_date="$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)"; \
@@ -171,25 +152,27 @@ RUN set -eu; \
         ./cmd/grype; \
     install -Dm644 LICENSE /licenses/grype/LICENSE
 
-# Prove the override reached the compiled binary's build info, which is what
-# Trivy actually reads — see Dockerfile.backend (#3655).
+# Prove x/crypto is at or above the #3698 floor in the compiled binary's build
+# info, which is what Trivy actually reads — see Dockerfile.backend (#3698,
+# #5565: the x/net and go-jose checks left with their overrides).
 RUN set -eu; \
     info="$(go version -m /grype)"; \
     deps="$(printf '%s\n' "${info}" | grep -c '^[[:space:]]*dep[[:space:]]')"; \
     if [ "${deps}" -lt 50 ]; then \
       echo "ERROR: /grype reports only ${deps} dependency records; build info is" >&2; \
-      echo "       unreadable or implausible, so the override is unverified." >&2; \
+      echo "       unreadable or implausible, so the x/crypto floor is unverified." >&2; \
       exit 1; \
     fi; \
-    recorded="$(printf '%s\n' "${info}" \
-                | sed -n 's|^[[:space:]]*dep[[:space:]]*google\.golang\.org/grpc[[:space:]]*\(v[^[:space:]]*\).*|\1|p' \
-                | head -n1)"; \
-    if [ "${recorded}" != "${GRPC_TO}" ]; then \
-      echo "ERROR: compiled grype records google.golang.org/grpc '${recorded}', want ${GRPC_TO}." >&2; \
-      echo "       The Trivy gate reads this build info; the override did not ship (#3655)." >&2; \
+    xcrypto="$(printf '%s\n' "${info}" \
+               | sed -n 's|^[[:space:]]*dep[[:space:]]*golang\.org/x/crypto[[:space:]]*\(v[^[:space:]]*\).*|\1|p' \
+               | head -n1)"; \
+    lowest="$(printf '%s\n%s\n' "${xcrypto}" "${XCRYPTO_MIN}" | sort -V | head -n1)"; \
+    if [ -z "${xcrypto}" ] || { [ "${xcrypto}" != "${XCRYPTO_MIN}" ] && [ "${lowest}" != "${XCRYPTO_MIN}" ]; }; then \
+      echo "ERROR: compiled grype records golang.org/x/crypto '${xcrypto}', below ${XCRYPTO_MIN}." >&2; \
+      echo "       That re-ships CVE-2026-56855 / CVE-2026-78662 (#3698)." >&2; \
       exit 1; \
     fi; \
-    echo "grype build: build info verified — google.golang.org/grpc ${recorded} across ${deps} deps"
+    echo "grype build: build info verified: golang.org/x/crypto ${xcrypto} across ${deps} deps"
 
 # ---------- Stage 4b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted
@@ -212,9 +195,11 @@ FROM alpine:${ALPINE_VERSION} AS runtime
 # APK security errata, then install the runtime deps (no libssl needed -
 # OpenSSL is vendored/static). `apk upgrade --no-cache` rebuilds against
 # current errata on every image build; the targeted `add` keeps the install
-# set explicit.
+# set explicit. squashfs-tools provides `unsquashfs`, which the Incus scanner
+# runs to extract SquashFS rootfs images (#4469).
 RUN apk upgrade --no-cache && \
-    apk add --no-cache --upgrade ca-certificates libgcc libstdc++ zlib xz-libs xz curl
+    apk add --no-cache --upgrade ca-certificates libgcc libstdc++ zlib xz-libs xz curl \
+        squashfs-tools
 
 # --- CIS hardening (adapted from CIS Alpine Linux Benchmark) ---
 
@@ -275,7 +260,6 @@ USER 1001
 # lifetime; refresh the DB by rebuilding the image. See artifact-keeper#1001
 # and PR #1002 (commit 23d9743) which added the seed stage.
 ENV RUST_LOG=info \
-    DATABASE_URL=set-database-url-at-runtime \
     STORAGE_PATH=/data/storage \
     BACKUP_PATH=/data/backups \
     GRYPE_DB_CACHE_DIR=/home/artifact/.cache/grype \

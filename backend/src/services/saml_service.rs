@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use quick_xml::escape::unescape;
+use quick_xml::escape::{resolve_predefined_entity, unescape};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use reqwest::Client;
@@ -208,9 +208,9 @@ pub struct SamlAssertion {
 /// Returns `None` if the attribute is not present.
 fn get_xml_attr(e: &quick_xml::events::BytesStart<'_>, attr_name: &str) -> Option<String> {
     e.attributes().flatten().find_map(|attr| {
-        let key = String::from_utf8_lossy(attr.key.as_ref());
+        let key: &str = attr.key.as_ref();
         if key == attr_name {
-            Some(String::from_utf8_lossy(&attr.value).to_string())
+            Some(attr.value.to_string())
         } else {
             None
         }
@@ -222,11 +222,38 @@ fn collect_xml_attrs(e: &quick_xml::events::BytesStart<'_>) -> Vec<(String, Stri
     e.attributes()
         .flatten()
         .map(|attr| {
-            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-            let value = String::from_utf8_lossy(&attr.value).to_string();
+            let key = attr.key.as_ref().to_string();
+            let value = attr.value.to_string();
             (key, value)
         })
         .collect()
+}
+
+/// The raw bytes of a quick-xml text, reference or CDATA event.
+fn event_bytes<T: AsRef<[u8]> + ?Sized>(content: &T) -> &[u8] {
+    content.as_ref()
+}
+
+/// XML 1.0 section 2.11 end-of-line handling: a literal CR LF or lone CR
+/// is read as LF. The signature verifier's parser does the same, so the
+/// signed (canonical) text never contains a literal CR.
+fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Decode an attribute value as written in the document (`get_xml_attr`
+/// and `collect_xml_attrs` return it raw) into the value an XML parser
+/// reads: line endings and literal tabs and newlines become spaces
+/// (XML 1.0 section 3.3.3), then the five predefined entities and numeric
+/// character references are resolved. Any other entity is an error.
+fn decode_xml_attr_value(raw: &str) -> std::result::Result<String, String> {
+    let blanks: String = normalize_line_endings(raw)
+        .chars()
+        .map(|c| if c == '\t' || c == '\n' { ' ' } else { c })
+        .collect();
+    unescape(&blanks)
+        .map(|v| v.into_owned())
+        .map_err(|e| format!("attribute value {raw:?}: {e}"))
 }
 
 /// Compare two ACS URLs for the SAML `Destination`/`Recipient` binding
@@ -294,7 +321,14 @@ struct SamlResponseParser {
     /// a signed value an attacker split across two text nodes with an
     /// intervening comment — `foo<!--c-->bar` yields `foobar`, matching the
     /// exclusive-c14n#(no-comments) view under which the signature was verified.
+    /// Entity and character references and CDATA sections are separate
+    /// events and are decoded into the same accumulator, so the committed
+    /// value is the text the signature covers.
     current_text: String,
+    /// First reference the parser refused to decode (an entity other than
+    /// the five predefined ones, or an invalid character reference). The
+    /// whole Response is rejected when this is set.
+    invalid_reference: Option<String>,
 }
 
 impl SamlResponseParser {
@@ -328,12 +362,13 @@ impl SamlResponseParser {
             current_attr_values: Vec::new(),
             assertion_count: 0,
             current_text: String::new(),
+            invalid_reference: None,
         }
     }
 
     /// Handle an `Event::Start` element.
     fn handle_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+        let name = e.local_name().as_ref().to_string();
         self.current_element = name.clone();
         // Start of a new element: reset the leaf-text accumulator so each
         // element's text is committed fresh on its own `End`.
@@ -363,7 +398,7 @@ impl SamlResponseParser {
 
     /// Handle an `Event::Empty` (self-closing) element.
     fn handle_empty(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+        let name = e.local_name().as_ref().to_string();
         match name.as_str() {
             "StatusCode" => self.handle_status_code(e),
             "AuthnStatement" => self.handle_authn_statement(e),
@@ -375,26 +410,93 @@ impl SamlResponseParser {
 
     /// Handle an `Event::Text` node.
     fn handle_text(&mut self, e: &quick_xml::events::BytesText<'_>) {
-        let raw = String::from_utf8_lossy(e.as_ref());
-        let text = unescape(&raw)
+        let raw: &str = e;
+        let text = unescape(raw)
             .map(|c| c.to_string())
             .unwrap_or_else(|_| raw.to_string());
 
-        if text.trim().is_empty() {
-            return;
-        }
-
+        // Whitespace is kept: it is part of the signed value when it sits
+        // between two references (`a &amp; b`), and the reader no longer
+        // trims each fragment.
+        //
         // Accumulate rather than commit here: a comment splitting a signed value
         // into two text nodes (`foo<!--c-->bar`) arrives as two `Text` events
         // with no intervening `Start`, so both segments concatenate into the
         // canonical value. The accumulated text is committed on the element's
         // `End`. Comments are `Event::Comment` and never reach this method.
-        self.current_text.push_str(&text);
+        self.current_text.push_str(&normalize_line_endings(&text));
+    }
+
+    /// Handle an `Event::GeneralRef` (`&amp;`, `&#233;`, ...). quick-xml
+    /// reports every reference in element text as its own event; it is
+    /// part of the element's value, so it is decoded into the accumulator.
+    /// Only the five predefined entities and character references are
+    /// resolved. A Response may not declare entities (see the `DocType`
+    /// arm in `parse_saml_response`), so any other name is refused rather
+    /// than skipped.
+    fn handle_general_ref(&mut self, e: &quick_xml::events::BytesRef<'_>) {
+        let name = String::from_utf8_lossy(event_bytes(&**e)).into_owned();
+        match e.resolve_char_ref() {
+            Ok(Some(c)) => self.current_text.push(c),
+            Ok(None) => match resolve_predefined_entity(&name) {
+                Some(value) => self.current_text.push_str(value),
+                None => self.refuse_reference(format!("&{name};")),
+            },
+            Err(err) => self.refuse_reference(format!("&{name}; ({err})")),
+        }
+    }
+
+    /// Handle an `Event::CData` section: literal text, part of the value.
+    fn handle_cdata(&mut self, e: &quick_xml::events::BytesCData<'_>) {
+        let text = String::from_utf8_lossy(event_bytes(&**e));
+        self.current_text.push_str(&normalize_line_endings(&text));
+    }
+
+    fn refuse_reference(&mut self, detail: String) {
+        if self.invalid_reference.is_none() {
+            self.invalid_reference = Some(detail);
+        }
+    }
+
+    /// A decoded attribute value (see `decode_xml_attr_value`).
+    fn attr(&mut self, e: &quick_xml::events::BytesStart<'_>, name: &str) -> Option<String> {
+        let raw = get_xml_attr(e, name)?;
+        match decode_xml_attr_value(&raw) {
+            Ok(value) => Some(value),
+            Err(detail) => {
+                self.refuse_reference(detail);
+                None
+            }
+        }
+    }
+
+    /// All attributes of `e` with decoded values.
+    fn attrs(&mut self, e: &quick_xml::events::BytesStart<'_>) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (key, raw) in collect_xml_attrs(e) {
+            match decode_xml_attr_value(&raw) {
+                Ok(value) => out.push((key, value)),
+                Err(detail) => self.refuse_reference(detail),
+            }
+        }
+        out
+    }
+
+    /// Take the accumulated text of the element that just ended. Text that
+    /// is only whitespace (the indentation around child elements) is not a
+    /// value.
+    fn take_text(&mut self) -> Option<String> {
+        let text = std::mem::take(&mut self.current_text);
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     /// Handle an `Event::End` element.
     fn handle_end(&mut self, e: &quick_xml::events::BytesEnd<'_>) {
-        let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+        let name = e.local_name().as_ref().to_string();
         match name.as_str() {
             "Assertion" => {
                 self.in_assertion = false;
@@ -416,26 +518,23 @@ impl SamlResponseParser {
                 self.handle_issuer_text(text);
             }
             "NameID" => {
-                if self.claims_active() && !self.current_text.is_empty() {
-                    self.assertion.name_id = std::mem::take(&mut self.current_text);
+                if let Some(text) = self.take_text().filter(|_| self.claims_active()) {
+                    self.assertion.name_id = text;
                 }
             }
             "Audience" => {
-                if self.claims_active() && !self.current_text.is_empty() {
-                    self.assertion
-                        .audiences
-                        .push(std::mem::take(&mut self.current_text));
+                if let Some(text) = self.take_text().filter(|_| self.claims_active()) {
+                    self.assertion.audiences.push(text);
                 }
             }
             "AttributeValue" => {
-                if self.claims_active() && !self.current_text.is_empty() {
-                    self.current_attr_values
-                        .push(std::mem::take(&mut self.current_text));
+                if let Some(text) = self.take_text().filter(|_| self.claims_active()) {
+                    self.current_attr_values.push(text);
                 }
             }
             "StatusMessage" => {
-                if !self.current_text.is_empty() {
-                    self.response.status_message = Some(std::mem::take(&mut self.current_text));
+                if let Some(text) = self.take_text() {
+                    self.response.status_message = Some(text);
                 }
             }
             "Attribute" => {
@@ -455,7 +554,7 @@ impl SamlResponseParser {
     // -- Element-specific handlers --
 
     fn handle_response_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        for (key, value) in collect_xml_attrs(e) {
+        for (key, value) in self.attrs(e) {
             match key.as_str() {
                 "ID" => self.response.id = value,
                 "InResponseTo" => self.response.in_response_to = Some(value),
@@ -479,7 +578,7 @@ impl SamlResponseParser {
 
     fn handle_subject_confirmation_data(&mut self, e: &quick_xml::events::BytesStart<'_>) {
         if self.claims_active() {
-            if let Some(recipient) = get_xml_attr(e, "Recipient") {
+            if let Some(recipient) = self.attr(e, "Recipient") {
                 self.assertion.recipient = Some(recipient);
             }
         }
@@ -488,20 +587,20 @@ impl SamlResponseParser {
     fn handle_assertion_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
         self.in_assertion = true;
         self.assertion_count += 1;
-        if let Some(id) = get_xml_attr(e, "ID") {
+        if let Some(id) = self.attr(e, "ID") {
             self.assertion.id = id;
         }
     }
 
     fn handle_status_code(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        if let Some(value) = get_xml_attr(e, "Value") {
+        if let Some(value) = self.attr(e, "Value") {
             self.response.status_code = value;
         }
     }
 
     fn handle_name_id_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
         if self.claims_active() {
-            if let Some(format) = get_xml_attr(e, "Format") {
+            if let Some(format) = self.attr(e, "Format") {
                 self.assertion.name_id_format = Some(format);
             }
         }
@@ -509,7 +608,7 @@ impl SamlResponseParser {
 
     fn handle_conditions_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
         if self.claims_active() {
-            for (key, value) in collect_xml_attrs(e) {
+            for (key, value) in self.attrs(e) {
                 match key.as_str() {
                     "NotBefore" => self.assertion.not_before = Some(value),
                     "NotOnOrAfter" => self.assertion.not_on_or_after = Some(value),
@@ -521,7 +620,7 @@ impl SamlResponseParser {
 
     fn handle_authn_statement(&mut self, e: &quick_xml::events::BytesStart<'_>) {
         if self.claims_active() {
-            if let Some(session_index) = get_xml_attr(e, "SessionIndex") {
+            if let Some(session_index) = self.attr(e, "SessionIndex") {
                 self.assertion.session_index = Some(session_index);
             }
         }
@@ -529,7 +628,7 @@ impl SamlResponseParser {
 
     fn handle_attribute_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
         if self.claims_active() {
-            if let Some(name) = get_xml_attr(e, "Name") {
+            if let Some(name) = self.attr(e, "Name") {
                 self.current_attr_name = Some(name);
                 self.current_attr_values.clear();
             }
@@ -662,8 +761,10 @@ impl SamlService {
             sp_entity_id = self.config.sp_entity_id,
         );
 
-        // Base64 encode and URL encode the request
-        let encoded_request = base64_encode(authn_request.as_bytes());
+        // HTTP-Redirect binding (SAML 2.0 Bindings §3.4.4.1): DEFLATE, then
+        // base64, then URL-encode. IdPs that enforce the DEFLATE step, such as
+        // Entra ID (AADSTS750055), reject the bare XML (#4475).
+        let encoded_request = base64_encode(&deflate_raw(authn_request.as_bytes())?);
         let url_encoded_request = urlencoding::encode(&encoded_request);
         let url_encoded_relay_state = urlencoding::encode(&relay_state);
 
@@ -743,7 +844,9 @@ impl SamlService {
     /// Parse SAML Response XML
     fn parse_saml_response(&self, xml: &str) -> Result<SamlResponse> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
+        // No trimming: whitespace next to a reference is part of the value,
+        // and quick-xml would trim each fragment between references.
+        reader.config_mut().trim_text(false);
 
         let mut parser = SamlResponseParser::new();
         let mut buf = Vec::new();
@@ -753,7 +856,19 @@ impl SamlService {
                 Ok(Event::Start(ref e)) => parser.handle_start(e),
                 Ok(Event::Empty(ref e)) => parser.handle_empty(e),
                 Ok(Event::Text(ref e)) => parser.handle_text(e),
+                Ok(Event::GeneralRef(ref e)) => parser.handle_general_ref(e),
+                Ok(Event::CData(ref e)) => parser.handle_cdata(e),
                 Ok(Event::End(ref e)) => parser.handle_end(e),
+                // A DTD could declare entities or default attributes that the
+                // signature verifier's parser applies and this one does not,
+                // so the two would read different documents. SAML messages
+                // carry none; refuse it before anything else is read.
+                Ok(Event::DocType(_)) => {
+                    return Err(AppError::Authentication(
+                        "SAML response contains a DOCTYPE declaration, which is not accepted"
+                            .to_string(),
+                    ));
+                }
                 Ok(Event::Eof) => break,
                 Err(e) => {
                     return Err(AppError::Authentication(format!(
@@ -764,6 +879,12 @@ impl SamlService {
                 _ => {}
             }
             buf.clear();
+        }
+
+        if let Some(detail) = parser.invalid_reference {
+            return Err(AppError::Authentication(format!(
+                "SAML response uses an XML reference that is not accepted: {detail}"
+            )));
         }
 
         // Structural XML Signature Wrapping (XSW) defense: reject any Response
@@ -1282,6 +1403,19 @@ impl SamlService {
     pub fn acs_url(&self) -> &str {
         &self.config.acs_url
     }
+}
+
+/// Raw DEFLATE (RFC 1951, no zlib or gzip header), the encoding the SAML
+/// HTTP-Redirect binding requires for `SAMLRequest`.
+fn deflate_raw(input: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+
+    let to_error =
+        |e: std::io::Error| AppError::Internal(format!("Failed to DEFLATE SAML message: {e}"));
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(input).map_err(to_error)?;
+    encoder.finish().map_err(to_error)
 }
 
 /// Base64 encode bytes
@@ -2703,6 +2837,54 @@ mod tests {
         assert!(request.redirect_url.contains("RelayState="));
     }
 
+    #[tokio::test]
+    async fn test_create_authn_request_is_deflate_encoded() {
+        // #4475: the HTTP-Redirect binding requires SAMLRequest to be raw
+        // DEFLATE before base64; Entra ID rejects bare XML (AADSTS750055).
+        use std::io::Read;
+
+        let service = make_test_saml_service();
+        let request = service.create_authn_request().unwrap();
+        let url = url::Url::parse(&request.redirect_url).unwrap();
+        let saml_request = url
+            .query_pairs()
+            .find(|(key, _)| key == "SAMLRequest")
+            .map(|(_, value)| value.into_owned())
+            .expect("SAMLRequest parameter");
+
+        let compressed = base64_decode(&saml_request).unwrap();
+        assert!(
+            !compressed.starts_with(b"<"),
+            "SAMLRequest must not be bare XML"
+        );
+        let mut xml = String::new();
+        flate2::read::DeflateDecoder::new(compressed.as_slice())
+            .read_to_string(&mut xml)
+            .expect("SAMLRequest must inflate as raw DEFLATE");
+
+        assert!(xml.contains("<samlp:AuthnRequest"));
+        assert!(xml.contains(&format!(r#"ID="{}""#, request.request_id)));
+        assert!(xml.contains(&format!(
+            r#"AssertionConsumerServiceURL="{}""#,
+            service.acs_url()
+        )));
+    }
+
+    #[test]
+    fn test_deflate_raw_round_trips() {
+        use std::io::Read;
+
+        let input = b"<samlp:AuthnRequest ID=\"_id1\"/>".repeat(20);
+        let compressed = deflate_raw(&input).unwrap();
+        assert!(compressed.len() < input.len());
+
+        let mut inflated = Vec::new();
+        flate2::read::DeflateDecoder::new(compressed.as_slice())
+            .read_to_end(&mut inflated)
+            .unwrap();
+        assert_eq!(inflated, input);
+    }
+
     // =======================================================================
     // SamlUserInfo serialization tests
     // =======================================================================
@@ -2974,7 +3156,7 @@ mod tests {
         use quick_xml::Reader;
 
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
+        reader.config_mut().trim_text(false);
 
         let mut parser = SamlResponseParser::new();
         let mut buf = Vec::new();
@@ -2984,6 +3166,8 @@ mod tests {
                 Ok(Event::Start(ref e)) => parser.handle_start(e),
                 Ok(Event::Empty(ref e)) => parser.handle_empty(e),
                 Ok(Event::Text(ref e)) => parser.handle_text(e),
+                Ok(Event::GeneralRef(ref e)) => parser.handle_general_ref(e),
+                Ok(Event::CData(ref e)) => parser.handle_cdata(e),
                 Ok(Event::End(ref e)) => parser.handle_end(e),
                 Ok(Event::Eof) => break,
                 Err(e) => panic!("XML parse error: {}", e),
@@ -4537,5 +4721,147 @@ mod tests {
             .await
             .expect("a normal federated login must still succeed");
         assert_eq!(ok.name_id, "john.doe@example.com");
+    }
+
+    // =======================================================================
+    // Escaped text and attribute values (GHSA-cp5x-hq47-4mg3)
+    // =======================================================================
+
+    /// A Response whose NameID, groups, email and StatusMessage are spelled
+    /// with entity references, character references and CDATA. The values
+    /// in the comments are what an XML parser (and the c14n view the
+    /// signature is verified over) reads.
+    fn escaped_values_response_xml() -> String {
+        r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                ID="_resp1" InResponseTo="_req&amp;1"
+                Destination="https://sp.example.com/acs?a=1&amp;b=2">
+    <saml:Issuer>https://idp.example.com/?x=1&amp;y=2</saml:Issuer>
+    <samlp:Status>
+        <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+        <samlp:StatusMessage>Caf&#233; &amp; <![CDATA[<b>]]> ok</samlp:StatusMessage>
+    </samlp:Status>
+    <saml:Assertion ID="_a1" Version="2.0">
+        <saml:Subject>
+            <saml:NameID>j&amp;smith&lt;x&gt;&apos;o&quot;-caf&#xE9;@corp.example</saml:NameID>
+            <saml:SubjectConfirmation>
+                <saml:SubjectConfirmationData Recipient="https://sp.example.com/acs?a=1&amp;b=2"/>
+            </saml:SubjectConfirmation>
+        </saml:Subject>
+        <saml:AttributeStatement>
+            <saml:Attribute Name="groups">
+                <saml:AttributeValue>R&amp;D Admins</saml:AttributeValue>
+                <saml:AttributeValue>a &amp; b</saml:AttributeValue>
+                <saml:AttributeValue><![CDATA[x<y & z]]></saml:AttributeValue>
+            </saml:Attribute>
+            <saml:Attribute Name="e&#109;ail">
+                <saml:AttributeValue>o&apos;neil@corp.example</saml:AttributeValue>
+            </saml:Attribute>
+        </saml:AttributeStatement>
+    </saml:Assertion>
+</samlp:Response>"#
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_parse_saml_response_text_keeps_entity_and_character_references() {
+        let service = make_test_saml_service();
+        let response = service
+            .parse_saml_response(&escaped_values_response_xml())
+            .expect("a response using only predefined references must parse");
+        let assertion = response.assertion.expect("assertion");
+
+        // The NameID is the account key: every reference must decode to its
+        // character, so `j&smith` and `jsmith` stay distinct identities.
+        assert_eq!(assertion.name_id, "j&smith<x>'o\"-caf\u{e9}@corp.example");
+        assert_eq!(
+            assertion.attributes.get("groups"),
+            Some(&vec![
+                "R&D Admins".to_string(),
+                "a & b".to_string(),
+                "x<y & z".to_string(),
+            ]),
+            "group values keep references, the blanks around them and CDATA"
+        );
+        assert_eq!(
+            assertion.attributes.get("email"),
+            Some(&vec!["o'neil@corp.example".to_string()]),
+            "attribute names and values are both decoded"
+        );
+        assert_eq!(response.issuer, "https://idp.example.com/?x=1&y=2");
+        assert_eq!(
+            response.status_message.as_deref(),
+            Some("Caf\u{e9} & <b> ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_saml_response_attribute_values_are_decoded() {
+        let service = make_test_saml_service();
+        let response = service
+            .parse_saml_response(&escaped_values_response_xml())
+            .expect("parse");
+        assert_eq!(response.in_response_to.as_deref(), Some("_req&1"));
+        assert_eq!(
+            response.destination.as_deref(),
+            Some("https://sp.example.com/acs?a=1&b=2")
+        );
+        assert_eq!(
+            response.assertion.expect("assertion").recipient.as_deref(),
+            Some("https://sp.example.com/acs?a=1&b=2")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_saml_response_text_line_endings_match_xml_parsing() {
+        // A literal CR LF in element text is read as LF by any XML parser
+        // (XML 1.0 section 2.11); a character reference keeps its CR.
+        let service = make_test_saml_service();
+        let xml = "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" \
+                   xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\">\
+                   <saml:Assertion ID=\"_a1\"><saml:Subject>\
+                   <saml:NameID>a\r\nb&#13;c</saml:NameID>\
+                   </saml:Subject></saml:Assertion></samlp:Response>";
+        let response = service.parse_saml_response(xml).expect("parse");
+        assert_eq!(response.assertion.expect("assertion").name_id, "a\nb\rc");
+    }
+
+    #[tokio::test]
+    async fn test_parse_saml_response_rejects_undeclared_entity_reference() {
+        let service = make_test_saml_service();
+        for (label, xml) in [
+            (
+                "text",
+                escaped_values_response_xml().replace("R&amp;D", "R&custom;D"),
+            ),
+            (
+                "attribute",
+                escaped_values_response_xml().replace("_req&amp;1", "_req&custom;1"),
+            ),
+        ] {
+            let err = service
+                .parse_saml_response(&xml)
+                .expect_err("an entity other than the five predefined ones must be refused");
+            assert!(
+                err.to_string().contains("custom"),
+                "{label}: error names the reference: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_saml_response_rejects_document_type_declaration() {
+        // SAML messages carry no DTD. One could declare entities or default
+        // attributes that the signature verifier's parser applies and this
+        // parser does not, so the two would read different documents.
+        let service = make_test_saml_service();
+        let xml = format!(
+            "<!DOCTYPE samlp:Response [<!ENTITY who \"admin\">]>{}",
+            escaped_values_response_xml().replace("R&amp;D Admins", "&who;")
+        );
+        let err = service
+            .parse_saml_response(&xml)
+            .expect_err("a Response with a DOCTYPE must be refused");
+        assert!(err.to_string().contains("DOCTYPE"), "{err}");
     }
 }

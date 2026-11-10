@@ -6,17 +6,35 @@
       {
         "ordinal": 0,
         "name": "hosted_bytes",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_usage_ledger",
+            "name": "hosted_bytes"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "proxy_bytes",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_usage_ledger",
+            "name": "proxy_bytes"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "oci_bytes",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_usage_ledger",
+            "name": "oci_bytes"
+          }
+        }
       }
     ],
     "parameters": {

@@ -1216,6 +1216,57 @@ async fn test_saml_acs_comment_split_nameid_uses_full_value() {
     delete_saml_provider(&pool, provider_id).await;
 }
 
+/// A signed NameID and group containing `&`, `<`, `>`, `'` and `"` (which
+/// the IdP serializes as entity references) are consumed exactly as signed:
+/// the account is keyed on the full NameID, and the group matches the
+/// configured admin group by its real name.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_signed_values_with_escaped_characters_are_kept() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let admin_group = "R&D <Admins> 'core' \"ops\"";
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            admin_group: Some(admin_group.to_string()),
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+
+    let suffix = Uuid::new_v4().as_simple().to_string();
+    let name_id = format!("j&smith<x>'o\"{suffix}");
+    let stripped = format!("jsmithxo{suffix}");
+    let request_id = seed_session(&pool, provider_id).await;
+    let mut spec = happy_spec(&request_id, &name_id);
+    spec.groups = vec![admin_group.to_string()];
+    let xml = spec.to_unsigned_xml();
+    assert!(
+        xml.contains("j&amp;smith&lt;x&gt;&apos;o&quot;"),
+        "fixture guard: the NameID is written with entity references"
+    );
+
+    let resp = post_acs(build_state(pool.clone()), provider_id, &spec.signed_b64()).await;
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+
+    let (_, _, _, is_admin) = get_saml_user(&pool, &name_id)
+        .await
+        .expect("the user is keyed on the NameID exactly as signed");
+    assert!(
+        is_admin,
+        "the signed group must match the configured admin group by its real name"
+    );
+    assert!(
+        get_saml_user(&pool, &stripped).await.is_none(),
+        "no user may be keyed on the NameID with its escaped characters removed"
+    );
+
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
 // ===========================================================================
 // Slug addressing (#2583)
 //
@@ -1234,10 +1285,12 @@ fn fresh_slug(prefix: &str) -> String {
 }
 
 /// Recover the AuthnRequest XML the SP emitted from the login redirect: the
-/// `SAMLRequest` query parameter is URL-encoded, base64 (standard alphabet)
-/// XML — see `SamlService::create_authn_request`.
+/// `SAMLRequest` query parameter is URL-encoded, base64 (standard alphabet),
+/// raw-DEFLATE XML (HTTP-Redirect binding, #4475) — see
+/// `SamlService::create_authn_request`.
 fn decode_authn_request(redirect_url: &str) -> String {
     use base64::Engine;
+    use std::io::Read;
     let encoded = redirect_url
         .split(['?', '&'])
         .find_map(|p| p.strip_prefix("SAMLRequest="))
@@ -1246,7 +1299,11 @@ fn decode_authn_request(redirect_url: &str) -> String {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(decoded.as_bytes())
         .expect("SAMLRequest is base64");
-    String::from_utf8(bytes).expect("AuthnRequest is UTF-8")
+    let mut xml = String::new();
+    flate2::read::DeflateDecoder::new(bytes.as_slice())
+        .read_to_string(&mut xml)
+        .expect("SAMLRequest is raw DEFLATE of UTF-8 XML");
+    xml
 }
 
 /// A validly signed assertion POSTed to `/saml/{slug}/acs` authenticates

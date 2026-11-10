@@ -144,11 +144,194 @@ mod test_env {
 }
 
 /// Read an environment variable and parse it, falling back to a default on missing or invalid values.
+/// `SMTP_TLS_CA_CERT` (path or inline PEM), falling back to the shared
+/// `CUSTOM_CA_CERT_PATH`. Returns the value and the variable it came from.
+fn smtp_tls_ca_cert_from_env() -> Option<(String, &'static str)> {
+    let non_empty = |k: &str| env::var(k).ok().filter(|v| !v.trim().is_empty());
+    non_empty("SMTP_TLS_CA_CERT")
+        .map(|v| (v, "SMTP_TLS_CA_CERT"))
+        .or_else(|| non_empty("CUSTOM_CA_CERT_PATH").map(|v| (v, "CUSTOM_CA_CERT_PATH")))
+}
+
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// The `DATABASE_URL` value backend images up to 1.11.x baked into their
+/// environment (`ENV DATABASE_URL=set-database-url-at-runtime`). The
+/// Dockerfiles no longer set it (#4819); an environment copied from an older
+/// container (`docker inspect`, a rendered pod spec) can still carry it, so
+/// it counts as unset rather than as a connection string. Scoped to
+/// `DATABASE_URL`: for any other setting it is an ordinary value.
+const LEGACY_DATABASE_URL_PLACEHOLDER: &str = "set-database-url-at-runtime";
+
+fn is_legacy_image_placeholder(name: &str, value: &str) -> bool {
+    name == "DATABASE_URL" && value.trim() == LEGACY_DATABASE_URL_PLACEHOLDER
+}
+
+/// Resolve a sensitive setting from the environment (#4142).
+///
+/// `<NAME>` holds the value directly; `<NAME>_FILE` holds a path to a file
+/// that contains the value (Docker/Kubernetes secret mounts, Vault agents,
+/// etc.). The direct value wins when both are set — the same precedence as the
+/// `DEPENDENCY_TRACK_API_KEY` handling (#2084) and `INITIAL_ADMIN_PASSWORD`
+/// (#2803), so operators can override a mounted secret with an env var
+/// without editing the mount.
+///
+/// File contents are trimmed of surrounding whitespace/newlines (a trailing
+/// newline from `echo secret > file` is the norm). The direct value is
+/// returned verbatim when it is set and non-empty after trimming (to preserve
+/// existing behaviour exactly). If the direct value is set but only contains
+/// whitespace, it falls through to the file form; if no file form is
+/// configured, the legacy value is preserved (potentially the whitespace-only
+/// string for certain call sites, or unset).
+///
+/// When `<NAME>_FILE` is set the file is authoritative: an unreadable or
+/// empty file is an error, not a silent fall-through to "unset". An operator
+/// who points at a broken mount must get a startup error naming the path
+/// (never the contents) rather than a backend that quietly starts with the
+/// secret missing.
+///
+/// Returns `Ok(None)` when neither form is set. Returns `Err(String)` when
+/// `<NAME>_FILE` is set to a path that cannot be read or is empty; the string
+/// message names the variable and path but never the contents.
+pub fn secret_or_env(name: &str) -> std::result::Result<Option<String>, String> {
+    let file_var = format!("{name}_FILE");
+    let path = env::var(&file_var).ok().filter(|p| !p.trim().is_empty());
+    let direct = env::var(name).ok();
+
+    // Treat the placeholder baked into published images as unset so that
+    // <NAME>_FILE can take effect (#4819).
+    let is_placeholder = direct
+        .as_deref()
+        .is_some_and(|v| is_legacy_image_placeholder(name, v));
+    let direct_usable = direct
+        .as_deref()
+        .is_some_and(|v| !v.trim().is_empty() && !is_placeholder);
+    if direct_usable {
+        return Ok(direct);
+    }
+
+    let Some(path) = path else {
+        if is_placeholder {
+            return Ok(None);
+        }
+        return Ok(direct);
+    };
+
+    let path_trimmed = path.trim();
+    match std::fs::read_to_string(path_trimmed) {
+        Ok(contents) => {
+            let value = contents.trim().to_string();
+            if value.is_empty() {
+                Err(format!(
+                    "{file_var} points at {path_trimmed}, but the file is empty"
+                ))
+            } else {
+                Ok(Some(value))
+            }
+        }
+        Err(e) => Err(format!(
+            "{file_var} points at {path_trimmed}, but the file could not be read: {e}"
+        )),
+    }
+}
+
+/// Check whether a secret is configured via `<NAME>` or `<NAME>_FILE` (#4142)
+/// without reading the file contents. This is the cheap presence form of
+/// [`secret_or_env`], for call sites that only need to know *whether*
+/// credentials exist (e.g. whether S3 requests will be signed). A direct
+/// value counts as present even when blank, exactly like the `env::var(..)
+/// .is_ok()` checks this replaces — the store builder passes a blank value
+/// through unchanged, so the two stay in step. A `<NAME>_FILE` naming a file
+/// that turns out to be unreadable counts as present here too; reading it is
+/// the actual reader's job, and its failure is loud there.
+pub fn secret_env_present(name: &str) -> bool {
+    if env::var(name).is_ok() {
+        return true;
+    }
+    env::var(format!("{name}_FILE").as_str())
+        .map(|path| !path.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Default for [`Config::http_header_read_timeout_secs`] (#4665).
+pub const DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS: u64 = 10;
+
+/// Default listen IP for the gRPC and metrics listeners (#2161): every
+/// interface, which is what both listeners hard-coded before they were
+/// configurable.
+pub const DEFAULT_LISTENER_BIND_IP: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+/// Parse the listen IP for a secondary listener from env var `key` (#2161).
+///
+/// Unset or blank means [`DEFAULT_LISTENER_BIND_IP`]. IPv6 literals are
+/// accepted bare (`::1`) or bracketed (`[::1]`), since operators copy them out
+/// of `host:port` strings. Anything else is a hard startup error rather than
+/// a silent fall-back to `0.0.0.0`: an operator who asked for loopback-only
+/// and got every interface would be exposed without knowing it.
+fn parse_bind_ip(key: &str, raw: Option<&str>) -> Result<std::net::IpAddr> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DEFAULT_LISTENER_BIND_IP);
+    };
+    let unbracketed = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(value);
+    unbracketed.parse().map_err(|_| {
+        AppError::Config(format!(
+            "{key} must be an IP address such as 127.0.0.1 or ::1 (no port), got {value:?}"
+        ))
+    })
+}
+
+/// Clamp `BLOB_GC_MIN_AGE_SECS` (#2906) and warn when the result is shorter
+/// than a slow real-world push can take. The clamp keeps a typo from either
+/// deleting a blob seconds after upload (floor) or disabling blob GC in
+/// practice (ceiling).
+fn resolve_blob_gc_min_age_secs(raw: u64) -> u64 {
+    use crate::services::storage_gc_service as gc;
+    let secs = gc::clamp_min_blob_age_secs(raw);
+    if secs != raw {
+        tracing::warn!(
+            requested = raw,
+            effective = secs,
+            "BLOB_GC_MIN_AGE_SECS is outside [{}, {}] seconds and was clamped",
+            gc::MIN_BLOB_AGE_FLOOR_SECS,
+            gc::MIN_BLOB_AGE_CEILING_SECS,
+        );
+    }
+    if secs < gc::MIN_BLOB_AGE_RECOMMENDED_SECS {
+        tracing::warn!(
+            min_age_secs = secs,
+            "BLOB_GC_MIN_AGE_SECS is under one hour: a push whose manifest lands \
+             later than this after its blobs can lose a blob to GC; use only on \
+             short-lived test deployments"
+        );
+    }
+    secs
+}
+
+/// Parse a comma-separated environment variable into its trimmed, non-empty
+/// entries. Unset or empty yields an empty list.
+fn parse_comma_list_env(key: &str) -> Vec<String> {
+    parse_comma_list(env::var(key).ok().as_deref())
+}
+
+/// The pure half of [`parse_comma_list_env`].
+fn parse_comma_list(raw: Option<&str>) -> Vec<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Parse a comma-separated list of CIDR ranges from env var `key`.
@@ -178,6 +361,15 @@ fn parse_cidr_list_env(key: &str) -> Vec<crate::api::middleware::rate_limit::Cid
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Trimmed, non-empty value of an optional repository-key setting; blank
+/// means "not configured".
+fn parse_optional_repo_key(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// Parse an opt-in boolean flag from an optional env value.
@@ -298,6 +490,220 @@ fn default_auth_max_concurrency() -> usize {
     std::cmp::max(32, cores.saturating_mul(8))
 }
 
+/// Settings for the Device Authorization Grant (RFC 8628, #3461).
+///
+/// The grant lets a headless client (a CLI, a CI runner, a device without a
+/// browser) obtain AK tokens by showing its user a short code that the user
+/// approves from an already signed-in browser session. It is an
+/// unauthenticated token-issuing surface and a well-known phishing lure
+/// (an attacker starts a flow and persuades a victim to approve the code), so
+/// it is **off by default**: operators opt in with `DEVICE_AUTH_ENABLED=true`.
+/// While it is off, every device route answers 404.
+///
+/// All numeric settings are clamped to safe ranges when read from the
+/// environment, so a typo cannot produce a code that never expires or a
+/// polling interval of zero.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceAuthConfig {
+    /// Master switch. Env: `DEVICE_AUTH_ENABLED` (`true`/`1`). Default off.
+    pub enabled: bool,
+    /// Lifetime of a device code / user code pair, in seconds. RFC 8628
+    /// §3.2 `expires_in`. Env: `DEVICE_AUTH_CODE_TTL_SECS`, clamped to
+    /// 60..=1800. Default 600.
+    pub code_ttl_secs: u32,
+    /// Minimum seconds between token polls (RFC 8628 §3.2 `interval`). Each
+    /// `slow_down` adds 5 seconds for that code. Env:
+    /// `DEVICE_AUTH_POLL_INTERVAL_SECS`, clamped to 1..=60. Default 5.
+    pub poll_interval_secs: u32,
+    /// Device-code requests allowed per client IP per
+    /// `rate_limit_window_secs`. Env: `DEVICE_AUTH_CODE_REQUESTS_PER_WINDOW`,
+    /// clamped to 1..=1000. Default 10.
+    pub code_requests_per_window: u32,
+    /// Wrong or malformed user codes one user may submit per
+    /// `failed_attempt_window_secs` before verification, approval and denial
+    /// are refused with 429. Env: `DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_USER`,
+    /// clamped to 1..=100. Default 5.
+    pub max_failed_attempts_per_user: u32,
+    /// The same budget keyed by client IP, so one host cannot multiply its
+    /// guesses across many accounts. Env:
+    /// `DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_IP`, clamped to 1..=1000.
+    /// Default 20.
+    pub max_failed_attempts_per_ip: u32,
+    /// Window for both failed-attempt budgets, in seconds. Env:
+    /// `DEVICE_AUTH_FAILED_ATTEMPT_WINDOW_SECS`, clamped to 60..=86400.
+    /// Default 900.
+    pub failed_attempt_window_secs: u64,
+}
+
+impl Default for DeviceAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            code_ttl_secs: 600,
+            poll_interval_secs: 5,
+            code_requests_per_window: 10,
+            max_failed_attempts_per_user: 5,
+            max_failed_attempts_per_ip: 20,
+            failed_attempt_window_secs: 900,
+        }
+    }
+}
+
+impl DeviceAuthConfig {
+    fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            enabled: matches!(env::var("DEVICE_AUTH_ENABLED").as_deref(), Ok("true" | "1")),
+            code_ttl_secs: env_parse("DEVICE_AUTH_CODE_TTL_SECS", d.code_ttl_secs).clamp(60, 1800),
+            poll_interval_secs: env_parse("DEVICE_AUTH_POLL_INTERVAL_SECS", d.poll_interval_secs)
+                .clamp(1, 60),
+            code_requests_per_window: env_parse(
+                "DEVICE_AUTH_CODE_REQUESTS_PER_WINDOW",
+                d.code_requests_per_window,
+            )
+            .clamp(1, 1000),
+            max_failed_attempts_per_user: env_parse(
+                "DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_USER",
+                d.max_failed_attempts_per_user,
+            )
+            .clamp(1, 100),
+            max_failed_attempts_per_ip: env_parse(
+                "DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_IP",
+                d.max_failed_attempts_per_ip,
+            )
+            .clamp(1, 1000),
+            failed_attempt_window_secs: env_parse(
+                "DEVICE_AUTH_FAILED_ATTEMPT_WINDOW_SECS",
+                d.failed_attempt_window_secs,
+            )
+            .clamp(60, 86_400),
+        }
+    }
+}
+
+/// How a Remote repository's upstream fetches are bounded (#5220).
+///
+/// The connect and read timeouts apply to every upstream request the proxy
+/// makes, streamed or buffered.
+///
+/// A cold buffered fetch runs on its own task, so a client that gives up does
+/// not cancel it: its retry joins the fill or reads the filled cache. Nothing
+/// else ends such a fill, so it carries its own bounds:
+///
+/// * The fetch deadline bounds the upstream fetch from the first byte sent to
+///   the last byte read. The read timeout restarts on every chunk, so without
+///   it an upstream that trickles bytes, or a connection that stalled after
+///   its headers, holds the fill for as long as the socket stays open. A
+///   fetch that hits the deadline is a transient failure, so stale-if-error
+///   still applies. The trade-off: a buffered object that cannot be fetched
+///   within the deadline (128 MiB at under ~220 KB/s with the 600-second
+///   default) is never cached, where an unbounded fetch would eventually
+///   finish. Raise it for slow upstreams with large buffered objects.
+/// * The cache write and bookkeeping after the fetch get a fixed extra
+///   allowance; past it the fill is abandoned, so a stalled storage or
+///   database write cannot hold the single-flight slot (and the cross-replica
+///   lock) forever.
+/// * At most `max_detached_fills` fills run detached at once. Past that, a
+///   fill runs in the request as before and ends if its client goes away, so
+///   clients that open many cold paths and disconnect cannot pile up buffered
+///   bodies and lock connections.
+///
+/// A streamed download is not bounded by the deadline, because its length is
+/// not bounded either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProxyUpstreamSettings {
+    /// TCP and TLS connect timeout, in seconds. Env:
+    /// `PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS`, clamped to 1..=300. Default 10.
+    pub connect_secs: u64,
+    /// Longest wait for the response headers or for the next body chunk, in
+    /// seconds. Env: `PROXY_UPSTREAM_READ_TIMEOUT_SECS`, clamped to 1..=3600.
+    /// Default 60.
+    pub read_secs: u64,
+    /// Deadline of one buffered upstream fetch, in seconds. Env:
+    /// `PROXY_UPSTREAM_FETCH_DEADLINE_SECS`, clamped to 1..=86400. Default
+    /// 600.
+    pub fetch_deadline_secs: u64,
+    /// Most fills allowed to run detached from their request at once: buffered
+    /// fills, and streamed fills whose client stopped reading after the first
+    /// bytes (#5509), each within the fetch deadline plus a 60-second commit
+    /// allowance. Env: `PROXY_UPSTREAM_MAX_DETACHED_FILLS`, clamped to
+    /// 0..=1024. Default 16. Zero keeps every fill in its request.
+    pub max_detached_fills: usize,
+}
+
+impl Default for ProxyUpstreamSettings {
+    fn default() -> Self {
+        Self {
+            connect_secs: 10,
+            read_secs: 60,
+            fetch_deadline_secs: 600,
+            max_detached_fills: 16,
+        }
+    }
+}
+
+impl ProxyUpstreamSettings {
+    fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            connect_secs: env_parse("PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS", d.connect_secs)
+                .clamp(1, 300),
+            read_secs: env_parse("PROXY_UPSTREAM_READ_TIMEOUT_SECS", d.read_secs).clamp(1, 3600),
+            fetch_deadline_secs: env_parse(
+                "PROXY_UPSTREAM_FETCH_DEADLINE_SECS",
+                d.fetch_deadline_secs,
+            )
+            .clamp(1, 86_400),
+            max_detached_fills: env_parse(
+                "PROXY_UPSTREAM_MAX_DETACHED_FILLS",
+                d.max_detached_fills,
+            )
+            .clamp(0, 1024),
+        }
+    }
+
+    /// The connect timeout as a [`std::time::Duration`].
+    pub fn connect(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.connect_secs)
+    }
+
+    /// The read timeout as a [`std::time::Duration`].
+    pub fn read(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.read_secs)
+    }
+
+    /// The buffered fetch deadline as a [`std::time::Duration`].
+    pub fn fetch_deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.fetch_deadline_secs)
+    }
+}
+
+/// Which upstream requests write an `UPSTREAM_FETCHED` audit row (#5286).
+/// Env `AUDIT_UPSTREAM_FETCHES`: `off` (the default), `errors` (failed
+/// requests only: `not_found`, `error`, `timeout`) or `all` (every request,
+/// what an air-gapped deployment sets to inventory its seed window). An
+/// unrecognised value falls back to `off`, like the other knobs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UpstreamFetchAuditMode {
+    #[default]
+    Off,
+    Errors,
+    All,
+}
+
+impl std::str::FromStr for UpstreamFetchAuditMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, ()> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "errors" => Ok(Self::Errors),
+            "all" => Ok(Self::All),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Application configuration
 #[derive(Clone)]
 pub struct Config {
@@ -354,6 +760,19 @@ pub struct Config {
     /// `[MIN_SIGNATURE_EXPIRY_SECONDS, MAX_SIGNATURE_EXPIRY_SECONDS]` by
     /// [`crate::services::signing_service::signature_expiry_duration`].
     pub signature_expiry_seconds: u64,
+
+    /// Rotation overlap window, in seconds (`SIGNING_KEY_ROTATION_OVERLAP_SECS`,
+    /// #1329). For this long after a signing key is rotated, Debian/RPM
+    /// metadata is signed by both the old and the new key and the public-key
+    /// endpoints serve both, so clients that still trust only the old key keep
+    /// verifying. Defaults to 14 days; `0` retires the old key immediately.
+    pub signing_key_rotation_overlap_secs: u64,
+
+    /// Replace legacy signing keys that are bound to Debian/RPM metadata
+    /// signing but cannot produce OpenPGP signatures with fresh
+    /// `key_type='gpg'` keys at startup (`SIGNING_AUTO_MIGRATE_LEGACY_KEYS`,
+    /// #1331). Off by default: the startup scan then only WARNs.
+    pub signing_auto_migrate_legacy_keys: bool,
 
     /// JWT token expiration in seconds (legacy, use jwt_access_token_expiry_minutes)
     pub jwt_expiration_secs: u64,
@@ -463,6 +882,14 @@ pub struct Config {
     /// token itself while this is `false`.
     pub guest_access_enabled: bool,
 
+    /// True when `AK_GUEST_ACCESS_ENABLED` was set explicitly to `true`, `1`,
+    /// `false` or `0` (#867). The env value then pins the effective setting
+    /// and the runtime `security.guest_access_enabled` row in
+    /// `system_settings` has no effect (break-glass, like `TOTP_POLICY`).
+    /// Otherwise `guest_access_enabled` is only the default the stored row
+    /// overrides; see `services::guest_access_policy`.
+    pub guest_access_env_pinned: bool,
+
     /// When true, the unauthenticated `/health` (and `/healthz`) response
     /// includes operator-only detail: the exact git commit SHA (`commit`),
     /// the prerelease/`dirty` flag, and live connection-pool internals
@@ -474,6 +901,13 @@ pub struct Config {
     /// still get pool detail from the authenticated `/metrics` /memory-stats
     /// endpoints regardless of this flag.
     pub expose_detailed_health: bool,
+
+    /// When true, `/readyz` answers 503 while OpenSearch is unhealthy (or not
+    /// configured), naming it under `failing`. Default false: ready means
+    /// "can serve artifacts" (database + migrations), and search status is
+    /// only reported under `dependencies` (#4610). Set it where search is part
+    /// of what a replica must provide before it takes traffic.
+    pub readyz_require_search: bool,
 
     /// Optional operator-supplied instruction for retrieving the generated
     /// initial admin password, shown on the first-time-setup login screen. The
@@ -503,6 +937,20 @@ pub struct Config {
     /// deployment that had not set `ENVIRONMENT=production` served them to
     /// anonymous callers.
     pub swagger_enabled: bool,
+    /// Master gate for the WASM plugin runtime. This defaults to enabled for
+    /// upstream compatibility; only an explicit `false`/`0` prevents runtime
+    /// construction, startup loading, and plugin route registration.
+    pub plugins_enabled: bool,
+
+    /// Repository key of the hosted Terraform/OpenTofu repository that answers
+    /// host-level service discovery (`GET /.well-known/terraform.json`).
+    /// Terraform and OpenTofu discover a registry per *host*, so an address
+    /// like `registry.example.com/ns/type` can only resolve to a repository
+    /// when the host itself names one. Unset (the default) leaves that route
+    /// answering 404, which is the behaviour before it existed; per-repository
+    /// discovery under `/terraform/{repo}/.well-known/terraform.json` is
+    /// unaffected either way. Env: `TERRAFORM_DEFAULT_REPO`.
+    pub terraform_default_repo: Option<String>,
 
     /// When true (the default), a WASM plugin may only be installed (via ZIP,
     /// Git, or reload) if it ships a detached Ed25519 signature
@@ -533,6 +981,22 @@ pub struct Config {
     /// `0` to accept unverified attestations in a trusted/dev environment.
     pub conda_attestation_require_verified: bool,
 
+    /// OIDC issuers a keyless CEP-27 bundle's certificate may name
+    /// (`CONDA_ATTESTATION_ISSUERS`, comma list). Empty means the default,
+    /// the GitHub Actions issuer.
+    pub conda_attestation_issuers: Vec<String>,
+
+    /// Certificate identity (SAN) patterns a keyless CEP-27 bundle must match
+    /// (`CONDA_ATTESTATION_IDENTITIES`, comma list, `*` wildcard). Empty
+    /// means any identity the issuer vouches for.
+    pub conda_attestation_identities: Vec<String>,
+
+    /// Public keys for key-based CEP-27 bundles
+    /// (`CONDA_ATTESTATION_PUBLIC_KEYS`, comma list of PEM file paths or
+    /// inline PEMs, each optionally `name=`-prefixed). See
+    /// `services::curation::attestation_verify::policy`.
+    pub conda_attestation_public_keys: Vec<String>,
+
     /// Peer instance name for mesh identification
     pub peer_instance_name: String,
 
@@ -562,6 +1026,14 @@ pub struct Config {
 
     /// OpenTelemetry service name (default: "artifact-keeper").
     pub otel_service_name: String,
+
+    /// Days a soft-deleted artifact stays in the trash, restorable through
+    /// `POST /api/v1/admin/trash/{id}/restore`, before storage GC may reclaim
+    /// its row and object (#2072). Env `GC_TRASH_RETENTION_DAYS`, default `0`:
+    /// reclaimable on the next GC pass, exactly the behaviour before this
+    /// setting existed, so an upgrade never silently stops reclaiming storage.
+    /// Clamped to [0, 3650].
+    pub gc_trash_retention_days: u32,
 
     /// Cron expression (6-field) for storage garbage collection (default: hourly).
     pub gc_schedule: String,
@@ -604,6 +1076,16 @@ pub struct Config {
     /// `BLOB_GC_SWEEP_GRACE_SECS` to tune. `0` sweeps a marked blob on the
     /// next pass with no extra delay.
     pub blob_gc_sweep_grace_secs: u64,
+
+    /// Minimum age (seconds) before an unreferenced OCI blob, or an OCI object
+    /// recorded as a GC candidate by a repository delete, may be reclaimed
+    /// (#2906). Shields an in-flight push whose blobs land before the manifest
+    /// that references them. Env `BLOB_GC_MIN_AGE_SECS`, default 86400 (24
+    /// hours, `storage_gc_service::MIN_BLOB_AGE_SECS`), clamped to
+    /// [60 s, 7 days]; a value under one hour is logged as a warning at
+    /// startup. Lowering it is for short-lived test deployments that need to
+    /// observe blob mark-and-sweep end to end.
+    pub blob_gc_min_age_secs: u64,
 
     /// How often (in seconds) the lifecycle scheduler checks for due policies.
     pub lifecycle_check_interval_secs: u64,
@@ -659,6 +1141,14 @@ pub struct Config {
     /// anyone out.
     pub oidc_silent_sso_enabled: bool,
 
+    /// Device Authorization Grant (RFC 8628) settings (#3461). Off unless
+    /// `DEVICE_AUTH_ENABLED=true`; see [`DeviceAuthConfig`].
+    pub device_auth: DeviceAuthConfig,
+
+    /// Upstream timeouts and detached-fill limits of the proxy (#5220); see
+    /// [`ProxyUpstreamSettings`].
+    pub proxy_upstream: ProxyUpstreamSettings,
+
     /// Optional pin for the system-wide TOTP (2FA) enforcement policy (#2805).
     ///
     /// When set, this value overrides the `security.totp_policy` row in
@@ -699,9 +1189,28 @@ pub struct Config {
     /// networks (e.g. restrict via firewall or Kubernetes NetworkPolicy).
     pub metrics_port: Option<u16>,
 
-    /// Maximum number of connections in the PostgreSQL pool.
-    /// Defaults to 20. Increase for higher concurrency, decrease for
+    /// IP address the gRPC listener (`GRPC_PORT`) binds (#2161). Env
+    /// `GRPC_BIND_IP`, default `0.0.0.0` (every interface). Set `127.0.0.1`
+    /// (or `::1`) to keep the listener off the network, e.g. behind a
+    /// service-mesh sidecar. An invalid value fails startup.
+    pub grpc_bind_ip: std::net::IpAddr,
+
+    /// IP address the unauthenticated metrics listener ([`Self::metrics_port`])
+    /// binds (#2161). Env `METRICS_BIND_IP`, default `0.0.0.0`. An invalid
+    /// value fails startup.
+    pub metrics_bind_ip: std::net::IpAddr,
+
+    /// Maximum number of connections in the PostgreSQL pool, per replica.
+    /// Defaults to 50. Increase for higher concurrency, decrease for
     /// databases with restricted connection budgets (e.g., shared RDS).
+    ///
+    /// Size the whole fleet, not one replica (#4549):
+    /// `DATABASE_MAX_CONNECTIONS × replicas` + the single-flight lock/wait
+    /// connections held outside the pool (capped per replica by
+    /// `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`) + headroom for one
+    /// rolling-update surge replica must stay below Postgres
+    /// `max_connections`. The defaults give 3 × 50 = 150 against a stock
+    /// server's 100; see the Database section of `.env.example`.
     pub database_max_connections: u32,
 
     /// Minimum number of idle connections kept in the PostgreSQL pool.
@@ -747,13 +1256,62 @@ pub struct Config {
     /// uploads and downloads turns a duration cap into an effective size cap —
     /// a ~90 MB upload over a slow link was aborted mid-body and the client saw
     /// only a connection reset. See `api::routes::is_byte_transfer_path` for the
-    /// exact route set; their size is still bounded by `MAX_UPLOAD_SIZE` and
-    /// their concurrency by `GLOBAL_MAX_CONCURRENCY`.
+    /// exact route set; their size is still bounded by `MAX_UPLOAD_SIZE`, their
+    /// concurrency by `GLOBAL_MAX_CONCURRENCY` and
+    /// `UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL`, and a stalled upload body by
+    /// `UPLOAD_PROGRESS_WINDOW_SECS` (GHSA-9f9r-c4w8-rjv9).
     ///
     /// This value therefore only has to exceed the slowest legitimate
     /// *non-transfer* request. Env var: `GLOBAL_REQUEST_TIMEOUT_SECS`.
     /// Default 120. Set to 0 to disable the layer.
     pub global_request_timeout_secs: u64,
+    /// How long a request waits for its proxy file scan to get a permit (#5231).
+    /// Env var: `AK_PROXY_SCAN_QUEUE_WAIT_SECS`. Default 60, least 1.
+    pub proxy_scan_queue_wait_secs: u64,
+
+    /// How long, in seconds, an HTTP/1 connection may take to deliver a
+    /// complete request head (request line plus headers) on the API and
+    /// metrics listeners (#4665). A client that connects and trickles header
+    /// bytes is disconnected when it expires, and
+    /// `ak_http_header_read_timeouts_total` is incremented, instead of
+    /// holding a socket open for as long as it likes. The clock restarts for
+    /// each request on a keep-alive connection, so an idle keep-alive
+    /// connection is closed after the same interval. HTTP/2 connections are
+    /// unaffected. Env var: `HTTP_HEADER_READ_TIMEOUT_SECS`. Default 10. Set
+    /// to 0 to disable the timeout.
+    pub http_header_read_timeout_secs: u64,
+
+    /// Accept-queue length requested for the API listener (#4647): how many
+    /// completed TCP handshakes the kernel holds while the process has not
+    /// yet accepted them. When it is full, Linux drops further SYNs, so a
+    /// client's connect stalls and retries instead of reaching the HTTP
+    /// load-shed that would answer 503 + `Retry-After`. Linux caps the value
+    /// at `net.core.somaxconn`. Env var: `HTTP_LISTEN_BACKLOG`. Default 0,
+    /// which keeps the OS maximum (`somaxconn` on Linux), the value the
+    /// listener has always used.
+    pub http_listen_backlog: u32,
+
+    /// Progress window, in seconds, for artifact upload bodies on the
+    /// byte-transfer routes that `global_request_timeout_secs` exempts
+    /// (GHSA-9f9r-c4w8-rjv9). An upload body that delivers fewer than
+    /// `upload_min_progress_bytes` during one window spent waiting for data is
+    /// aborted with 408, so a stalled or trickling client cannot hold a global
+    /// request permit indefinitely. Env var: `UPLOAD_PROGRESS_WINDOW_SECS`.
+    /// Default 60. Set to 0 to disable the deadline.
+    pub upload_progress_window_secs: u64,
+
+    /// Bytes an upload body must deliver per `upload_progress_window_secs`.
+    /// The default (16 KiB per 60 s, about 270 B/s) is far below any real
+    /// link. Env var: `UPLOAD_MIN_PROGRESS_BYTES`. Default 16384.
+    pub upload_min_progress_bytes: u64,
+
+    /// Concurrent artifact uploads one principal (an authenticated user, or a
+    /// client address for an anonymous caller) may have in flight on the
+    /// byte-transfer routes; further ones get 429 with `Retry-After`, so one
+    /// credential cannot hold the whole `global_max_concurrency` pool
+    /// (GHSA-9f9r-c4w8-rjv9). Env var: `UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL`.
+    /// Default 64. Set to 0 to disable the cap.
+    pub upload_max_in_flight_per_principal: usize,
 
     /// Idle timeout in seconds. Connections idle longer than this will be
     /// closed. Defaults to 600 (10 minutes).
@@ -765,6 +1323,15 @@ pub struct Config {
     /// lifetime policy or when running behind a TCP load balancer with an
     /// idle disconnect.
     pub database_max_lifetime_secs: u64,
+
+    /// Arm server-side TCP keepalives (15 s idle, 5 s interval, 3 probes) on
+    /// every new pool connection with an `after_connect` `set_config` query
+    /// (#4549), so Postgres reaps a force-killed pod's sessions in about 30 s.
+    /// Defaults to `true`; `DATABASE_TCP_KEEPALIVES=false` (or `0`) skips the
+    /// hook. A failure of that query is logged once and never fails the
+    /// connection; a pooler in transaction mode may not carry the setting to
+    /// the server session that ends up serving a query.
+    pub database_tcp_keepalives: bool,
 
     /// Master on/off switch for HTTP rate limiting. When `false`, none of
     /// the per-IP / per-user rate-limit middleware layers are installed, so
@@ -882,6 +1449,24 @@ pub struct Config {
     /// Example (single reverse proxy on loopback): `127.0.0.0/8`.
     pub rate_limit_trusted_proxy_cidrs: Vec<crate::api::middleware::rate_limit::CidrRange>,
 
+    /// When true, `X-Forwarded-For`-derived client IPs (resolved under the
+    /// `rate_limit_trusted_proxy_cidrs` policy) may feed authorization —
+    /// the permission `allowed_cidrs` conditions (#1849) — and auth-audit
+    /// IP attribution. When false (the default, fail closed), those
+    /// consumers treat the client IP as unknown whenever the request
+    /// arrived through a trusted proxy: a proxy that does NOT append the
+    /// downstream peer it observed leaves the XFF chain wholly attacker-
+    /// controlled, and no static configuration can detect that at request
+    /// time.
+    ///
+    /// Enable ONLY behind proxies confirmed to APPEND `X-Forwarded-For`
+    /// (Caddy and ingress-nginx do; Envoy Gateway passes inbound XFF
+    /// through unsanitized). Rate-limit keying is unaffected by this flag
+    /// and keeps the existing resolution either way.
+    ///
+    /// Env var: `XFF_TRUSTED_FOR_AUTHZ`. Default: false.
+    pub xff_trusted_for_authz: bool,
+
     /// Number of consecutive failed login attempts before a local account is
     /// locked. Set to 0 to disable account lockout. Default: 5.
     pub account_lockout_threshold: u32,
@@ -952,6 +1537,28 @@ pub struct Config {
     /// `presigned_downloads_enabled` is true. Default: 300 (5 minutes).
     pub presigned_download_expiry_secs: u64,
 
+    /// Verify a stored artifact's bytes against its recorded SHA-256 while
+    /// downloads stream them (#3919, #4323; the generic route, virtual-member
+    /// serves, the shared hosted fetch and Incus image downloads). An
+    /// object up to `storage::verify::VERIFY_BEFORE_HEADERS_MAX_BYTES` is
+    /// checked before the response starts (a mismatch is a 502); a larger one
+    /// is hashed incrementally (one chunk held back) and aborted before its
+    /// final bytes on a mismatch. Paths without a `Config` at hand read the
+    /// same variable through `storage::verify::serve_verification_enabled`.
+    /// Default: true. Set `DOWNLOAD_VERIFY_CHECKSUMS=false` to skip the
+    /// per-download hash (integrity is then the client's responsibility).
+    pub download_verify_checksums: bool,
+
+    /// Interval between scheduled storage scrub passes (#3910), in seconds.
+    /// `0` (default) disables the scheduled scrub; the admin endpoint
+    /// `POST /api/v1/admin/storage-scrub` works either way. Each pass is
+    /// report-only and bounded by the two budgets below.
+    pub storage_scrub_interval_secs: u64,
+    /// Objects checked per scrub pass (default 500).
+    pub storage_scrub_max_objects: u64,
+    /// Bytes read per scrub pass (default 2 GiB).
+    pub storage_scrub_max_bytes: u64,
+
     // -- Proxy pull-through cache cross-replica single-flight (#1609) --
     /// Enable the cross-replica single-flight coordinator for pull-through cache
     /// fills: a PostgreSQL advisory lock keyed on the cache key so exactly ONE
@@ -960,17 +1567,55 @@ pub struct Config {
     /// `.sha1`, #1606). Opt-in HA feature (like `presigned_downloads_enabled`):
     /// default `false` keeps the unchanged per-process single-flight for
     /// single-replica installs. Multi-replica deployments should set
-    /// `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`.
+    /// `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`. A held lock connection is
+    /// detached, so it sits outside the pool; `PROXY_SINGLEFLIGHT_LOCK_MAX_CONNECTIONS`
+    /// caps how many exist at once (default `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS` + 1).
     pub proxy_singleflight_advisory_locks_enabled: bool,
 
-    /// Follower poll cadence (milliseconds) while the cluster leader fetches,
-    /// when `proxy_singleflight_advisory_locks_enabled` is true. Default: 200.
+    /// Follower poll cadence (milliseconds) for the BUFFERED proxy path while
+    /// the cluster leader fetches, when `proxy_singleflight_advisory_locks_enabled`
+    /// is true. The streaming path does not poll (it blocks on the lock, see
+    /// below). Default: 200.
     pub proxy_singleflight_lock_poll_interval_ms: u64,
 
     /// Upper bound (seconds) a follower waits for the leader's commit before
     /// falling back to its own bounded fetch, when advisory locks are enabled.
-    /// Default: 65.
+    /// On the streaming path (#4013) only one request per replica waits: that
+    /// replica's in-process leader blocks on the advisory lock with this as its
+    /// `lock_timeout`, and the cluster leader releases the lock after its cache
+    /// publish, so the waiter wakes exactly when the object is readable and
+    /// serves it (and its local followers) from cache. If the leader is still
+    /// filling at the deadline the waiter fetches once for its replica, so a
+    /// cold object costs 1 upstream fetch, or at most one per replica when the
+    /// fill outlives this. Each waiting replica holds one database connection
+    /// per cold key while it waits (the server drops a waiter whose client went
+    /// away within about a second, PG 14+). Keep it BELOW the ingress / load
+    /// balancer read timeout (nginx-ingress: 60 s): a client cut off first
+    /// retries into a fresh wait, so the per-replica fallback never fires.
+    /// Default: 65. Concurrent waits per replica are capped by
+    /// `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS` (default 32, read by
+    /// `HydrationCoordinator::from_env`); past the cap a replica fetches at once.
     pub proxy_singleflight_lock_wait_timeout_secs: u64,
+
+    // -- stale-if-error response marking (#4581) --
+    /// Instance-wide default for the RFC 5861 `stale-if-error` grace window,
+    /// in seconds: how long a cached body past its freshness TTL may still be
+    /// served when the upstream is unreachable (5xx / timeout / transport).
+    /// A repository may override it with
+    /// `PUT /api/v1/repositories/{key}/stale-if-error-grace`; this value is
+    /// used when no per-repository override is stored. Responses served under
+    /// the grace are marked with `Warning: 110 - "Response is stale"` and
+    /// `X-AK-Stale-Since` so clients and caches can tell a stale body from a
+    /// fresh one. Clamped to `[0, STALE_IF_ERROR_GRACE_MAX_SECS]`; `0` disables
+    /// serving stale bodies. Env `PROXY_STALE_IF_ERROR_GRACE_SECS`, default
+    /// 3600.
+    pub proxy_stale_if_error_grace_secs: i64,
+
+    // -- upstream contact audit (#5286) --
+    /// Which upstream requests the proxy records as `UPSTREAM_FETCHED` audit
+    /// rows. Env `AUDIT_UPSTREAM_FETCHES`, default `off`; see
+    /// [`UpstreamFetchAuditMode`].
+    pub audit_upstream_fetches: UpstreamFetchAuditMode,
 
     // -- OCI virtual-resolution negative cache (#1424) --
     /// Freshness window in milliseconds for negative OCI virtual-resolution
@@ -1016,8 +1661,25 @@ pub struct Config {
     /// Sender address used in the From header (default: "noreply@artifact-keeper.local").
     pub smtp_from_address: String,
 
-    /// TLS mode for the SMTP connection: "starttls" (default), "tls", or "none".
+    /// TLS mode for the SMTP connection: "starttls" (default, STARTTLS
+    /// required), "starttls-opportunistic" (STARTTLS when the server offers
+    /// it, plaintext otherwise), "tls" (implicit TLS), or "none".
     pub smtp_tls_mode: String,
+
+    /// Extra CA certificate(s) trusted for the SMTP server's TLS certificate,
+    /// added to the system trust store. Either a path to a PEM file or the
+    /// PEM text itself. `SMTP_TLS_CA_CERT` wins; when it is unset the shared
+    /// `CUSTOM_CA_CERT_PATH` (also used by the outbound HTTP clients) applies.
+    pub smtp_tls_ca_cert: Option<String>,
+
+    /// Where `smtp_tls_ca_cert` came from: `SMTP_TLS_CA_CERT` or
+    /// `CUSTOM_CA_CERT_PATH`. Used for log and error messages only.
+    pub smtp_tls_ca_cert_source: Option<&'static str>,
+
+    /// Skip verification of the SMTP server's certificate and hostname
+    /// (`SMTP_TLS_SKIP_VERIFY`, default false). Testing only: it lets anyone
+    /// on the path read the SMTP credentials.
+    pub smtp_tls_skip_verify: bool,
 
     // -- npm computed-packument cache (#2162) --
     /// Whether the npm computed-packument response cache (with
@@ -1095,6 +1757,12 @@ pub struct Config {
     /// Endpoint of the npm replication feed. Env `NPM_UPSTREAM_FEED_URL`,
     /// default `https://replicate.npmjs.com/_changes`.
     pub npm_upstream_feed_url: String,
+
+    /// Pause every scheduled job that contacts an upstream on its own
+    /// (#5288; see `services::upstream_pause`). Env `UPSTREAM_JOBS_PAUSED`,
+    /// default `false`. `true` pins the switch on; otherwise the
+    /// `upstream_jobs_paused` runtime setting decides.
+    pub upstream_jobs_paused: bool,
 }
 
 redacted_debug!(Config {
@@ -1132,13 +1800,20 @@ redacted_debug!(Config {
     show scan_workspace_path,
     show demo_mode,
     show guest_access_enabled,
+    show guest_access_env_pinned,
     show expose_detailed_health,
+    show readyz_require_search,
     show setup_password_hint,
     show grpc_reflection_enabled,
     show swagger_enabled,
+    show plugins_enabled,
+    show terraform_default_repo,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
     show conda_attestation_require_verified,
+    show conda_attestation_issuers,
+    show conda_attestation_identities,
+    show conda_attestation_public_keys,
     show peer_instance_name,
     show peer_public_endpoint,
     redact peer_api_key,
@@ -1146,11 +1821,13 @@ redacted_debug!(Config {
     show dependency_track_enabled,
     show otel_exporter_otlp_endpoint,
     show otel_service_name,
+    show gc_trash_retention_days,
     show gc_schedule,
     show storage_stats_schedule,
     show blob_gc_enabled,
     show maven_flat_gc_enabled,
     show blob_gc_sweep_grace_secs,
+    show blob_gc_min_age_secs,
     show lifecycle_check_interval_secs,
     show stuck_scan_threshold_secs,
     show stuck_scan_check_interval_secs,
@@ -1159,17 +1836,28 @@ redacted_debug!(Config {
     show allow_local_admin_login,
     show sso_disable_admin_break_glass,
     show oidc_silent_sso_enabled,
+    show device_auth,
+    show proxy_upstream,
     show totp_policy,
     show api_token_expiry_policy,
     show metrics_port,
+    show grpc_bind_ip,
+    show metrics_bind_ip,
     show database_max_connections,
     show database_min_connections,
     show database_acquire_timeout_secs,
     show database_idle_timeout_secs,
     show database_max_lifetime_secs,
+    show database_tcp_keepalives,
     show auth_max_concurrency,
     show global_max_concurrency,
     show global_request_timeout_secs,
+    show proxy_scan_queue_wait_secs,
+    show http_header_read_timeout_secs,
+    show http_listen_backlog,
+    show upload_progress_window_secs,
+    show upload_min_progress_bytes,
+    show upload_max_in_flight_per_principal,
     show rate_limit_enabled,
     show rate_limit_auth_per_window,
     show rate_limit_api_per_window,
@@ -1201,9 +1889,15 @@ redacted_debug!(Config {
     show password_min_strength,
     show presigned_downloads_enabled,
     show presigned_download_expiry_secs,
+    show download_verify_checksums,
+    show storage_scrub_interval_secs,
+    show storage_scrub_max_objects,
+    show storage_scrub_max_bytes,
     show proxy_singleflight_advisory_locks_enabled,
     show proxy_singleflight_lock_poll_interval_ms,
     show proxy_singleflight_lock_wait_timeout_secs,
+    show proxy_stale_if_error_grace_secs,
+    show audit_upstream_fetches,
     show oci_virtual_negative_cache_ttl_ms,
     show oci_virtual_negative_cache_max_entries,
     show npm_virtual_negative_cache_ttl_ms,
@@ -1214,6 +1908,8 @@ redacted_debug!(Config {
     redact_option smtp_password,
     show smtp_from_address,
     show smtp_tls_mode,
+    show smtp_tls_ca_cert_source,
+    show smtp_tls_skip_verify,
     show npm_packument_cache_enabled,
     show npm_packument_cache_fresh_ttl_secs,
     show npm_packument_cache_stale_max_secs,
@@ -1224,6 +1920,7 @@ redacted_debug!(Config {
     show pypi_simple_cache_max_bytes,
     show npm_upstream_feed_enabled,
     redact npm_upstream_feed_url,
+    show upstream_jobs_paused,
 });
 
 impl Default for Config {
@@ -1243,6 +1940,9 @@ impl Default for Config {
             jwt_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
             signature_expiry_seconds:
                 crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
+            signing_key_rotation_overlap_secs:
+                crate::services::signing_service::DEFAULT_ROTATION_OVERLAP_SECONDS,
+            signing_auto_migrate_legacy_keys: false,
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,
             jwt_refresh_token_expiry_days: 7,
@@ -1265,25 +1965,35 @@ impl Default for Config {
             scan_workspace_path: "/tmp/scan-workspace".into(),
             demo_mode: false,
             guest_access_enabled: true,
+            guest_access_env_pinned: false,
             expose_detailed_health: false,
+            readyz_require_search: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,
             swagger_enabled: false,
+            plugins_enabled: true,
+            terraform_default_repo: None,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             conda_attestation_require_verified: true,
+            conda_attestation_issuers: Vec::new(),
+            conda_attestation_identities: Vec::new(),
+            conda_attestation_public_keys: Vec::new(),
             peer_instance_name: "test-instance".into(),
             peer_public_endpoint: "http://localhost:8080".into(),
             peer_api_key: "test-peer-api-key".into(),
+
             dependency_track_url: None,
             dependency_track_enabled: false,
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "artifact-keeper".into(),
+            gc_trash_retention_days: 0,
             gc_schedule: "0 0 * * * *".into(),
             storage_stats_schedule: "0 0 */4 * * *".into(),
             blob_gc_enabled: false,
             maven_flat_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
+            blob_gc_min_age_secs: crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
@@ -1292,17 +2002,28 @@ impl Default for Config {
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
+            device_auth: DeviceAuthConfig::default(),
+            proxy_upstream: ProxyUpstreamSettings::default(),
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
+            grpc_bind_ip: DEFAULT_LISTENER_BIND_IP,
+            metrics_bind_ip: DEFAULT_LISTENER_BIND_IP,
             database_max_connections: 50,
             database_min_connections: 5,
             database_acquire_timeout_secs: 5,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
+            database_tcp_keepalives: true,
             auth_max_concurrency: default_auth_max_concurrency(),
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
+            proxy_scan_queue_wait_secs: 60,
+            http_header_read_timeout_secs: DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS,
+            http_listen_backlog: 0,
+            upload_progress_window_secs: 60,
+            upload_min_progress_bytes: 16 * 1024,
+            upload_max_in_flight_per_principal: 64,
             rate_limit_enabled: true,
             rate_limit_auth_per_window: 120,
             rate_limit_api_per_window: 10000,
@@ -1320,6 +2041,7 @@ impl Default for Config {
             rate_limit_exempt_service_accounts: false,
             rate_limit_trusted_cidrs: Vec::new(),
             rate_limit_trusted_proxy_cidrs: Vec::new(),
+            xff_trusted_for_authz: false,
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
             quarantine_enabled: false,
@@ -1337,9 +2059,16 @@ impl Default for Config {
             password_min_strength: 0,
             presigned_downloads_enabled: false,
             presigned_download_expiry_secs: 300,
+            download_verify_checksums: true,
+            storage_scrub_interval_secs: 0,
+            storage_scrub_max_objects: 500,
+            storage_scrub_max_bytes: 2 << 30,
             proxy_singleflight_advisory_locks_enabled: false,
             proxy_singleflight_lock_poll_interval_ms: 200,
             proxy_singleflight_lock_wait_timeout_secs: 65,
+            proxy_stale_if_error_grace_secs:
+                crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+            audit_upstream_fetches: UpstreamFetchAuditMode::Off,
             oci_virtual_negative_cache_ttl_ms: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             oci_virtual_negative_cache_max_entries: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             npm_virtual_negative_cache_ttl_ms: DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
@@ -1350,6 +2079,9 @@ impl Default for Config {
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".into(),
             smtp_tls_mode: "starttls".into(),
+            smtp_tls_ca_cert: None,
+            smtp_tls_ca_cert_source: None,
+            smtp_tls_skip_verify: false,
             npm_packument_cache_enabled: true,
             npm_packument_cache_fresh_ttl_secs:
                 crate::services::npm_packument_cache::NPM_PACKUMENT_FRESH_TTL_DEFAULT_SECS,
@@ -1366,11 +2098,25 @@ impl Default for Config {
             npm_upstream_feed_enabled: false,
             npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
                 .into(),
+            upstream_jobs_paused: false,
         }
     }
 }
 
 impl Config {
+    /// The HTTP/1 header-read timeout to hand the server (#4665); `None`
+    /// when `HTTP_HEADER_READ_TIMEOUT_SECS=0` turned it off.
+    pub fn http_header_read_timeout(&self) -> Option<std::time::Duration> {
+        (self.http_header_read_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.http_header_read_timeout_secs))
+    }
+
+    /// The explicit API-listener backlog, or `None` for the OS maximum
+    /// (`HTTP_LISTEN_BACKLOG` unset or 0, #4647).
+    pub fn http_listen_backlog(&self) -> Option<u32> {
+        (self.http_listen_backlog > 0).then_some(self.http_listen_backlog)
+    }
+
     /// Return a `Config` with sensible defaults for unit tests. Equivalent to
     /// `Config::default()` today, but kept as a named constructor so tests read
     /// clearly and any future test-specific tweaks live in one place.
@@ -1381,9 +2127,15 @@ impl Config {
 
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self> {
+        let guest_access_pin = crate::services::guest_access_policy::parse_env_pin(
+            env::var(crate::services::guest_access_policy::GUEST_ACCESS_ENV_VAR)
+                .ok()
+                .as_deref(),
+        );
         let config = Self {
-            database_url: env::var("DATABASE_URL")
-                .map_err(|_| AppError::Config("DATABASE_URL not set".into()))?,
+            database_url: secret_or_env("DATABASE_URL")
+                .map_err(AppError::Config)?
+                .ok_or_else(|| AppError::Config("DATABASE_URL not set".into()))?,
             bind_address: env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".into()),
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
             environment: env::var("ENVIRONMENT").unwrap_or_else(|_| "development".into()),
@@ -1400,18 +2152,27 @@ impl Config {
             gcs_bucket: env::var("GCS_BUCKET").ok(),
             s3_region: env::var("S3_REGION").ok(),
             s3_endpoint: env::var("S3_ENDPOINT").ok(),
-            jwt_secret: env::var("JWT_SECRET")
-                .map_err(|_| AppError::Config("JWT_SECRET not set".into()))?,
+            jwt_secret: secret_or_env("JWT_SECRET")
+                .map_err(AppError::Config)?
+                .ok_or_else(|| AppError::Config("JWT_SECRET not set".into()))?,
             signature_expiry_seconds: env_parse(
                 "SIGNATURE_EXPIRY_SECONDS",
                 crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
+            ),
+            signing_key_rotation_overlap_secs: env_parse(
+                "SIGNING_KEY_ROTATION_OVERLAP_SECS",
+                crate::services::signing_service::DEFAULT_ROTATION_OVERLAP_SECONDS,
+            ),
+            signing_auto_migrate_legacy_keys: parse_opt_in_flag(
+                env::var("SIGNING_AUTO_MIGRATE_LEGACY_KEYS").ok().as_deref(),
             ),
             jwt_expiration_secs: env_parse("JWT_EXPIRATION_SECS", 86400),
             jwt_access_token_expiry_minutes: env_parse("JWT_ACCESS_TOKEN_EXPIRY_MINUTES", 30),
             jwt_refresh_token_expiry_days: env_parse("JWT_REFRESH_TOKEN_EXPIRY_DAYS", 7),
             oidc_issuer: env::var("OIDC_ISSUER").ok(),
             oidc_client_id: env::var("OIDC_CLIENT_ID").ok(),
-            oidc_client_secret: env::var("OIDC_CLIENT_SECRET").ok(),
+            oidc_client_secret: secret_or_env("OIDC_CLIENT_SECRET").map_err(AppError::Config)?,
+
             ldap_url: env::var("LDAP_URL").ok(),
             ldap_base_dn: env::var("LDAP_BASE_DN").ok(),
             trivy_url: env::var("TRIVY_URL").ok(),
@@ -1429,7 +2190,8 @@ impl Config {
                 .unwrap_or_else(|_| "xccdf_org.ssgproject.content_profile_standard".into()),
             opensearch_url: env::var("OPENSEARCH_URL").ok(),
             opensearch_username: env::var("OPENSEARCH_USERNAME").ok(),
-            opensearch_password: env::var("OPENSEARCH_PASSWORD").ok(),
+            opensearch_password: secret_or_env("OPENSEARCH_PASSWORD").map_err(AppError::Config)?,
+
             opensearch_allow_invalid_certs: matches!(
                 env::var("OPENSEARCH_ALLOW_INVALID_CERTS").as_deref(),
                 Ok("true" | "1")
@@ -1445,15 +2207,22 @@ impl Config {
             demo_mode: matches!(env::var("DEMO_MODE").as_deref(), Ok("true" | "1")),
             // Default to true for zero-impact upgrades; only "false"/"0" disables guests.
             // Any other value (including unset, garbage, or empty) keeps guests enabled.
-            guest_access_enabled: !matches!(
-                env::var("AK_GUEST_ACCESS_ENABLED").as_deref(),
-                Ok("false" | "0")
-            ),
+            // One parse (#867): only `false`/`0` disable guests, as before; the
+            // four explicit spellings also pin the runtime setting.
+            guest_access_enabled: guest_access_pin.unwrap_or(true),
+            guest_access_env_pinned: guest_access_pin.is_some(),
+            storage_scrub_interval_secs: env_parse("STORAGE_SCRUB_INTERVAL_SECS", 0),
+            storage_scrub_max_objects: env_parse("STORAGE_SCRUB_MAX_OBJECTS", 500),
+            storage_scrub_max_bytes: env_parse("STORAGE_SCRUB_MAX_BYTES", 2 << 30),
             // Info-disclosure hardening (#2226): the public /health response
             // hides the git commit SHA and live db-pool internals unless an
             // operator explicitly opts in. Default OFF; only "true"/"1" enables.
             expose_detailed_health: parse_opt_in_flag(
                 env::var("EXPOSE_DETAILED_HEALTH").ok().as_deref(),
+            ),
+            // #4610: OpenSearch gates /readyz only when an operator opts in.
+            readyz_require_search: parse_opt_in_flag(
+                env::var("READYZ_REQUIRE_SEARCH").ok().as_deref(),
             ),
             // Deployment-aware first-run instruction (#2802): the default
             // setup screen text assumes Docker Compose. Operators on
@@ -1474,6 +2243,13 @@ impl Config {
             // `ENABLE_SWAGGER` is now the sole switch (`ENVIRONMENT` no
             // longer enables it).
             swagger_enabled: parse_opt_in_flag(env::var("ENABLE_SWAGGER").ok().as_deref()),
+            // Compatibility-preserving outer gate for the WASM runtime. Only
+            // an explicit negative disables plugins; unset/invalid values keep
+            // the existing behavior.
+            plugins_enabled: parse_opt_out_flag(env::var("PLUGINS_ENABLED").ok().as_deref()),
+            terraform_default_repo: parse_optional_repo_key(
+                env::var("TERRAFORM_DEFAULT_REPO").ok().as_deref(),
+            ),
             // Fail-closed supply-chain control: defaults to true so an
             // unsigned WASM plugin cannot be installed out of the box. Only an
             // explicit, recognized negative ("false"/"0", case/whitespace-
@@ -1493,18 +2269,23 @@ impl Config {
                     .ok()
                     .as_deref(),
             ),
+            conda_attestation_issuers: parse_comma_list_env("CONDA_ATTESTATION_ISSUERS"),
+            conda_attestation_identities: parse_comma_list_env("CONDA_ATTESTATION_IDENTITIES"),
+            conda_attestation_public_keys: parse_comma_list_env("CONDA_ATTESTATION_PUBLIC_KEYS"),
             peer_instance_name: env::var("PEER_INSTANCE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper-local".into()),
             peer_public_endpoint: env::var("PEER_PUBLIC_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:8080".into()),
-            peer_api_key: env::var("PEER_API_KEY").unwrap_or_else(|_| {
-                let key = format!("{:032x}", rand::random::<u128>());
-                tracing::warn!(
-                    "PEER_API_KEY not set, generated random key. \
-                     Set PEER_API_KEY in your environment for stable peer authentication."
-                );
-                key
-            }),
+            peer_api_key: secret_or_env("PEER_API_KEY")
+                .map_err(AppError::Config)?
+                .unwrap_or_else(|| {
+                    let key = format!("{:032x}", rand::random::<u128>());
+                    tracing::warn!(
+                        "PEER_API_KEY not set, generated random key. \
+                         Set PEER_API_KEY in your environment for stable peer authentication."
+                    );
+                    key
+                }),
             dependency_track_url: env::var("DEPENDENCY_TRACK_URL").ok(),
             // Single source of truth for "DT is wired in". Defaults to false
             // when unset, so DT integration must be explicitly opted into.
@@ -1516,9 +2297,18 @@ impl Config {
                     v == "true" || v == "1"
                 })
                 .unwrap_or(false),
-            otel_exporter_otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
+            // An empty or blank value counts as unset, as in
+            // `telemetry::init_tracing` (#4931).
+            otel_exporter_otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             otel_service_name: env::var("OTEL_SERVICE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper".into()),
+            gc_trash_retention_days:
+                crate::services::storage_gc_service::clamp_trash_retention_days(env_parse(
+                    "GC_TRASH_RETENTION_DAYS",
+                    0u32,
+                )),
             gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
             storage_stats_schedule: env::var("STORAGE_STATS_SCHEDULE")
                 .unwrap_or_else(|_| "0 0 */4 * * *".into()),
@@ -1539,6 +2329,10 @@ impl Config {
             // sweep forever; `0` is allowed (sweep on the next pass).
             blob_gc_sweep_grace_secs: env_parse("BLOB_GC_SWEEP_GRACE_SECS", 3600u64)
                 .min(7 * 24 * 60 * 60),
+            blob_gc_min_age_secs: resolve_blob_gc_min_age_secs(env_parse(
+                "BLOB_GC_MIN_AGE_SECS",
+                crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
+            )),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
             stuck_scan_threshold_secs: clamp_stuck_scan_threshold(env_parse(
                 "STUCK_SCAN_THRESHOLD_SECS",
@@ -1569,6 +2363,8 @@ impl Config {
                 env::var("OIDC_SILENT_SSO").as_deref(),
                 Ok("false" | "0")
             ),
+            device_auth: DeviceAuthConfig::from_env(),
+            proxy_upstream: ProxyUpstreamSettings::from_env(),
             totp_policy: parse_totp_policy_env(
                 env::var(crate::services::totp_policy::TOTP_POLICY_ENV_VAR)
                     .ok()
@@ -1598,14 +2394,37 @@ impl Config {
                 },
                 Err(_) => None,
             },
+            grpc_bind_ip: parse_bind_ip("GRPC_BIND_IP", env::var("GRPC_BIND_IP").ok().as_deref())?,
+            metrics_bind_ip: parse_bind_ip(
+                "METRICS_BIND_IP",
+                env::var("METRICS_BIND_IP").ok().as_deref(),
+            )?,
             database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 50),
             database_min_connections: env_parse("DATABASE_MIN_CONNECTIONS", 5),
             database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 5),
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
+            database_tcp_keepalives: !matches!(
+                env::var("DATABASE_TCP_KEEPALIVES")
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .as_deref(),
+                Ok("false" | "0" | "no" | "off")
+            ),
             auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
             global_max_concurrency: env_parse("GLOBAL_MAX_CONCURRENCY", 512_usize),
             global_request_timeout_secs: env_parse("GLOBAL_REQUEST_TIMEOUT_SECS", 120_u64),
+            proxy_scan_queue_wait_secs: env_parse("AK_PROXY_SCAN_QUEUE_WAIT_SECS", 60_u64),
+            http_header_read_timeout_secs: env_parse(
+                "HTTP_HEADER_READ_TIMEOUT_SECS",
+                DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS,
+            ),
+            http_listen_backlog: env_parse("HTTP_LISTEN_BACKLOG", 0_u32),
+            upload_progress_window_secs: env_parse("UPLOAD_PROGRESS_WINDOW_SECS", 60_u64),
+            upload_min_progress_bytes: env_parse("UPLOAD_MIN_PROGRESS_BYTES", 16_384_u64),
+            upload_max_in_flight_per_principal: env_parse(
+                "UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL",
+                64_usize,
+            ),
             rate_limit_enabled: parse_opt_out_flag(env::var("RATE_LIMIT_ENABLED").ok().as_deref()),
             rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
             rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
@@ -1649,6 +2468,10 @@ impl Config {
             ),
             rate_limit_trusted_cidrs: parse_cidr_list_env("RATE_LIMIT_TRUSTED_CIDRS"),
             rate_limit_trusted_proxy_cidrs: parse_cidr_list_env("RATE_LIMIT_TRUSTED_PROXY_CIDRS"),
+            xff_trusted_for_authz: matches!(
+                env::var("XFF_TRUSTED_FOR_AUTHZ").as_deref(),
+                Ok("true" | "1")
+            ),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
             quarantine_enabled: matches!(
@@ -1701,6 +2524,10 @@ impl Config {
                 Ok("true" | "1")
             ),
             presigned_download_expiry_secs: env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300),
+            download_verify_checksums: !matches!(
+                env::var("DOWNLOAD_VERIFY_CHECKSUMS").as_deref(),
+                Ok("false" | "0")
+            ),
             proxy_singleflight_advisory_locks_enabled: matches!(
                 env::var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED").as_deref(),
                 Ok("true" | "1")
@@ -1712,6 +2539,23 @@ impl Config {
             proxy_singleflight_lock_wait_timeout_secs: env_parse(
                 "PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS",
                 65,
+            ),
+            // Instance-wide default for the stale-if-error grace window (#4581).
+            // Clamped to the documented `[0, MAX]` range so a negative or
+            // absurd value can neither disable the bound silently by underflow
+            // nor pin stale content forever. A repository may still override it
+            // downward (including to 0) with the per-repository endpoint.
+            proxy_stale_if_error_grace_secs: env_parse(
+                "PROXY_STALE_IF_ERROR_GRACE_SECS",
+                crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+            )
+            .clamp(
+                0,
+                crate::services::cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS,
+            ),
+            audit_upstream_fetches: env_parse(
+                "AUDIT_UPSTREAM_FETCHES",
+                UpstreamFetchAuditMode::Off,
             ),
             // Clamped like the other operator knobs (cf. `blob_gc_sweep_grace_secs`
             // above) so a fat-fingered enormous value can't pin a 404 on a
@@ -1747,7 +2591,10 @@ impl Config {
             smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
             smtp_port: env_parse("SMTP_PORT", 587),
             smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
-            smtp_password: env::var("SMTP_PASSWORD").ok().filter(|s| !s.is_empty()),
+            smtp_password: secret_or_env("SMTP_PASSWORD")
+                .map_err(AppError::Config)?
+                .filter(|s| !s.is_empty()),
+
             smtp_from_address: env::var("SMTP_FROM_ADDRESS")
                 .unwrap_or_else(|_| "noreply@artifact-keeper.local".into()),
             smtp_tls_mode: {
@@ -1755,7 +2602,7 @@ impl Config {
                     .unwrap_or_else(|_| "starttls".into())
                     .to_lowercase();
                 match mode.as_str() {
-                    "starttls" | "tls" | "none" => mode,
+                    "starttls" | "starttls-opportunistic" | "tls" | "none" => mode,
                     _ => {
                         tracing::warn!(
                             value = %mode,
@@ -1765,6 +2612,14 @@ impl Config {
                     }
                 }
             },
+            smtp_tls_ca_cert: smtp_tls_ca_cert_from_env().map(|(v, _)| v),
+            smtp_tls_ca_cert_source: smtp_tls_ca_cert_from_env().map(|(_, src)| src),
+            smtp_tls_skip_verify: env::var("SMTP_TLS_SKIP_VERIFY")
+                .map(|v| {
+                    let v = v.trim().to_lowercase();
+                    v == "true" || v == "1"
+                })
+                .unwrap_or(false),
             // On by default; only an explicit, recognized negative disables
             // the npm computed-packument cache (#2162).
             npm_packument_cache_enabled: parse_opt_out_flag(
@@ -1819,6 +2674,10 @@ impl Config {
                 .unwrap_or_else(|| {
                     crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL.into()
                 }),
+            // Off by default; only an explicit `true`/`1` pauses (#5288).
+            upstream_jobs_paused: parse_opt_in_flag(
+                env::var("UPSTREAM_JOBS_PAUSED").ok().as_deref(),
+            ),
         };
 
         config.validate_jwt_secret()?;
@@ -2290,6 +3149,33 @@ mod tests {
         );
     }
 
+    /// #5288: `UPSTREAM_JOBS_PAUSED` is opt-in; only `true`/`1` pauses the
+    /// scheduled upstream jobs, so defaults are unchanged.
+    #[test]
+    fn test_config_upstream_jobs_paused_is_opt_in() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(&str, Option<String>)> =
+            ["DATABASE_URL", "JWT_SECRET", "UPSTREAM_JOBS_PAUSED"]
+                .into_iter()
+                .map(|k| (k, env::var(k).ok()))
+                .collect();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        let mut observed = Vec::new();
+        for value in [None, Some("false"), Some("yes"), Some("TRUE"), Some("1")] {
+            match value {
+                Some(v) => env::set_var("UPSTREAM_JOBS_PAUSED", v),
+                None => env::remove_var("UPSTREAM_JOBS_PAUSED"),
+            }
+            observed.push(Config::from_env().expect("config").upstream_jobs_paused);
+        }
+        for (key, value) in saved {
+            restore_env(key, value);
+        }
+        assert_eq!(observed, vec![false, false, false, true, true]);
+        assert!(!Config::default().upstream_jobs_paused);
+    }
+
     #[test]
     fn test_config_rate_limit_enabled_by_default() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -2548,6 +3434,90 @@ mod tests {
         }
     }
 
+    /// #4665: the header-read timeout defaults to 10 s, honours a custom
+    /// #4647: `HTTP_LISTEN_BACKLOG` parses to an explicit accept-queue length;
+    /// unset, 0 and garbage keep the OS maximum the listener always used.
+    #[test]
+    fn test_http_listen_backlog_parsing_4647() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved = env::var("HTTP_LISTEN_BACKLOG").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        let cases: [(Option<&str>, Option<u32>); 4] = [
+            (None, None),
+            (Some("2048"), Some(2048)),
+            (Some("0"), None),
+            (Some("lots"), None),
+        ];
+        for (raw, backlog) in cases {
+            match raw {
+                Some(v) => env::set_var("HTTP_LISTEN_BACKLOG", v),
+                None => env::remove_var("HTTP_LISTEN_BACKLOG"),
+            }
+            let config = Config::from_env().expect("config should load");
+            assert_eq!(config.http_listen_backlog(), backlog, "{raw:?}");
+        }
+        assert_eq!(Config::default().http_listen_backlog(), None);
+
+        match saved {
+            Some(v) => env::set_var("HTTP_LISTEN_BACKLOG", v),
+            None => env::remove_var("HTTP_LISTEN_BACKLOG"),
+        }
+        match saved_db {
+            Some(v) => env::set_var("DATABASE_URL", v),
+            None => env::remove_var("DATABASE_URL"),
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        }
+    }
+
+    /// value, treats 0 as "off", and falls back to the default on garbage.
+    #[test]
+    fn test_http_header_read_timeout_parsing() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved = env::var("HTTP_HEADER_READ_TIMEOUT_SECS").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        let cases: [(Option<&str>, u64, Option<std::time::Duration>); 4] = [
+            (None, 10, Some(std::time::Duration::from_secs(10))),
+            (Some("3"), 3, Some(std::time::Duration::from_secs(3))),
+            (Some("0"), 0, None),
+            (Some("ten"), 10, Some(std::time::Duration::from_secs(10))),
+        ];
+        for (raw, secs, timeout) in cases {
+            match raw {
+                Some(v) => env::set_var("HTTP_HEADER_READ_TIMEOUT_SECS", v),
+                None => env::remove_var("HTTP_HEADER_READ_TIMEOUT_SECS"),
+            }
+            let config = Config::from_env().expect("config should load");
+            assert_eq!(config.http_header_read_timeout_secs, secs, "{raw:?}");
+            assert_eq!(config.http_header_read_timeout(), timeout, "{raw:?}");
+        }
+        assert_eq!(
+            Config::default().http_header_read_timeout_secs,
+            DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS
+        );
+
+        match saved {
+            Some(v) => env::set_var("HTTP_HEADER_READ_TIMEOUT_SECS", v),
+            None => env::remove_var("HTTP_HEADER_READ_TIMEOUT_SECS"),
+        }
+        match saved_db {
+            Some(v) => env::set_var("DATABASE_URL", v),
+            None => env::remove_var("DATABASE_URL"),
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        }
+    }
+
     #[test]
     fn test_global_backstop_parses_custom_values() {
         let _lock = ENV_MUTEX.lock().unwrap();
@@ -2703,6 +3673,316 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // secret_or_env / secret_env_present (#4142)
+    // -----------------------------------------------------------------------
+
+    /// Write `contents` to a fresh temp file and hand its path to `f`.
+    fn with_secret_file(contents: &str, f: impl FnOnce(&str)) {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(&mut file.as_file(), contents.as_bytes())
+            .expect("write secret file");
+        f(file.path().to_str().expect("utf-8 temp path"));
+    }
+
+    #[test]
+    fn secret_or_env_direct_value_wins_over_file() {
+        with_secret_file("from-file", |path| {
+            env::set_var("TEST_SECRET_4142", "from-env");
+            env::set_var("TEST_SECRET_4142_FILE", path);
+            assert_eq!(
+                secret_or_env("TEST_SECRET_4142").unwrap().as_deref(),
+                Some("from-env")
+            );
+        });
+    }
+
+    #[test]
+    fn secret_or_env_falls_back_to_file_and_trims_newline() {
+        with_secret_file("s3cr3t\n", |path| {
+            env::remove_var("TEST_SECRET_4142");
+            env::set_var("TEST_SECRET_4142_FILE", path);
+            assert_eq!(
+                secret_or_env("TEST_SECRET_4142").unwrap().as_deref(),
+                Some("s3cr3t")
+            );
+        });
+    }
+
+    #[test]
+    fn secret_or_env_blank_direct_value_falls_back_to_file() {
+        with_secret_file("from-file", |path| {
+            env::set_var("TEST_SECRET_4142", "   ");
+            env::set_var("TEST_SECRET_4142_FILE", path);
+            assert_eq!(
+                secret_or_env("TEST_SECRET_4142").unwrap().as_deref(),
+                Some("from-file")
+            );
+        });
+    }
+
+    #[test]
+    fn secret_or_env_unset_returns_none() {
+        env::remove_var("TEST_SECRET_4142");
+        env::remove_var("TEST_SECRET_4142_FILE");
+        assert_eq!(secret_or_env("TEST_SECRET_4142").unwrap(), None);
+    }
+
+    #[test]
+    fn secret_or_env_empty_file_path_treated_as_unset() {
+        env::set_var("TEST_SECRET_4142", "");
+        env::set_var("TEST_SECRET_4142_FILE", "");
+        // Empty direct value with no usable file path: legacy behaviour
+        // preserved (Some("")).
+        assert_eq!(
+            secret_or_env("TEST_SECRET_4142").unwrap().as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn secret_or_env_missing_file_is_hard_error() {
+        env::remove_var("TEST_SECRET_4142");
+        env::set_var("TEST_SECRET_4142_FILE", "/nonexistent/secret-4142");
+        let err = secret_or_env("TEST_SECRET_4142").unwrap_err();
+        assert!(err.contains("TEST_SECRET_4142_FILE"));
+        assert!(err.contains("/nonexistent/secret-4142"));
+    }
+
+    #[test]
+    fn secret_or_env_empty_file_is_hard_error() {
+        with_secret_file("   \n", |path| {
+            env::remove_var("TEST_SECRET_4142");
+            env::set_var("TEST_SECRET_4142_FILE", path);
+            let err = secret_or_env("TEST_SECRET_4142").unwrap_err();
+            assert!(err.contains("TEST_SECRET_4142_FILE"));
+            assert!(err.contains("empty"));
+        });
+    }
+
+    /// #4819: the placeholder older images baked into `DATABASE_URL` must not
+    /// shadow `DATABASE_URL_FILE`; a real `DATABASE_URL` still wins over the
+    /// file (#4775 precedence), and the placeholder alone reads as unset, so
+    /// startup says "DATABASE_URL not set" instead of failing to parse it.
+    #[test]
+    fn secret_or_env_database_url_placeholder_yields_to_file_4819() {
+        let file_url = "postgresql://u:p@db:5432/from_file";
+        with_secret_file(&format!("{file_url}\n"), |path| {
+            env::set_var("DATABASE_URL", LEGACY_DATABASE_URL_PLACEHOLDER);
+            env::set_var("DATABASE_URL_FILE", path);
+            assert_eq!(
+                secret_or_env("DATABASE_URL").unwrap().as_deref(),
+                Some(file_url)
+            );
+
+            env::set_var("DATABASE_URL", "postgresql://u:p@db:5432/direct");
+            assert_eq!(
+                secret_or_env("DATABASE_URL").unwrap().as_deref(),
+                Some("postgresql://u:p@db:5432/direct")
+            );
+        });
+
+        env::set_var("DATABASE_URL", LEGACY_DATABASE_URL_PLACEHOLDER);
+        env::remove_var("DATABASE_URL_FILE");
+        assert_eq!(secret_or_env("DATABASE_URL").unwrap(), None);
+    }
+
+    /// The placeholder is special for `DATABASE_URL` only.
+    #[test]
+    fn secret_or_env_placeholder_is_a_plain_value_for_other_settings() {
+        with_secret_file("from-file", |path| {
+            env::set_var("TEST_SECRET_4142", LEGACY_DATABASE_URL_PLACEHOLDER);
+            env::set_var("TEST_SECRET_4142_FILE", path);
+            assert_eq!(
+                secret_or_env("TEST_SECRET_4142").unwrap().as_deref(),
+                Some(LEGACY_DATABASE_URL_PLACEHOLDER)
+            );
+        });
+    }
+
+    /// #4819: the shipped images must not bake a `DATABASE_URL` into their
+    /// environment at all; an image-level value is a direct value and would
+    /// win over `DATABASE_URL_FILE`.
+    #[test]
+    fn backend_images_do_not_bake_database_url_4819() {
+        for (name, dockerfile) in [
+            (
+                "Dockerfile.backend",
+                include_str!("../../docker/Dockerfile.backend"),
+            ),
+            (
+                "Dockerfile.backend.alpine",
+                include_str!("../../docker/Dockerfile.backend.alpine"),
+            ),
+        ] {
+            let baked = dockerfile.lines().map(str::trim_start).any(|l| {
+                !l.starts_with('#')
+                    && (l.starts_with("DATABASE_URL=") || l.starts_with("ENV DATABASE_URL"))
+            });
+            assert!(!baked, "{name} sets DATABASE_URL in the image environment");
+        }
+    }
+
+    /// #5130: the shipped backend image runs on UBI 9/glibc, whose malloc
+    /// keeps freed memory in per-thread arenas. A proxy-only mirror serving
+    /// bursts of concurrent Maven downloads grew RSS from 77 MiB to 3919 MiB,
+    /// stayed flat while idle, and was OOM-killed at its 4 GiB limit. The
+    /// image therefore builds the backend with jemalloc, whose decay returns
+    /// freed pages instead of holding every arena warm.
+    ///
+    /// Both compiling stages declare `ARG CARGO_FEATURES`, and the cook and
+    /// the build must agree or the cooked dependencies are not reused. Pin
+    /// every declaration, and pin the workflow's explicit build arg: its
+    /// value overrides the Dockerfile default, so dropping it would ship the
+    /// system allocator again while the Dockerfile still looked fixed.
+    #[test]
+    fn backend_image_builds_with_jemalloc_5130() {
+        let dockerfile = include_str!("../../docker/Dockerfile.backend");
+        let values: Vec<&str> = dockerfile
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("ARG CARGO_FEATURES="))
+            .map(|value| value.trim_matches('"'))
+            .collect();
+        assert_eq!(
+            values.len(),
+            2,
+            "docker/Dockerfile.backend must declare ARG CARGO_FEATURES in \
+             both the deps and builder stages, found {values:?}"
+        );
+        assert!(
+            values.iter().all(|features| *features == "jemalloc"),
+            "docker/Dockerfile.backend must build with jemalloc (#5130); \
+             found CARGO_FEATURES={values:?}. glibc's malloc retains freed \
+             proxy-download buffers per thread, so bursts against a Maven \
+             remote grow RSS until the container is OOM-killed and do not \
+             release it while idle. See \
+             docs/operations/backend-memory-allocator.md."
+        );
+        assert!(
+            dockerfile
+                .matches(r#"--features "$CARGO_FEATURES""#)
+                .count()
+                >= 2,
+            "docker/Dockerfile.backend declares CARGO_FEATURES but no longer \
+             passes it to both cargo invocations; the jemalloc feature would \
+             not reach the binary (#5130)"
+        );
+        // jemalloc takes its page size from the build host and refuses to
+        // start on a kernel with larger pages, so the arm64 image, built on
+        // 4 KiB-page runners, must build it for 64 KiB pages in both stages.
+        assert_eq!(
+            dockerfile
+                .matches(r#"if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi"#)
+                .count(),
+            2,
+            "docker/Dockerfile.backend must build jemalloc for 64 KiB pages on \
+             aarch64 in both the deps and builder stages, or the arm64 image \
+             aborts at startup on a 64 KiB-page kernel (#5130)"
+        );
+
+        let workflow = include_str!("../../.github/workflows/docker-publish.yml");
+        let backend_job = workflow
+            .split_once("\n  build-backend:\n")
+            .and_then(|(_, rest)| rest.split_once("\n  build-openscap:\n"))
+            .map(|(backend, _)| backend)
+            .expect("docker-publish.yml must define build-backend before build-openscap");
+        assert!(
+            backend_job.contains("CARGO_FEATURES=jemalloc"),
+            "docker-publish.yml's build-backend job must pass \
+             CARGO_FEATURES=jemalloc (#5130). Its build args override the \
+             Dockerfile default, so omitting it publishes a glibc-malloc \
+             image that retains freed proxy-download memory."
+        );
+    }
+
+    /// #5130: the published container is not the only way the backend is
+    /// deployed. The Linux binaries attached to a release are built from the
+    /// same tree and used to keep glibc's malloc, so a tarball deployment
+    /// still had the retaining allocator. Pin the release workflows too:
+    /// `release.yml` builds the assets, `publish-binaries.yml` replaces them
+    /// when a release is cut without the normal gate, and
+    /// `release-cli-caches.yml` must warm the same feature set or the tag
+    /// build compiles jemalloc cold.
+    #[test]
+    fn release_binaries_build_with_jemalloc_5130() {
+        for (name, workflow) in [
+            (
+                "release.yml",
+                include_str!("../../.github/workflows/release.yml"),
+            ),
+            (
+                "publish-binaries.yml",
+                include_str!("../../.github/workflows/publish-binaries.yml"),
+            ),
+            (
+                "release-cli-caches.yml",
+                include_str!("../../.github/workflows/release-cli-caches.yml"),
+            ),
+        ] {
+            let features: Vec<&str> = workflow
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("features:"))
+                .collect();
+            assert_eq!(
+                features
+                    .iter()
+                    .filter(|line| **line == "features: vendored-openssl,jemalloc")
+                    .count(),
+                2,
+                "{name} must build both Linux release targets with jemalloc \
+                 (#5130); found {features:?}"
+            );
+            assert_eq!(
+                features
+                    .iter()
+                    .filter(|line| **line == "features: vendored-openssl")
+                    .count(),
+                3,
+                "{name} must leave the macOS and Windows release targets on \
+                 their platform allocator (#5130); found {features:?}"
+            );
+            assert!(
+                workflow.contains("--features ${{ matrix.features }}"),
+                "{name} declares per-target features but no longer passes them \
+                 to cargo, so the Linux tarball would ship glibc malloc again \
+                 (#5130)"
+            );
+            assert!(
+                workflow.contains("JEMALLOC_SYS_WITH_LG_PAGE=16"),
+                "{name} must build the aarch64 Linux jemalloc for 64 KiB pages, \
+                 or the tarball aborts on a 64 KiB-page kernel (#5130)"
+            );
+            assert!(
+                workflow.contains("CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"),
+                "{name} must set the aarch64 C compiler for the cross-built \
+                 jemalloc (#5130)"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_env_present_checks_both_forms() {
+        env::remove_var("TEST_SECRET_4142");
+        env::remove_var("TEST_SECRET_4142_FILE");
+        assert!(!secret_env_present("TEST_SECRET_4142"));
+
+        // A blank direct value still counts as set, matching the `.is_ok()`
+        // presence checks this replaces (the store builder passes a blank
+        // secret through unchanged, so presence must not disagree with it).
+        env::set_var("TEST_SECRET_4142", "");
+        assert!(secret_env_present("TEST_SECRET_4142"));
+
+        env::remove_var("TEST_SECRET_4142");
+        env::set_var("TEST_SECRET_4142_FILE", "/nonexistent/path");
+        assert!(secret_env_present("TEST_SECRET_4142"));
+
+        // An empty file path is unset, like any other empty `_FILE`.
+        env::set_var("TEST_SECRET_4142_FILE", "");
+        assert!(!secret_env_present("TEST_SECRET_4142"));
+    }
+
+    // -----------------------------------------------------------------------
     // Config::from_env
     // -----------------------------------------------------------------------
 
@@ -2753,6 +4033,77 @@ mod tests {
         if let Some(v) = saved_jwt {
             env::set_var("JWT_SECRET", v);
         }
+    }
+
+    #[test]
+    fn test_config_from_env_secrets_from_file_4142() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_db_file = env::var("DATABASE_URL_FILE").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_jwt_file = env::var("JWT_SECRET_FILE").ok();
+        let saved_oidc = env::var("OIDC_CLIENT_SECRET").ok();
+        let saved_oidc_file = env::var("OIDC_CLIENT_SECRET_FILE").ok();
+
+        let db_file = tempfile::NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(&mut db_file.as_file(), b"postgresql://127.0.0.1:1/testdb\n")
+            .expect("write db url");
+        let jwt_file = tempfile::NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(&mut jwt_file.as_file(), STRONG_SECRET.as_bytes())
+            .expect("write jwt secret");
+        let oidc_file = tempfile::NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(&mut oidc_file.as_file(), b"oidc-secret-from-file\n")
+            .expect("write oidc secret");
+
+        env::remove_var("DATABASE_URL");
+        env::remove_var("JWT_SECRET");
+        env::remove_var("OIDC_CLIENT_SECRET");
+        env::set_var(
+            "DATABASE_URL_FILE",
+            db_file.path().to_str().expect("utf-8 path"),
+        );
+        env::set_var(
+            "JWT_SECRET_FILE",
+            jwt_file.path().to_str().expect("utf-8 path"),
+        );
+        env::set_var(
+            "OIDC_CLIENT_SECRET_FILE",
+            oidc_file.path().to_str().expect("utf-8 path"),
+        );
+
+        let config = Config::from_env().expect("Config should load secrets from _FILE vars");
+        assert_eq!(config.database_url, "postgresql://127.0.0.1:1/testdb");
+        assert_eq!(config.jwt_secret, STRONG_SECRET);
+        assert_eq!(
+            config.oidc_client_secret.as_deref(),
+            Some("oidc-secret-from-file")
+        );
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("DATABASE_URL_FILE", saved_db_file);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("JWT_SECRET_FILE", saved_jwt_file);
+        restore_env("OIDC_CLIENT_SECRET", saved_oidc);
+        restore_env("OIDC_CLIENT_SECRET_FILE", saved_oidc_file);
+    }
+
+    #[test]
+    fn test_config_from_env_unreadable_secret_file_is_hard_error_4142() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_db_file = env::var("DATABASE_URL_FILE").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+
+        env::remove_var("DATABASE_URL");
+        env::set_var("DATABASE_URL_FILE", "/nonexistent/db-secret-4142");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        let err = Config::from_env().unwrap_err().to_string();
+        assert!(err.contains("DATABASE_URL_FILE"), "got: {err}");
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("DATABASE_URL_FILE", saved_db_file);
+        restore_env("JWT_SECRET", saved_jwt);
     }
 
     #[test]
@@ -3004,6 +4355,7 @@ mod tests {
 
         let config = Config::from_env().unwrap();
         assert!(config.guest_access_enabled);
+        assert!(!config.guest_access_env_pinned, "unset never pins (#867)");
 
         if let Some(v) = saved_db {
             env::set_var("DATABASE_URL", v);
@@ -3103,6 +4455,24 @@ mod tests {
 
         env::set_var("AK_GUEST_ACCESS_ENABLED", "");
         assert!(Config::from_env().unwrap().guest_access_enabled);
+
+        // #867: only the four explicit spellings pin the runtime setting;
+        // garbage and empty leave it to the admin-managed stored value.
+        for (raw, pinned) in [
+            ("false", true),
+            ("0", true),
+            ("true", true),
+            ("1", true),
+            ("yes", false),
+            ("", false),
+        ] {
+            env::set_var("AK_GUEST_ACCESS_ENABLED", raw);
+            assert_eq!(
+                Config::from_env().unwrap().guest_access_env_pinned,
+                pinned,
+                "{raw:?}"
+            );
+        }
 
         if let Some(v) = saved_db {
             env::set_var("DATABASE_URL", v);
@@ -3256,6 +4626,45 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_optional_repo_key() {
+        assert_eq!(parse_optional_repo_key(None), None);
+        assert_eq!(parse_optional_repo_key(Some("")), None);
+        assert_eq!(parse_optional_repo_key(Some("  \t ")), None);
+        assert_eq!(
+            parse_optional_repo_key(Some("  tf-hosted ")),
+            Some("tf-hosted".to_string())
+        );
+    }
+
+    #[test]
+    fn test_config_terraform_default_repo_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_repo = env::var("TERRAFORM_DEFAULT_REPO").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::remove_var("TERRAFORM_DEFAULT_REPO");
+        assert_eq!(Config::from_env().unwrap().terraform_default_repo, None);
+        env::set_var("TERRAFORM_DEFAULT_REPO", "   ");
+        assert_eq!(Config::from_env().unwrap().terraform_default_repo, None);
+        env::set_var("TERRAFORM_DEFAULT_REPO", " tf-hosted ");
+        assert_eq!(
+            Config::from_env()
+                .unwrap()
+                .terraform_default_repo
+                .as_deref(),
+            Some("tf-hosted")
+        );
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("TERRAFORM_DEFAULT_REPO", saved_repo);
+    }
+
+    #[test]
     fn test_config_swagger_enabled_explicit_values() {
         // Only "true"/"1" enable Swagger; everything else — including the
         // bare `ENABLE_SWAGGER=false` that the old presence-only check
@@ -3294,6 +4703,48 @@ mod tests {
         assert!(!config.expose_detailed_health);
         assert!(!config.grpc_reflection_enabled);
         assert!(!config.swagger_enabled);
+    }
+
+    #[test]
+    fn test_config_plugins_enabled_default_true() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("PLUGINS_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("PLUGINS_ENABLED");
+
+        assert!(Config::from_env().unwrap().plugins_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("PLUGINS_ENABLED", saved_flag);
+    }
+
+    #[test]
+    fn test_config_plugins_enabled_explicit_values() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("PLUGINS_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        for value in ["false", "FALSE", "  false  ", "0"] {
+            env::set_var("PLUGINS_ENABLED", value);
+            assert!(!Config::from_env().unwrap().plugins_enabled);
+        }
+        for value in ["true", "1", "garbage", ""] {
+            env::set_var("PLUGINS_ENABLED", value);
+            assert!(Config::from_env().unwrap().plugins_enabled);
+        }
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("PLUGINS_ENABLED", saved_flag);
     }
 
     #[test]
@@ -3577,6 +5028,110 @@ mod tests {
         restore_env("DATABASE_URL", saved_db);
         restore_env("JWT_SECRET", saved_jwt);
         restore_env("OIDC_SILENT_SSO", saved_flag);
+    }
+
+    #[test]
+    fn test_device_auth_config_defaults_off_and_clamps() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        const KEYS: &[&str] = &[
+            "DEVICE_AUTH_ENABLED",
+            "DEVICE_AUTH_CODE_TTL_SECS",
+            "DEVICE_AUTH_POLL_INTERVAL_SECS",
+            "DEVICE_AUTH_CODE_REQUESTS_PER_WINDOW",
+            "DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_USER",
+            "DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_IP",
+            "DEVICE_AUTH_FAILED_ATTEMPT_WINDOW_SECS",
+        ];
+        let saved: Vec<Option<String>> = KEYS.iter().map(|k| env::var(k).ok()).collect();
+
+        // Unset: the grant is off and every knob has its documented default.
+        for key in KEYS {
+            env::remove_var(key);
+        }
+        assert_eq!(DeviceAuthConfig::from_env(), DeviceAuthConfig::default());
+        assert!(!DeviceAuthConfig::default().enabled);
+
+        // Only an explicit true/1 turns it on; a typo leaves it off.
+        env::set_var("DEVICE_AUTH_ENABLED", "yes");
+        assert!(!DeviceAuthConfig::from_env().enabled);
+        env::set_var("DEVICE_AUTH_ENABLED", "1");
+        assert!(DeviceAuthConfig::from_env().enabled);
+
+        // Out-of-range values are clamped rather than honoured, so a code can
+        // neither live forever nor be polled with no interval.
+        env::set_var("DEVICE_AUTH_CODE_TTL_SECS", "999999");
+        env::set_var("DEVICE_AUTH_POLL_INTERVAL_SECS", "0");
+        env::set_var("DEVICE_AUTH_CODE_REQUESTS_PER_WINDOW", "0");
+        env::set_var("DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_USER", "100000");
+        env::set_var("DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_IP", "0");
+        env::set_var("DEVICE_AUTH_FAILED_ATTEMPT_WINDOW_SECS", "1");
+        let config = DeviceAuthConfig::from_env();
+        assert_eq!(config.code_ttl_secs, 1800);
+        assert_eq!(config.poll_interval_secs, 1);
+        assert_eq!(config.code_requests_per_window, 1);
+        assert_eq!(config.max_failed_attempts_per_user, 100);
+        assert_eq!(config.max_failed_attempts_per_ip, 1);
+        assert_eq!(config.failed_attempt_window_secs, 60);
+
+        for (key, value) in KEYS.iter().zip(saved) {
+            restore_env(key, value);
+        }
+    }
+
+    #[test]
+    fn test_proxy_upstream_settings_defaults_parse_and_clamp() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        const KEYS: &[&str] = &[
+            "PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS",
+            "PROXY_UPSTREAM_READ_TIMEOUT_SECS",
+            "PROXY_UPSTREAM_FETCH_DEADLINE_SECS",
+            "PROXY_UPSTREAM_MAX_DETACHED_FILLS",
+        ];
+        let saved: Vec<Option<String>> = KEYS.iter().map(|k| env::var(k).ok()).collect();
+
+        for key in KEYS {
+            env::remove_var(key);
+        }
+        let defaults = ProxyUpstreamSettings::from_env();
+        assert_eq!(defaults, ProxyUpstreamSettings::default());
+        assert_eq!(defaults.connect(), std::time::Duration::from_secs(10));
+        assert_eq!(defaults.read(), std::time::Duration::from_secs(60));
+        assert_eq!(
+            defaults.fetch_deadline(),
+            std::time::Duration::from_secs(600)
+        );
+        assert_eq!(defaults.max_detached_fills, 16);
+
+        env::set_var("PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS", "5");
+        env::set_var("PROXY_UPSTREAM_READ_TIMEOUT_SECS", "30");
+        env::set_var("PROXY_UPSTREAM_FETCH_DEADLINE_SECS", "45");
+        env::set_var("PROXY_UPSTREAM_MAX_DETACHED_FILLS", "0");
+        let set = ProxyUpstreamSettings::from_env();
+        assert_eq!(
+            (
+                set.connect_secs,
+                set.read_secs,
+                set.fetch_deadline_secs,
+                set.max_detached_fills
+            ),
+            (5, 30, 45, 0)
+        );
+
+        // Zero would disable a timeout outright and a huge value would pin a
+        // stalled connection; both are clamped. Garbage keeps the default.
+        env::set_var("PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS", "0");
+        env::set_var("PROXY_UPSTREAM_READ_TIMEOUT_SECS", "999999");
+        env::set_var("PROXY_UPSTREAM_FETCH_DEADLINE_SECS", "soon");
+        env::set_var("PROXY_UPSTREAM_MAX_DETACHED_FILLS", "100000");
+        let clamped = ProxyUpstreamSettings::from_env();
+        assert_eq!(clamped.connect_secs, 1);
+        assert_eq!(clamped.read_secs, 3600);
+        assert_eq!(clamped.fetch_deadline_secs, 600);
+        assert_eq!(clamped.max_detached_fills, 1024);
+
+        for (key, value) in KEYS.iter().zip(saved) {
+            restore_env(key, value);
+        }
     }
 
     #[test]
@@ -3897,6 +5452,119 @@ mod tests {
         } else {
             env::remove_var("MAX_UPLOAD_SIZE");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // BLOB_GC_MIN_AGE_SECS (#2906)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_blob_gc_min_age_from_env() {
+        use crate::services::storage_gc_service::MIN_BLOB_AGE_SECS;
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        let cases: [(Option<&str>, u64); 6] = [
+            (None, MIN_BLOB_AGE_SECS),
+            (Some("garbage"), MIN_BLOB_AGE_SECS),
+            (Some("120"), 120),
+            (Some("3600"), 3600),
+            (Some("1"), 60),
+            (Some("99999999"), 7 * 24 * 60 * 60),
+        ];
+        for (raw, want) in cases {
+            match raw {
+                Some(v) => env::set_var("BLOB_GC_MIN_AGE_SECS", v),
+                None => env::remove_var("BLOB_GC_MIN_AGE_SECS"),
+            }
+            let config = Config::from_env().expect("config should load");
+            assert_eq!(
+                config.blob_gc_min_age_secs, want,
+                "BLOB_GC_MIN_AGE_SECS={raw:?}"
+            );
+        }
+        env::remove_var("BLOB_GC_MIN_AGE_SECS");
+        assert_eq!(Config::default().blob_gc_min_age_secs, MIN_BLOB_AGE_SECS);
+    }
+
+    // -----------------------------------------------------------------------
+    // GRPC_BIND_IP / METRICS_BIND_IP (#2161)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_bind_ip_defaults_to_every_interface_when_unset_or_blank() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                parse_bind_ip("GRPC_BIND_IP", raw).unwrap(),
+                DEFAULT_LISTENER_BIND_IP,
+                "{raw:?} must keep the historical 0.0.0.0 bind"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bind_ip_accepts_ipv4_and_ipv6_literals() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let cases: [(&str, IpAddr); 5] = [
+            ("127.0.0.1", IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            (" 10.1.2.3 ", IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))),
+            ("::1", IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            ("[::1]", IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            ("::", IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(parse_bind_ip("METRICS_BIND_IP", Some(raw)).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn parse_bind_ip_rejects_garbage_ports_and_hostnames() {
+        for raw in [
+            "localhost",
+            "127.0.0.1:9090",
+            "[::1]:9090",
+            "999.0.0.1",
+            "[::1",
+        ] {
+            let err = parse_bind_ip("GRPC_BIND_IP", Some(raw))
+                .expect_err(&format!("{raw:?} must be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains("GRPC_BIND_IP"), "error names the var: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_config_listener_bind_ips_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("GRPC_BIND_IP");
+        env::remove_var("METRICS_BIND_IP");
+
+        let config = Config::from_env().expect("defaults load");
+        assert_eq!(config.grpc_bind_ip, DEFAULT_LISTENER_BIND_IP);
+        assert_eq!(config.metrics_bind_ip, DEFAULT_LISTENER_BIND_IP);
+
+        env::set_var("GRPC_BIND_IP", "127.0.0.1");
+        env::set_var("METRICS_BIND_IP", "::1");
+        let config = Config::from_env().expect("valid bind IPs load");
+        assert_eq!(config.grpc_bind_ip.to_string(), "127.0.0.1");
+        assert_eq!(config.metrics_bind_ip.to_string(), "::1");
+        assert_eq!(
+            std::net::SocketAddr::new(config.metrics_bind_ip, 9091).to_string(),
+            "[::1]:9091",
+            "an IPv6 bind IP must combine with the port without manual brackets"
+        );
+
+        // An invalid value fails startup instead of silently binding 0.0.0.0.
+        env::set_var("METRICS_BIND_IP", "not-an-ip");
+        assert!(Config::from_env().is_err());
+        env::set_var("METRICS_BIND_IP", "::1");
+        env::set_var("GRPC_BIND_IP", "127.0.0.1:9090");
+        assert!(Config::from_env().is_err());
+
+        env::remove_var("GRPC_BIND_IP");
+        env::remove_var("METRICS_BIND_IP");
     }
 
     #[test]
@@ -5679,12 +7347,15 @@ mod tests {
             .parent()
             .expect("backend crate has a parent directory (repo root)");
 
-        // (file, version, commit, go floor, grpc override from, grpc override
-        // to) per Dockerfile that builds grype. The override ARGs are part of
+        // (file, version, commit, go floor, [x/crypto floor]) per Dockerfile
+        // that builds grype. Override ARGs, when there are any, are part of
         // the pin: two images built from the same grype tag with different
         // overrides ship different binaries, and .trivyignore describes only
         // one of them (#3465 drifted exactly this way before it was retired).
-        let mut builds: Vec<(String, String, String, String, String, String)> = Vec::new();
+        // The grpc override ARGs left this list with the override itself when
+        // v0.120.1 made it redundant (#3698), and the x/net ones the same way
+        // when v0.121.3 did (#5565). A future override adds its ARGs back here.
+        let mut builds: Vec<(String, String, String, String, [String; 1])> = Vec::new();
         for file_name in discover_dockerfiles(repo_root) {
             let path = repo_root.join("docker").join(&file_name);
             let content = std::fs::read_to_string(&path)
@@ -5706,8 +7377,7 @@ mod tests {
                 arg("GRYPE_VERSION"),
                 arg("GRYPE_COMMIT"),
                 arg("GO_MIN_PATCH"),
-                arg("GRPC_FROM"),
-                arg("GRPC_TO"),
+                [arg("XCRYPTO_MIN")],
             ));
         }
 
@@ -5717,15 +7387,15 @@ mod tests {
              to build grype from source, found: {builds:?}"
         );
 
-        let (_, version, commit, go_min, grpc_from, grpc_to) = builds[0].clone();
-        for (file_name, v, c, g, gf, gt) in &builds {
+        let (_, version, commit, go_min, overrides) = builds[0].clone();
+        for (file_name, v, c, g, o) in &builds {
             assert_eq!(
-                (v, c, g, gf, gt),
-                (&version, &commit, &go_min, &grpc_from, &grpc_to),
+                (v, c, g, o),
+                (&version, &commit, &go_min, &overrides),
                 "grype source-build pin drift in {file_name}: it builds \
-                 v{v} @ {c} on go>={g} (grpc {gf}->{gt}) while another \
+                 v{v} @ {c} on go>={g} (overrides {o:?}) while another \
                  Dockerfile builds v{version} @ {commit} on go>={go_min} \
-                 (grpc {grpc_from}->{grpc_to}). Every image must ship the \
+                 (overrides {overrides:?}). Every image must ship the \
                  same grype build, otherwise .trivyignore's rationale \
                  describes a binary only some images carry. All: {builds:?}"
             );

@@ -6,12 +6,24 @@
       {
         "ordinal": 0,
         "name": "size_bytes",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "oci_blobs",
+            "name": "size_bytes"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "storage_key",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_blobs",
+            "name": "storage_key"
+          }
+        }
       }
     ],
     "parameters": {

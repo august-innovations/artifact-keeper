@@ -21,6 +21,9 @@ updates:
       - "artifact-keeper/maintainers"
     labels:
       - "dependencies"
+      # Dependency bumps have no issue to link; this label satisfies the
+      # linked-issue gate (require-linked-issue.yml) the way #3811 did by hand.
+      - "no-issue-required"
       - "registry/docker"
     commit-message:
       prefix: "chore"
@@ -37,6 +40,9 @@ updates:
       - "artifact-keeper/maintainers"
     labels:
       - "dependencies"
+      # Dependency bumps have no issue to link; this label satisfies the
+      # linked-issue gate (require-linked-issue.yml) the way #3811 did by hand.
+      - "no-issue-required"
       - "ci"
     commit-message:
       prefix: "chore"
@@ -58,6 +64,9 @@ updates:
       day: "saturday"
     labels:
       - "dependencies"
+      # Dependency bumps have no issue to link; this label satisfies the
+      # linked-issue gate (require-linked-issue.yml) the way #3811 did by hand.
+      - "no-issue-required"
       - "registry/cargo"
     commit-message:
       prefix: "chore"

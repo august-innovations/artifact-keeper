@@ -424,7 +424,12 @@ impl PypiHandler {
                 .by_index(i)
                 .map_err(|e| AppError::Validation(format!("Failed to read wheel entry: {}", e)))?;
 
-            let name = file.name().to_string();
+            let name = file
+                .name()
+                .map_err(|e| {
+                    AppError::Validation(format!("Failed to read wheel entry name: {}", e))
+                })?
+                .into_owned();
 
             // The ROOT `{name}-{version}.dist-info/METADATA` only (#3886): the
             // same predicate the `.metadata` sidecar serves by, so a vendored
@@ -1132,7 +1137,7 @@ pub(crate) mod tests {
 
         let mut cursor = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(&mut cursor);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("demo/_vendor/decoy-9.9.dist-info/METADATA", options)
             .unwrap();

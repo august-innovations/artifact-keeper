@@ -94,16 +94,15 @@ but not the hold.
 
 ### 1. Index build
 
-Two files. `220_artifacts_example_index_reset.sql`, an ordinary transactional
-migration:
+Two files and one registration. `220_artifacts_example_index_reset.sql`, an
+ordinary transactional migration:
 
 ```sql
--- Clear any index left INVALID by an earlier interrupted concurrent build.
---
--- The next migration is `-- no-transaction`: if it fails part-way it is NOT
--- rolled back and NOT recorded, so it re-runs on the next boot — and
--- `CREATE INDEX CONCURRENTLY IF NOT EXISTS` will happily skip a leftover
--- INVALID index and leave it invalid forever. Drop first, unconditionally.
+-- Clear an index left INVALID by a concurrent build attempted outside the
+-- migrator before this release (by hand, from this runbook, and cancelled).
+-- This runs once: sqlx records it on the first boot and never runs it again,
+-- so it does NOT clean up after a failed attempt of the next migration --
+-- the startup repair does (see below).
 DROP INDEX IF EXISTS idx_artifacts_example;
 ```
 
@@ -117,30 +116,72 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_artifacts_example
     WHERE is_deleted = false;
 ```
 
-One index per pair. `CONCURRENTLY` cannot share a file with anything else, and a
-file that builds two indexes has two ways to fail half-way.
+and register the build migration, by version and index name, in
+`CONCURRENT_INDEX_MIGRATIONS` (`backend/src/migration_repair.rs`):
+
+```rust
+(221, "idx_artifacts_example"),
+```
+
+The registration is what makes a failed build recoverable. sqlx records a
+migration only after its SQL succeeds. If the concurrent build fails part-way
+(a lock timeout behind a long transaction, a killed pod, a
+`pg_cancel_backend`), it leaves an INVALID index and is not recorded, so it
+re-runs on the next boot. On its own, that re-run is worse than the failure:
+`CREATE INDEX CONCURRENTLY IF NOT EXISTS` finds the INVALID leftover, skips it,
+and the migration is recorded as a success with an index the planner never
+uses. A later "drop the old index" migration then removes the only valid one.
+The reset migration cannot help, because it was recorded on the first boot and
+does not run again.
+
+So the backend repairs it before migrating. On every start that runs
+migrations (not with `SKIP_MIGRATIONS=true`), before `MIGRATOR.run` and under
+the migrator's advisory lock,
+`migration_repair::repair_invalid_concurrent_indexes` walks
+`CONCURRENT_INDEX_MIGRATIONS`. For each registered build migration that is not
+yet recorded in `_sqlx_migrations`, it drops the named index if
+`pg_index.indisvalid` is false, and the build re-runs from scratch. A recorded
+migration and a valid index are never touched. Keep the reset migration as
+well: it covers an attempt made outside the migrator, which the repair does not
+know about.
+
+One index per migration. `CONCURRENTLY` cannot share a file with anything else,
+and a file that builds two indexes has two ways to fail half-way.
 
 ### 2. Check or foreign-key constraint
 
-Two statements, and they may be in the same transactional migration:
+Two statements, in **two separate migrations**. `0300_artifacts_size_check.sql`:
 
 ```sql
 ALTER TABLE artifacts
     ADD CONSTRAINT artifacts_size_nonneg CHECK (size_bytes >= 0) NOT VALID;
+```
 
+then `0301_artifacts_size_check_validate.sql`:
+
+```sql
 ALTER TABLE artifacts VALIDATE CONSTRAINT artifacts_size_nonneg;
 ```
 
 `NOT VALID` is a catalogue update — new rows are checked immediately, existing
 rows are not. `VALIDATE CONSTRAINT` then scans under
-`SHARE UPDATE EXCLUSIVE`, which does not block writes. On a very large table,
-put the `VALIDATE` in a later migration so the two scans are separately
-restartable.
+`SHARE UPDATE EXCLUSIVE`, which does not block writes — **but only in a
+transaction of its own.** sqlx runs each migration file in one transaction and
+PostgreSQL holds locks until commit, so a `VALIDATE` in the same file as the
+`ADD CONSTRAINT … NOT VALID` (or an `ADD COLUMN`) still holds that statement's
+`ACCESS EXCLUSIVE` for the whole scan, blocking every reader and writer.
+
+If every existing row satisfies the constraint by construction — the column
+was added in the same migration with a constant default that passes the
+check — skip the `VALIDATE` entirely: the `NOT VALID` constraint already
+enforces every new write.
 
 ### 3. Unique constraint
 
-Same two-file shape as (1) — a transactional
-`DROP INDEX IF EXISTS packages_repository_id_name_key;` first, then:
+Same shape as (1): a transactional
+`DROP INDEX IF EXISTS packages_repository_id_name_key;` first, then the build,
+registered in `CONCURRENT_INDEX_MIGRATIONS` as
+`(<its version>, "packages_repository_id_name_key")`:
 
 ```sql
 -- no-transaction
@@ -200,6 +241,63 @@ counter, so an interrupted run resumes where it stopped instead of starting over
 the one not to copy: it backfills every live artifact row in one statement and
 then builds a GIN index over the result, in a single transaction.
 
+#### Bound every wait (#4153)
+
+A backfill's row locks, and a `CREATE TRIGGER … ON <hot table>` (`SHARE ROW
+EXCLUSIVE`, which queues behind any open transaction and blocks every write
+behind it while it waits), must not sit on the migration session's 5-minute
+`lock_timeout`. From migration 270 on, a gate
+(`hot_table_backfills_and_triggers_set_timeouts`) requires any migration that
+backfills (`UPDATE`, `DELETE`, `INSERT … SELECT`) or creates a trigger
+(`CREATE [OR REPLACE | CONSTRAINT] TRIGGER`) on a hot table to set
+`lock_timeout`, and fails any `ALTER TABLE <hot table> DISABLE|ENABLE TRIGGER`.
+In a batching `DO` block `SET LOCAL` ends at each `COMMIT`, so set it per
+batch, and retry a batch that hits `lock_not_available` rather than failing
+the deploy:
+
+```sql
+LOOP
+    attempt := 0;
+    LOOP
+        BEGIN
+            SET LOCAL lock_timeout = '5s';
+            -- one batch
+            EXIT;
+        EXCEPTION WHEN lock_not_available THEN
+            attempt := attempt + 1;
+            IF attempt >= 5 THEN RAISE; END IF;
+            PERFORM pg_sleep(attempt);
+        END;
+    END LOOP;
+    COMMIT;   -- outside the EXCEPTION block: a subtransaction cannot COMMIT
+    ...
+END LOOP;
+```
+
+The gate checks only that the file sets `lock_timeout` somewhere; that the SET
+reaches every batch is the author's job.
+
+`statement_timeout` is **not** a per-batch bound here. PostgreSQL arms the
+statement timer once per top-level statement, and the whole `DO` block is one
+statement: a `SET LOCAL statement_timeout` inside it, before or after a
+`COMMIT`, does not apply to the statements that follow in the block. A batched
+`DO` migration is bounded only by the migration session's
+`statement_timeout = '30min'` (main.rs) over the whole file, so keep batches
+small and the total work well inside that.
+
+#### Rewriting `artifacts.origin`
+
+`artifacts.origin` is immutable by trigger (`ak_artifacts_origin_immutable`).
+Never `ALTER TABLE artifacts DISABLE TRIGGER` to rewrite it: the ALTER takes a
+table lock, and in a `-- no-transaction` file the disabled state commits and is
+visible to every session until re-enabled. Instead, open a window in the
+migration itself, as 270 and 271 do: `CREATE OR REPLACE` the trigger function
+with a clause that admits exactly the one rewrite the migration performs, and
+only on a transaction that set `SET LOCAL ak.origin_rewrite = 'on'`; run the
+batches with that GUC; and end the file by restoring the strict function from
+migration 227. A file interrupted mid-run leaves its narrow clause in place
+until it is re-run on the next boot.
+
 ### 5. Column type change
 
 There is no online `ALTER COLUMN … TYPE`. Add a new column, backfill it in
@@ -221,6 +319,10 @@ update and none of this is needed
 - [ ] A `-- no-transaction` file contains exactly one statement.
 - [ ] A `-- no-transaction` file is re-runnable from any point: it will re-run
       in full if it fails, because nothing was recorded.
+- [ ] A `-- no-transaction` `CREATE INDEX CONCURRENTLY` migration is
+      registered in `CONCURRENT_INDEX_MIGRATIONS`
+      (`backend/src/migration_repair.rs`), so a failed build's INVALID index
+      is dropped before it re-runs.
 - [ ] The file's header comment says what the statement costs on a table with a
       million rows.
 
@@ -260,9 +362,11 @@ SELECT a.pid, a.state, l.mode, l.granted, now() - a.xact_start AS age, a.query
  ORDER BY a.xact_start;
 ```
 
-`SELECT pg_cancel_backend(<pid>)` stops a concurrent build safely; it leaves an
-invalid index, which the preceding `DROP INDEX IF EXISTS` migration clears on the
-next attempt.
+`SELECT pg_cancel_backend(<pid>)` stops a concurrent build safely. It leaves an
+invalid index, and the build migration is not recorded. On the next start the
+startup repair drops that index (for a migration registered in
+`CONCURRENT_INDEX_MIGRATIONS`) and the build runs again from scratch. The
+reset migration before it does not help here: it has already been recorded.
 
 ## Afterwards
 
@@ -274,7 +378,11 @@ SELECT c.relname
 ```
 
 An invalid index is not used by the planner but *is* maintained on every write,
-so it costs and gives nothing. Drop it and re-run the migration.
+so it costs and gives nothing. If its build migration is not recorded yet, the
+next start repairs it (see "Index build"). If the migration is recorded -- an
+`IF NOT EXISTS` build that skipped the leftover -- drop the index with
+`DROP INDEX CONCURRENTLY` and rebuild it by hand with the migration's
+`CREATE INDEX CONCURRENTLY` statement.
 
 Confirm the plan the index was built for actually changed:
 `EXPLAIN (ANALYZE, BUFFERS)` the query named in the migration header, and

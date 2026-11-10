@@ -64,6 +64,23 @@
 # that already exists on the base branch. Bullets under a heading the branch
 # adds are therefore exempt from assertions 1 and 3.
 #
+# FOLD-IN. RELEASING.md step 3 says a PR that merges after the release prep
+# and before the tag folds its fragment into the cut's existing, untagged
+# `## [X.Y.Z]` section with `assemble-changelog.sh --append`. That adds a
+# bullet under a heading the branch did NOT add, which is the #3570 shape to
+# everything above, so it is told apart by what else the same diff does: the
+# bullet's first `#NNNN` names a fragment this branch DELETES from
+# changes/unreleased/, and the section's version has no `vX.Y.Z` tag yet. Both
+# must hold; a bullet folded into a tagged section is still misplaced, because
+# that section is history (the assembler refuses --append there too).
+#
+# RECOGNITION. `### Sponsors` and `### Thank You` credit people; they do not
+# claim that work is in the release (release-preflight.sh skips them for the
+# same reason). A sponsor list that drifted, or a reporter missed at cut time,
+# is corrected in the section it belongs to, so a bullet added under one of
+# those two subheadings passes assertion 1 even inside a tagged section
+# (#4754). Every other subheading of a shipped section stays history.
+#
 # Usage:  check-changelog-placement.sh [<base-ref>]        (default origin/main)
 #
 # Env:
@@ -183,6 +200,16 @@ ADDED_HEADINGS="$(printf '%s\n' "$DIFF" | awk '
   /^\+## \[/ { h = substr($0, 2); sub(/[[:space:]]+$/, "", h); print h }
 ')"
 
+# Issue ids of fragments this branch DELETES (an `--append` fold-in, or a
+# prep). Read from the merge base, where the file still exists. The first
+# `#NNNN` in `issues:` is the one the bullet leads with (changes/README.md).
+FOLDED_IDS="$(while IFS= read -r path; do
+  [[ -z "$path" ]] && continue
+  git show "${MERGE_BASE}:${path}" 2>/dev/null \
+    | grep -m1 -oE '^issues:[[:space:]]*\[[[:space:]]*#[0-9]+' \
+    | grep -oE '#[0-9]+' || true
+done < <(git diff --name-only --no-renames --diff-filter=D "$MERGE_BASE" HEAD -- "${CHANGES_PATH}/unreleased"))"
+
 # ── 1. bullets this branch adds, with their line number in HEAD ─────────────
 #
 # `-U0` means there are no context lines, so every `+` line is an addition and
@@ -219,6 +246,8 @@ if [[ -n "$ADDED" ]]; then
   misplaced=0
   legacy=0
   assembled=0
+  folded=0
+  recognition=0
   while IFS=$'\037' read -r vh sh bullet; do
     [[ -z "$bullet" ]] && continue
     if [[ "$vh" == "## [Unreleased]" ]]; then
@@ -227,6 +256,26 @@ if [[ -n "$ADDED" ]]; then
     fi
     if [[ -n "$vh" ]] && printf '%s\n' "$ADDED_HEADINGS" | grep -qxF -- "$vh"; then
       assembled=$((assembled + 1))
+      continue
+    fi
+    # Recognition bullets credit people rather than document work, so they
+    # may be corrected in a shipped section (see RECOGNITION in the header).
+    if [[ -n "$vh" ]] && [[ "$sh" =~ ^###[[:space:]]+(Sponsors|Thank[[:space:]]You)([[:space:]]|$) ]]; then
+      recognition=$((recognition + 1))
+      continue
+    fi
+    # A fold-in: the bullet's issue is a fragment this branch deletes, and the
+    # section it lands in is not tagged yet (see FOLD-IN in the header).
+    bid="$(printf '%s\n' "$bullet" | grep -oE '#[0-9]+' | head -1 || true)"
+    if [[ -n "$vh" && -n "$bid" && -n "$FOLDED_IDS" ]] && printf '%s\n' "$FOLDED_IDS" | grep -qxF -- "$bid"; then
+      ver="$(printf '%s\n' "$vh" | sed -nE 's/^## \[([0-9]+\.[0-9]+\.[0-9]+)\].*/\1/p')"
+      if [[ -n "$ver" ]] && [[ -z "$(git tag -l "v${ver}")" ]]; then
+        folded=$((folded + 1))
+        continue
+      fi
+      misplaced=$((misplaced + 1))
+      echo "::error title=CHANGELOG bullet folded into a tagged section::This branch deletes the fragment for ${bid} and adds its bullet under '${vh}', but v${ver} is already tagged, so that section is history (#3797). Put the entry back as a fragment; it belongs to the next version."
+      echo "  bullet: ${bullet}"
       continue
     fi
     misplaced=$((misplaced + 1))
@@ -253,6 +302,12 @@ if [[ -n "$ADDED" ]]; then
   else
     if [[ "$assembled" -gt 0 ]]; then
       echo "  ${assembled} added bullet(s) under a version heading this branch adds (a release prep assembling the fragments)"
+    fi
+    if [[ "$folded" -gt 0 ]]; then
+      echo "  ${folded} added bullet(s) folded into an untagged version section from fragment(s) this branch deletes (assemble-changelog.sh --append)"
+    fi
+    if [[ "$recognition" -gt 0 ]]; then
+      echo "  ${recognition} added bullet(s) under a '### Sponsors' / '### Thank You' recognition heading of a shipped section (credits, not entries)"
     fi
     if [[ "$legacy" -gt 0 ]]; then
       echo "  ${legacy} added bullet(s), all under '## [Unreleased]'"

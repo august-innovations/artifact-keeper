@@ -19,8 +19,9 @@
 //!    it defeats both the *pre-target-inflation* bomb (huge entries walked
 //!    before the metadata file) and the *entry-count* bomb (the walk hits the
 //!    byte budget and stops),
-//! 2. a **10 000 entry-count cap** ([`MAX_INGEST_ARCHIVE_ENTRIES`]) —
-//!    defence-in-depth against inode/entry-count bombs with a clearer error,
+//! 2. an **entry-count cap** (default 10 000, env
+//!    [`MAX_INGEST_ARCHIVE_ENTRIES_ENV`]) — defence-in-depth against
+//!    inode/entry-count bombs with a clearer error,
 //! 3. an **8 MiB per-metadata-entry cap** ([`MAX_INGEST_METADATA_ENTRY_BYTES`])
 //!    — a metadata file larger than this is itself a bomb.
 //!
@@ -61,9 +62,17 @@ pub const DEFAULT_MAX_INGEST_DECOMPRESSED_BYTES: u64 = 128 * 1024 * 1024;
 /// ingestion and scan caps with the same idiom.
 pub const MAX_INGEST_DECOMPRESSED_BYTES_ENV: &str = "MAX_INGEST_DECOMPRESSED_BYTES";
 
-/// Maximum tar/zip entries walked while searching for the metadata file.
-/// 10 000 matches conda's `MAX_TAR_ENTRIES`; bounds inode/entry-count bombs.
-pub const MAX_INGEST_ARCHIVE_ENTRIES: u64 = 10_000;
+/// Default maximum tar/zip entries walked while searching for the metadata
+/// file. 10 000 matches conda's `MAX_TAR_ENTRIES`; bounds inode/entry-count
+/// bombs.
+pub const DEFAULT_MAX_INGEST_ARCHIVE_ENTRIES: u64 = 10_000;
+
+/// Env var overriding [`DEFAULT_MAX_INGEST_ARCHIVE_ENTRIES`] (#4093), for
+/// packages that legitimately ship more files (a Composer package that
+/// vendors its dependencies). Value is a plain decimal entry count;
+/// blank/zero/non-numeric falls back to the default, like
+/// [`MAX_INGEST_DECOMPRESSED_BYTES_ENV`].
+pub const MAX_INGEST_ARCHIVE_ENTRIES_ENV: &str = "MAX_INGEST_ARCHIVE_ENTRIES";
 
 /// Maximum bytes read for the single matched metadata entry (`Chart.yaml` /
 /// `.nuspec` / `pubspec.yaml` / `METADATA` / …). 8 MiB is ≥ helm's prior 4 MiB
@@ -89,6 +98,36 @@ pub fn max_ingest_decompressed_bytes() -> u64 {
         MAX_INGEST_DECOMPRESSED_BYTES_ENV,
         DEFAULT_MAX_INGEST_DECOMPRESSED_BYTES,
     )
+}
+
+/// Effective archive entry-count ceiling, honouring
+/// [`MAX_INGEST_ARCHIVE_ENTRIES_ENV`] over the default.
+pub fn max_ingest_archive_entries() -> u64 {
+    positive_env_or(
+        MAX_INGEST_ARCHIVE_ENTRIES_ENV,
+        DEFAULT_MAX_INGEST_ARCHIVE_ENTRIES,
+    )
+}
+
+/// Reject `archive` when its central directory holds more entries than
+/// [`max_ingest_archive_entries`]. Shared by this module's ZIP readers and by
+/// readers such as MCPB's manifest lookup that do not go through
+/// [`read_metadata_from_zip`].
+pub fn check_zip_entry_count<R: Read + Seek>(archive: &zip::ZipArchive<R>) -> Result<()> {
+    check_zip_entry_count_limited(archive.len() as u64, max_ingest_archive_entries())
+}
+
+/// `_limited` seam for [`check_zip_entry_count`] with an explicit ceiling
+/// ([`read_metadata_from_zip_limited`] callers such as proxy identity probing
+/// raise it for their name walk).
+fn check_zip_entry_count_limited(entry_count: u64, max_entries: u64) -> Result<()> {
+    if entry_count > max_entries {
+        return Err(AppError::Validation(format!(
+            "ZIP archive contains too many entries (> {}); refusing suspected decompression bomb",
+            max_entries
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -632,7 +671,7 @@ fn map_archive_err(context: &str, err: &io::Error) -> AppError {
 /// Wrap a *decoded* stream in the shared total-byte budget so a decompression
 /// bomb aborts mid-inflate. Use when a caller must drive its own tar/zip walk
 /// (e.g. to keep a format-specific per-entry cap or message) but still wants the
-/// module's total-byte defence; pair it with [`MAX_INGEST_ARCHIVE_ENTRIES`] for
+/// module's total-byte defence; pair it with [`max_ingest_archive_entries`] for
 /// the entry-count cap. A budget breach surfaces as an [`io::Error`] during the
 /// walk, which the caller maps to its own validation error.
 pub fn budgeted<R: Read>(reader: R) -> impl Read {
@@ -726,7 +765,7 @@ pub fn read_metadata_from_tar_gz<R: Read>(
         reader,
         matches,
         max_ingest_decompressed_bytes(),
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -759,7 +798,7 @@ pub fn read_metadata_from_tar_bz2<R: Read>(
         reader,
         matches,
         max_ingest_decompressed_bytes(),
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -797,7 +836,7 @@ pub fn read_metadata_from_tar_xz<R: Read>(
         reader,
         matches,
         max_ingest_decompressed_bytes(),
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -830,7 +869,7 @@ pub fn read_metadata_from_tar_zst<R: Read>(
         reader,
         matches,
         max_ingest_decompressed_bytes(),
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -862,7 +901,7 @@ pub fn read_metadata_from_decoded_tar<R: Read>(
         decoded,
         matches,
         max_ingest_decompressed_bytes(),
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -905,7 +944,7 @@ pub fn read_metadata_from_tar<R: Read>(
         reader,
         matches,
         max_ingest_decompressed_bytes(),
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -937,7 +976,7 @@ pub fn read_metadata_from_zip<R: Read + Seek>(
     read_metadata_from_zip_limited(
         reader,
         matches,
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -952,18 +991,16 @@ pub fn read_metadata_from_zip_limited<R: Read + Seek>(
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| AppError::Validation(format!("Invalid ZIP archive: {}", e)))?;
 
-    if archive.len() as u64 > max_entries {
-        return Err(AppError::Validation(format!(
-            "ZIP archive contains too many entries (> {}); refusing suspected decompression bomb",
-            max_entries
-        )));
-    }
+    check_zip_entry_count_limited(archive.len() as u64, max_entries)?;
 
     for i in 0..archive.len() {
         // Match on the central-directory name BEFORE opening the entry, so an
         // unmatched entry costs one string comparison rather than a local-
         // header read; large archives (a 12k-entry wheel, #3886) walk cheaply.
-        if !archive.name_for_index(i).is_some_and(&matches) {
+        if !archive
+            .name_for_index(i)
+            .is_some_and(|name| name.as_deref().is_ok_and(&matches))
+        {
             continue;
         }
         let mut file = archive
@@ -987,11 +1024,73 @@ pub fn read_metadata_from_zip_limited<R: Read + Seek>(
     Ok(None)
 }
 
+/// Whether an archive entry name would escape, or not be relative to, the
+/// directory a client extracts into (#4673): an absolute path (`/x`), a
+/// backslash-rooted path (`\\x`, a UNC `\\\\host\\share`), a drive-qualified
+/// path (`C:...`), or any `..` segment, with either separator.
+pub fn is_unsafe_archive_entry_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    name.starts_with(['/', '\\'])
+        || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
+        || name.split(['/', '\\']).any(|segment| segment == "..")
+}
+
+/// Walk a zip's central directory (names only, nothing is opened or
+/// inflated) and refuse it if any entry name is unsafe to extract
+/// ([`is_unsafe_archive_entry_name`]). Bounded like
+/// [`read_metadata_from_zip`]: the entry-count cap is checked first.
+/// Formats that store an archive verbatim after only inspecting it use this
+/// so a client that later unzips the stored bytes naively is not handed a
+/// path-traversal entry (#4673).
+pub fn reject_unsafe_zip_entry_names<R: Read + Seek>(archive: &zip::ZipArchive<R>) -> Result<()> {
+    check_zip_entry_count(archive)?;
+    for i in 0..archive.len() {
+        if let Some(name) = archive.name_for_index(i) {
+            // zip 9 decodes the name as UTF-8 or CP437 and refuses anything
+            // else; a name this check cannot read is a name it cannot vet.
+            let name = name.map_err(|e| {
+                AppError::Validation(format!(
+                    "ZIP archive entry {i} has an undecodable name: {e}"
+                ))
+            })?;
+            if is_unsafe_archive_entry_name(&name) {
+                let shown: String = name.chars().take(200).collect();
+                return Err(AppError::Validation(format!(
+                    "ZIP archive entry {shown:?} is an absolute path or escapes the archive root"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// #4673: names a naive unzip would resolve outside its target directory.
+    #[test]
+    fn unsafe_archive_entry_names() {
+        for name in [
+            "..",
+            "../x",
+            "a/../b",
+            "a/..",
+            "/etc/passwd",
+            "\\x",
+            "\\\\host\\share\\x",
+            "a\\..\\b",
+            "C:\\x",
+            "z:x",
+        ] {
+            assert!(is_unsafe_archive_entry_name(name), "{name}");
+        }
+        for name in ["a/b", "a..b", "..a/b..", "dir/", "./a", "1:x", ""] {
+            assert!(!is_unsafe_archive_entry_name(name), "{name}");
+        }
+    }
 
     /// Tests using only local semaphores need not take these.
     use super::test_support::{lock_singletons, lock_singletons_async};
@@ -1027,7 +1126,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut w = zip::ZipWriter::new(&mut cursor);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (name, data) in entries {
                 w.start_file(*name, opts).unwrap();
@@ -1045,6 +1144,46 @@ mod tests {
     #[test]
     fn positive_env_or_falls_back_on_blank_zero_nonnumeric() {
         assert_eq!(positive_env_or("AK_TEST_UNSET_VAR_XYZ", 42), 42);
+    }
+
+    /// #4093: the archive entry-count cap is read from
+    /// `MAX_INGEST_ARCHIVE_ENTRIES` the way the decompressed-byte budget is
+    /// read from `MAX_INGEST_DECOMPRESSED_BYTES`: default when unset, a
+    /// positive integer wins, blank / zero / non-numeric fall back to the
+    /// default. The override stays BELOW the default so a concurrently running
+    /// test that relies on the cap refusing an over-cap archive still sees a
+    /// refusal while the variable is set.
+    #[test]
+    fn max_ingest_archive_entries_env_override_4093() {
+        let key = MAX_INGEST_ARCHIVE_ENTRIES_ENV;
+        assert_eq!(key, "MAX_INGEST_ARCHIVE_ENTRIES");
+        let saved = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert_eq!(max_ingest_archive_entries(), 10_000);
+        assert_eq!(
+            max_ingest_archive_entries(),
+            DEFAULT_MAX_INGEST_ARCHIVE_ENTRIES
+        );
+
+        std::env::set_var(key, "2500");
+        assert_eq!(max_ingest_archive_entries(), 2_500);
+        std::env::set_var(key, " 9000 ");
+        assert_eq!(max_ingest_archive_entries(), 9_000);
+
+        for bad in ["0", "", "   ", "abc", "-1", "1.5"] {
+            std::env::set_var(key, bad);
+            assert_eq!(
+                max_ingest_archive_entries(),
+                DEFAULT_MAX_INGEST_ARCHIVE_ENTRIES,
+                "value {bad:?} should fall back to the default"
+            );
+        }
+
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[test]
@@ -1252,7 +1391,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut w = zip::ZipWriter::new(&mut cursor);
-            let stored: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let stored: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             let target_opts = if deflate {
                 stored.compression_method(zip::CompressionMethod::Deflated)
@@ -1277,13 +1416,13 @@ mod tests {
         let ok = zip_with_filler(10, "composer.json", json, false);
         assert!(crate::formats::composer::ComposerHandler::parse_composer_json(&ok).is_ok());
         let over = zip_with_filler(
-            MAX_INGEST_ARCHIVE_ENTRIES as usize,
+            max_ingest_archive_entries() as usize,
             "composer.json",
             json,
             false,
         );
         let err = crate::formats::composer::ComposerHandler::parse_composer_json(&over)
-            .expect_err("composer must still refuse > MAX_INGEST_ARCHIVE_ENTRIES");
+            .expect_err("composer must still refuse > max_ingest_archive_entries()");
         assert!(err.to_string().contains("too many entries"), "{err}");
         assert!(read_metadata_from_zip(std::io::Cursor::new(&over), |n| n
             .ends_with("composer.json"))

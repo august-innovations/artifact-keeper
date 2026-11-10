@@ -15,7 +15,8 @@
 //!   different places.
 //! - An epoch (`1!2.0`) dominates every epoch-less version in conda; the
 //!   segment splitter compared `"1!2"` lexicographically and ordered it
-//!   **below** `2.0`.
+//!   **below** `2.0`. (Since #4507 that comparator parses the epoch, so the
+//!   two agree on this point.)
 //! - Conda orders letters *below* numbers inside a segment (that is why
 //!   `1.0a < 1.0`), so a local segment behaves nothing like the segment
 //!   splitter assumed: `1.0+local` orders **below** `1.0` (the bare version's
@@ -188,6 +189,12 @@ mod tests {
             ("2.31.0", "2.31.0", 0),
             ("2020.1", "2020.10", -1),
             ("0.9", "1.0", -1),
+            // An epoch dominates every epoch-less version. The legacy
+            // comparator disagreed here until #4507 taught it to parse the
+            // `N!` epoch (it compared "1!2" against "2").
+            ("1!2.0", "2.0", 1),
+            ("1!1.0", "999.0", 1),
+            ("0!1.0", "1.0", 0),
         ];
         for (a, b, expected) in agreeing {
             let rattler =
@@ -219,10 +226,6 @@ mod tests {
             ("1.0b2", "1.0", -1, 1),
             ("1.0rc1", "1.0", -1, 1),
             ("1.0.dev1", "1.0", -1, 1),
-            // An epoch dominates every epoch-less version; the splitter
-            // compared "1!2" lexicographically against "2".
-            ("1!2.0", "2.0", 1, -1),
-            ("1!1.0", "999.0", 1, -1),
             // Conda orders letters below numbers, and the missing local part
             // of the bare version pads to 0, so `1.0+local` < `1.0`; the
             // splitter saw a distinct, greater segment.

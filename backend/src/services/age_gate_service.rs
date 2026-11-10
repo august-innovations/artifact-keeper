@@ -1,11 +1,13 @@
 //! Age-based quality gate for supported remote proxy registries.
 //!
-//! npm and PyPI support upstream publish time and first-seen policy; Go
-//! supports first-seen policy. Direct Remote repositories are evaluated
+//! npm, PyPI and Maven (#4702, see [`crate::services::age_gate_maven`])
+//! support upstream publish time and first-seen policy; Go supports
+//! first-seen policy. Direct Remote repositories are evaluated
 //! directly. Virtual repositories apply the policy of the Remote member that
 //! supplied metadata or content, while Local members remain ungated.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -19,6 +21,9 @@ use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::event_bus::EventBus;
 use crate::services::metrics_service;
 use crate::services::upstream_metadata::UpstreamMetadataCache;
+use crate::services::version_order::{
+    compare_natural_segment, compare_semver_prerelease_identifier,
+};
 
 pub const AUTO_APPROVE_REASON: &str = "auto-approved: crossed age threshold";
 
@@ -167,9 +172,94 @@ pub async fn resolve_repo_params(db: &PgPool, repository_id: Uuid) -> Result<Age
 /// registry. Binding the identity to the upstream means a repoint starts a
 /// fresh clock by construction, instead of requiring every repository-update
 /// path to remember to invalidate observations.
+///
+/// Userinfo is not part of the identity (#4467): rotating credentials embedded
+/// in the URL names the same registry, so it must not restart every version's
+/// clock or void manual approvals. Host and path still are.
 pub fn upstream_fingerprint(upstream_url: Option<&str>) -> String {
-    let normalized = normalize_upstream_url(upstream_url.unwrap_or_default());
-    hex::encode(Sha256::digest(normalized.as_bytes()))
+    let raw = upstream_url.unwrap_or_default().trim();
+    let (stripped, _) = crate::services::proxy_service::strip_url_userinfo(raw);
+    hex::encode(Sha256::digest(normalize_upstream_url(&stripped).as_bytes()))
+}
+
+/// The fingerprint releases before #4467 computed for `upstream_url` (userinfo
+/// included), when it differs from [`upstream_fingerprint`]; `None` for a URL
+/// without userinfo, whose fingerprint did not change.
+pub(crate) fn legacy_upstream_fingerprint(upstream_url: Option<&str>) -> Option<String> {
+    let legacy = hex::encode(Sha256::digest(
+        normalize_upstream_url(upstream_url.unwrap_or_default()).as_bytes(),
+    ));
+    (legacy != upstream_fingerprint(upstream_url)).then_some(legacy)
+}
+
+/// Move one repository's age-gate state recorded under the legacy
+/// (userinfo-bearing) fingerprint of `upstream_url` to the current one (#4467):
+/// first-seen observations keep their EARLIEST time and review rows keep their
+/// decisions, so the fingerprint change neither restarts clocks nor voids
+/// approvals. Idempotent; a no-op for a URL without userinfo. Returns the
+/// number of rows moved.
+pub async fn rekey_legacy_fingerprint(
+    db: &PgPool,
+    repo_id: Uuid,
+    upstream_url: Option<&str>,
+) -> Result<u64> {
+    let Some(legacy) = legacy_upstream_fingerprint(upstream_url) else {
+        return Ok(0);
+    };
+    let current = upstream_fingerprint(upstream_url);
+    let mut tx = db.begin().await?;
+    let moved = sqlx::query(
+        "INSERT INTO age_gate_version_observations
+             (repository_id, upstream_fingerprint, package_name, package_version, first_seen_at)
+         SELECT repository_id, $3, package_name, package_version, first_seen_at
+         FROM age_gate_version_observations
+         WHERE repository_id = $1 AND upstream_fingerprint = $2
+         ON CONFLICT (repository_id, upstream_fingerprint, package_name, package_version)
+         DO UPDATE SET first_seen_at =
+             LEAST(age_gate_version_observations.first_seen_at, EXCLUDED.first_seen_at)",
+    )
+    .bind(repo_id)
+    .bind(&legacy)
+    .bind(&current)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    sqlx::query(
+        "DELETE FROM age_gate_version_observations
+         WHERE repository_id = $1 AND upstream_fingerprint = $2",
+    )
+    .bind(repo_id)
+    .bind(&legacy)
+    .execute(&mut *tx)
+    .await?;
+    let reviews = sqlx::query(
+        "UPDATE age_gate_reviews SET basis_upstream_fingerprint = $3
+         WHERE repository_id = $1 AND basis_upstream_fingerprint = $2",
+    )
+    .bind(repo_id)
+    .bind(&legacy)
+    .bind(&current)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(moved + reviews)
+}
+
+/// Startup pass: [`rekey_legacy_fingerprint`] for every repository whose
+/// upstream URL carries userinfo. Best-effort and idempotent, so every replica
+/// may run it; rows an older replica writes during a rolling upgrade are
+/// picked up by the next start or by the PATCH that rotates the URL.
+pub async fn rekey_all_legacy_fingerprints(db: &PgPool) -> Result<u64> {
+    let repos: Vec<(Uuid, Option<String>)> =
+        sqlx::query_as("SELECT id, upstream_url FROM repositories WHERE upstream_url LIKE '%@%'")
+            .fetch_all(db)
+            .await?;
+    let mut moved = 0;
+    for (id, url) in repos {
+        moved += rekey_legacy_fingerprint(db, id, url.as_deref()).await?;
+    }
+    Ok(moved)
 }
 
 /// Normalize an upstream URL so that cosmetically different spellings of the
@@ -313,6 +403,63 @@ pub(crate) fn decide_age_gate_check(
     }
 }
 
+/// What a gated Remote's upstream says about one version on the download path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamVersionEvidence {
+    /// The upstream lists the version, with its publish time when it gives one.
+    Listed(Option<DateTime<Utc>>),
+    /// The upstream answered and does not have the version: a 404 or 410, or a
+    /// readable package document that does not list it.
+    NotHosted,
+    /// No answer about the version: an outage, a refusal, a document that is
+    /// not package metadata, or no read attempted. Never a reason to skip the
+    /// gate, because a member that cannot be read may host the version.
+    Unknown,
+}
+
+impl UpstreamVersionEvidence {
+    pub(crate) fn published_at(self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Listed(published_at) => published_at,
+            Self::NotHosted | Self::Unknown => None,
+        }
+    }
+
+    /// Positive evidence that may start a `first_seen` clock.
+    pub(crate) fn is_listed(self) -> bool {
+        matches!(self, Self::Listed(_))
+    }
+}
+
+/// Read one version's evidence out of an npm packument body.
+///
+/// `versions` is what the registry serves and `time` what it dates. A version
+/// in either is hosted (a `time` entry without a manifest keeps the gate
+/// deciding rather than reading as a miss), and a body with neither map is not
+/// a packument at all, so it says nothing.
+pub(crate) fn npm_packument_version_evidence(
+    body: &[u8],
+    version: &str,
+) -> UpstreamVersionEvidence {
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return UpstreamVersionEvidence::Unknown;
+    };
+    let versions = doc.get("versions").and_then(|v| v.as_object());
+    let time = doc.get("time").and_then(|t| t.as_object());
+    if versions.is_none() && time.is_none() {
+        return UpstreamVersionEvidence::Unknown;
+    }
+    if versions.is_some_and(|v| v.contains_key(version))
+        || time.is_some_and(|t| t.contains_key(version))
+    {
+        let published_at = UpstreamMetadataCache::parse_npm_publish_times(&doc)
+            .get(version)
+            .copied();
+        return UpstreamVersionEvidence::Listed(published_at);
+    }
+    UpstreamVersionEvidence::NotHosted
+}
+
 /// Per-version classification output for metadata listing (npm packument / PyPI simple index).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MetadataListingClassification {
@@ -453,6 +600,111 @@ pub struct AgeGateReview {
     pub basis_upstream_fingerprint: Option<String>,
     #[sqlx(default)]
     pub repository_key: Option<String>,
+    /// Display name of the principal that recorded the current decision, and
+    /// whether that principal is a machine identity (#4238).
+    ///
+    /// Hydrated by the two API-facing reads (`list_reviews`, `get_review_by_id`)
+    /// from a `LEFT JOIN users`, the same way `promotion_history` hydrates
+    /// `promoted_by_username`. `#[sqlx(default)]` so the internal reads on the
+    /// download path, which have no reason to pay for the join, keep their
+    /// existing projection and leave these `None`.
+    #[sqlx(default)]
+    pub reviewed_by_username: Option<String>,
+    #[sqlx(default)]
+    pub reviewed_by_is_service_account: Option<bool>,
+    /// An instance administrator has decided this review (migration 290): a
+    /// repository administrator may still reject it, but not approve or reopen
+    /// it. See [`require_may_relax_review`].
+    #[sqlx(default)]
+    pub instance_locked: bool,
+}
+
+/// Which tier of administrator is acting on the age gate (#4238).
+///
+/// Since #4238 a repository's own admins operate its gate alongside instance
+/// admins. The tier decides whether an action may RELAX something an instance
+/// admin decided: only an instance admin may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorTier {
+    Instance,
+    Repository,
+}
+
+impl ActorTier {
+    /// The tier of a caller, from its effective instance-admin bit.
+    pub fn of(is_instance_admin: bool) -> Self {
+        if is_instance_admin {
+            Self::Instance
+        } else {
+            Self::Repository
+        }
+    }
+
+    fn is_instance(self) -> bool {
+        self == Self::Instance
+    }
+}
+
+/// Refuse a repository-tier approve or reopen of a review an instance admin
+/// has decided (#4238). Rejecting stays allowed: it can only tighten.
+///
+/// Approving relaxes a rejection, and reopening does too — a reopened review
+/// is pending, and a pending review is honoured once the package ages past
+/// the threshold — so an instance admin's decision could otherwise be
+/// overturned by any administrator of the repository.
+pub fn require_may_relax_review(tier: ActorTier, instance_locked: bool) -> Result<()> {
+    if instance_locked && tier == ActorTier::Repository {
+        return Err(AppError::Authorization(
+            "This review was decided by an instance administrator. A repository \
+             administrator can reject it, but only an instance administrator can \
+             approve or reopen it."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A repository's age-gate policy (#4238).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgeGatePolicy {
+    pub enabled: bool,
+    pub min_age_days: i32,
+    pub mode: AgeGateMode,
+}
+
+/// What [`AgeGateService::update_repo_config_as`] replaced, and how the
+/// policy lock moved (#4238).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyWrite {
+    pub previous: AgeGatePolicy,
+    pub was_locked: bool,
+    pub now_locked: bool,
+}
+
+/// Whether an instance administrator's lock currently holds a repository's
+/// age-gate policy (#4238). Read on the policy GET so a client can explain a
+/// refused write before attempting it.
+pub async fn repo_policy_locked(db: &PgPool, repository_id: Uuid) -> Result<bool> {
+    sqlx::query_scalar("SELECT age_gate_instance_locked FROM repositories WHERE id = $1")
+        .bind(repository_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound(format!("Repository {repository_id} not found")))
+}
+
+impl AgeGatePolicy {
+    /// Whether replacing `self` with `next` makes the gate LESS strict:
+    /// disabling it, lowering the minimum age, or switching the age source.
+    ///
+    /// A mode switch counts because neither mode dominates the other — each
+    /// admits versions the other would hold back — so it cannot be treated as
+    /// a tightening. A disabled gate cannot be weakened further, so any change
+    /// from one is allowed.
+    pub fn is_relaxed_by(self, next: AgeGatePolicy) -> bool {
+        self.enabled
+            && (!next.enabled || next.min_age_days < self.min_age_days || next.mode != self.mode)
+    }
 }
 
 /// Drop every process-local memo of a decision this repository's age-gate
@@ -565,11 +817,19 @@ impl AgeGateService {
     }
 
     /// Whether a version meets the minimum age threshold.
+    ///
+    /// A threshold of 0 asks for no age, so it is met whatever is known about
+    /// the version (#5151). Above 0 an unknown time does not meet it: the gate
+    /// cannot show the version is old enough, so it fails closed, and an
+    /// upstream that publishes no times is what `first_seen` mode is for.
     pub fn meets_age_threshold(
         published_at: Option<DateTime<Utc>>,
         min_age_days: i32,
         now: DateTime<Utc>,
     ) -> bool {
+        if min_age_days <= 0 {
+            return true;
+        }
         match published_at {
             Some(ts) => Self::package_age_days(ts, now) >= i64::from(min_age_days),
             None => false,
@@ -807,6 +1067,35 @@ impl AgeGateService {
                 }
             }
         }
+    }
+
+    /// Whether a Virtual member whose upstream does not host this version may
+    /// stay out of the request (#5150).
+    ///
+    /// The upstream's answer covers what it serves now, not what this server
+    /// has on record. A rejection is an administrator's decision about the
+    /// version on this member, and a `first_seen` observation shows the member
+    /// did carry it, so either keeps the ordinary decision in charge.
+    pub async fn member_may_step_aside(
+        &self,
+        repo: &AgeGateRepoParams,
+        package_name: &str,
+        version: &str,
+    ) -> Result<bool> {
+        if let Some(review) = self.get_review(repo.id, package_name, version).await? {
+            if review.status == AgeGateReviewStatus::Rejected.as_str() {
+                return Ok(false);
+            }
+        }
+        if repo.age_gate_mode == AgeGateMode::FirstSeen
+            && self
+                .lookup_first_seen(repo, package_name, version)
+                .await?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Resolve the age basis of every version in a metadata listing according
@@ -1057,9 +1346,13 @@ impl AgeGateService {
                 r.reviewed_by, r.reviewed_at, r.review_reason,
                 r.request_count, r.last_requested_at,
                 r.basis_mode, r.basis_upstream_fingerprint,
-                repo.key as repository_key
+                repo.key as repository_key,
+                reviewer.username as reviewed_by_username,
+                reviewer.is_service_account as reviewed_by_is_service_account,
+                r.instance_locked
             FROM age_gate_reviews r
             INNER JOIN repositories repo ON repo.id = r.repository_id
+            LEFT JOIN users reviewer ON reviewer.id = r.reviewed_by
             WHERE ($1::text IS NULL OR repo.key = $1)
               AND ($2::text[] IS NULL OR r.status = ANY($2))
             ORDER BY r.last_requested_at DESC
@@ -1086,9 +1379,13 @@ impl AgeGateService {
                 r.reviewed_by, r.reviewed_at, r.review_reason,
                 r.request_count, r.last_requested_at,
                 r.basis_mode, r.basis_upstream_fingerprint,
-                repo.key as repository_key
+                repo.key as repository_key,
+                reviewer.username as reviewed_by_username,
+                reviewer.is_service_account as reviewed_by_is_service_account,
+                r.instance_locked
             FROM age_gate_reviews r
             INNER JOIN repositories repo ON repo.id = r.repository_id
+            LEFT JOIN users reviewer ON reviewer.id = r.reviewed_by
             WHERE r.id = $1
             "#,
         )
@@ -1099,13 +1396,32 @@ impl AgeGateService {
         .ok_or_else(|| AppError::NotFound("Age gate review not found".to_string()))
     }
 
+    /// Approve as an instance administrator — the only tier that could decide
+    /// a review before #4238.
     pub async fn approve(
         &self,
         id: Uuid,
         reviewer_id: Uuid,
         reason: Option<&str>,
     ) -> Result<AgeGateReview> {
+        self.approve_as(id, reviewer_id, ActorTier::Instance, reason)
+            .await
+    }
+
+    /// Approve as `tier` (#4238). A repository-tier approval of an
+    /// instance-locked review is refused; the lock is ALSO a predicate of the
+    /// compare-and-set below, so an instance admin's decision that lands
+    /// between the read and the write turns this into a retryable conflict
+    /// instead of being overwritten.
+    pub async fn approve_as(
+        &self,
+        id: Uuid,
+        reviewer_id: Uuid,
+        tier: ActorTier,
+        reason: Option<&str>,
+    ) -> Result<AgeGateReview> {
         let review = self.get_review_by_id(id).await?;
+        require_may_relax_review(tier, review.instance_locked)?;
         require_distinct_status(&review.status, AgeGateReviewStatus::Approved)?;
         let expected_status = review.status.clone();
 
@@ -1115,8 +1431,9 @@ impl AgeGateService {
             "UPDATE age_gate_reviews
              SET status = 'approved', reviewed_by = $2, reviewed_at = NOW(),
                  review_reason = $3, basis_mode = $4,
-                 basis_upstream_fingerprint = $5
-             WHERE id = $1 AND status = $6",
+                 basis_upstream_fingerprint = $5,
+                 instance_locked = instance_locked OR $7
+             WHERE id = $1 AND status = $6 AND ($7 OR NOT instance_locked)",
         )
         .bind(id)
         .bind(reviewer_id)
@@ -1124,6 +1441,7 @@ impl AgeGateService {
         .bind(params.age_gate_mode.as_str())
         .bind(&fingerprint)
         .bind(&expected_status)
+        .bind(tier.is_instance())
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1144,10 +1462,27 @@ impl AgeGateService {
         self.get_review_by_id(id).await
     }
 
+    /// Reject as an instance administrator — the only tier that could decide
+    /// a review before #4238.
     pub async fn reject(
         &self,
         id: Uuid,
         reviewer_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<AgeGateReview> {
+        self.reject_as(id, reviewer_id, ActorTier::Instance, reason)
+            .await
+    }
+
+    /// Reject as `tier` (#4238). Always allowed — a rejection only tightens —
+    /// and it never clears an instance lock: an instance admin's approval that
+    /// a repository admin rejects stays instance-locked, so the repository
+    /// admin cannot then re-approve it past the instance admin.
+    pub async fn reject_as(
+        &self,
+        id: Uuid,
+        reviewer_id: Uuid,
+        tier: ActorTier,
         reason: Option<&str>,
     ) -> Result<AgeGateReview> {
         let review = self.get_review_by_id(id).await?;
@@ -1160,7 +1495,8 @@ impl AgeGateService {
             "UPDATE age_gate_reviews
              SET status = 'rejected', reviewed_by = $2, reviewed_at = NOW(),
                  review_reason = $3, basis_mode = $4,
-                 basis_upstream_fingerprint = $5
+                 basis_upstream_fingerprint = $5,
+                 instance_locked = instance_locked OR $7
              WHERE id = $1 AND status = $6",
         )
         .bind(id)
@@ -1169,6 +1505,7 @@ impl AgeGateService {
         .bind(params.age_gate_mode.as_str())
         .bind(&fingerprint)
         .bind(&expected_status)
+        .bind(tier.is_instance())
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1203,20 +1540,42 @@ impl AgeGateService {
         reviewer_id: Uuid,
         reason: Option<&str>,
     ) -> Result<(String, AgeGateReview)> {
+        self.reopen_as(id, reviewer_id, ActorTier::Instance, reason)
+            .await
+    }
+
+    /// Reopen as `tier` (#4238). Refused for a repository-tier actor on an
+    /// instance-locked review, with the lock also a compare-and-set
+    /// predicate — see [`Self::approve_as`].
+    ///
+    /// An instance administrator's reopen RELEASES the lock: a reopened review
+    /// is undecided, so it is no longer an instance decision, and the
+    /// repository's admins may decide it. A repository-tier reopen never
+    /// changes the lock (it can only reach an unlocked review).
+    pub async fn reopen_as(
+        &self,
+        id: Uuid,
+        reviewer_id: Uuid,
+        tier: ActorTier,
+        reason: Option<&str>,
+    ) -> Result<(String, AgeGateReview)> {
         let review = self.get_review_by_id(id).await?;
+        require_may_relax_review(tier, review.instance_locked)?;
         require_distinct_status(&review.status, AgeGateReviewStatus::Pending)?;
         let previous_status = review.status.clone();
 
         let res = sqlx::query(
             "UPDATE age_gate_reviews
              SET status = 'pending', reviewed_by = $2, reviewed_at = NOW(),
-                 review_reason = $3
-             WHERE id = $1 AND status = $4",
+                 review_reason = $3,
+                 instance_locked = instance_locked AND NOT $5
+             WHERE id = $1 AND status = $4 AND ($5 OR NOT instance_locked)",
         )
         .bind(id)
         .bind(reviewer_id)
         .bind(reason)
         .bind(&previous_status)
+        .bind(tier.is_instance())
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1238,6 +1597,8 @@ impl AgeGateService {
         Ok((previous_status, updated))
     }
 
+    /// Set a repository's policy as an instance administrator — the only tier
+    /// that could before #4238.
     pub async fn update_repo_config(
         &self,
         repo_id: Uuid,
@@ -1245,7 +1606,50 @@ impl AgeGateService {
         min_age_days: i32,
         mode: AgeGateMode,
     ) -> Result<()> {
-        validate_min_age_days(min_age_days)?;
+        let next = AgeGatePolicy {
+            enabled,
+            min_age_days,
+            mode,
+        };
+        self.update_repo_config_as(repo_id, next, ActorTier::Instance, None)
+            .await
+            .map(|_write| ())
+    }
+
+    /// Set a repository's policy as `tier` and report what it replaced and
+    /// how the lock moved, so the audit trail can show both (#4238).
+    ///
+    /// A repository-tier actor may not RELAX a policy an instance admin set
+    /// ([`AgeGatePolicy::is_relaxed_by`]); it may still tighten it. The check
+    /// runs under the `FOR UPDATE` row lock that already serialises policy
+    /// writes, so it cannot race an instance admin's change.
+    ///
+    /// `lock` is the instance administrator's explicit choice for the policy
+    /// lock: `Some(false)` hands the policy back to the repository's admins,
+    /// `Some(true)` or `None` locks it (an instance write is an instance
+    /// decision unless it says otherwise). A repository-tier write may not
+    /// touch the lock at all, so `Some(_)` from that tier is refused, and its
+    /// write leaves the lock exactly as it was.
+    pub async fn update_repo_config_as(
+        &self,
+        repo_id: Uuid,
+        next: AgeGatePolicy,
+        tier: ActorTier,
+        lock: Option<bool>,
+    ) -> Result<PolicyWrite> {
+        if tier == ActorTier::Repository && lock.is_some() {
+            return Err(AppError::Authorization(
+                "Only an instance administrator can lock an age-gate policy or hand it \
+                 back to the repository's administrators."
+                    .to_string(),
+            ));
+        }
+        validate_min_age_days(next.min_age_days)?;
+        let AgeGatePolicy {
+            enabled,
+            min_age_days,
+            mode,
+        } = next;
 
         let mut tx = self
             .db
@@ -1253,31 +1657,53 @@ impl AgeGateService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let current: Option<String> =
-            sqlx::query_scalar("SELECT age_gate_mode FROM repositories WHERE id = $1 FOR UPDATE")
-                .bind(repo_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
+        let row: Option<(bool, i32, String, bool)> = sqlx::query_as(
+            "SELECT age_gate_enabled, age_gate_min_age_days, age_gate_mode, \
+                    age_gate_instance_locked \
+             FROM repositories WHERE id = $1 FOR UPDATE",
+        )
+        .bind(repo_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let current =
-            current.ok_or_else(|| AppError::NotFound(format!("Repository {repo_id} not found")))?;
+        let (current_enabled, current_min_age_days, current_mode, locked) =
+            row.ok_or_else(|| AppError::NotFound(format!("Repository {repo_id} not found")))?;
+        let current = AgeGatePolicy {
+            enabled: current_enabled,
+            min_age_days: current_min_age_days,
+            mode: AgeGateMode::parse(&current_mode)?,
+        };
+        let now_locked = match tier {
+            ActorTier::Instance => lock.unwrap_or(true),
+            ActorTier::Repository => locked,
+        };
+        if locked && tier == ActorTier::Repository && current.is_relaxed_by(next) {
+            return Err(AppError::Authorization(
+                "This repository's age gate was set by an instance administrator. A \
+                 repository administrator can tighten it, but only an instance \
+                 administrator can disable it, lower its minimum age, or change its mode."
+                    .to_string(),
+            ));
+        }
 
         sqlx::query(
             "UPDATE repositories
              SET age_gate_enabled = $2, age_gate_min_age_days = $3,
-                 age_gate_mode = $4, updated_at = NOW()
+                 age_gate_mode = $4, updated_at = NOW(),
+                 age_gate_instance_locked = $5
              WHERE id = $1",
         )
         .bind(repo_id)
         .bind(enabled)
         .bind(min_age_days)
         .bind(mode.as_str())
+        .bind(now_locked)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        if current != mode.as_str() {
+        if current.mode != mode {
             sqlx::query(
                 "UPDATE age_gate_reviews
                  SET upstream_published_at = NULL, basis_mode = NULL,
@@ -1295,7 +1721,11 @@ impl AgeGateService {
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         invalidate_decision_memos(repo_id);
-        Ok(())
+        Ok(PolicyWrite {
+            previous: current,
+            was_locked: locked,
+            now_locked,
+        })
     }
 
     pub async fn find_last_known_good(
@@ -1335,7 +1765,7 @@ impl AgeGateService {
         ))
     }
 
-    async fn get_review(
+    pub(crate) async fn get_review(
         &self,
         repository_id: Uuid,
         package_name: &str,
@@ -1705,8 +2135,9 @@ impl AgeGateService {
                     review_reason = $2
                 WHERE repository_id = $1
                   AND status = 'pending'
-                  AND upstream_published_at IS NOT NULL
-                  AND NOW() - upstream_published_at >= make_interval(days => $3)
+                  AND ($3 = 0
+                       OR (upstream_published_at IS NOT NULL
+                           AND NOW() - upstream_published_at >= make_interval(days => $3)))
                   AND ((basis_mode = $4 AND basis_upstream_fingerprint = $5)
                        OR (basis_mode IS NULL AND basis_upstream_fingerprint IS NULL
                            AND $4 = 'upstream_publish_time'))
@@ -1793,8 +2224,36 @@ type PypiSimpleIndexParseResult = (Vec<PypiAnchorSpan>, Vec<(String, Option<Date
 
 /// First pass over PyPI simple-index HTML: locate anchors and dedupe versions.
 pub(crate) fn parse_pypi_simple_index_anchors(html: &str) -> PypiSimpleIndexParseResult {
+    parse_pypi_index_anchors_where(html, |_| true)
+}
+
+/// The versions in a simple index that come from files named for `project`
+/// (its PEP 503 form). A link to anything else on the page says nothing about
+/// this project's releases.
+pub(crate) fn parse_pypi_project_index_anchors(
+    html: &str,
+    project: &str,
+) -> Vec<(String, Option<DateTime<Utc>>)> {
+    parse_pypi_index_anchors_where(html, |anchor| {
+        extract_href_filename(anchor).is_some_and(|f| pypi_filename_names_project(&f, project))
+    })
+    .1
+}
+
+/// Whether a distribution filename names `project` (its PEP 503 form).
+pub(crate) fn pypi_filename_names_project(filename: &str, project: &str) -> bool {
+    crate::formats::pypi::PypiHandler::parse_filename(filename)
+        .ok()
+        .and_then(|info| info.name)
+        .is_some_and(|name| crate::formats::pypi::PypiHandler::normalize_name(&name) == project)
+}
+
+fn parse_pypi_index_anchors_where(
+    html: &str,
+    keep_version: impl Fn(&str) -> bool,
+) -> PypiSimpleIndexParseResult {
     let mut spans: Vec<PypiAnchorSpan> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut versions: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
     let mut cursor = 0usize;
     while let Some(rel) = html[cursor..].find("<a ") {
@@ -1803,10 +2262,19 @@ pub(crate) fn parse_pypi_simple_index_anchors(html: &str) -> PypiSimpleIndexPars
             break;
         };
         let end = start + end_rel + 4;
-        let version = pypi_anchor_version(&html[start..end]);
-        if let Some(ref ver) = version {
-            if seen.insert(ver.clone()) {
+        let anchor = &html[start..end];
+        let version = pypi_anchor_version(anchor);
+        if let Some(ver) = version.as_ref().filter(|_| keep_version(anchor)) {
+            // A version is as old as its earliest file, as in the PEP 691 walk.
+            let index = *seen.entry(ver.clone()).or_insert_with(|| {
                 versions.push((ver.clone(), None));
+                versions.len() - 1
+            });
+            if let Some(uploaded) = pypi_anchor_upload_time(anchor) {
+                let earliest = &mut versions[index].1;
+                if earliest.is_none_or(|existing| uploaded < existing) {
+                    *earliest = Some(uploaded);
+                }
             }
         }
         spans.push(PypiAnchorSpan {
@@ -1819,13 +2287,64 @@ pub(crate) fn parse_pypi_simple_index_anchors(html: &str) -> PypiSimpleIndexPars
     (spans, versions)
 }
 
-/// Attach publish times to parsed simple-index versions.
+/// Find a version in a parsed simple index, matching PEP 440-equal spellings.
+/// `Some(time)` when it is listed, where a spelling with no time makes the
+/// answer `Some(None)`: the fallback must never be more permissive than an
+/// exact hit, the same rule as [`pypi_publish_time`].
+pub(crate) fn pypi_listed_version(
+    versions: &[(String, Option<DateTime<Utc>>)],
+    version: &str,
+) -> Option<Option<DateTime<Utc>>> {
+    if let Some((_, time)) = versions.iter().find(|(listed, _)| listed == version) {
+        return Some(*time);
+    }
+    let wanted = crate::formats::pypi::PypiHandler::pep440_sort_key(version)?;
+    versions
+        .iter()
+        .filter(|(listed, _)| {
+            crate::formats::pypi::PypiHandler::pep440_sort_key(listed).as_ref() == Some(&wanted)
+        })
+        .map(|(_, time)| *time)
+        .reduce(|a, b| a.zip(b).map(|(a, b)| a.max(b)))
+}
+
+/// Look up a PyPI version's publish time, matching PEP 440-equal spellings.
+///
+/// Warehouse keys `releases` by the release's own spelling (`13.0.3`), but a
+/// distribution filename may spell the same version differently
+/// (`cuda_toolkit-13.0.3.0-...whl`, `setuptools-69.3.tar.gz` under `69.3.0`).
+/// An exact-string miss reads as "no publish time", which the gate treats as
+/// young and blocks (#2066), so an old release would be withheld forever.
+/// Falls back to comparing PEP 440 sort keys; on more than one match the
+/// youngest wins, so the fallback is never more permissive than an exact hit.
+pub(crate) fn pypi_publish_time(
+    publish_times: &std::collections::HashMap<String, DateTime<Utc>>,
+    version: &str,
+) -> Option<DateTime<Utc>> {
+    if let Some(ts) = publish_times.get(version) {
+        return Some(*ts);
+    }
+    let wanted = crate::formats::pypi::PypiHandler::pep440_sort_key(version)?;
+    publish_times
+        .iter()
+        .filter(|(key, _)| {
+            crate::formats::pypi::PypiHandler::pep440_sort_key(key).as_ref() == Some(&wanted)
+        })
+        .map(|(_, ts)| *ts)
+        .max()
+}
+
+/// Attach publish times to the versions of an HTML simple index. In this
+/// listing the upstream's JSON API wins, the same order the download path reads
+/// them in, and an anchor's own time stays where the API has nothing. The PEP
+/// 691 listing is the other way round: [`AgeGateService::filter_pypi_simple_json`]
+/// keeps the document's `upload-time` and only falls back to the API.
 pub(crate) fn attach_pypi_publish_times(
     versions: &mut [(String, Option<DateTime<Utc>>)],
     publish_times: &std::collections::HashMap<String, DateTime<Utc>>,
 ) {
     for (ver, ts) in versions {
-        *ts = publish_times.get(ver).copied();
+        *ts = pypi_publish_time(publish_times, ver).or(*ts);
     }
 }
 
@@ -1880,8 +2399,21 @@ fn extract_href_filename(anchor: &str) -> Option<String> {
     if filename.is_empty() {
         None
     } else {
-        Some(filename.to_string())
+        // A local version's `+` arrives as `%2B` on some indexes (#5151).
+        Some(
+            urlencoding::decode(filename)
+                .map(|decoded| decoded.into_owned())
+                .unwrap_or_else(|_| filename.to_string()),
+        )
     }
+}
+
+/// An anchor's `data-upload-time`, the HTML form of PEP 700 `upload-time`.
+fn pypi_anchor_upload_time(anchor: &str) -> Option<DateTime<Utc>> {
+    let start_tag = &anchor[..anchor.find('>').unwrap_or(anchor.len())];
+    let rest = &start_tag[start_tag.find("data-upload-time=\"")? + 18..];
+    let value = &rest[..rest.find('"')?];
+    crate::services::upstream_metadata::parse_iso_timestamp(&serde_json::Value::from(value))
 }
 
 /// Extract the package version a PyPI simple-index anchor links to, if any.
@@ -1963,7 +2495,7 @@ pub(crate) fn fill_missing_publish_times(
 ) {
     for (version, ts) in versions {
         if ts.is_none() {
-            *ts = fallback.get(version).copied();
+            *ts = pypi_publish_time(fallback, version);
         }
     }
 }
@@ -2004,7 +2536,15 @@ pub(crate) fn format_label(format: &RepositoryFormat) -> &'static str {
 }
 
 /// Drop any `dist-tags` entry whose target version is no longer present in the
-/// filtered packument, then re-point `latest` to the newest surviving version.
+/// filtered packument, then re-point `latest` if the gate removed its target.
+///
+/// `latest` is the publisher's choice, so a surviving `latest` is kept even when
+/// a higher prerelease also survived: re-pointing it to the newest version would
+/// hand `npm install pkg` a nightly. When the gate removed it, the replacement is
+/// the newest allowed release at or below the old `latest`, then the newest
+/// allowed release, then the newest allowed version of any kind. A blocked
+/// prerelease `latest` is therefore replaced by a release whenever one
+/// survives.
 ///
 /// `allowed` is the set of versions that survived age-gate filtering and must be
 /// sorted newest-first. When `allowed` is empty every tag is removed, leaving an
@@ -2017,8 +2557,27 @@ fn reconcile_dist_tags(packument: &mut serde_json::Value, allowed: &[String]) {
     else {
         return;
     };
+    let previous_latest = dist_tags
+        .get("latest")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
     dist_tags.retain(|_tag, target| target.as_str().is_some_and(|v| allowed_set.contains(v)));
-    if let Some(latest) = allowed.first() {
+    if dist_tags.contains_key("latest") {
+        return;
+    }
+
+    let is_release = |v: &&String| split_version_prerelease(v).1.is_none();
+    let replacement = allowed
+        .iter()
+        .filter(is_release)
+        .find(|v| {
+            previous_latest
+                .as_deref()
+                .is_none_or(|latest| version_compare(v, latest) <= 0)
+        })
+        .or_else(|| allowed.iter().find(is_release))
+        .or_else(|| allowed.first());
+    if let Some(latest) = replacement {
         dist_tags.insert(
             "latest".to_string(),
             serde_json::Value::String(latest.clone()),
@@ -2038,7 +2597,7 @@ fn version_compare(a: &str, b: &str) -> i32 {
     let (main_a, pre_a) = split_version_prerelease(a);
     let (main_b, pre_b) = split_version_prerelease(b);
 
-    let main_cmp = compare_dot_segments(main_a, main_b);
+    let main_cmp = compare_dot_segments(main_a, main_b, compare_natural_segment);
     if main_cmp != 0 {
         return main_cmp;
     }
@@ -2047,7 +2606,7 @@ fn version_compare(a: &str, b: &str) -> i32 {
         (None, None) => 0,
         (None, Some(_)) => 1,
         (Some(_), None) => -1,
-        (Some(pa), Some(pb)) => compare_dot_segments(pa, pb),
+        (Some(pa), Some(pb)) => compare_dot_segments(pa, pb, compare_semver_prerelease_identifier),
     }
 }
 
@@ -2058,10 +2617,13 @@ fn split_version_prerelease(version: &str) -> (&str, Option<&str>) {
 }
 
 /// Compare two dot-separated version segment lists (the numeric core such as
-/// `1.2.3`, or a prerelease tail such as `alpha.1`). Each segment is compared
-/// numerically when both sides parse as integers, otherwise lexically. Missing
-/// trailing segments default to `0`. Returns -1, 0, or 1.
-fn compare_dot_segments(a: &str, b: &str) -> i32 {
+/// `1.2.3`, or a prerelease tail such as `alpha.1`), one segment at a time with
+/// `compare_segment`. Missing trailing segments default to `0`. Returns -1, 0,
+/// or 1.
+///
+/// `compare_segment` must be a total order, or so is not the result: `sort_by`
+/// panics on a comparator with a cycle once the slice is long enough.
+fn compare_dot_segments(a: &str, b: &str, compare_segment: fn(&str, &str) -> Ordering) -> i32 {
     let seg_a: Vec<&str> = a.split('.').collect();
     let seg_b: Vec<&str> = b.split('.').collect();
 
@@ -2069,20 +2631,10 @@ fn compare_dot_segments(a: &str, b: &str) -> i32 {
         let sa = seg_a.get(i).unwrap_or(&"0");
         let sb = seg_b.get(i).unwrap_or(&"0");
 
-        match (sa.parse::<u64>(), sb.parse::<u64>()) {
-            (Ok(na), Ok(nb)) => {
-                if na < nb {
-                    return -1;
-                }
-                if na > nb {
-                    return 1;
-                }
-            }
-            _ => match sa.cmp(sb) {
-                std::cmp::Ordering::Less => return -1,
-                std::cmp::Ordering::Greater => return 1,
-                std::cmp::Ordering::Equal => {}
-            },
+        match compare_segment(sa, sb) {
+            Ordering::Less => return -1,
+            Ordering::Greater => return 1,
+            Ordering::Equal => {}
         }
     }
     0
@@ -2092,16 +2644,59 @@ fn compare_dot_segments(a: &str, b: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- #4238: the instance-admin lock ------------------------------------------
+
+    #[test]
+    fn actor_tier_follows_the_instance_admin_bit() {
+        assert_eq!(ActorTier::of(true), ActorTier::Instance);
+        assert_eq!(ActorTier::of(false), ActorTier::Repository);
+    }
+
+    #[test]
+    fn only_an_instance_admin_may_relax_an_instance_locked_review() {
+        assert!(require_may_relax_review(ActorTier::Instance, true).is_ok());
+        assert!(require_may_relax_review(ActorTier::Instance, false).is_ok());
+        assert!(require_may_relax_review(ActorTier::Repository, false).is_ok());
+        assert!(matches!(
+            require_may_relax_review(ActorTier::Repository, true),
+            Err(AppError::Authorization(_))
+        ));
+    }
+
+    #[test]
+    fn a_policy_is_relaxed_by_disabling_lowering_or_switching_mode() {
+        let set = AgeGatePolicy {
+            enabled: true,
+            min_age_days: 30,
+            mode: AgeGateMode::FirstSeen,
+        };
+        let with = |f: fn(&mut AgeGatePolicy)| {
+            let mut p = set;
+            f(&mut p);
+            p
+        };
+        assert!(set.is_relaxed_by(with(|p| p.enabled = false)));
+        assert!(set.is_relaxed_by(with(|p| p.min_age_days = 29)));
+        assert!(set.is_relaxed_by(with(|p| p.mode = AgeGateMode::UpstreamPublishTime)));
+        assert!(
+            !set.is_relaxed_by(set),
+            "an identical write is not a relaxation"
+        );
+        assert!(!set.is_relaxed_by(with(|p| p.min_age_days = 60)));
+
+        // A disabled gate cannot be weakened further, whatever the new values.
+        let off = AgeGatePolicy {
+            enabled: false,
+            ..set
+        };
+        assert!(!off.is_relaxed_by(with(|p| p.min_age_days = 0)));
+        assert!(!off.is_relaxed_by(off));
+    }
     use chrono::{Duration, TimeZone};
 
     async fn try_db_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(3)
-            .acquire_timeout(std::time::Duration::from_secs(3))
-            .connect(&url)
-            .await
-            .ok()
+        crate::testing::try_pool_with(3).await
     }
 
     fn lazy_pool() -> sqlx::PgPool {
@@ -2260,6 +2855,102 @@ mod tests {
 
     const TEST_UPSTREAM: &str = "https://upstream.example.test";
 
+    /// #4467: state recorded under the pre-#4467 (userinfo-bearing)
+    /// fingerprint moves to the current one with its earliest first-seen time
+    /// and its review decision, so neither the upgrade nor a later credential
+    /// rotation restarts a clock or voids an approval. A repoint to another
+    /// host still gets a fresh identity.
+    #[tokio::test]
+    async fn rekey_keeps_first_seen_and_reviews_across_credential_rotation_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let old_url = "https://svc:old-4467@registry.example.test/npm";
+        sqlx::query("UPDATE repositories SET upstream_url = $2 WHERE id = $1")
+            .bind(repo_id)
+            .bind(old_url)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let legacy = legacy_upstream_fingerprint(Some(old_url)).expect("credentialed url");
+        let current = upstream_fingerprint(Some(old_url));
+        // 1.0.0 seen 30 days ago under the legacy key, and again just now
+        // under the new key (a request served after the upgrade): the
+        // earliest time must win.
+        for (fp, age) in [(&legacy, 30), (&current, 0)] {
+            sqlx::query(
+                "INSERT INTO age_gate_version_observations \
+                 (repository_id, upstream_fingerprint, package_name, package_version, first_seen_at) \
+                 VALUES ($1, $2, 'pkg', '1.0.0', NOW() - make_interval(days => $3))",
+            )
+            .bind(repo_id)
+            .bind(fp)
+            .bind(age)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO age_gate_reviews (repository_id, package_name, package_version, status, \
+             basis_mode, basis_upstream_fingerprint) \
+             VALUES ($1, 'pkg', '2.0.0', 'approved', 'first_seen', $2)",
+        )
+        .bind(repo_id)
+        .bind(&legacy)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        rekey_all_legacy_fingerprints(&pool).await.expect("rekey");
+        // Idempotent.
+        assert_eq!(
+            rekey_legacy_fingerprint(&pool, repo_id, Some(old_url))
+                .await
+                .unwrap(),
+            0
+        );
+
+        // The credential rotation keeps the (now current) identity.
+        let rotated = "https://svc:new-4467@registry.example.test/npm";
+        assert_eq!(upstream_fingerprint(Some(rotated)), current);
+        let observations: Vec<(String, i32)> = sqlx::query_as(
+            "SELECT upstream_fingerprint, \
+             EXTRACT(DAY FROM NOW() - first_seen_at)::int \
+             FROM age_gate_version_observations WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let basis: Option<String> = sqlx::query_scalar(
+            "SELECT basis_upstream_fingerprint FROM age_gate_reviews WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+
+        assert_eq!(observations, vec![(current.clone(), 30)]);
+        assert_eq!(basis.as_deref(), Some(current.as_str()));
+        assert_eq!(
+            review_identity_match(
+                Some("first_seen"),
+                basis.as_deref(),
+                AgeGateMode::FirstSeen,
+                &upstream_fingerprint(Some(rotated)),
+            ),
+            ReviewIdentityMatch::Matches
+        );
+        // A repoint to another host is a different identity.
+        assert_ne!(
+            upstream_fingerprint(Some("https://svc:new-4467@other.example.test/npm")),
+            current
+        );
+    }
+
     fn npm_params(id: Uuid, key: String, min_age_days: i32) -> AgeGateRepoParams {
         params_with_mode(
             id,
@@ -2316,6 +3007,180 @@ mod tests {
     fn missing_timestamp_does_not_meet_threshold() {
         let now = Utc::now();
         assert!(!AgeGateService::meets_age_threshold(None, 7, now));
+    }
+
+    /// #5151: no age is required at 0, so an unknown one cannot fall short.
+    #[test]
+    fn zero_days_is_met_without_a_timestamp_5151() {
+        let now = Utc::now();
+        assert!(AgeGateService::meets_age_threshold(None, 0, now));
+        assert!(AgeGateService::meets_age_threshold(Some(now), 0, now));
+        assert!(!AgeGateService::meets_age_threshold(None, 1, now));
+    }
+
+    /// #5151: a listing makes the same decision as a download at 0 days, and
+    /// a rejection is still honoured there.
+    #[test]
+    fn listing_at_zero_days_withholds_only_a_rejection_5151() {
+        let now = Utc::now();
+        let versions = vec![("1.0.0".to_string(), None), ("2.0.0".to_string(), None)];
+        let existing = std::collections::HashMap::from([(
+            "2.0.0".to_string(),
+            PackageReviewRow {
+                status: AgeGateReviewStatus::Rejected.as_str().to_string(),
+                is_automatic: false,
+                basis_mode: None,
+                basis_upstream_fingerprint: None,
+            },
+        )]);
+        let out = classify_versions_for_metadata_listing(
+            &versions,
+            &existing,
+            0,
+            AgeGateMode::UpstreamPublishTime,
+            "fp",
+            now,
+        );
+        assert_eq!(
+            out.blocked,
+            std::collections::HashSet::from(["2.0.0".to_string()])
+        );
+        assert!(out.request_versions.is_empty());
+    }
+
+    /// #5151: an anchor's upload time is the version's, as old as its earliest
+    /// file, and a percent-encoded local version parses to its real spelling.
+    #[test]
+    fn simple_index_anchors_carry_their_upload_time_5151() {
+        let html = "<a href=\"/f/a-1.0.0-py3-none-any.whl\" \
+                    data-upload-time=\"2023-10-06T00:25:26Z\">x</a>\
+                    <a href=\"/f/a-1.0.0.tar.gz\" \
+                    data-upload-time=\"2022-01-02T03:04:05Z\">x</a>\
+                    <a href=\"/f/a-2.0.0%2Bcpu-py3-none-any.whl#sha256=ab\">x</a>\
+                    <a href=\"/f/a-3.0.0-py3-none-any.whl\" \
+                    data-upload-time=\"not a date\">x</a>";
+        let (spans, versions) = parse_pypi_simple_index_anchors(html);
+        assert_eq!(spans.len(), 4);
+        let expected = "2022-01-02T03:04:05Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            versions,
+            vec![
+                ("1.0.0".to_string(), Some(expected)),
+                ("2.0.0+cpu".to_string(), None),
+                ("3.0.0".to_string(), None),
+            ]
+        );
+    }
+
+    /// #5151: a time from the upstream's JSON API wins over an anchor's, and
+    /// an anchor's survives where the API has nothing.
+    #[test]
+    fn attach_publish_times_keeps_an_anchor_time_the_api_lacks_5151() {
+        let anchor = "2022-01-02T03:04:05Z".parse::<DateTime<Utc>>().unwrap();
+        let api = "2020-01-02T03:04:05Z".parse::<DateTime<Utc>>().unwrap();
+        let mut versions = vec![
+            ("1.0.0".to_string(), Some(anchor)),
+            ("2.0.0".to_string(), Some(anchor)),
+            ("3.0.0".to_string(), None),
+        ];
+        let times = std::collections::HashMap::from([("1.0.0".to_string(), api)]);
+        attach_pypi_publish_times(&mut versions, &times);
+        assert_eq!(versions[0].1, Some(api));
+        assert_eq!(versions[1].1, Some(anchor));
+        assert_eq!(versions[2].1, None);
+    }
+
+    /// #5150: what counts as "not hosted" in a packument, and what does not.
+    #[test]
+    fn npm_packument_evidence_separates_a_miss_from_no_answer_5150() {
+        use UpstreamVersionEvidence::{Listed, NotHosted, Unknown};
+        let at = "2024-06-01T12:00:00.000Z".parse::<DateTime<Utc>>().unwrap();
+        let check = |doc: serde_json::Value| {
+            npm_packument_version_evidence(doc.to_string().as_bytes(), "1.0.0")
+        };
+        assert_eq!(
+            check(serde_json::json!({
+                "versions": {"1.0.0": {}}, "time": {"1.0.0": "2024-06-01T12:00:00.000Z"}
+            })),
+            Listed(Some(at))
+        );
+        assert_eq!(
+            check(serde_json::json!({"versions": {"1.0.0": {}}})),
+            Listed(None)
+        );
+        assert_eq!(
+            check(serde_json::json!({"time": {"1.0.0": "2024-06-01T12:00:00.000Z"}})),
+            Listed(Some(at))
+        );
+        assert_eq!(
+            check(serde_json::json!({"versions": {"2.0.0": {}}})),
+            NotHosted
+        );
+        // Fully unpublished: npm keeps `time` and drops `versions`.
+        assert_eq!(
+            check(serde_json::json!({"time": {"unpublished": {"time": "x"}}})),
+            NotHosted
+        );
+        assert_eq!(check(serde_json::json!({"error": "not_found"})), Unknown);
+        assert_eq!(check(serde_json::json!(["1.0.0"])), Unknown);
+        assert_eq!(npm_packument_version_evidence(b"<html>", "1.0.0"), Unknown);
+    }
+
+    /// PEP 440-equal spellings match, and any spelling without a time leaves
+    /// the answer undated, so the fallback never admits more than an exact hit.
+    #[test]
+    fn pypi_listed_version_matches_spellings_conservatively_5151() {
+        let old = "2020-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let new = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let versions = vec![
+            ("1.0".to_string(), Some(old)),
+            ("2.0".to_string(), Some(old)),
+            ("2.0.0".to_string(), Some(new)),
+            ("3.0".to_string(), Some(old)),
+            ("3.0.0".to_string(), None),
+        ];
+        assert_eq!(pypi_listed_version(&versions, "1.0"), Some(Some(old)));
+        assert_eq!(pypi_listed_version(&versions, "1.0.0"), Some(Some(old)));
+        assert_eq!(pypi_listed_version(&versions, "2.0.0.0"), Some(Some(new)));
+        assert_eq!(pypi_listed_version(&versions, "3.0.0.0"), Some(None));
+        assert_eq!(pypi_listed_version(&versions, "9.0"), None);
+    }
+
+    /// #5151: the sweep mirrors the threshold at 0 too, so a row with no time
+    /// does not sit pending in the queue after the read path would allow it.
+    #[tokio::test]
+    async fn sweep_releases_an_undated_pending_row_only_at_zero_days_5151() {
+        let Some(pool) = try_db_pool().await else {
+            return;
+        };
+        let svc = AgeGateService::new(pool.clone(), Arc::new(EventBus::new(4)));
+        let (zero, _) = create_age_gate_repo(&pool, RepositoryFormat::Npm, 0).await;
+        let (seven, _) = create_age_gate_repo(&pool, RepositoryFormat::Npm, 7).await;
+        let zero_row = insert_review_row(&pool, zero, "pkg", "1.0.0", "pending", None).await;
+        let seven_row = insert_review_row(&pool, seven, "pkg", "1.0.0", "pending", None).await;
+
+        svc.auto_approve_aged_reviews().await.expect("sweep");
+        let status = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT status FROM age_gate_reviews WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("row")
+            }
+        };
+        let zero_status = status(zero_row).await;
+        let seven_status = status(seven_row).await;
+        for repo in [zero, seven] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+
+        assert_eq!(zero_status, "approved");
+        assert_eq!(seven_status, "pending");
     }
 
     #[tokio::test]
@@ -2672,6 +3537,8 @@ mod tests {
         assert_eq!(format_label(&RepositoryFormat::Yarn), "npm");
         assert_eq!(format_label(&RepositoryFormat::Poetry), "pypi");
         assert_eq!(format_label(&RepositoryFormat::Jupyter), "pypi");
+        assert_eq!(format_label(&RepositoryFormat::Maven), "maven");
+        assert_eq!(format_label(&RepositoryFormat::Gradle), "maven");
         // Anything outside the gate's supported formats collapses to "other"
         // so the metric label set stays bounded.
         assert_eq!(format_label(&RepositoryFormat::Generic), "other");
@@ -2718,6 +3585,96 @@ mod tests {
         });
         reconcile_dist_tags(&mut packument, &["2.0.0".to_string(), "1.0.0".to_string()]);
         assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("2.0.0"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_keeps_surviving_latest_over_newer_prerelease() {
+        // typescript: `latest` is a release, nightlies above it are allowed too.
+        // `npm install typescript` must keep resolving to the release.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "7.0.2", "next": "7.1.0-dev.20260926.1" },
+            "versions": { "7.0.2": {}, "7.1.0-dev.20260926.1": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &["7.1.0-dev.20260926.1".to_string(), "7.0.2".to_string()],
+        );
+        let tags = packument["dist-tags"].as_object().unwrap();
+        assert_eq!(tags.get("latest"), Some(&serde_json::json!("7.0.2")));
+        assert_eq!(
+            tags.get("next"),
+            Some(&serde_json::json!("7.1.0-dev.20260926.1"))
+        );
+    }
+
+    #[test]
+    fn reconcile_dist_tags_repoints_blocked_latest_to_a_release_not_a_prerelease() {
+        // `latest` was blocked; the newest survivor is a prerelease and a release
+        // line above the old `latest` survives as well. Neither is a fit for
+        // `latest`: the replacement is the newest release at or below it.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "7.0.2" },
+            "versions": { "8.0.0": {}, "7.1.0-dev.1": {}, "7.0.1": {}, "7.0.0": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &[
+                "8.0.0".to_string(),
+                "7.1.0-dev.1".to_string(),
+                "7.0.1".to_string(),
+                "7.0.0".to_string(),
+            ],
+        );
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("7.0.1"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_takes_a_newer_release_when_none_at_or_below_latest_survives() {
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "3.0.0-rc.1": {}, "3.0.0": {}, "2.0.0": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &[
+                "3.0.0".to_string(),
+                "3.0.0-rc.1".to_string(),
+                "2.0.0".to_string(),
+            ],
+        );
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("3.0.0"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_replaces_a_blocked_prerelease_latest_with_a_release() {
+        // A publisher may tag a prerelease as `latest`. When the gate blocks
+        // it, the replacement is the newest release below it, not an older
+        // prerelease of the same line.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "3.0.0-beta.5" },
+            "versions": { "3.0.0-beta.4": {}, "2.9.0": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &["3.0.0-beta.4".to_string(), "2.9.0".to_string()],
+        );
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("2.9.0"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_falls_back_to_a_prerelease_when_no_release_survives() {
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "1.0.0-rc.2": {}, "1.0.0-rc.1": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &["1.0.0-rc.2".to_string(), "1.0.0-rc.1".to_string()],
+        );
+        assert_eq!(
+            packument["dist-tags"]["latest"],
+            serde_json::json!("1.0.0-rc.2")
+        );
     }
 
     #[test]
@@ -3096,6 +4053,62 @@ mod tests {
     }
 
     #[test]
+    fn pypi_publish_time_matches_pep440_equal_spellings() {
+        // Real Warehouse shapes: `cuda-toolkit` release `13.0.3` ships
+        // `cuda_toolkit-13.0.3.0-py2.py3-none-any.whl`, and `setuptools`
+        // release `69.3.0` ships `setuptools-69.3.tar.gz`. Exact-string
+        // lookup missed both, so an old release was gated as young forever.
+        let published = Utc.with_ymd_and_hms(2026, 4, 14, 0, 50, 8).unwrap();
+        let times = std::collections::HashMap::from([
+            ("13.0.3".to_string(), published),
+            ("69.3.0".to_string(), published),
+            ("4.21.0rc1".to_string(), published),
+        ]);
+
+        assert_eq!(pypi_publish_time(&times, "13.0.3"), Some(published));
+        assert_eq!(pypi_publish_time(&times, "13.0.3.0"), Some(published));
+        assert_eq!(pypi_publish_time(&times, "69.3"), Some(published));
+        assert_eq!(pypi_publish_time(&times, "4.21.0_rc_1"), Some(published));
+
+        // Not the same version under PEP 440: still a miss, still gated.
+        assert_eq!(pypi_publish_time(&times, "13.0.3.1"), None);
+        assert_eq!(pypi_publish_time(&times, "13.0.3.post0"), None);
+        assert_eq!(pypi_publish_time(&times, "not-a-version"), None);
+    }
+
+    #[test]
+    fn pypi_publish_time_prefers_youngest_of_equal_spellings() {
+        let old = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let young = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let times = std::collections::HashMap::from([
+            ("1.0".to_string(), old),
+            ("1.0.0".to_string(), young),
+        ]);
+        assert_eq!(pypi_publish_time(&times, "1.0.0.0"), Some(young));
+        assert_eq!(
+            pypi_publish_time(&times, "1.0"),
+            Some(old),
+            "exact hit wins"
+        );
+    }
+
+    #[test]
+    fn listing_helpers_attach_times_for_pep440_equal_filename_versions() {
+        let published = Utc.with_ymd_and_hms(2026, 4, 14, 0, 50, 8).unwrap();
+        let warehouse = std::collections::HashMap::from([("13.0.3".to_string(), published)]);
+
+        let html = r#"<a href="/pkg/cuda_toolkit-13.0.3.0-py2.py3-none-any.whl">wheel</a>"#;
+        let (_, mut versions) = parse_pypi_simple_index_anchors(html);
+        assert_eq!(versions, vec![("13.0.3.0".to_string(), None)]);
+        attach_pypi_publish_times(&mut versions, &warehouse);
+        assert_eq!(versions[0].1, Some(published), "HTML listing path");
+
+        let mut versions = vec![("13.0.3.0".to_string(), None)];
+        fill_missing_publish_times(&mut versions, &warehouse);
+        assert_eq!(versions[0].1, Some(published), "JSON fallback path");
+    }
+
+    #[test]
     fn apply_pypi_simple_json_blocks_removes_files_and_versions_entries() {
         let mut index = serde_json::json!({
             "name": "demo",
@@ -3218,6 +4231,81 @@ mod tests {
     }
 
     #[test]
+    fn version_compare_numeric_prerelease_sorts_below_alphanumeric() {
+        // SemVer 2.0.0 §11.4.3: numeric identifiers have lower precedence
+        // than alphanumeric ones, whatever their lexical order.
+        assert!(version_compare("2.0.0-next.103", "2.0.0-next.2150693d") < 0);
+        assert!(version_compare("2.0.0-next.74", "2.0.0-next.2150693d") < 0);
+        assert!(version_compare("2.0.0-next.2150693d", "2.0.0-next.74") > 0);
+        assert!(version_compare("1.0.0-1", "1.0.0-alpha") < 0);
+    }
+
+    #[test]
+    fn version_compare_ranks_digit_led_core_segments_by_their_digits() {
+        // The core uses natural order, not the SemVer prerelease rule, so a
+        // PyPI pre-release or a build suffix stays below the next release.
+        assert!(version_compare("2.0.0rc1", "2.0.1") < 0);
+        assert!(version_compare("1.1rc1", "1.2") < 0);
+        assert!(version_compare("2.0.0+cu118", "2.0.1") < 0);
+    }
+
+    #[test]
+    fn version_compare_is_transitive_across_numeric_and_hash_prereleases() {
+        // The three versions that formed a cycle under the old comparator.
+        let cycle = ["2.0.0-next.74", "2.0.0-next.103", "2.0.0-next.2150693d"];
+        for a in cycle {
+            for b in cycle {
+                for c in cycle {
+                    if version_compare(a, b) <= 0 && version_compare(b, c) <= 0 {
+                        assert!(version_compare(a, c) <= 0, "{a} <= {b} <= {c}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_npm_packument_blocks_sorts_mixed_prereleases_without_panicking() {
+        // The version keys of confusing-browser-globals, whose packument made
+        // `sort_by` panic with "user-provided comparison function does not
+        // correctly implement a total order". Insertion sort on a short slice
+        // never notices, so the test needs the full, long list.
+        let keys: Vec<&str> = concat!(
+            "0.0.0 1.0.1 1.0.2 1.0.3 1.0.4 1.0.5 1.0.5-next.9b4009d7 1.0.5-next.c662dfb0 ",
+            "1.0.6 1.0.6-next.6a95aae9 1.0.7 1.0.8 1.0.9 1.0.10 1.0.11 1.1.0-next.14 ",
+            "1.1.0-next.61 1.1.0-next.62 1.1.0-next.85 1.1.0-next.103 2.0.0-next.03604a46 ",
+            "2.0.0-next.096703ab 2.0.0-next.101 2.0.0-next.102 2.0.0-next.103 ",
+            "2.0.0-next.104 2.0.0-next.2150693d 2.0.0-next.247 2.0.0-next.260 ",
+            "2.0.0-next.279 2.0.0-next.281 2.0.0-next.299 2.0.0-next.300 ",
+            "2.0.0-next.3e165448 2.0.0-next.47d2d941 2.0.0-next.66cc7a90 2.0.0-next.74 ",
+            "2.0.0-next.75 2.0.0-next.81 2.0.0-next.91 2.0.0-next.9754a231 ",
+            "2.0.0-next.a671462c 2.0.0-next.b0cbf2ca 2.0.0-next.b2fd8db8 ",
+            "2.0.0-next.fb6e6f70 ",
+        )
+        .split_whitespace()
+        .collect();
+        let versions: serde_json::Map<String, serde_json::Value> = keys
+            .iter()
+            .map(|k| (k.to_string(), serde_json::json!({})))
+            .collect();
+        let mut packument = serde_json::json!({
+            "dist-tags": {"latest": "1.0.11"},
+            "versions": versions,
+        });
+
+        let allowed = apply_npm_packument_blocks(&mut packument, &std::collections::HashSet::new());
+
+        assert_eq!(allowed.len(), keys.len());
+        for pair in allowed.windows(2) {
+            assert!(version_compare(&pair[0], &pair[1]) >= 0, "{pair:?}");
+        }
+        // Numeric prereleases rank below hash prereleases of the same core.
+        let pos = |v: &str| allowed.iter().position(|a| a == v).unwrap();
+        assert!(pos("2.0.0-next.2150693d") < pos("2.0.0-next.300"));
+        assert!(pos("2.0.0-next.300") < pos("2.0.0-next.74"));
+    }
+
+    #[test]
     fn pypi_anchor_version_parses_wheel() {
         let anchor =
             r#"<a href="/packages/requests/2.31.0/requests-2.31.0-py3-none-any.whl">link</a>"#;
@@ -3262,6 +4350,35 @@ mod tests {
             upstream_fingerprint(Some("https://evil.example.test"))
         );
         assert_ne!(canonical, upstream_fingerprint(None));
+        // #4467: rotating userinfo keeps the identity; host and path do not.
+        let rotated_old = Some("https://alice:old@registry.example.test/npm");
+        let rotated_new = Some("https://alice:new@registry.example.test/npm");
+        assert_eq!(
+            upstream_fingerprint(rotated_old),
+            upstream_fingerprint(rotated_new)
+        );
+        assert_eq!(
+            upstream_fingerprint(rotated_old),
+            upstream_fingerprint(Some("https://registry.example.test/npm"))
+        );
+        assert_ne!(
+            upstream_fingerprint(rotated_old),
+            upstream_fingerprint(Some("https://alice:old@other.example.test/npm"))
+        );
+        assert_ne!(
+            upstream_fingerprint(rotated_old),
+            upstream_fingerprint(Some("https://alice:old@registry.example.test/pypi"))
+        );
+        assert!(legacy_upstream_fingerprint(rotated_old).is_some());
+        assert_ne!(
+            legacy_upstream_fingerprint(rotated_old),
+            legacy_upstream_fingerprint(rotated_new)
+        );
+        assert_eq!(
+            legacy_upstream_fingerprint(Some("https://registry.npmjs.org")),
+            None
+        );
+        assert_eq!(legacy_upstream_fingerprint(None), None);
         // Paths stay case-sensitive: most registries treat them that way.
         assert_ne!(
             upstream_fingerprint(Some("https://example.test/Repo")),
@@ -3297,14 +4414,24 @@ mod tests {
                 &RepositoryFormat::Vscode,
                 mode
             ));
-            // No registry entry -> not gateable in any mode. NuGet stays
-            // here until its enforcement seam lands.
-            assert!(!AgeGateService::supports_format_mode(
+            // #4702: Maven (and Gradle, same handler) in both modes.
+            assert!(AgeGateService::supports_format_mode(
                 &RepositoryFormat::Maven,
                 mode
             ));
+            assert!(AgeGateService::supports_format_mode(
+                &RepositoryFormat::Gradle,
+                mode
+            ));
+            // No registry entry -> not gateable in any mode. NuGet stays
+            // here until its enforcement seam lands; sbt has its own handler
+            // with no age-gate seam.
             assert!(!AgeGateService::supports_format_mode(
                 &RepositoryFormat::Nuget,
+                mode
+            ));
+            assert!(!AgeGateService::supports_format_mode(
+                &RepositoryFormat::Sbt,
                 mode
             ));
         }

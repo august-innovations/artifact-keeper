@@ -53,27 +53,62 @@ use crate::formats::incus::IncusHandler;
 const STREAM_CHUNK_BUDGET: usize = 256 * 1024;
 const INCUS_FINALIZE_LEASE_TTL_SECS: f64 = 6.0 * 3600.0;
 
+/// RFC 9745 `Deprecation` value for Incus's native chunked upload endpoints
+/// (#1846 remainder, #5002): an RFC 9651 structured-field Date naming when the
+/// endpoints became deprecated (1793404800 = 2026-10-31).
+///
+/// The endpoints stay functional. New clients should use the shared
+/// `/api/v1/uploads` session API, which every other format's resumable upload
+/// already uses and which keeps one crash-recovery, quota and authorization
+/// path. No `Sunset` is sent: no removal date has been decided.
+const INCUS_CHUNKED_DEPRECATION: &str = "@1793404800";
+
+/// RFC 8288 `Link` sent with [`INCUS_CHUNKED_DEPRECATION`].
+const INCUS_CHUNKED_SUCCESSOR_LINK: &str = "</api/v1/uploads>; rel=\"successor-version\"";
+
+/// Add the deprecation headers to an Incus native chunked upload response.
+fn incus_chunked_deprecation_layer(router: Router<SharedState>) -> Router<SharedState> {
+    router.layer(axum::middleware::map_response(
+        |mut response: Response| async move {
+            let headers = response.headers_mut();
+            if let Ok(value) = INCUS_CHUNKED_DEPRECATION.parse() {
+                headers.insert("Deprecation", value);
+            }
+            if let Ok(value) = INCUS_CHUNKED_SUCCESSOR_LINK.parse() {
+                headers.insert("Link", value);
+            }
+            response
+        },
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
 pub fn router() -> Router<SharedState> {
+    // The native chunked endpoints predate the shared session API and are kept
+    // only for existing Incus clients; mark them deprecated on every response,
+    // including errors, so a client or proxy can surface the successor (#5002).
+    let chunked = incus_chunked_deprecation_layer(
+        Router::new()
+            .route(
+                "/:repo_key/images/:product/:version/:filename/uploads",
+                post(start_chunked_upload),
+            )
+            .route(
+                "/:repo_key/uploads/:uuid",
+                patch(upload_chunk)
+                    .put(complete_chunked_upload)
+                    .delete(cancel_chunked_upload)
+                    .get(get_upload_progress),
+            ),
+    );
     Router::new()
         // SimpleStreams discovery endpoints
         .route("/:repo_key/streams/v1/index.json", get(streams_index))
         .route("/:repo_key/streams/v1/images.json", get(streams_images))
-        // Chunked / resumable upload endpoints (more-specific routes first)
-        .route(
-            "/:repo_key/images/:product/:version/:filename/uploads",
-            post(start_chunked_upload),
-        )
-        .route(
-            "/:repo_key/uploads/:uuid",
-            patch(upload_chunk)
-                .put(complete_chunked_upload)
-                .delete(cancel_chunked_upload)
-                .get(get_upload_progress),
-        )
+        .merge(chunked)
         // Image file operations (monolithic upload via PUT)
         .route(
             "/:repo_key/images/:product/:version/:filename",
@@ -319,6 +354,12 @@ pub(crate) fn storage_path_for_key(storage_base: &str, key: &str) -> PathBuf {
 /// staging files and to recognise crash-orphans during the age-based sweep.
 const STAGING_FILE_PREFIX: &str = "ak-incus-upload-";
 
+/// Prefix for a temporary local copy a format parser materializes from a
+/// backend-staged upload (#5002). Same staging volume as the upload spools, and
+/// recognised by [`is_staging_file`] so a crash-orphaned copy is reaped by the
+/// age-based sweep.
+pub(crate) const STAGED_PARSE_FILE_PREFIX: &str = "ak-staged-parse-";
+
 /// Resolve the base directory used to stage in-progress uploads (#1573).
 ///
 /// Resolution order:
@@ -364,7 +405,7 @@ pub(crate) fn temp_upload_path(storage_path: &str, session_id: &Uuid) -> PathBuf
 /// orphan sweep so it only ever reaps files this handler created, never
 /// anything else that may share the staging volume.
 pub(crate) fn is_staging_file(file_name: &str) -> bool {
-    file_name.starts_with(STAGING_FILE_PREFIX)
+    file_name.starts_with(STAGING_FILE_PREFIX) || file_name.starts_with(STAGED_PARSE_FILE_PREFIX)
 }
 
 /// RAII guard that best-effort removes a staged temp file when dropped,
@@ -626,6 +667,58 @@ pub(crate) fn build_streams_index_json(products: &[String]) -> serde_json::Value
     })
 }
 
+/// Extract an image's `artifact_metadata` document (file type, product,
+/// version and, for tarballs, the `metadata.yaml` arch/os/release) from the
+/// staged file at `file`. Best-effort: #2561 permit-scoped decode, so a
+/// saturated server, an unparseable path or a tarball without
+/// `metadata.yaml` all yield the `{"file_type": "unknown"}` placeholder
+/// rather than failing an upload whose bytes are already staged.
+///
+/// Shared by the monolithic and native chunked uploads and by the generic
+/// chunked completion (`/api/v1/uploads`, #1846), so all three record the
+/// same document for the same bytes. Synchronous (bounded decode); async
+/// callers that can afford it run it on the blocking pool.
+pub(crate) fn extract_image_metadata(artifact_path: &str, file: &Path) -> serde_json::Value {
+    crate::util::bounded_archive::with_ingest_extraction(|| {
+        IncusHandler::parse_metadata_from_file(artifact_path, file).ok()
+    })
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| serde_json::json!({"file_type": "unknown"}))
+}
+
+/// The `(product, version)` coordinates of an Incus image path laid out as
+/// `<product>/<version>/<file>` with a recognised image file name, i.e. the
+/// `name`/`version` the native upload routes write and `streams_images` keys
+/// on. `None` for anything else (a sidecar, a malformed path).
+pub(crate) fn image_coordinates_from_path(artifact_path: &str) -> Option<(String, String)> {
+    let info = IncusHandler::parse_path(artifact_path).ok()?;
+    Some((info.product?, info.version?))
+}
+
+/// Write (or replace) an image's `artifact_metadata` row, which
+/// `streams_images` reads arch/os/release from. Shared by the native upload
+/// finalize and the generic chunked completion (#1846).
+pub(crate) async fn store_image_metadata(
+    db: &PgPool,
+    artifact_id: Uuid,
+    metadata: &serde_json::Value,
+) -> Result<(), String> {
+    sqlx::query(
+        r#"
+        INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'incus', $2)
+        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(metadata)
+    .execute(db)
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("store metadata: {e}"))
+}
+
 /// Parameters for creating or updating an artifact record.
 struct UpsertArtifactParams<'a> {
     db: &'a PgPool,
@@ -640,6 +733,10 @@ struct UpsertArtifactParams<'a> {
     storage_key: &'a str,
     user_id: Uuid,
     metadata: &'a serde_json::Value,
+    /// #4725: whether the finalize request should fan out push sync tasks —
+    /// false when the write arrived as peer replication (or from a caller with
+    /// no request context).
+    enqueue_sync_tasks: bool,
 }
 
 /// Insert or update the artifact record and store metadata. Shared by
@@ -657,9 +754,24 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
         storage_key,
         user_id,
         metadata,
+        enqueue_sync_tasks,
     } = p;
     let content_type = content_type_for_artifact(artifact_path);
 
+    // Authoritative storage-quota admission, in the transaction of the row it
+    // admits (#4422). The client already has its 202, so a denial is recorded
+    // on the upload session as the scope's message.
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| format!("database error: {e}"))?;
+    if let Some(scope) =
+        super::publish_quota::locked_quota_denial(&mut tx, db, repo_id, artifact_path, size_bytes)
+            .await
+            .map_err(|e| format!("database error: {e}"))?
+    {
+        return Err(scope.exceeded_message().to_string());
+    }
     let artifact = sqlx::query(
         r#"
         INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
@@ -680,24 +792,16 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
     .bind(content_type)
     .bind(storage_key)
     .bind(user_id)
-    .fetch_one(db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| format!("database error: {e}"))?;
+    tx.commit()
+        .await
+        .map_err(|e| format!("database error: {e}"))?;
 
     let artifact_id: Uuid = artifact.get("id");
 
-    sqlx::query(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'incus', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-    )
-    .bind(artifact_id)
-    .bind(metadata)
-    .execute(db)
-    .await
-    .map_err(|e| format!("store metadata: {e}"))?;
+    store_image_metadata(db, artifact_id, metadata).await?;
 
     // Surface Incus images in the top-level package browser. The generic
     // upload path (artifact_service) and the npm/pypi/nuget handlers populate
@@ -707,6 +811,12 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
         db, event_bus, repo_id, "incus", product, version, size_bytes, checksum, None,
     )
     .await;
+
+    // #4725: fan out to subscribed push peers now that the row, its metadata
+    // and its catalog entry are committed.
+    if enqueue_sync_tasks {
+        super::queue_push_sync_tasks_now(db, repo_id, artifact_id, artifact_path, size_bytes).await;
+    }
 
     Ok(artifact_id)
 }
@@ -719,7 +829,7 @@ async fn resolve_incus_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
     use sqlx::Row;
     let repo = sqlx::query(
         r#"SELECT id, key, storage_backend, storage_path, format::text as format, repo_type::text as repo_type, upstream_url, promotion_only
-        FROM repositories WHERE key = $1"#,
+        FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'"#,
     )
     .bind(repo_key)
     .fetch_optional(db)
@@ -999,7 +1109,8 @@ async fn download_image(
             checksum,
         ),
     ];
-    crate::api::handlers::repositories::ranged_stream_response(
+    // #4323: verified against the advertised `X-Checksum-Sha256`.
+    crate::api::handlers::repositories::ranged_stream_response_advertised(
         range_header,
         size_bytes.max(0) as u64,
         stream,
@@ -1017,6 +1128,7 @@ async fn upload_image(
     Extension(auth): Extension<Option<AuthExtension>>,
     OriginalUri(original_uri): OriginalUri,
     AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -1059,12 +1171,7 @@ async fn upload_image(
     // Extract metadata from the file on disk. #2561: permit-scoped decode; the
     // artifact is already staged, so a saturated server skips this best-effort
     // extraction rather than shedding the upload.
-    let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
-        IncusHandler::parse_metadata_from_file(&artifact_path, &temp_path).ok()
-    })
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| serde_json::json!({"file_type": "unknown"}));
+    let metadata = extract_image_metadata(&artifact_path, &temp_path);
 
     // Record an upload session in `finalizing` state, then push to the
     // StorageBackend on a background task and return 202. Doing the
@@ -1072,6 +1179,15 @@ async fn upload_image(
     // (504) even though the body was fully received (#1471/#1494). The
     // session row makes the async finalize observable: the client polls
     // `GET /incus/{repo}/uploads/{id}` for `completed`/`failed`.
+    // Refuse an over-quota image synchronously, while the staged body is
+    // still guarded and before the 202 (#4422).
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        size_bytes,
+    )
+    .await?;
     let storage_key = build_storage_key(&repo.id, &artifact_path);
     let session_id = Uuid::new_v4();
     // Fresh session, but it still carries a finalize lease so the background
@@ -1127,6 +1243,9 @@ async fn upload_image(
             committed_offset: size_bytes,
             final_path: None,
             finalize_token,
+            staged_part_keys: Vec::new(),
+            // #4725: a peer-replicated publish must not fan back out.
+            enqueue_sync_tasks: !super::is_replication_request(&headers),
         },
     ));
 
@@ -1214,7 +1333,7 @@ async fn get_session(
         r#"
         SELECT id, repository_id, user_id, artifact_path, product, version,
                filename, bytes_received, storage_temp_path, status,
-               finalize_error, artifact_id
+               finalize_error, artifact_id, staged_parts
         FROM incus_upload_sessions
         WHERE id = $1 AND repository_id = $2
         "#,
@@ -1241,6 +1360,165 @@ struct UploadSession {
     status: String,
     finalize_error: Option<String>,
     artifact_id: Option<Uuid>,
+    /// The session's chunks on the repository's storage backend (#4302), or
+    /// NULL for a session started by an earlier server version, whose chunks
+    /// live in the local `storage_temp_path` file instead.
+    staged_parts: Option<serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
+// Shared chunk staging (#4302)
+// ---------------------------------------------------------------------------
+//
+// A chunked session used to append every chunk to a file on the local disk of
+// the replica that served the start, so behind more than one backend replica
+// a chunk or the completion routed to another replica found no staged data
+// and failed (the Incus instance of #3918). Each chunk is now staged as its
+// own object on the repository's storage backend through the #3916 generic
+// staging path (`proxy_helpers::stage_stream_on_backend`), and the session row
+// records the objects in commit order, in the same guarded UPDATE that
+// advances `bytes_received`. Any replica can therefore take any chunk. The
+// completing replica copies the recorded chunks back into its own staging
+// file and runs the unchanged seal / checksum / background-push finalize.
+//
+// Limits of this contained version (the shared-scratch redesign is separate):
+//
+// * the completion reads the whole image back from the storage backend before
+//   it hashes it, so `complete` takes one extra read of the image, and the
+//   completing replica's staging disk must still hold the whole image;
+// * each chunk is one extra object write and delete on the backend;
+// * a chunk object is tracked in `generic_upload_staging` from the moment it
+//   is written, so the hourly generic staging sweep reclaims the chunks of an
+//   abandoned session (the stale-session reaper deletes the row only); every
+//   accepted chunk refreshes the tracking rows of the session's chunks, so a
+//   session still receiving is never swept;
+// * a session started by an earlier server version (`staged_parts` NULL)
+//   keeps the local-file path and still needs session affinity.
+
+/// One chunk of a shared-staging session, as recorded in
+/// `incus_upload_sessions.staged_parts`.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct StagedPart {
+    key: String,
+    offset: i64,
+    size: i64,
+}
+
+/// Parse a session's recorded chunks and check that they cover exactly the
+/// committed bytes `[0, committed)`, in order and without gaps.
+fn staged_parts_covering(
+    parts: &serde_json::Value,
+    committed: i64,
+) -> Result<Vec<StagedPart>, String> {
+    let parts: Vec<StagedPart> = serde_json::from_value(parts.clone())
+        .map_err(|e| format!("unreadable staged chunk list: {e}"))?;
+    let mut next = 0_i64;
+    for part in &parts {
+        if part.offset != next || part.size < 0 {
+            return Err(format!(
+                "staged chunk {} starts at {} (size {}), expected offset {}",
+                part.key, part.offset, part.size, next
+            ));
+        }
+        next += part.size;
+    }
+    if next != committed {
+        return Err(format!(
+            "staged chunks cover {next} bytes but the session has {committed} committed"
+        ));
+    }
+    Ok(parts)
+}
+
+/// The object keys recorded on a session, best effort (for cleanup).
+fn staged_part_keys(parts: Option<&serde_json::Value>) -> Vec<String> {
+    parts
+        .and_then(|v| v.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("key").and_then(|k| k.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Stage one chunk body as an object on the repository's storage backend.
+async fn stage_chunk_on_backend(
+    state: &SharedState,
+    repo: &RepoInfo,
+    body: Body,
+) -> Result<proxy_helpers::BackendStagedUpload, Response> {
+    let (staged, _digests) = proxy_helpers::stage_stream_on_backend(
+        state,
+        &repo.storage_location(),
+        body.into_data_stream(),
+    )
+    .await?;
+    Ok(staged)
+}
+
+/// Delete a session's staged chunk objects (and their tracking rows).
+async fn purge_staged_parts(state: &SharedState, repo: &RepoInfo, keys: &[String]) {
+    if keys.is_empty() {
+        return;
+    }
+    match state.storage_for_repo(&repo.storage_location()) {
+        Ok(storage) => {
+            for key in keys {
+                proxy_helpers::delete_generic_staging(&state.db, storage.as_ref(), key).await;
+            }
+        }
+        // The tracking rows stay, so the generic staging sweep reclaims them.
+        Err(e) => tracing::warn!(error = %e, "cannot resolve storage to purge staged chunks"),
+    }
+}
+
+/// Copy a session's committed chunks, in order, from the storage backend into
+/// this replica's staging file `temp`, replacing whatever was there.
+async fn materialize_staged_parts(
+    state: &SharedState,
+    repo: &RepoInfo,
+    parts: &[StagedPart],
+    temp: &Path,
+) -> Result<(), Response> {
+    let unavailable = |what: &str, e: &dyn Display| {
+        tracing::error!(error = %e, "{what}");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Staged upload data could not be read from storage; retry the completion",
+        )
+            .into_response()
+    };
+    ensure_parent_dirs(temp).await?;
+    let mut file = tokio::fs::File::create(temp)
+        .await
+        .map_err(|e| fs_err("create temp file", e))?;
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    for part in parts {
+        let mut stream = storage
+            .get_stream(&part.key)
+            .await
+            .map_err(|e| unavailable("open staged chunk", &e))?;
+        let mut copied = 0_i64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| unavailable("read staged chunk", &e))?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| fs_err("write to disk", e))?;
+            copied += chunk.len() as i64;
+        }
+        if copied != part.size {
+            return Err(unavailable(
+                "staged chunk size changed",
+                &format!("{} holds {copied} bytes, {} recorded", part.key, part.size),
+            ));
+        }
+    }
+    file.sync_all().await.map_err(|e| fs_err("sync file", e))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,23 +1550,31 @@ async fn start_chunked_upload(
     })?;
 
     let session_id = Uuid::new_v4();
-    // Stage to a local scratch file; the final copy is uploaded through
-    // the repo's StorageBackend at `complete_chunked_upload` time (#1471).
-    // The chosen path is persisted to `incus_upload_sessions.storage_temp_path`,
-    // so subsequent chunk/complete/cancel calls read it back from the
-    // session row and don't need to re-derive it.
+    // The local staging path is recorded for the completion's bookkeeping;
+    // the chunks themselves are staged on the repository's storage backend
+    // so any replica can take the next chunk or the completion (#4302).
     let temp_path = temp_upload_path(&state.config.storage_path, &session_id);
 
-    // Stream initial body (may be empty) to temp file
-    let (initial_bytes, _checksum) = stream_body_to_file(body, &temp_path).await?;
+    // Stage the initial body (may be empty) as the session's first chunk.
+    let staged = stage_chunk_on_backend(&state, &repo, body).await?;
+    let initial_bytes = staged.size_bytes();
+    let (first_part, parts) = if initial_bytes > 0 {
+        let parts = serde_json::json!([
+            { "key": staged.key(), "offset": 0, "size": initial_bytes }
+        ]);
+        (Some(staged), parts)
+    } else {
+        staged.discard().await;
+        (None, serde_json::json!([]))
+    };
 
     // Record session
-    sqlx::query(
+    let inserted = sqlx::query(
         r#"
         INSERT INTO incus_upload_sessions
             (id, repository_id, user_id, artifact_path, product, version,
-             filename, bytes_received, storage_temp_path)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             filename, bytes_received, storage_temp_path, staged_parts)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
     .bind(session_id)
@@ -1300,9 +1586,21 @@ async fn start_chunked_upload(
     .bind(&filename)
     .bind(initial_bytes)
     .bind(&*temp_path.to_string_lossy())
+    .bind(&parts)
     .execute(&state.db)
-    .await
-    .map_err(db_err)?;
+    .await;
+    match (inserted, first_part) {
+        (Ok(_), Some(part)) => {
+            part.keep();
+        }
+        (Ok(_), None) => {}
+        (Err(e), part) => {
+            if let Some(part) = part {
+                part.discard().await;
+            }
+            return Err(db_err(e));
+        }
+    }
 
     tracing::info!(
         "Started chunked upload session {} for {}/{}/{} ({} initial bytes)",
@@ -1368,6 +1666,12 @@ async fn upload_chunk(
             .into_response());
     }
 
+    if session.staged_parts.is_some() {
+        let new_total = stage_shared_chunk(&state, &repo, session_id, body).await?;
+        return Ok(chunk_accepted(prefix, &repo_key, &session_id, new_total));
+    }
+
+    // A session started by an earlier server version keeps its local file.
     // Append body to temp file (no read-back of existing data). Once a
     // finalize has sealed the staging file this open fails with ENOENT and is
     // reported as 409, so a chunk arriving after the claim cannot write bytes
@@ -1422,16 +1726,92 @@ async fn upload_chunk(
         new_total
     );
 
-    Ok(Response::builder()
+    Ok(chunk_accepted(prefix, &repo_key, &session_id, new_total))
+}
+
+/// The `202` a PATCH answers once its chunk is committed.
+fn chunk_accepted(prefix: &str, repo_key: &str, session_id: &Uuid, new_total: i64) -> Response {
+    Response::builder()
         .status(StatusCode::ACCEPTED)
         .header(
             "Location",
-            build_upload_location(prefix, &repo_key, &session_id),
+            build_upload_location(prefix, repo_key, session_id),
         )
         .header("Upload-UUID", session_id.to_string())
         .header("Range", format!("0-{}", new_total))
         .body(Body::empty())
-        .unwrap())
+        .unwrap()
+}
+
+/// Stage one chunk of a shared-staging session (#4302) and commit it: the
+/// object is recorded at the session's current offset in the same guarded
+/// UPDATE that advances `bytes_received`, so the recorded chunks are always
+/// exactly the committed bytes, in order. A chunk that loses the race with a
+/// finalize claim is deleted and refused with 409, as on the local path.
+/// Returns the new committed offset.
+async fn stage_shared_chunk(
+    state: &SharedState,
+    repo: &RepoInfo,
+    session_id: Uuid,
+    body: Body,
+) -> Result<i64, Response> {
+    let staged = stage_chunk_on_backend(state, repo, body).await?;
+    let size = staged.size_bytes();
+    let committed = sqlx::query_scalar::<_, i64>(
+        "UPDATE incus_upload_sessions SET \
+             staged_parts = CASE WHEN $2 > 0 THEN staged_parts || jsonb_build_array( \
+                 jsonb_build_object('key', $3::text, 'offset', bytes_received, 'size', $2)) \
+                 ELSE staged_parts END, \
+             bytes_received = bytes_received + $2, \
+             updated_at = NOW() \
+         WHERE id = $1 AND status = 'receiving' AND staged_parts IS NOT NULL \
+         RETURNING bytes_received",
+    )
+    .bind(session_id)
+    .bind(size)
+    .bind(staged.key())
+    .fetch_optional(&state.db)
+    .await;
+    let new_total = match committed {
+        Ok(Some(total)) if size > 0 => {
+            staged.keep();
+            total
+        }
+        Ok(Some(total)) => {
+            staged.discard().await;
+            total
+        }
+        Ok(None) => {
+            staged.discard().await;
+            return Err((
+                StatusCode::CONFLICT,
+                "Upload session entered finalize while this chunk was uploading".to_string(),
+            )
+                .into_response());
+        }
+        Err(e) => {
+            staged.discard().await;
+            return Err(db_err(e));
+        }
+    };
+    // Keep every chunk of a session that is still receiving out of the
+    // generic staging sweep's age window; abandoned sessions age out.
+    let _ = sqlx::query(
+        "UPDATE generic_upload_staging SET created_at = NOW() \
+         WHERE storage_key IN ( \
+             SELECT jsonb_array_elements(staged_parts)->>'key' \
+             FROM incus_upload_sessions WHERE id = $1)",
+    )
+    .bind(session_id)
+    .execute(&state.db)
+    .await;
+    tracing::debug!(
+        session_id = %session_id,
+        bytes = size,
+        total = new_total,
+        "Incus chunk staged on the repository backend"
+    );
+    Ok(new_total)
 }
 
 // ---------------------------------------------------------------------------
@@ -1735,7 +2115,15 @@ async fn complete_chunked_upload(
     // created in repo A cannot be finalized via repo B's URL.
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
     let session = get_session(&state.db, session_id, repo.id).await?;
-    let temp_path = PathBuf::from(&session.storage_temp_path);
+    // A shared-staging session (#4302) is assembled in THIS replica's staging
+    // root, whichever replica started it; an earlier version's session keeps
+    // the local file it recorded.
+    let shared = session.staged_parts.is_some();
+    let temp_path = if shared {
+        temp_upload_path(&state.config.storage_path, &session_id)
+    } else {
+        PathBuf::from(&session.storage_temp_path)
+    };
     // Both derived from the session's temp path, so every finalize attempt on
     // this session — including one reclaiming a crashed predecessor's lease —
     // names the exact same pair of files.
@@ -1763,26 +2151,60 @@ async fn complete_chunked_upload(
     // committed length: the pre-claim `session` read can be stale, and the
     // PATCH path only advances this column while the session is 'receiving'.
     // Every read this finalize performs is bounded to it.
-    let persisted_bytes: i64 =
-        match sqlx::query_scalar("SELECT bytes_received FROM incus_upload_sessions WHERE id = $1")
-            .bind(session_id)
-            .fetch_one(&state.db)
-            .await
-        {
-            Ok(n) => n,
-            Err(e) => {
-                abort_incus_finalize(
-                    &state.db,
-                    session_id,
-                    finalize_token,
-                    &temp_path,
-                    &sealed_path,
-                    &final_path,
+    let (persisted_bytes, staged_parts): (i64, Option<serde_json::Value>) = match sqlx::query_as(
+        "SELECT bytes_received, staged_parts FROM incus_upload_sessions WHERE id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            abort_incus_finalize(
+                &state.db,
+                session_id,
+                finalize_token,
+                &temp_path,
+                &sealed_path,
+                &final_path,
+            )
+            .await;
+            return Err(db_err(e));
+        }
+    };
+
+    // #4302: rebuild the committed chunks in this replica's staging file. The
+    // chunk list was read under the lease, so it is exactly the committed
+    // bytes; a stale local copy from an earlier attempt is replaced.
+    let staged_keys = staged_part_keys(staged_parts.as_ref());
+    if let Some(parts) = staged_parts.as_ref() {
+        remove_staging_files(&temp_path, &sealed_path, &final_path).await;
+        let rebuilt = match staged_parts_covering(parts, persisted_bytes) {
+            Ok(parts) => materialize_staged_parts(&state, &repo, &parts, &temp_path).await,
+            Err(reason) => {
+                tracing::error!(session = %session_id, %reason, "inconsistent staged chunks");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Upload session's staged chunks are inconsistent; cancel this \
+                     session and re-upload the image",
                 )
-                .await;
-                return Err(db_err(e));
+                    .into_response())
             }
         };
+        if let Err(resp) = rebuilt {
+            abort_incus_finalize(
+                &state.db,
+                session_id,
+                finalize_token,
+                &temp_path,
+                &sealed_path,
+                &final_path,
+            )
+            .await;
+            remove_staging_files(&temp_path, &sealed_path, &final_path).await;
+            return Err(resp);
+        }
+    }
 
     // Seal the staged chunks, stage the trailing body, and hash the result.
     // Any failure in there releases the lease back to 'receiving' (and
@@ -1820,13 +2242,16 @@ async fn complete_chunked_upload(
             // Checksum mismatch — clean up (token-guarded: only the lease
             // owner may delete the session out from under other requests)
             remove_staging_files(&temp_path, &sealed_path, &final_path).await;
-            let _ = sqlx::query(
+            let deleted = sqlx::query(
                 "DELETE FROM incus_upload_sessions WHERE id = $1 AND finalize_token = $2",
             )
             .bind(session_id)
             .bind(finalize_token)
             .execute(&state.db)
             .await;
+            if matches!(deleted, Ok(r) if r.rows_affected() == 1) {
+                purge_staged_parts(&state, &repo, &staged_keys).await;
+            }
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!(
@@ -1851,12 +2276,7 @@ async fn complete_chunked_upload(
     } else {
         &final_path
     };
-    let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
-        IncusHandler::parse_metadata_from_file(&session.artifact_path, metadata_source).ok()
-    })
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| serde_json::json!({"file_type": "unknown"}));
+    let metadata = extract_image_metadata(&session.artifact_path, metadata_source);
 
     // Finalize asynchronously: push to the StorageBackend on a background
     // task and return 202. The assembled multi-GiB push can outlive an L7
@@ -1917,6 +2337,9 @@ async fn complete_chunked_upload(
             committed_offset: persisted_bytes,
             final_path: Some(final_path.clone()),
             finalize_token,
+            staged_part_keys: staged_keys,
+            // #4725: a peer-replicated publish must not fan back out.
+            enqueue_sync_tasks: !super::is_replication_request(&headers),
         },
     ));
 
@@ -2000,7 +2423,7 @@ async fn cancel_chunked_upload(
     let claimed = sqlx::query(
         "DELETE FROM incus_upload_sessions \
          WHERE id = $1 AND user_id = $2 AND status = 'receiving' \
-         RETURNING storage_temp_path",
+         RETURNING storage_temp_path, staged_parts",
     )
     .bind(session_id)
     .bind(user_id)
@@ -2017,6 +2440,7 @@ async fn cancel_chunked_upload(
     };
 
     let staged: String = row.try_get("storage_temp_path").map_err(db_err)?;
+    let parts: Option<serde_json::Value> = row.try_get("staged_parts").map_err(db_err)?;
     let temp_path = PathBuf::from(staged);
     remove_staging_files(
         &temp_path,
@@ -2024,6 +2448,7 @@ async fn cancel_chunked_upload(
         &final_upload_path(&temp_path),
     )
     .await;
+    purge_staged_parts(&state, &repo, &staged_part_keys(parts.as_ref())).await;
 
     tracing::info!("Cancelled chunked upload session {}", session_id);
 
@@ -2278,6 +2703,13 @@ struct FinalizeParams {
     /// The finalizer's terminal updates must present it, so a finalizer whose
     /// lease expired and was reclaimed cannot clobber the new owner's state.
     finalize_token: Uuid,
+    /// The session's chunk objects on the storage backend (#4302), deleted
+    /// once the session is terminal. Empty for the monolithic path and for a
+    /// session started by an earlier server version.
+    staged_part_keys: Vec<String>,
+    /// #4725: whether this finalize should fan out push sync tasks to
+    /// subscribed peers. False for a write that arrived as peer replication.
+    enqueue_sync_tasks: bool,
 }
 
 /// Push the staged temp file to the repo's StorageBackend, create the
@@ -2293,6 +2725,19 @@ async fn run_finalize(
     repo: &RepoInfo,
     p: &FinalizeParams,
 ) -> Result<Uuid, String> {
+    // Refuse an over-quota image before pushing its bytes to the backend
+    // (#4422); the authoritative admission runs with the row INSERT.
+    if let Some(scope) = super::publish_quota::preflight_quota_denial(
+        &state.db,
+        p.repo_id,
+        super::publish_quota::PublishAt::Path(&p.artifact_path),
+        p.size_bytes,
+    )
+    .await
+    .map_err(|e| format!("database error: {e}"))?
+    {
+        return Err(scope.exceeded_message().to_string());
+    }
     put_staged_upload_to_storage(
         state,
         repo,
@@ -2315,36 +2760,20 @@ async fn run_finalize(
         storage_key: &p.storage_key,
         user_id: p.user_id,
         metadata: &p.metadata,
+        enqueue_sync_tasks: p.enqueue_sync_tasks,
     })
     .await?;
 
     // scan_on_upload trigger — format-native upload paths bypass
     // `ArtifactService::upload`'s auto-scan gate, so mirror it here. No-op when
     // the scanner_service is None or `scan_on_upload`/`scan_enabled` is false.
-    if let Some(scanner) = state.scanner_service.clone() {
-        let should_scan = sqlx::query_scalar!(
-            "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
-            p.repo_id
-        )
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(false);
-        crate::services::scanner_service::spawn_scan_on_upload(
-            should_scan,
-            artifact_id,
-            move |aid| async move {
-                if let Err(e) = scanner.scan_artifact(aid).await {
-                    tracing::warn!(
-                        artifact_id = %aid,
-                        error = %e,
-                        "scan_on_upload trigger failed"
-                    );
-                }
-            },
-        );
-    }
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        p.repo_id,
+        artifact_id,
+    )
+    .await;
 
     Ok(artifact_id)
 }
@@ -2371,6 +2800,9 @@ async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizePar
     if let Some(final_path) = &params.final_path {
         let _ = tokio::fs::remove_file(final_path).await;
     }
+    // Completed or failed, the session is terminal and its staged chunks are
+    // no longer needed (#4302); a retry starts a new session.
+    purge_staged_parts(&state, &repo, &params.staged_part_keys).await;
     match outcome {
         Ok(artifact_id) => {
             tracing::info!(
@@ -2445,6 +2877,27 @@ mod tests {
 
     /// This file's own source, for the structural guards below.
     const INCUS_RS_SRC: &str = include_str!("incus.rs");
+
+    /// #1846: only a `<product>/<version>/<image file>` path gets native
+    /// coordinates; anything else (a sidecar, a short or malformed path)
+    /// returns `None`, which keeps the chunked completion generic.
+    #[test]
+    fn image_coordinates_from_path_table_1846() {
+        let some = |p: &str, v: &str| Some((p.to_string(), v.to_string()));
+        for (path, want) in [
+            ("ubuntu/2024/incus.tar.gz", some("ubuntu", "2024")),
+            ("ubuntu/2024/rootfs.squashfs", some("ubuntu", "2024")),
+            ("ubuntu/2024/disk.qcow2", some("ubuntu", "2024")),
+            ("ubuntu/2024/SHA256SUMS", None),
+            ("ubuntu/2024/notes.txt", None),
+            ("foo.tar.gz", None),
+            ("ubuntu/incus.tar.gz", None),
+            ("streams/v1/images.json", None),
+            ("", None),
+        ] {
+            assert_eq!(image_coordinates_from_path(path), want, "{path}");
+        }
+    }
 
     #[test]
     fn legacy_in_flight_finalize_is_not_reclaimable() {
@@ -2701,6 +3154,7 @@ mod tests {
         assert!(is_staging_file(
             "ak-incus-upload-550e8400-e29b-41d4-a716-446655440000"
         ));
+        assert!(is_staging_file("ak-staged-parse-AbCdEf"));
         assert!(!is_staging_file("img.tar.xz"));
         assert!(!is_staging_file(".keep"));
         assert!(!is_staging_file("ak-other-upload-123"));
@@ -3377,7 +3831,9 @@ mod tests {
 
     #[test]
     fn test_db_err_produces_500() {
-        let resp = db_err("connection refused");
+        // A query error, not an outage: an unreachable database is a 503
+        // since #4756.
+        let resp = db_err("error returned from database: relation \"t\" does not exist");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -3966,6 +4422,7 @@ mod tests {
             storage_key: &storage_key,
             user_id: f.user_id,
             metadata: &metadata,
+            enqueue_sync_tasks: false,
         })
         .await
         else {
@@ -4440,6 +4897,67 @@ mod streaming_pipeline_regression_tests {
         f.teardown().await;
     }
 
+    /// #4725: a monolithic image upload to a hosted repository must queue a
+    /// push sync task for a subscribed push peer, and an upload that arrives
+    /// as peer replication must not be fanned back out.
+    #[tokio::test]
+    async fn monolithic_upload_queues_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "incus").await;
+
+        // PUT a monolithic image, wait for the async finalize, and return the
+        // artifact path it wrote.
+        async fn put(f: &tdh::Fixture, version: &str, replication: bool) -> String {
+            let mut builder = axum::http::Request::builder().method("PUT").uri(format!(
+                "/{}/images/ubuntu-noble/{}/incus.tar.xz",
+                f.repo_key, version
+            ));
+            if replication {
+                builder = builder.header("x-artifact-keeper-replication", "true");
+            }
+            let req = builder
+                .body(Body::from(vec![7u8; 4096]))
+                .expect("build PUT");
+            let (status, body) = tdh::send(f.router_with_auth(router()), req).await;
+            assert_eq!(
+                status,
+                StatusCode::ACCEPTED,
+                "monolithic PUT must return 202: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("parse upload response");
+            let session_id: Uuid = json["session_id"]
+                .as_str()
+                .expect("response has session_id")
+                .parse()
+                .expect("session_id is a UUID");
+            let progress = await_finalize(f, session_id).await;
+            assert_eq!(
+                progress["status"].as_str(),
+                Some("completed"),
+                "finalize must complete: {progress}"
+            );
+            build_artifact_path("ubuntu-noble", version, "incus.tar.xz")
+        }
+
+        let first = put(&f, "20240215", false).await;
+        // A replicated publish (as the sync worker sends it) stores the image
+        // but must not queue another task.
+        let second = put(&f, "20240216", true).await;
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec![first.clone()],
+            "only the client upload queues a push task; the replicated one ({second}) must not"
+        );
+    }
+
     /// GET for an artifact whose `storage_key` row exists but whose object
     /// is missing from the StorageBackend must surface as a non-200 error.
     /// Exercises `download_image`'s `get_stream` error-mapping closure.
@@ -4616,6 +5134,290 @@ mod streaming_pipeline_regression_tests {
         f.teardown().await;
     }
 
+    /// #4302: behind more than one backend replica, the chunks and the
+    /// completion of one upload land on different replicas. Each replica
+    /// stages on its own local disk (here: two states with different
+    /// `storage_path`s, sharing the database and the repository's storage),
+    /// so a chunk or the completion routed away from the replica that served
+    /// the start used to find no staged data and fail. Start on A, chunk on
+    /// B, chunk on A, complete on B: the image must assemble in order, and
+    /// no staged data may survive the finalize on either replica. Both
+    /// "replicas" run on this host, so A's staging directory is hidden while
+    /// B serves a request, as it would be on another pod.
+    #[tokio::test]
+    async fn chunked_upload_across_two_replicas_4302() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let scratch_a = tempfile::tempdir().expect("replica A scratch");
+        let scratch_b = tempfile::tempdir().expect("replica B scratch");
+        let replica_a = tdh::build_state(f.pool.clone(), scratch_a.path().to_str().unwrap());
+        let replica_b = tdh::build_state(f.pool.clone(), scratch_b.path().to_str().unwrap());
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let a_root = staging_root(scratch_a.path().to_str().unwrap());
+        let a_hidden = scratch_a.path().join("replica-a-disk-unreachable");
+        let hide_a = |hidden: bool| {
+            let (from, to) = if hidden {
+                (&a_root, &a_hidden)
+            } else {
+                (&a_hidden, &a_root)
+            };
+            if from.exists() {
+                std::fs::rename(from, to).expect("toggle replica A staging dir");
+            }
+        };
+        let send = |state: &SharedState, method: &str, uri: String, body: Vec<u8>| {
+            let app = tdh::router_with_auth(router(), state.clone(), auth.clone());
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::from(body))
+                .expect("build request");
+            async move { tdh::send(app, req).await }
+        };
+
+        let parts: Vec<Vec<u8>> = (0u8..3)
+            .map(|i| (0u32..(70 * 1024)).map(|b| (b % 241) as u8 ^ i).collect())
+            .collect();
+        let expected: Vec<u8> = parts.concat();
+
+        let (status, body) = send(
+            &replica_a,
+            "POST",
+            format!("/{}/images/alpine/3.20/rootfs.squashfs/uploads", f.repo_key),
+            parts[0].clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let session_id: Uuid = serde_json::from_slice::<serde_json::Value>(&body)
+            .expect("start JSON")["session_id"]
+            .as_str()
+            .expect("session_id")
+            .parse()
+            .expect("uuid");
+        let session_uri = format!("/{}/uploads/{}", f.repo_key, session_id);
+        hide_a(true);
+        let (b_status, b_body) =
+            send(&replica_b, "PATCH", session_uri.clone(), parts[1].clone()).await;
+        hide_a(false);
+        let (a_status, a_body) =
+            send(&replica_a, "PATCH", session_uri.clone(), parts[2].clone()).await;
+        hide_a(true);
+        let (c_status, c_body) = send(&replica_b, "PUT", session_uri.clone(), Vec::new()).await;
+        let progress = if c_status == StatusCode::ACCEPTED {
+            Some(await_finalize(&f, session_id).await)
+        } else {
+            None
+        };
+        hide_a(false);
+        let resp = download(&f, "alpine/3.20/rootfs.squashfs").await;
+        let served_status = resp.status();
+        let served = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("download body");
+        let leftovers: Vec<std::path::PathBuf> = [&scratch_a, &scratch_b]
+            .iter()
+            .filter_map(|d| std::fs::read_dir(staging_root(d.path().to_str().unwrap())).ok())
+            .flat_map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())))
+            .collect();
+        let staged_objects = std::fs::read_dir(f.storage_dir.join("generic-upload-staging"))
+            .map(|rd| rd.count())
+            .unwrap_or(0);
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+
+        let text = |b: &Bytes| String::from_utf8_lossy(b).into_owned();
+        assert_eq!(
+            b_status,
+            StatusCode::ACCEPTED,
+            "chunk on replica B: {}",
+            text(&b_body)
+        );
+        assert_eq!(
+            a_status,
+            StatusCode::ACCEPTED,
+            "chunk on replica A: {}",
+            text(&a_body)
+        );
+        assert_eq!(
+            c_status,
+            StatusCode::ACCEPTED,
+            "complete on replica B: {}",
+            text(&c_body)
+        );
+        let complete: serde_json::Value = serde_json::from_slice(&c_body).expect("complete JSON");
+        assert_eq!(complete["size"].as_i64(), Some(expected.len() as i64));
+        assert_eq!(
+            complete["sha256"].as_str(),
+            Some(sha256_hex(&expected).as_str())
+        );
+        assert_eq!(
+            progress.as_ref().and_then(|p| p["status"].as_str()),
+            Some("completed"),
+            "{progress:?}"
+        );
+        assert_eq!(served_status, StatusCode::OK);
+        assert!(
+            served.as_ref() == expected.as_slice(),
+            "chunks assembled out of order"
+        );
+        assert!(leftovers.is_empty(), "local staging leaked: {leftovers:?}");
+        assert_eq!(staged_objects, 0, "shared staged chunks must be purged");
+    }
+
+    /// The fixture repository as the finalize task sees it.
+    fn fixture_repo_info(f: &tdh::Fixture) -> RepoInfo {
+        RepoInfo {
+            id: f.repo_id,
+            key: f.repo_key.clone(),
+            storage_path: std::env::temp_dir().to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            format: "generic".to_string(),
+            upstream_url: None,
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
+        }
+    }
+
+    /// #4422 review: an Incus image over the repository quota is refused
+    /// synchronously (507, before any 202) when the preflight already fails.
+    /// When the space is used up only after the 202, the background finalize
+    /// refuses it: the session flips to `failed` with the quota message, the
+    /// staged bytes are removed and no row is written. The locked admission
+    /// in `upsert_artifact` refuses the row the same way.
+    #[tokio::test]
+    async fn quota_refusal_sync_and_in_finalize_4422() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET quota_bytes = 10 WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let image = vec![7u8; 64];
+
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/images/ubuntu/2/incus.tar.xz", f.repo_key))
+            .body(Body::from(image.clone()))
+            .expect("build PUT");
+        let (status, body) = tdh::send(f.router_with_auth(router()), req).await;
+        assert_eq!(
+            status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // The late path: a finalizing session whose image no longer fits.
+        let session_id = Uuid::new_v4();
+        let artifact_path = build_artifact_path("ubuntu", "1", "incus.tar.xz");
+        let staged = std::env::temp_dir().join(format!("ak-incus-quota-{session_id}"));
+        std::fs::write(&staged, &image).expect("stage image");
+        let finalize_token = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO incus_upload_sessions \
+             (id, repository_id, user_id, artifact_path, product, version, filename, \
+              bytes_received, storage_temp_path, status, finalize_token, \
+              finalize_claimed_until) \
+             VALUES ($1, $2, $3, $4, 'ubuntu', '1', 'incus.tar.xz', 64, $5, 'finalizing', $6, \
+                     NOW() + make_interval(secs => $7))",
+        )
+        .bind(session_id)
+        .bind(f.repo_id)
+        .bind(f.user_id)
+        .bind(&artifact_path)
+        .bind(&*staged.to_string_lossy())
+        .bind(finalize_token)
+        .bind(INCUS_FINALIZE_LEASE_TTL_SECS)
+        .execute(&f.pool)
+        .await
+        .expect("insert finalizing session");
+        let metadata = serde_json::json!({ "file_type": "unknown" });
+        finalize_upload(
+            f.state.clone(),
+            fixture_repo_info(&f),
+            FinalizeParams {
+                session_id,
+                repo_id: f.repo_id,
+                artifact_path: artifact_path.clone(),
+                product: "ubuntu".to_string(),
+                version: "1".to_string(),
+                size_bytes: image.len() as i64,
+                checksum: "0".repeat(64),
+                storage_key: build_storage_key(&f.repo_id, &artifact_path),
+                user_id: f.user_id,
+                metadata: metadata.clone(),
+                sealed_path: staged.clone(),
+                committed_offset: image.len() as i64,
+                final_path: None,
+                finalize_token,
+                staged_part_keys: Vec::new(),
+                enqueue_sync_tasks: false,
+            },
+        )
+        .await;
+        let (status, err): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, finalize_error FROM incus_upload_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("session row");
+        assert_eq!(status, "failed");
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("Repository storage quota exceeded")),
+            "{err:?}"
+        );
+        assert!(!staged.exists(), "the staged image must be removed");
+
+        // The authoritative admission in the row upsert refuses it too.
+        let refused = upsert_artifact(UpsertArtifactParams {
+            db: &f.pool,
+            event_bus: &f.state.event_bus,
+            repo_id: f.repo_id,
+            artifact_path: &artifact_path,
+            product: "ubuntu",
+            version: "1",
+            size_bytes: image.len() as i64,
+            checksum: &"0".repeat(64),
+            storage_key: &build_storage_key(&f.repo_id, &artifact_path),
+            user_id: f.user_id,
+            metadata: &metadata,
+            enqueue_sync_tasks: false,
+        })
+        .await
+        .expect_err("the locked admission refuses the row");
+        assert!(
+            refused.contains("Repository storage quota exceeded"),
+            "{refused}"
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
+
+        f.teardown().await;
+    }
+
     /// A finalize whose backend push fails must flip the session to `failed`
     /// with an error string, so the client that already received `202` can
     /// observe the failure via `GET /uploads/{id}` instead of it being lost.
@@ -4651,21 +5453,7 @@ mod streaming_pipeline_regression_tests {
         .await
         .expect("insert finalizing session");
 
-        let repo = RepoInfo {
-            id: f.repo_id,
-            key: f.repo_key.clone(),
-            storage_path: std::env::temp_dir().to_string_lossy().into_owned(),
-            storage_backend: "filesystem".to_string(),
-            repo_type: "local".to_string(),
-            format: "generic".to_string(),
-            upstream_url: None,
-            promotion_only: false,
-            age_gate_enabled: false,
-            age_gate_min_age_days: 7,
-            age_gate_mode: "upstream_publish_time".to_string(),
-            curation_enabled: false,
-            curation_default_action: "allow".to_string(),
-        };
+        let repo = fixture_repo_info(&f);
 
         finalize_upload(
             f.state.clone(),
@@ -4685,6 +5473,8 @@ mod streaming_pipeline_regression_tests {
                 committed_offset: 0,
                 final_path: None,
                 finalize_token,
+                staged_part_keys: Vec::new(),
+                enqueue_sync_tasks: false,
             },
         )
         .await;
@@ -4810,6 +5600,8 @@ mod streaming_pipeline_regression_tests {
                 committed_offset: 0,
                 final_path: None,
                 finalize_token: stale_token,
+                staged_part_keys: Vec::new(),
+                enqueue_sync_tasks: false,
             },
         )
         .await;
@@ -6231,6 +7023,106 @@ mod streaming_pipeline_regression_tests {
             .bind(session_id)
             .execute(&f.pool)
             .await;
+        f.teardown().await;
+    }
+
+    /// #1846: an Incus image pushed through the generic chunked flow
+    /// (`/api/v1/uploads`) gets the native finalize: the row is named after
+    /// the product (the old path named it `incus.tar.gz`, so its download URL
+    /// pointed at a product that does not exist), its `metadata.yaml`
+    /// arch/os/release land in `artifact_metadata`, and `images.json` lists
+    /// it with them.
+    #[tokio::test]
+    async fn chunked_image_upload_runs_native_finalize_1846() {
+        use std::io::Write;
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let yaml = b"architecture: aarch64\nproperties:\n  os: Debian\n  release: trixie\n";
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(yaml.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "metadata.yaml", &yaml[..])
+            .unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar.into_inner().unwrap()).unwrap();
+        let image = gz.finish().unwrap();
+
+        let path = build_artifact_path("debian-trixie", "20261004", "incus.tar.gz");
+        let mut events = f.state.event_bus.subscribe();
+        let (status, body) = f
+            .chunked_upload(&path, &image, serde_json::json!({}), false)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "chunked completion failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        // The catalog write is silent: completion emits its one
+        // `artifact.uploaded` itself (#3939), so the finalize must not add one.
+        tdh::assert_one_artifact_uploaded_event(
+            &mut events,
+            f.repo_id,
+            tdh::artifact_id_at(&f.pool, f.repo_id, &path).await,
+        );
+
+        let (artifact_id, name, version): (Uuid, String, Option<String>) = sqlx::query_as(
+            "SELECT id, name, version FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(&path)
+        .fetch_one(&f.pool)
+        .await
+        .expect("chunked artifact row");
+        assert_eq!(name, "debian-trixie", "named by product, not file");
+        assert_eq!(version.as_deref(), Some("20261004"));
+        let metadata: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata FROM artifact_metadata WHERE artifact_id = $1 AND format = 'incus'",
+        )
+        .bind(artifact_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("chunked upload must write the incus artifact_metadata row");
+        assert_eq!(metadata["image_metadata"]["os"], "Debian");
+        let catalog: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM packages WHERE repository_id = $1 AND name = 'debian-trixie'",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(catalog, 1, "the image is in the package catalog");
+
+        let req = axum::http::Request::builder()
+            .uri(format!("/{}/streams/v1/images.json", f.repo_key))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(f.router_with_auth(router()), req).await;
+        assert_eq!(status, StatusCode::OK);
+        let catalog: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let product = &catalog["products"]["debian-trixie"];
+        assert_eq!(product["arch"], "aarch64", "{catalog}");
+        assert_eq!(product["os"], "Debian");
+        assert_eq!(product["release"], "trixie");
+        let item = &product["versions"]["20261004"]["items"]["incus.tar.xz"];
+        assert_eq!(item["size"], image.len() as i64, "{catalog}");
+
+        // The SimpleStreams download URL resolves to the chunked bytes.
+        let download = item["path"].as_str().expect("item path").to_string();
+        let req = axum::http::Request::builder()
+            .uri(format!(
+                "/{}",
+                download.trim_start_matches('/').split_once('/').unwrap().1
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(f.router_with_auth(router()), req).await;
+        assert_eq!(status, StatusCode::OK, "download of {download}");
+        assert_eq!(&body[..], &image[..]);
+
         f.teardown().await;
     }
 }

@@ -6,17 +6,35 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "name",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "name"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "endpoint_url",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "endpoint_url"
+          }
+        }
       },
       {
         "ordinal": 3,
@@ -33,107 +51,233 @@
               ]
             }
           }
+        },
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "status"
+          }
         }
       },
       {
         "ordinal": 4,
         "name": "region",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "region"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "cache_size_bytes",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "cache_size_bytes"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "cache_used_bytes",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "cache_used_bytes"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "last_heartbeat_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "last_heartbeat_at"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "last_sync_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "last_sync_at"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "sync_filter",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "sync_filter"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "max_bandwidth_bps",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "max_bandwidth_bps"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "sync_window_start",
-        "type_info": "Time"
+        "type_info": "Time",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "sync_window_start"
+          }
+        }
       },
       {
         "ordinal": 12,
         "name": "sync_window_end",
-        "type_info": "Time"
+        "type_info": "Time",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "sync_window_end"
+          }
+        }
       },
       {
         "ordinal": 13,
         "name": "sync_window_timezone",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "sync_window_timezone"
+          }
+        }
       },
       {
         "ordinal": 14,
         "name": "concurrent_transfers_limit",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "concurrent_transfers_limit"
+          }
+        }
       },
       {
         "ordinal": 15,
         "name": "active_transfers",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "active_transfers"
+          }
+        }
       },
       {
         "ordinal": 16,
         "name": "backoff_until",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "backoff_until"
+          }
+        }
       },
       {
         "ordinal": 17,
         "name": "consecutive_failures",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "consecutive_failures"
+          }
+        }
       },
       {
         "ordinal": 18,
         "name": "bytes_transferred_total",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "bytes_transferred_total"
+          }
+        }
       },
       {
         "ordinal": 19,
         "name": "transfer_failures_total",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "transfer_failures_total"
+          }
+        }
       },
       {
         "ordinal": 20,
         "name": "api_key",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "api_key"
+          }
+        }
       },
       {
         "ordinal": 21,
         "name": "is_local",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "is_local"
+          }
+        }
       },
       {
         "ordinal": 22,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 23,
         "name": "updated_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "peer_instances",
+            "name": "updated_at"
+          }
+        }
       }
     ],
     "parameters": {

@@ -106,7 +106,12 @@
                 "bazel",
                 "protobuf",
                 "incus",
-                "lxc"
+                "lxc",
+                "jupyter",
+                "github",
+                "mise",
+                "aqua",
+                "pacman"
               ]
             }
           }
@@ -446,7 +451,12 @@
                 "bazel",
                 "protobuf",
                 "incus",
-                "lxc"
+                "lxc",
+                "jupyter",
+                "github",
+                "mise",
+                "aqua",
+                "pacman"
               ]
             }
           }

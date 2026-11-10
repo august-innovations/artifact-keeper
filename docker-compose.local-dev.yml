@@ -65,9 +65,11 @@ services:
     restart: unless-stopped
 
   trivy:
-    image: ghcr.io/aquasecurity/trivy:0.74.0
+    image: ghcr.io/aquasecurity/trivy:0.76.0
     container_name: artifact-keeper-dev-trivy
     command: ["server", "--listen", "0.0.0.0:8090"]
+    # Air-gapped variant (#5287): add "--skip-db-update" once the cache volume
+    # holds a DB; see the trivy service in docker-compose.yml.
     ports:
       - "8090:8090"
     volumes:
@@ -211,7 +213,8 @@ services:
       JWT_SECRET: dev-secret-change-in-production-please
       ADMIN_PASSWORD: admin
       RUST_LOG: info,artifact_keeper=debug
-      LOG_FORMAT: ${LOG_FORMAT:-pretty}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+      LOG_ANSI: ${LOG_ANSI:-auto}
       AUDIT_STREAM: ${AUDIT_STREAM:-off}
       ENVIRONMENT: development
       CORS_ORIGINS: http://localhost:3000,http://localhost:8080

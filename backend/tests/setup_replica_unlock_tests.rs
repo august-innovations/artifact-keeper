@@ -47,7 +47,6 @@ use artifact_keeper_backend::storage::{StorageBackend, StorageRegistry};
 
 use common::{require_db_pool, test_config_with_default_jwt};
 
-const USER_PREFIX: &str = "setup-unlock";
 const INIT_PASSWORD: &str = "InitBootstrapPass_2492!a";
 const NEW_PASSWORD: &str = "FreshAdminPass_2492!b";
 
@@ -118,11 +117,10 @@ fn mint_admin_jwt(auth_service: &AuthService, user_id: Uuid, username: &str) -> 
         .access_token
 }
 
-/// Insert a bootstrap-style admin: `is_admin = true`,
+/// Insert a bootstrap-style local admin named `username`: `is_admin = true`,
 /// `must_change_password = true`, known "initialization" password.
-async fn insert_bootstrap_admin(pool: &PgPool) -> (Uuid, String) {
+async fn insert_pending_admin(pool: &PgPool, username: &str) -> (Uuid, String) {
     let id = Uuid::new_v4();
-    let username = format!("{}-{}", USER_PREFIX, &id.to_string()[..8]);
     let pw_hash = AuthService::hash_password(INIT_PASSWORD)
         .await
         .expect("hash");
@@ -136,31 +134,60 @@ async fn insert_bootstrap_admin(pool: &PgPool) -> (Uuid, String) {
         "#,
     )
     .bind(id)
-    .bind(&username)
+    .bind(username)
     .bind(format!("{}@test.local", username))
     .bind(&pw_hash)
     .execute(pool)
     .await
-    .expect("insert bootstrap admin");
-    (id, username)
+    .expect("insert pending admin");
+    (id, username.to_string())
 }
 
-/// Remove leftovers from previous (possibly crashed) runs, and neutralize
-/// any pre-existing `is_admin AND must_change_password` rows so the
-/// DB-authority re-check under test sees exactly the state this test
-/// controls. The DB-gated suites run against a throwaway database
-/// (`require_db_pool` contract), single-threaded in CI.
-async fn reset_setup_state(pool: &PgPool) {
-    let _ = sqlx::query("DELETE FROM users WHERE username LIKE $1")
-        .bind(format!("{}-%", USER_PREFIX))
-        .execute(pool)
-        .await;
-    let _ = sqlx::query(
-        "UPDATE users SET must_change_password = false \
-         WHERE is_admin = true AND must_change_password = true",
-    )
-    .execute(pool)
-    .await;
+/// A fresh, fully migrated database of its own. The gate is keyed on the
+/// built-in `admin` username (#4634), so these tests must start from a
+/// database that holds no admin of any name.
+async fn isolated_db() -> artifact_keeper_backend::testing::IsolatedDb {
+    artifact_keeper_backend::testing::try_isolated_pool()
+        .await
+        .expect("isolated test database (DATABASE_URL must be set)")
+}
+
+/// Serve the first-time password change for `user_id` through the real
+/// change-password handler on the replica owning `state`, exactly as a login
+/// with the initialization password would.
+async fn change_own_password(
+    state: &SharedState,
+    pool: &PgPool,
+    user_id: Uuid,
+    username: &str,
+) -> (StatusCode, String) {
+    let auth_service = Arc::new(AuthService::new(
+        pool.clone(),
+        Arc::new(state.config.clone()),
+    ));
+    let app: Router = Router::new()
+        .nest("/api/v1/users", self_password_router())
+        .layer(middleware::from_fn_with_state(
+            auth_service.clone(),
+            auth_middleware,
+        ))
+        .with_state(state.clone());
+    let jwt = mint_admin_jwt(&auth_service, user_id, username);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/users/{}/password", user_id))
+                .header("Authorization", format!("Bearer {jwt}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"current_password":"{INIT_PASSWORD}","new_password":"{NEW_PASSWORD}"}}"#
+                )))
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    status_and_body(resp).await
 }
 
 async fn cleanup(pool: &PgPool, user_id: Uuid) {
@@ -203,9 +230,9 @@ async fn get_path(app: &Router, path: &str) -> (StatusCode, String) {
 #[tokio::test]
 #[ignore] // requires PostgreSQL (DATABASE_URL)
 async fn peer_replica_unlocks_without_restart_after_setup_completes() {
-    let pool = require_db_pool().await;
-    reset_setup_state(&pool).await;
-    let (admin_id, admin_username) = insert_bootstrap_admin(&pool).await;
+    let iso = isolated_db().await;
+    let pool = iso.pool.clone();
+    let (admin_id, admin_username) = insert_pending_admin(&pool, "admin").await;
 
     // Two "replicas": independent AppStates sharing the same database,
     // both booted while the admin password change was still pending.
@@ -234,33 +261,7 @@ async fn peer_replica_unlocks_without_restart_after_setup_completes() {
 
     // Replica A serves the real first-time password change (the handler
     // that clears must_change_password and A's own in-process flag).
-    let auth_service = Arc::new(AuthService::new(
-        pool.clone(),
-        Arc::new(state_a.config.clone()),
-    ));
-    let app_a: Router = Router::new()
-        .nest("/api/v1/users", self_password_router())
-        .layer(middleware::from_fn_with_state(
-            auth_service.clone(),
-            auth_middleware,
-        ))
-        .with_state(state_a.clone());
-    let jwt = mint_admin_jwt(&auth_service, admin_id, &admin_username);
-    let resp = app_a
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/users/{}/password", admin_id))
-                .header("Authorization", format!("Bearer {jwt}"))
-                .header("Content-Type", "application/json")
-                .body(Body::from(format!(
-                    r#"{{"current_password":"{INIT_PASSWORD}","new_password":"{NEW_PASSWORD}"}}"#
-                )))
-                .expect("request"),
-        )
-        .await
-        .expect("oneshot");
-    let (status, body) = status_and_body(resp).await;
+    let (status, body) = change_own_password(&state_a, &pool, admin_id, &admin_username).await;
     assert_eq!(status, StatusCode::OK, "password change failed: {body}");
     assert!(
         !state_a.setup_required.load(Ordering::Relaxed),
@@ -300,6 +301,45 @@ async fn peer_replica_unlocks_without_restart_after_setup_completes() {
     assert!(!state_b.setup_required.load(Ordering::Relaxed));
 
     cleanup(&pool, admin_id).await;
+}
+
+/// #4634: another admin that still holds a temporary password must not
+/// release the gate when it rotates, because the gate is about the built-in
+/// `admin`; only `admin`'s own rotation unlocks. Pre-fix, any user that had a
+/// pending flag cleared the replica's gate on rotation.
+#[tokio::test]
+#[ignore] // requires PostgreSQL (DATABASE_URL)
+async fn other_admin_rotating_does_not_unlock_setup_4634() {
+    let iso = isolated_db().await;
+    let pool = iso.pool.clone();
+    let (admin_id, admin_username) = insert_pending_admin(&pool, "admin").await;
+    let (other_id, other_username) = insert_pending_admin(&pool, "other-admin-4634").await;
+
+    let state = build_state(pool.clone(), make_test_config());
+    state.setup_required.store(true, Ordering::Relaxed);
+    let app = build_replica_app(state.clone());
+
+    let (status, body) = change_own_password(&state, &pool, other_id, &other_username).await;
+    assert_eq!(status, StatusCode::OK, "password change failed: {body}");
+    assert!(
+        state.setup_required.load(Ordering::Relaxed),
+        "another admin rotating must not clear the gate while `admin` is pending"
+    );
+    let (status, body) = get_path(&app, "/api/v1/repositories").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the gate must still refuse; body: {body}"
+    );
+
+    let (status, body) = change_own_password(&state, &pool, admin_id, &admin_username).await;
+    assert_eq!(status, StatusCode::OK, "password change failed: {body}");
+    assert!(
+        !state.setup_required.load(Ordering::Relaxed),
+        "`admin` rotating completes setup"
+    );
+    let (status, body) = get_path(&app, "/api/v1/repositories").await;
+    assert_eq!(status, StatusCode::OK, "gate must be open; body: {body}");
 }
 
 /// Fail-closed contract: if the DB re-check cannot run (connection lost),

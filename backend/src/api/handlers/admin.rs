@@ -3,8 +3,13 @@
 use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
+use crate::services::guest_access_policy::{
+    GuestAccessSource, ResolvedGuestAccess, GUEST_ACCESS_SETTING_KEY,
+};
+use crate::services::hidden_nav_items;
 use crate::services::token_expiry_policy::{self, ApiTokenExpiryPolicy, TokenPolicySource};
 use crate::services::totp_policy::{self, check_policy_activation, TotpPolicy, TotpPolicySource};
+use crate::services::upstream_pause::{self, UpstreamPauseSource, UpstreamPauseState};
 use axum::{
     extract::{Extension, Path, Query, State},
     routing::{get, post},
@@ -42,6 +47,10 @@ pub fn router() -> Router<SharedState> {
             "/settings/token-policy",
             get(get_token_policy).put(update_token_policy),
         )
+        .route(
+            "/settings/system",
+            get(get_runtime_settings).patch(update_runtime_settings),
+        )
         .route("/stats", get(get_system_stats))
         .route("/storage/ledger/backfill", post(backfill_storage_ledger))
         .route("/downloads", get(list_downloads))
@@ -57,6 +66,53 @@ pub fn router() -> Router<SharedState> {
             "/proxy-scan-verdicts/:digest",
             get(get_proxy_scan_verdicts).delete(delete_proxy_scan_verdicts),
         )
+        .route(
+            "/npm/upstream-feed/status",
+            get(get_npm_upstream_feed_status),
+        )
+}
+
+// ---------------------------------------------------------------------------
+// npm upstream change-feed status (#3069)
+// ---------------------------------------------------------------------------
+
+/// Status of the npm upstream change-feed consumer (#2249): effective
+/// configuration, persisted cursor, leadership and the last feed error.
+///
+/// Read-only; the feed is configured through `NPM_UPSTREAM_FEED_ENABLED` /
+/// `NPM_UPSTREAM_FEED_URL`. `consumer_running`, `is_leader` and `last_error`
+/// describe only the replica that answered, which `replica_id` names; behind a
+/// load balancer successive calls may hit different replicas.
+/// `cluster_leader_active`, `cursor` and `last_poll_at` are cluster-wide.
+#[utoipa::path(
+    get,
+    path = "/npm/upstream-feed/status",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    responses(
+        (status = 200, description = "npm upstream change-feed status", body = crate::services::upstream_feed::NpmUpstreamFeedStatus),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin privileges required"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_npm_upstream_feed_status(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<crate::services::upstream_feed::NpmUpstreamFeedStatus>> {
+    if !auth.is_admin {
+        return Err(AppError::Authorization(
+            "Admin privileges required".to_string(),
+        ));
+    }
+    let status = crate::services::upstream_feed::npm_feed_status(
+        &state.config,
+        &state.db,
+        &state.upstream_feed_status,
+    )
+    .await?;
+    Ok(Json(status))
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +566,8 @@ pub async fn execute_backup(
     let archive_storage =
         StorageService::backup_archive_from_config(&state.config, &archive_root).await?;
     let source = Arc::new(StorageService::artifact_source_from_config(&state.config).await?);
-    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage);
+    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage)
+        .with_storage_registry(state.storage_registry.clone());
 
     // `execute_run`, not `execute`: a run that ends FAILED has already recorded
     // its own terminal state and the message naming what went wrong, and that
@@ -608,7 +665,8 @@ pub async fn restore_backup(
     let archive_storage =
         StorageService::backup_archive_from_config(&state.config, &archive_root).await?;
     let source = Arc::new(StorageService::artifact_source_from_config(&state.config).await?);
-    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage);
+    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage)
+        .with_storage_registry(state.storage_registry.clone());
 
     let options = RestoreOptions {
         restore_database: payload.restore_database.unwrap_or(true),
@@ -743,7 +801,9 @@ pub async fn get_settings(State(state): State<SharedState>) -> Result<Json<Syste
         allow_anonymous_download: false,
         max_upload_size_bytes: 100 * 1024 * 1024, // 100MB default
         retention_days: 365,
-        audit_retention_days: 90,
+        // #4718: report the EFFECTIVE audit retention. Retention is off (0)
+        // until a period is saved; a displayed default of 90 was never applied.
+        audit_retention_days: 0,
         backup_retention_count: 10,
         edge_stale_threshold_minutes: 5,
     };
@@ -1033,6 +1093,322 @@ pub async fn update_totp_policy(
 }
 
 // ---------------------------------------------------------------------------
+// Runtime system settings: guest access (#867), hidden navigation (#4574)
+// ---------------------------------------------------------------------------
+
+/// Runtime-managed system settings: guest access and the web UI navigation
+/// entries hidden for every user.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RuntimeSettingsResponse {
+    /// Whether anonymous (unauthenticated) access is allowed right now. This
+    /// is the value the guest-access guard enforces.
+    pub guest_access_enabled: bool,
+    /// Where that value comes from: `environment` (`AK_GUEST_ACCESS_ENABLED`
+    /// set explicitly -- it wins), `database` (set through this API) or
+    /// `default` (neither; guests allowed).
+    pub guest_access_source: GuestAccessSource,
+    /// The value stored through this API, if any. Reported even while the
+    /// environment pins the setting: it takes over once the env var is unset.
+    pub guest_access_stored: Option<bool>,
+    /// Whether a `PATCH` changes the effective value now. `false` while
+    /// `AK_GUEST_ACCESS_ENABLED` pins it; the write is still stored.
+    pub guest_access_editable: bool,
+    /// Web UI navigation entries hidden for every user (#4574). Display only:
+    /// a hidden page stays reachable by URL and keeps its permission checks.
+    /// Empty (the default) means every entry is shown.
+    pub hidden_nav_items: Vec<String>,
+    /// Whether every scheduled job that contacts an upstream on its own is
+    /// paused (#5288): curation sync, environment re-evaluation, the npm
+    /// replication feed, peer replication transfers and scheduled `mirror`
+    /// passes (#5342).
+    pub upstream_jobs_paused: bool,
+    /// Where that value comes from: `environment` (`UPSTREAM_JOBS_PAUSED=true`
+    /// pins it on), `database` (set through this API), `default` (neither) or
+    /// `unavailable`.
+    pub upstream_jobs_paused_source: UpstreamPauseSource,
+    /// The value stored through this API, if any.
+    pub upstream_jobs_paused_stored: Option<bool>,
+}
+
+/// Request body for `PATCH /admin/settings/system`. Omitted fields are left
+/// unchanged; unknown fields are rejected so a typo is not a silent no-op.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateRuntimeSettingsRequest {
+    /// Allow (`true`) or refuse (`false`) anonymous access server-wide.
+    pub guest_access_enabled: Option<bool>,
+    /// Replace the list of web UI navigation entries hidden for every user
+    /// (#4574). The identifiers are opaque to the server (the web UI sends
+    /// route paths such as `/peers`); each must be 1-128 characters of ASCII
+    /// letters, digits, `/`, `-`, `_` or `.`, at most 200 entries. An empty
+    /// list shows every entry again.
+    pub hidden_nav_items: Option<Vec<String>>,
+    /// Pause (`true`) or resume (`false`) every scheduled job that contacts an
+    /// upstream (#5288). Takes effect on each job's next tick. While
+    /// `UPSTREAM_JOBS_PAUSED=true` the jobs stay paused whatever is stored.
+    pub upstream_jobs_paused: Option<bool>,
+}
+
+fn runtime_settings_response(
+    resolved: ResolvedGuestAccess,
+    pinned: bool,
+    hidden_nav_items: Vec<String>,
+    upstream: UpstreamPauseState,
+) -> RuntimeSettingsResponse {
+    RuntimeSettingsResponse {
+        guest_access_enabled: resolved.enabled,
+        guest_access_source: resolved.source,
+        guest_access_stored: resolved.stored,
+        guest_access_editable: !pinned,
+        hidden_nav_items,
+        upstream_jobs_paused: upstream.paused,
+        upstream_jobs_paused_source: upstream.source,
+        upstream_jobs_paused_stored: upstream.stored,
+    }
+}
+
+/// Fresh read of the #5288 switch for the admin endpoints; a read error is a
+/// 503, as for [`read_hidden_nav_items`].
+async fn read_upstream_pause(db: &sqlx::PgPool) -> Result<UpstreamPauseState> {
+    upstream_pause::try_state(db).await.map_err(|e| {
+        tracing::warn!(error = %e, "failed to read the upstream_jobs_paused setting");
+        AppError::ServiceUnavailable(
+            "the upstream_jobs_paused setting could not be read; retry shortly".to_string(),
+        )
+    })
+}
+
+/// Audit `details` for an `upstream_jobs_paused` write (#5288).
+fn upstream_pause_audit_details(
+    before: UpstreamPauseState,
+    after: UpstreamPauseState,
+) -> serde_json::Value {
+    serde_json::json!({
+        "setting": upstream_pause::UPSTREAM_JOBS_PAUSED_SETTING,
+        "from": before.paused,
+        "to": after.paused,
+        "stored_from": before.stored,
+        "stored_to": after.stored,
+        "source": after.source,
+    })
+}
+
+/// Write a `SETTING_CHANGED` audit entry for a runtime setting. The resource
+/// is the acting admin, as for every runtime-settings write.
+async fn audit_setting_changed(
+    state: &SharedState,
+    auth: &AuthExtension,
+    key: &str,
+    details: serde_json::Value,
+) {
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting)
+            .user(auth.user_id)
+            .resource(auth.user_id)
+            .actor_name(&auth.username)
+            .resource_name(key)
+            .details(details),
+    )
+    .await;
+}
+
+/// Audit `details` for a hidden-navigation write (#4574).
+fn hidden_nav_items_audit_details(before: &[String], after: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "setting": hidden_nav_items::HIDDEN_NAV_ITEMS_SETTING_KEY,
+        "from": before,
+        "to": after,
+    })
+}
+
+/// Fresh read of the hidden navigation entries for the admin endpoints. Like
+/// [`read_guest_access`], a database error is a 503 here: the admin form must
+/// not be seeded from a guessed value. (`/system/config` fails open instead.)
+async fn read_hidden_nav_items(db: &sqlx::PgPool) -> Result<Vec<String>> {
+    hidden_nav_items::try_load(db).await.map_err(|e| {
+        tracing::warn!(error = %e, "failed to read the hidden navigation items");
+        AppError::ServiceUnavailable(
+            "the navigation setting could not be read; retry shortly".to_string(),
+        )
+    })
+}
+
+/// Audit `details` for a guest-access write: old -> new effective value, the
+/// stored value before/after, and the source after the write (so an entry
+/// written while the env var pins the value says it changed nothing yet).
+fn guest_access_audit_details(
+    before: ResolvedGuestAccess,
+    after: ResolvedGuestAccess,
+) -> serde_json::Value {
+    serde_json::json!({
+        "setting": GUEST_ACCESS_SETTING_KEY,
+        "from": before.enabled,
+        "to": after.enabled,
+        "stored_from": before.stored,
+        "stored_to": after.stored,
+        "source": after.source,
+        "effective_changed": before.enabled != after.enabled,
+    })
+}
+
+/// Fresh read of the guest-access setting for the admin endpoints. A database
+/// error is a 503, never the cached or fail-closed fallback the guard serves:
+/// an admin must not be shown (or audit against) a value that was not read.
+async fn read_guest_access(
+    policy: &crate::services::guest_access_policy::GuestAccessPolicy,
+) -> Result<ResolvedGuestAccess> {
+    policy.try_refresh().await.map_err(|e| {
+        tracing::warn!(error = %e, "failed to read the guest-access setting");
+        AppError::ServiceUnavailable(
+            "the guest-access setting could not be read; retry shortly".to_string(),
+        )
+    })
+}
+
+/// Read the runtime system settings (guest access and its source, hidden
+/// navigation entries).
+#[utoipa::path(
+    get,
+    path = "/settings/system",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Runtime system settings", body = RuntimeSettingsResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+        (status = 503, description = "The setting could not be read", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_runtime_settings(
+    State(state): State<SharedState>,
+) -> Result<Json<RuntimeSettingsResponse>> {
+    let policy = &state.guest_access_policy;
+    // Bypass the cache: an operator checking the setting wants the database's
+    // answer, not a cached or fallback one -- a read failure is a 503.
+    let resolved = read_guest_access(policy).await?;
+    let hidden = read_hidden_nav_items(&state.db).await?;
+    let upstream = read_upstream_pause(&state.db).await?;
+    Ok(Json(runtime_settings_response(
+        resolved,
+        policy.is_env_pinned(),
+        hidden,
+        upstream,
+    )))
+}
+
+/// Change runtime system settings. Takes effect immediately: the replica that
+/// serves the request enforces the new guest-access value on its next request,
+/// and other replicas within the policy cache TTL (5 s). No restart.
+///
+/// `AK_GUEST_ACCESS_ENABLED`, when set explicitly, still wins (it is the
+/// break-glass): the value is stored but `guest_access_editable` is `false`
+/// and the effective value does not change until the env var is unset.
+///
+/// `hidden_nav_items` replaces the list of web UI navigation entries hidden
+/// for every user. It is validated before anything is written, so an invalid
+/// list leaves both settings untouched.
+#[utoipa::path(
+    patch,
+    path = "/settings/system",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    request_body = UpdateRuntimeSettingsRequest,
+    responses(
+        (status = 200, description = "Settings updated", body = RuntimeSettingsResponse),
+        (status = 400, description = "No setting to update", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+        (status = 503, description = "The setting could not be read", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_runtime_settings(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(payload): Json<UpdateRuntimeSettingsRequest>,
+) -> Result<Json<RuntimeSettingsResponse>> {
+    if payload.guest_access_enabled.is_none()
+        && payload.hidden_nav_items.is_none()
+        && payload.upstream_jobs_paused.is_none()
+    {
+        return Err(AppError::Validation(
+            "no setting to update; supported fields: guest_access_enabled, hidden_nav_items, \
+             upstream_jobs_paused"
+                .to_string(),
+        ));
+    }
+    let new_hidden = payload
+        .hidden_nav_items
+        .map(hidden_nav_items::normalize)
+        .transpose()
+        .map_err(AppError::Validation)?;
+
+    let policy = &state.guest_access_policy;
+    // Read both before writing either, so a failed read cannot leave one
+    // setting written and the request reported as failed.
+    let before = read_guest_access(policy).await?;
+    let hidden_before = read_hidden_nav_items(&state.db).await?;
+    let upstream_before = read_upstream_pause(&state.db).await?;
+
+    let guest = match payload.guest_access_enabled {
+        Some(enabled) => {
+            let after = policy.store(enabled, auth.user_id).await?;
+            audit_setting_changed(
+                &state,
+                &auth,
+                GUEST_ACCESS_SETTING_KEY,
+                guest_access_audit_details(before, after),
+            )
+            .await;
+            after
+        }
+        None => before,
+    };
+
+    let hidden = match new_hidden {
+        Some(items) => {
+            hidden_nav_items::store(&state.db, &items, auth.user_id)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            audit_setting_changed(
+                &state,
+                &auth,
+                hidden_nav_items::HIDDEN_NAV_ITEMS_SETTING_KEY,
+                hidden_nav_items_audit_details(&hidden_before, &items),
+            )
+            .await;
+            items
+        }
+        None => hidden_before,
+    };
+
+    let upstream = match payload.upstream_jobs_paused {
+        Some(paused) => {
+            upstream_pause::store(&state.db, paused, auth.user_id)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            let after = read_upstream_pause(&state.db).await?;
+            audit_setting_changed(
+                &state,
+                &auth,
+                upstream_pause::UPSTREAM_JOBS_PAUSED_SETTING,
+                upstream_pause_audit_details(upstream_before, after),
+            )
+            .await;
+            after
+        }
+        None => upstream_before,
+    };
+
+    Ok(Json(runtime_settings_response(
+        guest,
+        policy.is_env_pinned(),
+        hidden,
+        upstream,
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // API token expiration policy (#3460)
 // ---------------------------------------------------------------------------
 
@@ -1192,7 +1568,15 @@ pub struct SystemStats {
     /// (`oci_blobs`) and proxy-cached bytes; `proxy_storage_bytes` below is
     /// a *breakdown* of this total, not a disjoint bucket.
     pub total_storage_bytes: i64,
+    /// Every recorded download: hosted artifact downloads
+    /// (`download_statistics`) plus proxy pull-through serves
+    /// (`proxy_download_statistics`). Before #4539 this counted hosted
+    /// downloads only, so an all-proxy deployment reported zero.
     pub total_downloads: i64,
+    /// Proxy pull-through serves. A **breakdown of** `total_downloads`, not a
+    /// disjoint bucket (the same relation `proxy_storage_bytes` has to
+    /// `total_storage_bytes`): hosted downloads are the difference (#4539).
+    pub proxy_download_count: i64,
     pub total_users: i64,
     pub active_peers: i64,
     pub pending_sync_tasks: i64,
@@ -1217,11 +1601,17 @@ pub struct SystemStats {
     tag = "admin",
     responses(
         (status = 200, description = "System statistics", body = SystemStats),
+        (status = 403, description = "Admin privileges required, or the token is repository-scoped"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
 )]
-pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<SystemStats>> {
+pub async fn get_system_stats(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<SystemStats>> {
+    // Instance-wide totals across every repository (#4550).
+    auth.require_unscoped_admin("instance-wide system statistics")?;
     let mut conn = state
         .db
         .acquire()
@@ -1283,8 +1673,13 @@ async fn collect_system_stats(conn: &mut sqlx::PgConnection) -> Result<SystemSta
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let download_count =
+    let hosted_download_count =
         sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM download_statistics")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    let proxy_download_count =
+        sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM proxy_download_statistics")
             .fetch_one(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1312,7 +1707,8 @@ async fn collect_system_stats(conn: &mut sqlx::PgConnection) -> Result<SystemSta
         total_repositories: repo_count,
         total_artifacts: artifact_count,
         total_storage_bytes: storage_totals.total,
-        total_downloads: download_count,
+        total_downloads: hosted_download_count + proxy_download_count,
+        proxy_download_count,
         total_users: user_count,
         active_peers: active_edge_count,
         pending_sync_tasks: pending_sync_count,
@@ -1378,9 +1774,11 @@ pub struct LedgerBackfillResponse {
 /// The blobs are present and served correctly; only the accounting is wrong.
 /// Run this once after a restore.
 ///
-/// **What it recomputes**, mirroring the migration-182 trigger rules exactly:
-/// `hosted_bytes` = `artifacts` with `is_deleted = false` and
-/// `storage_key NOT LIKE 'proxy-cache/%'`; `proxy_bytes` = every
+/// **What it recomputes**, mirroring the ledger trigger rules exactly
+/// (migration 182, amended by 288): `hosted_bytes` = `artifacts` with
+/// `is_deleted = false`, `storage_key NOT LIKE 'proxy-cache/%'` and
+/// `storage_key NOT LIKE 'oci-manifests/%'` (an OCI manifest row records the
+/// image size, whose bytes `oci_bytes` already counts, #4483); `proxy_bytes` = every
 /// `proxy_cache_artifacts` row; `oci_bytes` = every `oci_blobs` row. It is an
 /// absolute recompute per repository, so it is idempotent: on a consistent
 /// instance every row is rewritten with the value it already held and
@@ -1475,20 +1873,89 @@ pub struct ListDownloadsQuery {
     pub artifact_id: Option<Uuid>,
     /// Filter to downloads by one user.
     pub user_id: Option<Uuid>,
+    /// Filter on whether the download was attributed to a user: `all`
+    /// (default), `anonymous` (no user, `user_id` is null) or `authenticated`
+    /// (any user). `anonymous` together with `user_id` is rejected (#4839).
+    pub downloader: Option<DownloaderFilter>,
     /// Filter to downloads from one client IP (exact match).
     pub ip: Option<String>,
     /// Inclusive lower bound on `downloaded_at` (RFC 3339).
     pub from: Option<String>,
     /// Inclusive upper bound on `downloaded_at` (RFC 3339).
     pub to: Option<String>,
+    /// Filter to one source: `hosted` (a hosted artifact) or `proxy` (a
+    /// pull-through serve from a Remote repository). Omitted: both (#4539).
+    pub source: Option<DownloadSource>,
+    /// Filter to downloads served from one repository: the artifact's
+    /// repository for a hosted download, the Remote repository for a proxy
+    /// serve (#4539).
+    pub repository_id: Option<Uuid>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
 
-/// One attributed download event.
+/// Which downloaders the listing returns (#4839). Anonymous downloads are
+/// recorded with a null `user_id`, which the UUID-typed `user_id` filter
+/// cannot select.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloaderFilter {
+    /// Every download, attributed or not.
+    #[default]
+    All,
+    /// Only downloads with no authenticated user (`user_id` is null).
+    Anonymous,
+    /// Only downloads attributed to a user.
+    Authenticated,
+}
+
+/// Where a download event was recorded (#4539). Hosted artifacts and proxy
+/// pull-through serves live in two tables (`download_statistics`, keyed on the
+/// `artifacts` row, and `proxy_download_statistics`, keyed on the Remote
+/// repository and path, since proxied content has no `artifacts` row); the
+/// listing returns both, and this says which one a row came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloadSource {
+    Hosted,
+    Proxy,
+}
+
+impl DownloadSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hosted => "hosted",
+            Self::Proxy => "proxy",
+        }
+    }
+}
+
+impl TryFrom<String> for DownloadSource {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        match value.as_str() {
+            "hosted" => Ok(Self::Hosted),
+            "proxy" => Ok(Self::Proxy),
+            other => Err(format!("unknown download source `{other}`")),
+        }
+    }
+}
+
+/// One attributed download event: a hosted artifact download or a proxy
+/// pull-through serve (#4539).
 #[derive(Debug, Serialize, ToSchema, sqlx::FromRow)]
 pub struct DownloadRecord {
-    pub artifact_id: Uuid,
+    #[sqlx(try_from = "String")]
+    pub source: DownloadSource,
+    /// The hosted artifact downloaded. `null` for a proxy serve: proxied
+    /// content has no `artifacts` row.
+    pub artifact_id: Option<Uuid>,
+    /// The repository that served the download: the artifact's repository,
+    /// or the Remote repository a proxy serve was recorded under.
+    pub repository_id: Option<Uuid>,
+    /// The artifact's path in that repository, or the proxied path.
+    pub path: Option<String>,
     pub user_id: Option<Uuid>,
     /// Username of the downloader, when the download was authenticated and
     /// the user still exists.
@@ -1530,11 +1997,28 @@ fn push_download_filters(
     to: Option<chrono::DateTime<chrono::Utc>>,
 ) {
     builder.push(" WHERE TRUE");
+    if let Some(source) = query.source {
+        builder.push(" AND d.source = ").push_bind(source.as_str());
+    }
     if let Some(artifact_id) = query.artifact_id {
         builder.push(" AND d.artifact_id = ").push_bind(artifact_id);
     }
+    if let Some(repository_id) = query.repository_id {
+        builder
+            .push(" AND COALESCE(d.repository_id, a.repository_id) = ")
+            .push_bind(repository_id);
+    }
     if let Some(user_id) = query.user_id {
         builder.push(" AND d.user_id = ").push_bind(user_id);
+    }
+    match query.downloader.unwrap_or_default() {
+        DownloaderFilter::All => {}
+        DownloaderFilter::Anonymous => {
+            builder.push(" AND d.user_id IS NULL");
+        }
+        DownloaderFilter::Authenticated => {
+            builder.push(" AND d.user_id IS NOT NULL");
+        }
     }
     if let Some(ip) = &query.ip {
         builder.push(" AND d.ip_address = ").push_bind(ip);
@@ -1547,6 +2031,35 @@ fn push_download_filters(
     }
 }
 
+/// Every recorded download event, hosted and proxy, as one relation `d`
+/// (#4539), with the hosted artifact row joined as `a` so a hosted event
+/// reports its repository and path too. Read-time `UNION ALL` of the two
+/// tables: neither hot-path INSERT changes, and a filter on `d` is pushed down
+/// into both branches (a `source` filter prunes the other branch outright).
+/// The `artifacts` join is a primary-key lookup the planner drops when no
+/// `a` column is referenced.
+const DOWNLOAD_EVENTS_FROM: &str = " FROM ( \
+     SELECT 'hosted'::TEXT AS source, artifact_id, NULL::UUID AS repository_id, \
+            NULL::TEXT AS path, user_id, ip_address, user_agent, downloaded_at \
+       FROM download_statistics \
+     UNION ALL \
+     SELECT 'proxy'::TEXT, NULL::UUID, repository_id, path, \
+            user_id, ip_address, user_agent, downloaded_at \
+       FROM proxy_download_statistics \
+     ) d LEFT JOIN artifacts a ON a.id = d.artifact_id";
+
+/// `downloader=anonymous` selects rows with no user, so pairing it with a
+/// `user_id` (query or path) can only ever match nothing: refuse it instead
+/// of answering an empty page (#4839).
+fn validate_downloader_filter(query: &ListDownloadsQuery) -> Result<()> {
+    if query.downloader == Some(DownloaderFilter::Anonymous) && query.user_id.is_some() {
+        return Err(AppError::Validation(
+            "`downloader=anonymous` cannot be combined with `user_id`".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Shared listing core for the three download-telemetry endpoints.
 async fn query_downloads(
     db: &sqlx::PgPool,
@@ -1557,8 +2070,10 @@ async fn query_downloads(
     let offset = ((page - 1) * per_page) as i64;
     let from = parse_rfc3339_bound(query.from.as_deref(), "from")?;
     let to = parse_rfc3339_bound(query.to.as_deref(), "to")?;
+    validate_downloader_filter(query)?;
 
-    let mut count_builder = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM download_statistics d");
+    let mut count_builder = sqlx::QueryBuilder::new("SELECT COUNT(*)");
+    count_builder.push(DOWNLOAD_EVENTS_FROM);
     push_download_filters(&mut count_builder, query, from, to);
     let total: i64 = count_builder
         .build_query_scalar()
@@ -1567,10 +2082,13 @@ async fn query_downloads(
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     let mut builder = sqlx::QueryBuilder::new(
-        "SELECT d.artifact_id, d.user_id, u.username, d.ip_address, d.user_agent, \
-         d.downloaded_at \
-         FROM download_statistics d LEFT JOIN users u ON u.id = d.user_id",
+        "SELECT d.source, d.artifact_id, \
+         COALESCE(d.repository_id, a.repository_id) AS repository_id, \
+         COALESCE(d.path, a.path) AS path, \
+         d.user_id, u.username, d.ip_address, d.user_agent, d.downloaded_at",
     );
+    builder.push(DOWNLOAD_EVENTS_FROM);
+    builder.push(" LEFT JOIN users u ON u.id = d.user_id");
     push_download_filters(&mut builder, query, from, to);
     builder
         .push(" ORDER BY d.downloaded_at DESC LIMIT ")
@@ -1591,9 +2109,17 @@ async fn query_downloads(
     })
 }
 
+/// Gate for the `/downloads*` listings: they return client IPs, users and
+/// paths from every repository, hosted and proxy, so a repository-scoped
+/// admin token is refused like on the hold queues (#4550, #4273).
+fn require_download_attribution_admin(auth: &AuthExtension) -> Result<()> {
+    auth.require_unscoped_admin("download attribution across repositories")
+}
+
 /// List attributed downloads (client IP + user), filterable by artifact,
-/// user, IP, and time range (#2365). Admin-only: download attribution is
-/// sensitive.
+/// user, IP, and time range (#2365). Covers hosted artifact downloads and
+/// proxy pull-through serves alike, each row marked with its `source`
+/// (#4539). Admin-only: download attribution is sensitive.
 #[utoipa::path(
     get,
     path = "/downloads",
@@ -1603,14 +2129,16 @@ async fn query_downloads(
     responses(
         (status = 200, description = "Attributed download events", body = DownloadListResponse),
         (status = 400, description = "Invalid filter parameter"),
-        (status = 403, description = "Admin privileges required")
+        (status = 403, description = "Admin privileges required, or the token is repository-scoped")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_downloads(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListDownloadsQuery>,
 ) -> Result<Json<DownloadListResponse>> {
+    require_download_attribution_admin(&auth)?;
     Ok(Json(query_downloads(&state.db, &query).await?))
 }
 
@@ -1631,7 +2159,10 @@ pub async fn list_downloads(
     params(
         ("ip" = String, Path, description = "Client IP address"),
         ("artifact_id" = Option<Uuid>, Query, description = "Filter to downloads of one artifact"),
+        ("source" = Option<DownloadSource>, Query, description = "Filter to `hosted` or `proxy` downloads"),
+        ("repository_id" = Option<Uuid>, Query, description = "Filter to downloads served from one repository"),
         ("user_id" = Option<Uuid>, Query, description = "Filter to downloads by one user"),
+        ("downloader" = Option<DownloaderFilter>, Query, description = "`all` (default), `anonymous` (no user) or `authenticated` (any user); `anonymous` with `user_id` is rejected"),
         ("from" = Option<String>, Query, description = "Inclusive lower bound on downloaded_at (RFC 3339)"),
         ("to" = Option<String>, Query, description = "Inclusive upper bound on downloaded_at (RFC 3339)"),
         ("page" = Option<u32>, Query),
@@ -1640,15 +2171,17 @@ pub async fn list_downloads(
     responses(
         (status = 200, description = "Downloads from the IP", body = DownloadListResponse),
         (status = 400, description = "Invalid IP address"),
-        (status = 403, description = "Admin privileges required")
+        (status = 403, description = "Admin privileges required, or the token is repository-scoped")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_downloads_by_ip(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(ip): Path<String>,
     Query(query): Query<ListDownloadsQuery>,
 ) -> Result<Json<DownloadListResponse>> {
+    require_download_attribution_admin(&auth)?;
     let ip: std::net::IpAddr = ip
         .parse()
         .map_err(|_| AppError::Validation("invalid IP address".to_string()))?;
@@ -1672,7 +2205,10 @@ pub async fn list_downloads_by_ip(
     params(
         ("user_id" = Uuid, Path, description = "User id"),
         ("artifact_id" = Option<Uuid>, Query, description = "Filter to downloads of one artifact"),
+        ("source" = Option<DownloadSource>, Query, description = "Filter to `hosted` or `proxy` downloads"),
+        ("repository_id" = Option<Uuid>, Query, description = "Filter to downloads served from one repository"),
         ("ip" = Option<String>, Query, description = "Filter to downloads from one client IP (exact match)"),
+        ("downloader" = Option<DownloaderFilter>, Query, description = "`all` (default) or `authenticated`; `anonymous` is rejected because the path names a user"),
         ("from" = Option<String>, Query, description = "Inclusive lower bound on downloaded_at (RFC 3339)"),
         ("to" = Option<String>, Query, description = "Inclusive upper bound on downloaded_at (RFC 3339)"),
         ("page" = Option<u32>, Query),
@@ -1680,15 +2216,18 @@ pub async fn list_downloads_by_ip(
     ),
     responses(
         (status = 200, description = "Downloads by the user", body = DownloadListResponse),
-        (status = 403, description = "Admin privileges required")
+        (status = 400, description = "Invalid filter parameter, or `downloader=anonymous` with a user"),
+        (status = 403, description = "Admin privileges required, or the token is repository-scoped")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_downloads_by_user(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(user_id): Path<Uuid>,
     Query(query): Query<ListDownloadsQuery>,
 ) -> Result<Json<DownloadListResponse>> {
+    require_download_attribution_admin(&auth)?;
     let query = ListDownloadsQuery {
         user_id: Some(user_id),
         ..query
@@ -1710,6 +2249,14 @@ pub struct CleanupResponse {
     pub backups_deleted: i64,
     pub peers_marked_offline: i64,
     pub stale_uploads_deleted: i64,
+}
+
+/// Whether a manual cleanup deletes audit rows: requested, and a positive
+/// retention period. `audit_retention_days <= 0` means retention is off
+/// (#4718), as for the scheduled job; `cleanup(0)` would otherwise delete
+/// every audit row.
+fn audit_cleanup_applies(requested: Option<bool>, audit_retention_days: i32) -> bool {
+    requested.unwrap_or(false) && audit_retention_days > 0
 }
 
 /// Run cleanup tasks
@@ -1740,7 +2287,7 @@ pub async fn run_cleanup(
     // Get settings for cleanup
     let settings = get_settings(State(state.clone())).await?.0;
 
-    if request.cleanup_audit_logs.unwrap_or(false) {
+    if audit_cleanup_applies(request.cleanup_audit_logs, settings.audit_retention_days) {
         use crate::services::audit_service::AuditService;
         let audit_service = AuditService::new(state.db.clone());
         result.audit_logs_deleted =
@@ -1840,12 +2387,14 @@ pub async fn backfill_packages(
     let repository_id = match query.repository_key.as_deref() {
         None => None,
         Some(key) => Some(
-            sqlx::query_scalar::<_, Uuid>("SELECT id FROM repositories WHERE key = $1")
-                .bind(key)
-                .fetch_optional(&state.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?
-                .ok_or_else(|| AppError::NotFound(format!("Repository '{key}' not found")))?,
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
+            )
+            .bind(key)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound(format!("Repository '{key}' not found")))?,
         ),
     };
 
@@ -2289,6 +2838,8 @@ pub async fn delete_proxy_scan_verdicts(
         update_totp_policy,
         get_token_policy,
         update_token_policy,
+        get_runtime_settings,
+        update_runtime_settings,
         get_system_stats,
         list_downloads,
         list_downloads_by_ip,
@@ -2302,6 +2853,7 @@ pub async fn delete_proxy_scan_verdicts(
         list_audit_logs,
         get_proxy_scan_verdicts,
         delete_proxy_scan_verdicts,
+        get_npm_upstream_feed_status,
     ),
     components(schemas(
         ListBackupsQuery,
@@ -2319,8 +2871,14 @@ pub async fn delete_proxy_scan_verdicts(
         UpdateTokenPolicyRequest,
         ApiTokenExpiryPolicy,
         TokenPolicySource,
+        RuntimeSettingsResponse,
+        UpdateRuntimeSettingsRequest,
+        GuestAccessSource,
+        UpstreamPauseSource,
         SystemStats,
         ListDownloadsQuery,
+        DownloaderFilter,
+        DownloadSource,
         DownloadRecord,
         DownloadListResponse,
         CleanupRequest,
@@ -2336,6 +2894,7 @@ pub async fn delete_proxy_scan_verdicts(
         AuditLogListResponse,
         ProxyScanVerdictItem,
         ProxyScanVerdictListResponse,
+        crate::services::upstream_feed::NpmUpstreamFeedStatus,
     ))
 )]
 pub struct AdminApiDoc;
@@ -2344,6 +2903,29 @@ pub struct AdminApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4550: the `/downloads*` gate refuses a non-admin and a
+    /// repository-scoped admin, and admits an unrestricted admin.
+    #[test]
+    fn download_attribution_gate_refuses_repo_scoped_admin() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::access_scope::AccessScope;
+
+        let admin = tdh::admin_auth(Uuid::new_v4(), "dl-admin");
+        assert!(require_download_attribution_admin(&admin).is_ok());
+        let user = tdh::make_auth(Uuid::new_v4(), "dl-user");
+        assert!(matches!(
+            require_download_attribution_admin(&user),
+            Err(AppError::Authorization(_))
+        ));
+        let scoped = AuthExtension {
+            allowed_repo_ids: AccessScope::Restricted(vec![Uuid::new_v4()]),
+            ..admin
+        };
+        let err = require_download_attribution_admin(&scoped).expect_err("repo-scoped admin");
+        assert!(matches!(err, AppError::Authorization(_)), "{err}");
+        assert!(err.to_string().contains("Repository-scoped"), "{err}");
+    }
 
     // -----------------------------------------------------------------------
     // audit_page_bounds (#2366) — pure pagination arithmetic, no DB required so
@@ -2549,6 +3131,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_manual_audit_cleanup_needs_request_and_positive_period() {
+        assert!(audit_cleanup_applies(Some(true), 90));
+        assert!(!audit_cleanup_applies(Some(true), 0));
+        assert!(!audit_cleanup_applies(Some(true), -1));
+        assert!(!audit_cleanup_applies(Some(false), 90));
+        assert!(!audit_cleanup_applies(None, 90));
+    }
+
+    #[test]
     fn test_system_settings_defaults() {
         let settings = SystemSettings {
             storage_backend: "filesystem".to_string(),
@@ -2652,6 +3243,60 @@ mod tests {
         let Json(settings) = get_settings(State(state)).await.unwrap();
 
         assert_eq!(settings.environment, "development");
+    }
+
+    /// #3069: the npm upstream-feed status endpoint is admin-only and reports
+    /// the persisted cursor row of the configured feed.
+    #[tokio::test]
+    async fn test_npm_upstream_feed_status_admin_only_and_reads_state_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let host = format!("feed-{}.example.test", Uuid::new_v4().simple());
+        let feed_url = format!("https://{host}/_changes");
+        let state = tdh::build_state_with(pool.clone(), "/tmp/admin-npm-feed-status", |cfg| {
+            cfg.npm_upstream_feed_enabled = true;
+            cfg.npm_upstream_feed_url = feed_url.clone();
+        });
+        let feed_key = format!("npm-changes:{feed_url}");
+        sqlx::query(
+            "INSERT INTO upstream_feed_state (feed_key, last_seq, updated_at) \
+             VALUES ($1, '777', now())",
+        )
+        .bind(&feed_key)
+        .execute(&pool)
+        .await
+        .expect("seed feed state");
+
+        let mut non_admin = admin_auth(Uuid::new_v4(), "feed-viewer");
+        non_admin.is_admin = false;
+        let denied = get_npm_upstream_feed_status(State(state.clone()), Extension(non_admin)).await;
+        let admitted = get_npm_upstream_feed_status(
+            State(state),
+            Extension(admin_auth(Uuid::new_v4(), "feed-admin")),
+        )
+        .await;
+        sqlx::query("DELETE FROM upstream_feed_state WHERE feed_key = $1")
+            .bind(&feed_key)
+            .execute(&pool)
+            .await
+            .expect("cleanup feed state");
+
+        let err = denied.expect_err("non-admin must be refused");
+        assert!(matches!(err, AppError::Authorization(_)), "{err:?}");
+        let Json(status) = admitted.expect("admin status");
+        assert!(status.enabled);
+        assert_eq!(
+            status.replica_id,
+            crate::services::cluster_work::WorkerIdentity::for_process().as_str()
+        );
+        assert_eq!(status.feed_url, feed_url);
+        assert_eq!(status.cursor.as_deref(), Some("777"));
+        assert!(status.last_poll_at.is_some());
+        assert!(!status.is_leader && !status.cluster_leader_active);
+        assert_eq!(status.leader_term_secs, 300);
     }
 
     // -----------------------------------------------------------------------
@@ -3028,6 +3673,7 @@ mod tests {
             total_artifacts: 500,
             total_storage_bytes: 1_000_000_000,
             total_downloads: 5000,
+            proxy_download_count: 1200,
             total_users: 25,
             active_peers: 3,
             pending_sync_tasks: 0,
@@ -3039,6 +3685,7 @@ mod tests {
         assert_eq!(json["total_artifacts"], 500);
         assert_eq!(json["total_storage_bytes"], 1_000_000_000i64);
         assert_eq!(json["total_downloads"], 5000);
+        assert_eq!(json["proxy_download_count"], 1200);
         assert_eq!(json["total_users"], 25);
         assert_eq!(json["proxy_artifact_count"], 12);
         assert_eq!(json["proxy_storage_bytes"], 2_000_000i64);
@@ -3124,6 +3771,16 @@ mod tests {
             bytes,
             "proxy bytes are a breakdown of total_storage_bytes"
         );
+        assert_eq!(
+            after.proxy_download_count - before.proxy_download_count,
+            rows,
+            "get_system_stats.proxy_download_count must count proxy serves (#4539)"
+        );
+        assert_eq!(
+            after.total_downloads - before.total_downloads,
+            rows,
+            "proxy serves are a breakdown of total_downloads (#4539)"
+        );
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(repo_id)
@@ -3184,6 +3841,14 @@ mod tests {
             .execute(&mut *tx)
             .await?;
         }
+        // One proxy serve per seeded entry (#4539).
+        sqlx::query(
+            "INSERT INTO proxy_download_statistics (proxy_cache_id, repository_id, path) \
+             SELECT id, repository_id, path FROM proxy_cache_artifacts WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await?;
 
         let after = collect_system_stats(&mut tx)
             .await
@@ -3356,7 +4021,9 @@ mod tests {
                  VALUES ($1, $2, 'app', 'v1', $3, 'cafe', 'application/octet-stream', $2)",
             )
             .bind(repo)
-            .bind(format!("oci-manifests/sha256:{uid}{uid}"))
+            // A hosted (non-manifest) key: `oci-manifests/%` rows are not
+            // charged to `hosted_bytes` (#4483).
+            .bind(format!("cas/ledger-3650/{uid}"))
             .bind(HOSTED)
             .execute(&fx.pool)
             .await
@@ -3529,30 +4196,22 @@ mod tests {
     ///    `proxy-cache/%` storage key is excluded from the total (its bytes
     ///    are represented by the catalog row instead).
     ///
-    /// Assertions are before/after deltas produced by this fixture's own
-    /// rows. The suite runs process-per-test against a SHARED database, so a
-    /// cluster-wide delta races every concurrently running test (the #3129
-    /// flake class): under a full-suite parallel run an exact-equality check
-    /// here fails reliably. Two defenses, both required:
-    ///  - fixture sizes are TERABYTE-scale integers (no real storage is
-    ///    written), so each accounting component sits 4+ orders of magnitude
-    ///    above realistic concurrent churn, and every wrong composition
-    ///    (blob bytes missing, per-reference double count, physical-once
-    ///    dedup, legacy row double count) lands >= 23 TB away from the
-    ///    expected window while concurrent tests move KBs-to-GBs;
-    ///  - the check tolerates +/- `SLACK` (10 GB) of unrelated churn inside
-    ///    the observation window and retries a few times in case a concurrent
-    ///    test ever moves more than that (like
-    ///    `test_get_system_stats_reports_proxy_cache_totals_db` did before
-    ///    #4250).
+    /// The handler aggregates the whole ledger and the suite shares one
+    /// database, so a delta read there absorbs other tests' rows (#4256). This
+    /// test owns a private database ([`crate::testing::try_isolated_pool`]):
+    /// nothing else can move the totals, so the deltas are exact and there is
+    /// no retry. It is not the REPEATABLE READ snapshot used by
+    /// `test_get_system_stats_reports_proxy_cache_totals_db` because it also
+    /// reconciles the ledger, which reads committed rows.
     #[tokio::test]
     async fn test_system_stats_total_storage_includes_oci_blob_bytes() {
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::services::repository_service::RepositoryService;
 
-        let Some(pool) = tdh::try_pool().await else {
+        let Some(iso) = crate::testing::try_isolated_pool().await else {
             return;
         };
+        let pool = iso.pool.clone();
         let state = tdh::build_state(pool.clone(), "/tmp/admin-oci-stats");
         let repo_service = RepositoryService::new(pool.clone());
 
@@ -3565,7 +4224,6 @@ mod tests {
         const HOSTED_PLAIN: i64 = 41 * TB; // artifacts row in the generic repo
         const LEGACY: i64 = 53 * TB; // legacy `proxy-cache/%` artifacts row
         const CACHED: i64 = 61 * TB; // proxy_cache_artifacts catalog row
-        const SLACK: i64 = 10_000_000_000; // unrelated concurrent churn budget
 
         // Once per repo: BLOB_SHARED twice (two repos), refs don't multiply.
         const EXPECTED_TOTAL_DELTA: i64 =
@@ -3577,158 +4235,133 @@ mod tests {
         let (remote, _, _) = tdh::create_repo(&pool, "remote", "pypi").await;
         let repo_ids = [oci_a, oci_b, plain, remote];
 
-        let mut matched = false;
-        for _attempt in 0..5 {
-            let Json(before) = get_system_stats(State(state.clone())).await.unwrap();
+        let Json(before) = get_system_stats(
+            State(state.clone()),
+            Extension(tdh::admin_auth(Uuid::new_v4(), "stats-admin")),
+        )
+        .await
+        .unwrap();
 
-            let digest_shared = format!("sha256:{:0>64}", Uuid::new_v4().simple());
-            let digest_solo = format!("sha256:{:0>64}", Uuid::new_v4().simple());
+        let digest_shared = format!("sha256:{:0>64}", Uuid::new_v4().simple());
+        let digest_solo = format!("sha256:{:0>64}", Uuid::new_v4().simple());
 
-            for (repo, name, size, storage_key) in [
-                (
-                    oci_a,
-                    "manifest",
-                    MANIFEST,
-                    format!("oci/{oci_a}/manifests/m"),
-                ),
-                (
-                    plain,
-                    "plain",
-                    HOSTED_PLAIN,
-                    format!("generic/{plain}/plain.bin"),
-                ),
-                (
-                    remote,
-                    "legacy",
-                    LEGACY,
-                    format!("proxy-cache/{remote}/legacy.whl"),
-                ),
-            ] {
-                sqlx::query(
-                    "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
-                     checksum_sha256, content_type, storage_key) \
-                     VALUES ($1, $2, $3, '1.0.0', $4, $5, 'application/octet-stream', $6)",
-                )
-                .bind(repo)
-                .bind(format!("stats-3134/{name}/{}", Uuid::new_v4()))
-                .bind(name)
-                .bind(size)
-                .bind(format!("{:0>64}", "3134"))
-                .bind(storage_key)
-                .execute(&pool)
-                .await
-                .expect("seed artifacts row");
-            }
-
-            for (repo, digest, size) in [
-                (oci_a, &digest_shared, BLOB_SHARED),
-                (oci_b, &digest_shared, BLOB_SHARED),
-                (oci_a, &digest_solo, BLOB_SOLO),
-            ] {
-                sqlx::query(
-                    "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
-                     VALUES ($1, $2, $3, $4)",
-                )
-                .bind(repo)
-                .bind(digest)
-                .bind(size)
-                .bind(format!("oci-blobs/{digest}"))
-                .execute(&pool)
-                .await
-                .expect("seed oci_blobs row");
-            }
-
-            // Two manifests referencing the shared blob in the same repo:
-            // per-REFERENCE counting would inflate the figure; per-repo-row
-            // counting (the ledger's) must not.
-            for i in 0..2 {
-                sqlx::query(
-                    "INSERT INTO manifest_blob_refs \
-                     (manifest_digest, blob_digest, repository_id, kind) \
-                     VALUES ($1, $2, $3, 'layer')",
-                )
-                .bind(format!("sha256:{:0>63}{i}", Uuid::new_v4().simple()))
-                .bind(&digest_shared)
-                .bind(oci_a)
-                .execute(&pool)
-                .await
-                .expect("seed manifest_blob_refs row");
-            }
-
+        for (repo, name, size, storage_key) in [
+            (
+                oci_a,
+                "manifest",
+                MANIFEST,
+                format!("oci/{oci_a}/manifests/m"),
+            ),
+            (
+                plain,
+                "plain",
+                HOSTED_PLAIN,
+                format!("generic/{plain}/plain.bin"),
+            ),
+            (
+                remote,
+                "legacy",
+                LEGACY,
+                format!("proxy-cache/{remote}/legacy.whl"),
+            ),
+        ] {
             sqlx::query(
-                "INSERT INTO proxy_cache_artifacts \
-                 (repository_id, path, storage_key, metadata_key, size_bytes) \
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, $3, '1.0.0', $4, $5, 'application/octet-stream', $6)",
             )
-            .bind(remote)
-            .bind("stats-3134/legacy.whl")
-            .bind(format!(
-                "proxy-cache/{remote}/stats-3134/legacy.whl/__content__"
-            ))
-            .bind(format!(
-                "proxy-cache/{remote}/stats-3134/legacy.whl/__cache_meta__.json"
-            ))
-            .bind(CACHED)
+            .bind(repo)
+            .bind(format!("stats-3134/{name}/{}", Uuid::new_v4()))
+            .bind(name)
+            .bind(size)
+            .bind(format!("{:0>64}", "3134"))
+            .bind(storage_key)
             .execute(&pool)
             .await
-            .expect("seed proxy cache row");
-
-            // The migration-182 triggers charge the ledger inline; reconcile
-            // anyway so the assertion binds to the documented authoritative
-            // per-repo sums rather than to trigger bookkeeping.
-            for repo in repo_ids {
-                repo_service
-                    .reconcile_usage_ledger(repo)
-                    .await
-                    .expect("reconcile usage ledger");
-            }
-
-            let Json(after) = get_system_stats(State(state.clone())).await.unwrap();
-
-            // Remove this attempt's rows before deciding, so a retry re-seeds
-            // from a clean slate.
-            for table in ["manifest_blob_refs", "oci_blobs", "proxy_cache_artifacts"] {
-                let sql = format!("DELETE FROM {table} WHERE repository_id = ANY($1)");
-                sqlx::query(sqlx::AssertSqlSafe(&*sql))
-                    .bind(&repo_ids[..])
-                    .execute(&pool)
-                    .await
-                    .expect("cleanup seeded rows");
-            }
-            sqlx::query("DELETE FROM artifacts WHERE repository_id = ANY($1)")
-                .bind(&repo_ids[..])
-                .execute(&pool)
-                .await
-                .expect("cleanup seeded artifacts");
-
-            let total_delta = after.total_storage_bytes - before.total_storage_bytes;
-            let proxy_delta = after.proxy_storage_bytes - before.proxy_storage_bytes;
-            if (total_delta - EXPECTED_TOTAL_DELTA).abs() <= SLACK
-                && (proxy_delta - CACHED).abs() <= SLACK
-            {
-                matched = true;
-                break;
-            }
-            eprintln!(
-                "attempt saw total delta {total_delta} (expected {EXPECTED_TOTAL_DELTA}) / \
-                 proxy delta {proxy_delta} (expected {CACHED}); retrying"
-            );
+            .expect("seed artifacts row");
         }
-        // Clean up the fixture repositories BEFORE asserting, so a failing
-        // run does not leak them into the shared test database.
-        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
-            .bind(&repo_ids[..])
+
+        for (repo, digest, size) in [
+            (oci_a, &digest_shared, BLOB_SHARED),
+            (oci_b, &digest_shared, BLOB_SHARED),
+            (oci_a, &digest_solo, BLOB_SOLO),
+        ] {
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(repo)
+            .bind(digest)
+            .bind(size)
+            .bind(format!("oci-blobs/{digest}"))
             .execute(&pool)
             .await
-            .expect("cleanup repos");
+            .expect("seed oci_blobs row");
+        }
 
-        assert!(
-            matched,
-            "get_system_stats never reflected the seeded storage: expected \
-             total_storage_bytes +{EXPECTED_TOTAL_DELTA} +/- {SLACK} (manifest {MANIFEST} + \
-             shared blob {BLOB_SHARED} once per mounted repo + solo blob {BLOB_SOLO} + hosted \
-             {HOSTED_PLAIN} + cached {CACHED}, legacy proxy-cache/% row {LEGACY} excluded) \
-             and proxy_storage_bytes +{CACHED} +/- {SLACK}"
+        // Two manifests referencing the shared blob in the same repo:
+        // per-REFERENCE counting would inflate the figure; per-repo-row
+        // counting (the ledger's) must not.
+        for i in 0..2 {
+            sqlx::query(
+                "INSERT INTO manifest_blob_refs \
+                 (manifest_digest, blob_digest, repository_id, kind) \
+                 VALUES ($1, $2, $3, 'layer')",
+            )
+            .bind(format!("sha256:{:0>63}{i}", Uuid::new_v4().simple()))
+            .bind(&digest_shared)
+            .bind(oci_a)
+            .execute(&pool)
+            .await
+            .expect("seed manifest_blob_refs row");
+        }
+
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts \
+             (repository_id, path, storage_key, metadata_key, size_bytes) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(remote)
+        .bind("stats-3134/legacy.whl")
+        .bind(format!(
+            "proxy-cache/{remote}/stats-3134/legacy.whl/__content__"
+        ))
+        .bind(format!(
+            "proxy-cache/{remote}/stats-3134/legacy.whl/__cache_meta__.json"
+        ))
+        .bind(CACHED)
+        .execute(&pool)
+        .await
+        .expect("seed proxy cache row");
+
+        // The migration-182 triggers charge the ledger inline; reconcile
+        // anyway so the assertion binds to the documented authoritative
+        // per-repo sums rather than to trigger bookkeeping.
+        for repo in repo_ids {
+            repo_service
+                .reconcile_usage_ledger(repo)
+                .await
+                .expect("reconcile usage ledger");
+        }
+
+        let Json(after) = get_system_stats(
+            State(state.clone()),
+            Extension(tdh::admin_auth(Uuid::new_v4(), "stats-admin")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            after.total_storage_bytes - before.total_storage_bytes,
+            EXPECTED_TOTAL_DELTA,
+            "total_storage_bytes must move by manifest {MANIFEST} + shared blob {BLOB_SHARED} \
+             once per mounted repo + solo blob {BLOB_SOLO} + hosted {HOSTED_PLAIN} + cached \
+             {CACHED}, with the legacy proxy-cache/% row {LEGACY} excluded"
+        );
+        assert_eq!(
+            after.proxy_storage_bytes - before.proxy_storage_bytes,
+            CACHED,
+            "proxy_storage_bytes must move by exactly the cached bytes"
         );
     }
 
@@ -4075,6 +4708,33 @@ mod tests {
         .expect("query by artifact");
         assert_eq!(by_artifact.total, 2);
         assert_eq!(by_artifact.downloads.len(), 2);
+        // #4539: a hosted row names its source and the artifact's repository.
+        assert!(by_artifact.downloads.iter().all(|d| {
+            d.source == DownloadSource::Hosted
+                && d.repository_id == Some(repo_id)
+                && d.path
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with("dl-telemetry/"))
+        }));
+
+        // #4539: the repository filter reaches hosted rows through their
+        // artifact, and the source filter excludes them.
+        let in_repo = |source| ListDownloadsQuery {
+            repository_id: Some(repo_id),
+            source,
+            ..Default::default()
+        };
+        let repo_all = query_downloads(&pool, &in_repo(None))
+            .await
+            .expect("query by repository");
+        assert_eq!(
+            repo_all.total, 2,
+            "hosted rows match their artifact's repository"
+        );
+        let repo_proxy = query_downloads(&pool, &in_repo(Some(DownloadSource::Proxy)))
+            .await
+            .expect("query proxy in repository");
+        assert_eq!(repo_proxy.total, 0);
 
         // Filter by IP: only the authenticated row, with the username joined.
         let by_ip = query_downloads(
@@ -4138,6 +4798,299 @@ mod tests {
         assert_eq!(paged.page, 2);
 
         tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #4839: `downloader=anonymous|authenticated` selects rows by whether a
+    /// user is attached, on hosted and proxy rows alike, combines with the
+    /// other filters, and refuses `anonymous` together with a user.
+    #[tokio::test]
+    async fn test_query_downloads_downloader_filter() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'dl-downloader', '1.0.0', 10, $3, 'application/octet-stream', $2) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("dl-downloader/{}.bin", Uuid::new_v4()))
+        .bind(format!("{:0>64}", "2"))
+        .fetch_one(&pool)
+        .await
+        .expect("insert artifact");
+        // Two hosted rows (one per kind of downloader) and two proxy rows
+        // recorded under the same repository.
+        for user in [Some(user_id), None] {
+            sqlx::query(
+                "INSERT INTO download_statistics (artifact_id, user_id, ip_address) \
+                 VALUES ($1, $2, '203.0.113.20')",
+            )
+            .bind(artifact_id)
+            .bind(user)
+            .execute(&pool)
+            .await
+            .expect("insert hosted download");
+            sqlx::query(
+                "INSERT INTO proxy_download_statistics (repository_id, path, user_id, ip_address) \
+                 VALUES ($1, 'proxied/pkg.bin', $2, '203.0.113.21')",
+            )
+            .bind(repo_id)
+            .bind(user)
+            .execute(&pool)
+            .await
+            .expect("insert proxy download");
+        }
+
+        let list = |downloader, source| {
+            let pool = pool.clone();
+            async move {
+                query_downloads(
+                    &pool,
+                    &ListDownloadsQuery {
+                        repository_id: Some(repo_id),
+                        downloader,
+                        source,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("query downloads")
+            }
+        };
+
+        assert_eq!(list(None, None).await.total, 4);
+        assert_eq!(list(Some(DownloaderFilter::All), None).await.total, 4);
+
+        let anon = list(Some(DownloaderFilter::Anonymous), None).await;
+        assert_eq!(anon.total, 2, "one hosted and one proxy anonymous row");
+        assert!(anon.downloads.iter().all(|d| d.user_id.is_none()));
+
+        let authed = list(Some(DownloaderFilter::Authenticated), None).await;
+        assert_eq!(authed.total, 2);
+        assert!(authed.downloads.iter().all(|d| d.user_id == Some(user_id)));
+
+        // Combines with the source filter.
+        let anon_proxy = list(
+            Some(DownloaderFilter::Anonymous),
+            Some(DownloadSource::Proxy),
+        )
+        .await;
+        assert_eq!(anon_proxy.total, 1);
+        assert_eq!(anon_proxy.downloads[0].source, DownloadSource::Proxy);
+        assert_eq!(anon_proxy.downloads[0].user_id, None);
+
+        // `authenticated` with a user is redundant but valid.
+        let authed_user = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                repository_id: Some(repo_id),
+                user_id: Some(user_id),
+                downloader: Some(DownloaderFilter::Authenticated),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("authenticated + user_id");
+        assert_eq!(authed_user.total, 2);
+
+        // `anonymous` with a user can only match nothing: refused.
+        let err = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                user_id: Some(user_id),
+                downloader: Some(DownloaderFilter::Anonymous),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+    }
+
+    /// #4839: the query string spelling of the filter.
+    #[test]
+    fn test_downloader_filter_query_parsing() {
+        use axum::extract::Query;
+        let parse = |qs: &str| {
+            let uri: axum::http::Uri = format!("/downloads?{qs}").parse().unwrap();
+            Query::<ListDownloadsQuery>::try_from_uri(&uri).map(|q| q.0.downloader)
+        };
+        assert_eq!(parse("").unwrap(), None);
+        assert_eq!(
+            parse("downloader=all").unwrap(),
+            Some(DownloaderFilter::All)
+        );
+        assert_eq!(
+            parse("downloader=anonymous").unwrap(),
+            Some(DownloaderFilter::Anonymous)
+        );
+        assert_eq!(
+            parse("downloader=authenticated").unwrap(),
+            Some(DownloaderFilter::Authenticated)
+        );
+        assert!(parse("downloader=bots").is_err());
+    }
+
+    /// #4539: the download listing returns proxy pull-through serves alongside
+    /// hosted downloads, keyed on the Remote repository and path, and the
+    /// `source` / `repository_id` filters select between them.
+    #[tokio::test]
+    async fn test_query_downloads_includes_proxy_serves_4539() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let path = format!("simple/p/p-{}.whl", Uuid::new_v4().simple());
+        crate::services::proxy_catalog::record_proxy_download(
+            &pool,
+            repo_id,
+            &path,
+            "k",
+            "m",
+            Some(user_id),
+            Some("198.51.100.7"),
+            Some("pip/24"),
+        )
+        .await
+        .expect("record proxy serve");
+
+        let in_repo = |source| ListDownloadsQuery {
+            repository_id: Some(repo_id),
+            source,
+            ..Default::default()
+        };
+        let all = query_downloads(&pool, &in_repo(None))
+            .await
+            .expect("query repo");
+        let proxy_only = query_downloads(&pool, &in_repo(Some(DownloadSource::Proxy)))
+            .await
+            .expect("query proxy");
+        let hosted_only = query_downloads(&pool, &in_repo(Some(DownloadSource::Hosted)))
+            .await
+            .expect("query hosted");
+        let by_ip = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                ip: Some("198.51.100.7".to_string()),
+                user_id: Some(user_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query by ip");
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(all.total, 1, "the proxy serve is listed");
+        let row = &all.downloads[0];
+        assert_eq!(row.source, DownloadSource::Proxy);
+        assert_eq!(row.artifact_id, None, "proxied content has no artifact row");
+        assert_eq!(row.repository_id, Some(repo_id));
+        assert_eq!(row.path.as_deref(), Some(path.as_str()));
+        assert_eq!(row.username.as_deref(), Some(username.as_str()));
+        assert_eq!(row.user_agent.as_deref(), Some("pip/24"));
+        assert_eq!(proxy_only.total, 1);
+        assert_eq!(hosted_only.total, 0);
+        assert_eq!(by_ip.total, 1, "the IP / user filters see proxy serves");
+    }
+
+    /// #4539: one page mixing hosted and proxy events is ordered newest
+    /// first across both tables, and pagination walks the union.
+    #[tokio::test]
+    async fn test_query_downloads_orders_and_pages_across_sources_4539() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (local_id, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let (remote_id, _, _) = tdh::create_repo(&pool, "remote", "generic").await;
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, 'mix/a.bin', 'mix', '1.0.0', 1, $2, 'application/octet-stream', \
+             'mix/a.bin') RETURNING id",
+        )
+        .bind(local_id)
+        .bind(format!("{:0>64}", "4539"))
+        .fetch_one(&pool)
+        .await
+        .expect("insert artifact");
+        // hosted 1 min ago, proxy 2 min ago, hosted 3 min ago.
+        for minutes in [1, 3] {
+            sqlx::query(
+                "INSERT INTO download_statistics (artifact_id, user_id, downloaded_at) \
+                 VALUES ($1, $2, NOW() - make_interval(mins => $3))",
+            )
+            .bind(artifact_id)
+            .bind(user_id)
+            .bind(minutes)
+            .execute(&pool)
+            .await
+            .expect("hosted row");
+        }
+        sqlx::query(
+            "INSERT INTO proxy_download_statistics (repository_id, path, user_id, downloaded_at) \
+             VALUES ($1, 'mix/b.bin', $2, NOW() - make_interval(mins => 2))",
+        )
+        .bind(remote_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("proxy row");
+
+        let page = |page| ListDownloadsQuery {
+            user_id: Some(user_id),
+            page: Some(page),
+            per_page: Some(2),
+            ..Default::default()
+        };
+        let first = query_downloads(&pool, &page(1)).await.expect("page 1");
+        let second = query_downloads(&pool, &page(2)).await.expect("page 2");
+        tdh::cleanup(&pool, remote_id, Uuid::nil()).await;
+        tdh::cleanup(&pool, local_id, user_id).await;
+
+        let sources = |r: &DownloadListResponse| -> Vec<(DownloadSource, Option<Uuid>)> {
+            r.downloads
+                .iter()
+                .map(|d| (d.source, d.repository_id))
+                .collect()
+        };
+        assert_eq!((first.total, second.total), (3, 3));
+        assert_eq!(
+            sources(&first),
+            vec![
+                (DownloadSource::Hosted, Some(local_id)),
+                (DownloadSource::Proxy, Some(remote_id)),
+            ],
+            "newest first across both tables"
+        );
+        assert_eq!(
+            sources(&second),
+            vec![(DownloadSource::Hosted, Some(local_id))]
+        );
+    }
+
+    #[test]
+    fn test_download_source_round_trips() {
+        for source in [DownloadSource::Hosted, DownloadSource::Proxy] {
+            assert_eq!(
+                DownloadSource::try_from(source.as_str().to_string()),
+                Ok(source)
+            );
+            assert_eq!(
+                serde_json::to_value(source).unwrap(),
+                serde_json::Value::String(source.as_str().to_string())
+            );
+        }
+        assert!(DownloadSource::try_from("mirror".to_string()).is_err());
     }
 
     #[tokio::test]
@@ -4306,5 +5259,413 @@ mod tests {
             .execute(&f.pool)
             .await;
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Runtime guest-access toggle (#867)
+    // -----------------------------------------------------------------------
+
+    fn resolved(
+        enabled: bool,
+        source: GuestAccessSource,
+        stored: Option<bool>,
+    ) -> ResolvedGuestAccess {
+        ResolvedGuestAccess {
+            enabled,
+            source,
+            stored,
+        }
+    }
+
+    #[test]
+    fn test_runtime_settings_response_reports_source_and_editability() {
+        let r = runtime_settings_response(
+            resolved(false, GuestAccessSource::Environment, Some(true)),
+            true,
+            vec!["/peers".to_string()],
+            upstream_pause::resolve(true, Ok(None)),
+        );
+        assert!(!r.guest_access_enabled);
+        assert_eq!(r.guest_access_source, GuestAccessSource::Environment);
+        assert_eq!(r.guest_access_stored, Some(true));
+        assert!(!r.guest_access_editable);
+        let json = serde_json::to_value(runtime_settings_response(
+            resolved(true, GuestAccessSource::Default, None),
+            false,
+            Vec::new(),
+            upstream_pause::resolve(false, Ok(None)),
+        ))
+        .unwrap();
+        assert_eq!(json["guest_access_source"], "default");
+        assert_eq!(json["guest_access_editable"], true);
+        assert!(json["guest_access_stored"].is_null());
+        assert_eq!(json["hidden_nav_items"], serde_json::json!([]));
+        assert_eq!(r.hidden_nav_items, vec!["/peers".to_string()]);
+        assert!(r.upstream_jobs_paused);
+        assert_eq!(
+            r.upstream_jobs_paused_source,
+            UpstreamPauseSource::Environment
+        );
+        assert_eq!(json["upstream_jobs_paused"], false);
+        assert_eq!(json["upstream_jobs_paused_source"], "default");
+        assert!(json["upstream_jobs_paused_stored"].is_null());
+    }
+
+    #[test]
+    fn test_upstream_pause_audit_details_record_the_change() {
+        let d = upstream_pause_audit_details(
+            upstream_pause::resolve(false, Ok(None)),
+            upstream_pause::resolve(false, Ok(Some(&serde_json::json!(true)))),
+        );
+        assert_eq!(d["setting"], "upstream_jobs_paused");
+        assert_eq!(d["from"], false);
+        assert_eq!(d["to"], true);
+        assert!(d["stored_from"].is_null());
+        assert_eq!(d["stored_to"], true);
+        assert_eq!(d["source"], "database");
+    }
+
+    #[test]
+    fn test_update_runtime_settings_accepts_hidden_nav_items() {
+        let r: UpdateRuntimeSettingsRequest =
+            serde_json::from_value(serde_json::json!({"hidden_nav_items": ["/peers"]})).unwrap();
+        assert_eq!(r.guest_access_enabled, None);
+        assert_eq!(r.hidden_nav_items, Some(vec!["/peers".to_string()]));
+    }
+
+    #[test]
+    fn test_hidden_nav_items_audit_details_record_the_change() {
+        let d = hidden_nav_items_audit_details(&[], &["/peers".to_string()]);
+        assert_eq!(d["setting"], hidden_nav_items::HIDDEN_NAV_ITEMS_SETTING_KEY);
+        assert_eq!(d["from"], serde_json::json!([]));
+        assert_eq!(d["to"], serde_json::json!(["/peers"]));
+    }
+
+    /// #4574: an admin PATCH stores the hidden navigation entries (normalized),
+    /// GET reports them, an invalid list writes nothing, and the guest-access
+    /// setting is left alone when only the navigation list is sent.
+    #[tokio::test]
+    async fn test_runtime_hidden_nav_items_round_trip() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::hidden_nav_items_serial_lock().await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-hidden-nav");
+        let auth = admin_auth(user_id, &username);
+        let before = hidden_nav_items::try_load(&pool).await.expect("read");
+        let patch = |items: Vec<&str>| {
+            update_runtime_settings(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(UpdateRuntimeSettingsRequest {
+                    guest_access_enabled: None,
+                    hidden_nav_items: Some(items.into_iter().map(String::from).collect()),
+                    upstream_jobs_paused: None,
+                }),
+            )
+        };
+
+        let Json(initial) = get_runtime_settings(State(state.clone())).await.unwrap();
+        let Json(set) = patch(vec!["/webhooks", "/peers", "/peers"])
+            .await
+            .expect("hide entries");
+        let Json(read) = get_runtime_settings(State(state.clone())).await.unwrap();
+        let invalid = patch(vec!["/peers", "not allowed"]).await.err();
+        let Json(after_invalid) = get_runtime_settings(State(state.clone())).await.unwrap();
+        let Json(cleared) = patch(vec![]).await.expect("show everything");
+        let audited = tdh::audit_count_eventually(&pool, user_id, "SETTING_CHANGED", 2).await;
+
+        if before.is_empty() {
+            sqlx::query("DELETE FROM system_settings WHERE key = $1")
+                .bind(hidden_nav_items::HIDDEN_NAV_ITEMS_SETTING_KEY)
+                .execute(&pool)
+                .await
+                .expect("cleanup setting");
+        } else {
+            hidden_nav_items::store(&pool, &before, user_id)
+                .await
+                .expect("restore setting");
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        let expected = vec!["/peers".to_string(), "/webhooks".to_string()];
+        assert_eq!(set.hidden_nav_items, expected);
+        assert_eq!(read.hidden_nav_items, expected);
+        assert!(
+            matches!(invalid, Some(AppError::Validation(_))),
+            "{invalid:?}"
+        );
+        assert_eq!(after_invalid.hidden_nav_items, expected);
+        assert!(cleared.hidden_nav_items.is_empty());
+        assert_eq!(set.guest_access_enabled, initial.guest_access_enabled);
+        assert_eq!(set.guest_access_source, initial.guest_access_source);
+        assert_eq!(audited, 2, "each navigation write must be audited");
+    }
+
+    /// #5288: an admin PATCH pauses and resumes the scheduled upstream jobs
+    /// with no restart, GET reports it, each write is audited, and the other
+    /// runtime settings are left alone.
+    #[tokio::test]
+    async fn test_runtime_upstream_jobs_paused_round_trip() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // The test compares `hidden_nav_items` across two reads, so a
+        // concurrent hidden-nav test writing that shared row between them
+        // made it flaky (#5431). Hold the same lock those tests take.
+        let _guard = tdh::hidden_nav_items_serial_lock().await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-upstream-pause");
+        let auth = admin_auth(user_id, &username);
+        let before = upstream_pause::try_state(&pool).await.expect("read");
+        let patch = |paused: bool| {
+            update_runtime_settings(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(UpdateRuntimeSettingsRequest {
+                    guest_access_enabled: None,
+                    hidden_nav_items: None,
+                    upstream_jobs_paused: Some(paused),
+                }),
+            )
+        };
+
+        let Json(on) = patch(true).await.expect("pause");
+        let paused_now = upstream_pause::upstream_jobs_paused(&pool).await;
+        let Json(read) = get_runtime_settings(State(state.clone())).await.unwrap();
+        let Json(off) = patch(false).await.expect("resume");
+        let resumed_now = upstream_pause::upstream_jobs_paused(&pool).await;
+        let audited = tdh::audit_count_eventually(&pool, user_id, "SETTING_CHANGED", 2).await;
+
+        match before.stored {
+            Some(v) => upstream_pause::store(&pool, v, user_id)
+                .await
+                .expect("restore setting"),
+            None => {
+                sqlx::query("DELETE FROM system_settings WHERE key = $1")
+                    .bind(upstream_pause::UPSTREAM_JOBS_PAUSED_SETTING)
+                    .execute(&pool)
+                    .await
+                    .expect("cleanup setting");
+            }
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(on.upstream_jobs_paused && read.upstream_jobs_paused && paused_now);
+        assert_eq!(
+            on.upstream_jobs_paused_source,
+            UpstreamPauseSource::Database
+        );
+        assert_eq!(read.upstream_jobs_paused_stored, Some(true));
+        assert!(!off.upstream_jobs_paused && !resumed_now);
+        assert_eq!(off.upstream_jobs_paused_stored, Some(false));
+        assert_eq!(on.hidden_nav_items, read.hidden_nav_items);
+        assert_eq!(
+            audited, 2,
+            "each upstream_jobs_paused write must be audited"
+        );
+    }
+
+    #[test]
+    fn test_guest_access_audit_details_record_the_flip() {
+        let d = guest_access_audit_details(
+            resolved(true, GuestAccessSource::Default, None),
+            resolved(false, GuestAccessSource::Database, Some(false)),
+        );
+        assert_eq!(d["setting"], GUEST_ACCESS_SETTING_KEY);
+        assert_eq!(d["from"], true);
+        assert_eq!(d["to"], false);
+        assert!(d["stored_from"].is_null());
+        assert_eq!(d["stored_to"], false);
+        assert_eq!(d["source"], "database");
+        assert_eq!(d["effective_changed"], true);
+    }
+
+    #[test]
+    fn test_update_runtime_settings_rejects_unknown_fields() {
+        let r: std::result::Result<UpdateRuntimeSettingsRequest, _> =
+            serde_json::from_value(serde_json::json!({"guest_access": false}));
+        assert!(r.is_err());
+    }
+
+    /// The #867 acceptance test: after the admin PATCH, the guest-access guard
+    /// refuses an anonymous read on the very next request -- no restart, no
+    /// TTL wait -- and lets it through again after flipping back. Also pins
+    /// the env-var precedence and the audit trail.
+    #[tokio::test]
+    async fn test_runtime_guest_access_toggle_applies_without_restart() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::guest_access::{guest_access_guard, GuestAccessState};
+        use crate::services::guest_access_policy::GuestAccessPolicy;
+        use axum::{body::Body, http::Request, http::StatusCode, middleware::from_fn_with_state};
+        use tower::ServiceExt;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        // A private setting row so this test never races the real key.
+        let key = format!("test.guest_access.{}", Uuid::new_v4());
+        let mut inner = (*tdh::build_state(pool.clone(), "/tmp/admin-guest-access")).clone();
+        inner.guest_access_policy = Arc::new(GuestAccessPolicy::new(
+            Some(pool.clone()),
+            key.clone(),
+            None,
+            true,
+        ));
+        let state = Arc::new(inner);
+        let auth = admin_auth(user_id, &username);
+
+        let guard = GuestAccessState {
+            policy: state.guest_access_policy.clone(),
+            auth_service: Arc::new(crate::services::auth_service::AuthService::new(
+                pool.clone(),
+                Arc::new(state.config.clone()),
+            )),
+        };
+        let app = Router::new()
+            .route("/api/v1/repositories", get(|| async { "repos" }))
+            .layer(from_fn_with_state(guard, guest_access_guard));
+        let anon = |app: Router| async move {
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/v1/repositories")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+
+        let Json(initial) = get_runtime_settings(State(state.clone())).await.unwrap();
+        assert!(initial.guest_access_enabled);
+        assert_eq!(initial.guest_access_source, GuestAccessSource::Default);
+        assert!(initial.guest_access_editable);
+        assert_eq!(anon(app.clone()).await, StatusCode::OK);
+
+        let patch = |v: Option<bool>| {
+            update_runtime_settings(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(UpdateRuntimeSettingsRequest {
+                    guest_access_enabled: v,
+                    hidden_nav_items: None,
+                    upstream_jobs_paused: None,
+                }),
+            )
+        };
+
+        let Json(off) = patch(Some(false)).await.expect("disable guests");
+        assert!(!off.guest_access_enabled);
+        assert_eq!(off.guest_access_source, GuestAccessSource::Database);
+        assert_eq!(anon(app.clone()).await, StatusCode::UNAUTHORIZED);
+
+        assert!(matches!(patch(None).await, Err(AppError::Validation(_))));
+
+        let Json(on) = patch(Some(true)).await.expect("re-enable guests");
+        assert!(on.guest_access_enabled);
+        assert_eq!(anon(app.clone()).await, StatusCode::OK);
+
+        // Env pin wins: a write is stored but changes nothing yet.
+        let mut pinned = (*state).clone();
+        pinned.guest_access_policy = Arc::new(GuestAccessPolicy::new(
+            Some(pool.clone()),
+            key.clone(),
+            Some(true),
+            true,
+        ));
+        let Json(p) = update_runtime_settings(
+            State(Arc::new(pinned)),
+            Extension(auth.clone()),
+            Json(UpdateRuntimeSettingsRequest {
+                guest_access_enabled: Some(false),
+                hidden_nav_items: None,
+                upstream_jobs_paused: None,
+            }),
+        )
+        .await
+        .expect("stored while pinned");
+        assert!(p.guest_access_enabled);
+        assert_eq!(p.guest_access_source, GuestAccessSource::Environment);
+        assert_eq!(p.guest_access_stored, Some(false));
+        assert!(!p.guest_access_editable);
+
+        // Every write was audited (resource = the acting admin).
+        let audited = tdh::audit_count_eventually(&pool, user_id, "SETTING_CHANGED", 3).await;
+
+        // A database that cannot be read is a 503 on both admin endpoints,
+        // never a cached or guessed value.
+        let mut dead = (*state).clone();
+        dead.guest_access_policy = Arc::new(GuestAccessPolicy::new(
+            Some(
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(std::time::Duration::from_millis(200))
+                    .connect_lazy("postgresql://localhost:1/__admin_guest_access__")
+                    .expect("lazy pool"),
+            ),
+            key.clone(),
+            None,
+            true,
+        ));
+        let dead = Arc::new(dead);
+        let get_err = get_runtime_settings(State(dead.clone())).await.err();
+        let patch_err = update_runtime_settings(
+            State(dead),
+            Extension(auth.clone()),
+            Json(UpdateRuntimeSettingsRequest {
+                guest_access_enabled: Some(false),
+                hidden_nav_items: None,
+                upstream_jobs_paused: None,
+            }),
+        )
+        .await
+        .err();
+
+        sqlx::query("DELETE FROM system_settings WHERE key = $1")
+            .bind(&key)
+            .execute(&pool)
+            .await
+            .expect("cleanup setting");
+        tdh::cleanup_user(&pool, user_id).await;
+        assert_eq!(audited, 3, "each PATCH that wrote must be audited");
+        assert!(
+            matches!(get_err, Some(AppError::ServiceUnavailable(_))),
+            "{get_err:?}"
+        );
+        assert!(
+            matches!(patch_err, Some(AppError::ServiceUnavailable(_))),
+            "{patch_err:?}"
+        );
+    }
+}
+
+/// Through the real router: the `/admin` nest's `admin_middleware` plus the
+/// handler gate on the instance-wide listings (#4550).
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod router_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn downloads_and_stats_refuse_repo_scoped_admin_tokens() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let by_user = format!("/api/v1/admin/downloads/by-user/{}", fx.user_id);
+        let routes = [
+            "/api/v1/admin/downloads",
+            "/api/v1/admin/downloads/by-ip/127.0.0.1",
+            by_user.as_str(),
+            "/api/v1/admin/stats",
+        ];
+        tdh::assert_admin_routes_refuse_repo_scoped_tokens(&fx, &routes).await;
+        fx.teardown().await;
     }
 }

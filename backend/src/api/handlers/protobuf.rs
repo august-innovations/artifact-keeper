@@ -20,7 +20,7 @@ use std::io::Write;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Extension;
@@ -86,7 +86,18 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/buf.registry.module.v1.ResourceService/GetResources",
             post(get_resources),
         )
+        .route("/:repo_key/*bsr_path", post(catch_all_bsr))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256 MB
+}
+
+async fn catch_all_bsr(
+    State(state): State<SharedState>,
+    Path((repo_key, bsr_path)): Path<(String, String)>,
+    headers: HeaderMap,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    super::protobuf_bsr::dispatch_unknown_bsr(state, repo_key, bsr_path, headers, body, auth).await
 }
 
 // ---------------------------------------------------------------------------
@@ -379,7 +390,15 @@ struct GetResourcesResponse {
 // Connect RPC error helper
 // ---------------------------------------------------------------------------
 
-fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
+pub(crate) fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
+    // The database sites pass `db_status(&e)` with `internal`; a 503 there
+    // (saturated pool, unreachable database) is Connect's retryable
+    // `unavailable`, the code Connect itself maps HTTP 503 to (#4765).
+    let code = if status == StatusCode::SERVICE_UNAVAILABLE && code == "internal" {
+        "unavailable"
+    } else {
+        code
+    };
     let body = serde_json::json!({ "code": code, "message": message });
     super::with_retry_after_on_503(
         Response::builder()
@@ -390,15 +409,52 @@ fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
     )
 }
 
+/// A database failure as the Connect `internal` error.
+fn connect_db_error(e: sqlx::Error) -> Response {
+    connect_error(
+        crate::api::handlers::db_status(&e),
+        "internal",
+        crate::api::handlers::db_err_message(&e),
+    )
+}
+
+/// #4422: a storage-quota decision as the Connect error an upload answers:
+/// `507 resource_exhausted` naming the repository or project quota that
+/// refuses it, or `internal` when the check itself failed.
+#[allow(clippy::result_large_err)]
+fn connect_quota_decision(
+    decision: crate::error::Result<Option<crate::services::repository_service::QuotaScope>>,
+) -> Result<(), Response> {
+    match decision {
+        Ok(None) => Ok(()),
+        Ok(Some(scope)) => Err(connect_error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "resource_exhausted",
+            scope.exceeded_message(),
+        )),
+        Err(e) => {
+            tracing::error!("storage quota check failed: {e}");
+            Err(connect_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "storage quota check failed",
+            ))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Repository resolution
 // ---------------------------------------------------------------------------
 
-async fn resolve_protobuf_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
+pub(crate) async fn resolve_protobuf_repo(
+    db: &PgPool,
+    repo_key: &str,
+) -> Result<RepoInfo, Response> {
     use sqlx::Row;
     let row = sqlx::query(
         r#"SELECT id, key, storage_backend, storage_path, format::text AS format, repo_type::text AS repo_type, upstream_url, promotion_only
-        FROM repositories WHERE key = $1"#,
+        FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'"#,
     )
     .bind(repo_key)
     .fetch_optional(db)
@@ -558,7 +614,7 @@ fn build_bundle(files: &[UploadFile]) -> Result<Vec<u8>, Response> {
 #[allow(clippy::result_large_err)]
 fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response> {
     use crate::util::bounded_archive::{
-        budgeted, read_capped, MAX_INGEST_ARCHIVE_ENTRIES, MAX_INGEST_METADATA_ENTRY_BYTES,
+        budgeted, max_ingest_archive_entries, read_capped, MAX_INGEST_METADATA_ENTRY_BYTES,
     };
 
     // This extractor reads EVERY entry into memory and base64-encodes it (~1.33x
@@ -570,6 +626,7 @@ fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response>
     let mut archive = tar::Archive::new(budgeted(gz_decoder));
 
     let mut files = Vec::new();
+    let max_entries = max_ingest_archive_entries();
     let mut entries_seen: u64 = 0;
 
     for entry_result in archive.entries().map_err(|e| {
@@ -588,13 +645,13 @@ fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response>
         })?;
 
         entries_seen += 1;
-        if entries_seen > MAX_INGEST_ARCHIVE_ENTRIES {
+        if entries_seen > max_entries {
             return Err(connect_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_argument",
                 &format!(
                     "Bundle contains too many entries (> {}); refusing suspected decompression bomb",
-                    MAX_INGEST_ARCHIVE_ENTRIES
+                    max_entries
                 ),
             ));
         }
@@ -673,26 +730,67 @@ async fn load_label_index(
     }
 }
 
-/// Save the label index for a module. Creates or updates the _labels artifact.
+/// Save the label index for a module. Creates or updates the `_labels` artifact.
+///
+/// #4889: the index used to be a zero-byte row with checksum `none`, so the
+/// push-sync worker had no object to transfer and a label move never reached
+/// peers. Store the rendered label document in content-addressed storage and
+/// queue a normal push after the row and metadata are committed. The peer's
+/// generic upload path refreshes the row in place (the `_labels` path is a
+/// known mutable index) so an updated label map replaces the old one.
 async fn save_label_index(
-    db: &PgPool,
-    repo_id: uuid::Uuid,
+    state: &SharedState,
+    repo: &RepoInfo,
     module_name: &str,
     labels: &serde_json::Map<String, serde_json::Value>,
     user_id: uuid::Uuid,
+    headers: &HeaderMap,
 ) -> Result<(), Response> {
     let label_path = build_label_path(module_name);
-    let metadata = serde_json::json!({ "labels": labels });
+    let storage = state.storage_for_repo_or_500(&repo.storage_location())?;
 
-    // Check if the label artifact already exists
-    let existing_id: Option<uuid::Uuid> = sqlx::query(
-        r#"SELECT id FROM artifacts
-        WHERE repository_id = $1 AND path = $2 AND is_deleted = false
-        LIMIT 1"#,
+    // Write the row and its metadata together: a sync task must never observe
+    // a row whose label document is still the previous revision.
+    let mut tx = state.db.begin().await.map_err(|e| {
+        connect_error(
+            crate::api::handlers::db_status(&e),
+            "internal",
+            crate::api::handlers::db_err_message(&e),
+        )
+    })?;
+
+    // #4916: the label document carries a monotonic revision so a peer that
+    // receives a delayed or simultaneous move can compare it with the index it
+    // already holds instead of blindly applying the last writer. Allocate the
+    // revision under a per-module advisory lock and store the doc in the same
+    // transaction, so two local moves cannot both claim the same revision
+    // (the row lock alone does not serialise the first write, when no row
+    // exists yet).
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "protobuf-label\u{1f}{}\u{1f}{}",
+            repo.id, label_path
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            connect_error(
+                crate::api::handlers::db_status(&e),
+                "internal",
+                crate::api::handlers::db_err_message(&e),
+            )
+        })?;
+    let previous: Option<(uuid::Uuid, String, Option<serde_json::Value>)> = sqlx::query_as(
+        r#"SELECT a.id, a.storage_key, am.metadata
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.path = $2
+        FOR UPDATE OF a"#,
     )
-    .bind(repo_id)
+    .bind(repo.id)
     .bind(&label_path)
-    .fetch_optional(db)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| {
         connect_error(
@@ -700,41 +798,76 @@ async fn save_label_index(
             "internal",
             crate::api::handlers::db_err_message(&e),
         )
-    })?
-    .map(|row| row.get("id"));
+    })?;
+    let previous_storage_key = previous.as_ref().map(|(_, key, _)| key.clone());
+    let revision = previous
+        .as_ref()
+        .and_then(|(_, _, metadata)| metadata.as_ref())
+        .and_then(|metadata| metadata.get("revision"))
+        .and_then(|revision| revision.as_i64())
+        .unwrap_or(0)
+        + 1;
+    let metadata = serde_json::json!({ "labels": labels, "revision": revision });
+    let bytes = Bytes::from(serde_json::to_vec(&metadata).map_err(|e| {
+        connect_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            crate::api::handlers::internal_err_message("Failed to serialize label index", &e),
+        )
+    })?);
+    let size_bytes = bytes.len() as i64;
+    let checksum_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let storage_key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+        &checksum_sha256,
+    );
+    storage.put(&storage_key, bytes).await.map_err(|e| {
+        connect_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            crate::api::handlers::storage_err_message(&e),
+        )
+    })?;
 
-    let artifact_id = match existing_id {
-        Some(id) => id,
-        None => {
-            crate::api::handlers::cleanup_soft_deleted_artifact(db, repo_id, &label_path).await;
-            // Create label index artifact
-            let row = sqlx::query(
-                r#"INSERT INTO artifacts (
-                    repository_id, path, name, version, size_bytes,
-                    checksum_sha256, content_type, storage_key, uploaded_by
-                )
-                VALUES ($1, $2, $3, '_labels', 0, 'none', 'application/json', $4, $5)
-                RETURNING id"#,
-            )
-            .bind(repo_id)
-            .bind(&label_path)
-            .bind(module_name)
-            .bind(&label_path)
-            .bind(user_id)
-            .fetch_one(db)
-            .await
-            .map_err(|e| {
-                connect_error(
-                    crate::api::handlers::db_status(&e),
-                    "internal",
-                    &format!("Database error creating label index: {}", e),
-                )
-            })?;
-            row.get("id")
-        }
-    };
+    // NO-SCAN-ON-UPLOAD: the `_labels` index is a registry-generated JSON
+    // document, not uploaded content; the module upload itself triggers the
+    // scan (#4166).
+    // NO-QUOTA-ADMISSION: the generated `_labels` index is a few bytes the
+    // registry writes for an already-admitted module commit (#4422).
+    let artifact_id: uuid::Uuid = sqlx::query_scalar(
+        r#"INSERT INTO artifacts (
+            repository_id, path, name, version, size_bytes,
+            checksum_sha256, content_type, storage_key, uploaded_by
+        )
+        VALUES ($1, $2, $3, '_labels', $4, $5, 'application/json', $6, $7)
+        ON CONFLICT (repository_id, path) DO UPDATE SET
+            name = EXCLUDED.name,
+            version = EXCLUDED.version,
+            size_bytes = EXCLUDED.size_bytes,
+            checksum_sha256 = EXCLUDED.checksum_sha256,
+            content_type = EXCLUDED.content_type,
+            storage_key = EXCLUDED.storage_key,
+            uploaded_by = EXCLUDED.uploaded_by,
+            is_deleted = false,
+            updated_at = NOW()
+        RETURNING id"#,
+    )
+    .bind(repo.id)
+    .bind(&label_path)
+    .bind(module_name)
+    .bind(size_bytes)
+    .bind(&checksum_sha256)
+    .bind(&storage_key)
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        connect_error(
+            crate::api::handlers::db_status(&e),
+            "internal",
+            &format!("Database error creating label index: {}", e),
+        )
+    })?;
 
-    // Upsert metadata with the label map
     sqlx::query(
         r#"INSERT INTO artifact_metadata (artifact_id, format, metadata)
         VALUES ($1, 'protobuf', $2)
@@ -742,7 +875,7 @@ async fn save_label_index(
     )
     .bind(artifact_id)
     .bind(&metadata)
-    .execute(db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         connect_error(
@@ -752,23 +885,92 @@ async fn save_label_index(
         )
     })?;
 
+    tx.commit().await.map_err(|e| {
+        connect_error(
+            crate::api::handlers::db_status(&e),
+            "internal",
+            crate::api::handlers::db_err_message(&e),
+        )
+    })?;
+
+    // #4916: the previous label document is content-addressed and immutable,
+    // so the upsert replaced the row's pointer but left its object behind.
+    // Delete it once no live row on the same backend still names it (two
+    // modules can legitimately dedupe to one document). Best-effort: a failed
+    // delete leaks an object, never a row.
+    if let Some(previous_storage_key) = previous_storage_key {
+        if previous_storage_key != storage_key
+            && previous_storage_key != "none"
+            && previous_storage_key != label_path
+        {
+            let still_referenced = sqlx::query_scalar::<_, bool>(
+                r#"SELECT EXISTS (
+                    SELECT 1
+                    FROM artifacts a
+                    JOIN repositories r ON r.id = a.repository_id
+                    WHERE a.storage_key = $1
+                      AND a.is_deleted = false
+                      AND r.storage_backend = $2
+                      AND (r.storage_backend <> 'filesystem' OR r.storage_path = $3)
+                    UNION ALL
+                    SELECT 1
+                    FROM artifact_versions av
+                    JOIN repositories r ON r.id = av.repository_id
+                    WHERE av.storage_key = $1
+                      AND r.storage_backend = $2
+                      AND (r.storage_backend <> 'filesystem' OR r.storage_path = $3)
+                )"#,
+            )
+            .bind(&previous_storage_key)
+            .bind(&repo.storage_backend)
+            .bind(&repo.storage_path)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(true);
+            if !still_referenced {
+                if let Err(e) = storage.delete(&previous_storage_key).await {
+                    tracing::warn!(
+                        storage_key = %previous_storage_key,
+                        error = %e,
+                        "failed to delete a superseded protobuf label document"
+                    );
+                }
+            }
+        }
+    }
+
+    // #4725/#4889: fan the label index out like any other upload (the helper
+    // skips a write that is itself a replication). The sync worker sends the
+    // JSON bytes and the `protobuf` metadata document; the receiver's generic
+    // upload restores both.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        headers,
+        repo.id,
+        artifact_id,
+        &label_path,
+        size_bytes,
+    )
+    .await;
+
     Ok(())
 }
 
 /// Update labels for a module, mapping each label name to a commit digest.
 async fn update_labels(
-    db: &PgPool,
-    repo_id: uuid::Uuid,
+    state: &SharedState,
+    repo: &RepoInfo,
     module_name: &str,
     label_refs: &[LabelRef],
     commit_digest: &str,
     user_id: uuid::Uuid,
+    headers: &HeaderMap,
 ) -> Result<(), Response> {
     if label_refs.is_empty() {
         return Ok(());
     }
 
-    let mut labels = load_label_index(db, repo_id, module_name).await?;
+    let mut labels = load_label_index(&state.db, repo.id, module_name).await?;
 
     for label_ref in label_refs {
         labels.insert(
@@ -777,7 +979,7 @@ async fn update_labels(
         );
     }
 
-    save_label_index(db, repo_id, module_name, &labels, user_id).await
+    save_label_index(state, repo, module_name, &labels, user_id, headers).await
 }
 
 /// Resolve a label to a commit digest for a given module.
@@ -1059,6 +1261,7 @@ async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     axum::Json(body): axum::Json<UploadRequest>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -1120,12 +1323,13 @@ async fn upload(
 
             // Still update labels if provided
             update_labels(
-                &state.db,
-                repo.id,
+                &state,
+                &repo,
                 &module_name,
                 &content.label_refs,
                 &commit_digest,
                 user_id,
+                &headers,
             )
             .await?;
 
@@ -1136,6 +1340,23 @@ async fn upload(
         let bundle = build_bundle(&content.files)?;
         let bundle_bytes = Bytes::from(bundle);
         let size_bytes = bundle_bytes.len() as i64;
+        // #4921: `checksum_sha256` is the sha256 of the stored bundle, the
+        // value a replication peer verifies the pushed bytes against. The
+        // commit digest is the row's `version` (and `commitDigest` in the
+        // protobuf metadata), which is what every lookup keys on.
+        let bundle_sha256 = format!("{:x}", Sha256::digest(&bundle_bytes));
+
+        // Refuse an over-quota commit before its bundle is stored (#4422).
+        let artifact_path = build_module_artifact_path(&module_name, &commit_digest);
+        connect_quota_decision(
+            super::publish_quota::preflight_quota_denial(
+                &state.db,
+                repo.id,
+                super::publish_quota::PublishAt::Path(&artifact_path),
+                size_bytes,
+            )
+            .await,
+        )?;
 
         // Store via StorageBackend
         let storage_key = build_module_storage_key(&module_name, &commit_digest);
@@ -1152,11 +1373,21 @@ async fn upload(
             )
         })?;
 
-        let artifact_path = build_module_artifact_path(&module_name, &commit_digest);
-
         super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-        // Insert artifact record
+        // Insert artifact record, admitted against the storage quotas in the
+        // same transaction (#4422).
+        let mut tx = state.db.begin().await.map_err(connect_db_error)?;
+        connect_quota_decision(
+            super::publish_quota::locked_quota_denial(
+                &mut tx,
+                &state.db,
+                repo.id,
+                &artifact_path,
+                size_bytes,
+            )
+            .await,
+        )?;
         let row = sqlx::query(
             r#"INSERT INTO artifacts (
                 repository_id, path, name, version, size_bytes,
@@ -1170,11 +1401,11 @@ async fn upload(
         .bind(&module_name)
         .bind(&commit_digest)
         .bind(size_bytes)
-        .bind(&commit_digest)
+        .bind(&bundle_sha256)
         .bind("application/gzip")
         .bind(&storage_key)
         .bind(user_id)
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
             connect_error(
@@ -1183,11 +1414,19 @@ async fn upload(
                 crate::api::handlers::db_err_message(&e),
             )
         })?;
+        tx.commit().await.map_err(connect_db_error)?;
 
         let artifact_id: uuid::Uuid = row.get("id");
 
         crate::services::quarantine_service::apply_upload_hold_hosted(
             &state.db,
+            repo.id,
+            artifact_id,
+        )
+        .await;
+        crate::services::scanner_service::trigger_scan_on_upload(
+            &state.db,
+            state.scanner_service.clone(),
             repo.id,
             artifact_id,
         )
@@ -1222,12 +1461,13 @@ async fn upload(
             });
         }
         update_labels(
-            &state.db,
-            repo.id,
+            &state,
+            &repo,
             &module_name,
             &effective_labels,
             &commit_digest,
             user_id,
+            &headers,
         )
         .await?;
 
@@ -1251,8 +1491,19 @@ async fn upload(
             &module_name,
             &commit_digest,
             size_bytes,
-            &commit_digest,
+            &bundle_sha256,
             None,
+        )
+        .await;
+
+        // #4725: fan out to subscribed push peers.
+        super::queue_push_sync_tasks_for_upload(
+            &state.db,
+            &headers,
+            repo.id,
+            artifact_id,
+            &artifact_path,
+            size_bytes,
         )
         .await;
 
@@ -1321,6 +1572,7 @@ async fn download(
                 FROM artifacts
                 WHERE repository_id = $1
                   AND name = $2
+                  AND version IS DISTINCT FROM '_labels'
                   AND is_deleted = false
                 ORDER BY created_at DESC
                 LIMIT 1"#,
@@ -1396,6 +1648,11 @@ async fn download(
                         state.proxy_service.as_deref(),
                         repo.id,
                         &upstream_path,
+                        // Parity with the Remote arm above, which reads the
+                        // bundle through the capped fetch and records no proxy
+                        // download: a Remote member's bundle is not counted
+                        // here either (#3844).
+                        None,
                         |member_id, location| {
                             let db = db.clone();
                             let state = state.clone();
@@ -1538,6 +1795,7 @@ async fn create_or_update_labels(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     axum::Json(body): axum::Json<CreateOrUpdateLabelsRequest>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -1596,14 +1854,15 @@ async fn create_or_update_labels(
         }
 
         update_labels(
-            &state.db,
-            repo.id,
+            &state,
+            &repo,
             &module_name,
             &[LabelRef {
                 name: value.name.clone(),
             }],
             &value.commit_id,
             user_id,
+            &headers,
         )
         .await?;
 
@@ -1923,6 +2182,20 @@ fn extract_graph_edges(metadata: &Option<serde_json::Value>, commit_id: &str) ->
 mod tests {
     use super::*;
 
+    /// #4422: a quota decision maps to the Connect error an upload answers.
+    #[test]
+    fn connect_quota_decision_maps_scopes_4422() {
+        use crate::services::repository_service::QuotaScope;
+        assert!(connect_quota_decision(Ok(None)).is_ok());
+        for scope in [QuotaScope::Repository, QuotaScope::Project] {
+            let resp = connect_quota_decision(Ok(Some(scope))).unwrap_err();
+            assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+        }
+        let resp =
+            connect_quota_decision(Err(crate::error::AppError::Database("x".into()))).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     // -----------------------------------------------------------------------
     // connect_error
     // -----------------------------------------------------------------------
@@ -2005,6 +2278,37 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
         assert_eq!(json["code"], "internal");
         assert_eq!(json["message"], "Database operation failed");
+    }
+
+    /// #4765: a database outage in a Connect handler is Connect's retryable
+    /// `unavailable` at 503 with `Retry-After: 1`, not `internal` at 500.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_connect_db_error_db_unavailable_is_503_unavailable_4765() {
+        let pool = crate::api::handlers::test_db_helpers::lazy_pool();
+        pool.close().await;
+        let e = sqlx::query("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .expect_err("a closed pool cannot run a query");
+
+        let response = connect_db_error(e);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "1"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["code"], "unavailable");
     }
 
     #[test]
@@ -2707,6 +3011,514 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].to_commit_id, "valid/dep");
     }
+
+    /// #4725: a `buf push` to a hosted repository must queue a push sync task
+    /// for a subscribed push peer. Since #4889 the registry-generated `_labels`
+    /// index is a stored JSON document and is queued alongside the commit, and
+    /// a push that arrives as peer replication must not be fanned back out.
+    #[tokio::test]
+    async fn protobuf_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use base64::Engine;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "protobuf").await;
+
+        let file = (
+            "acme/repl/v1/repl.proto".to_string(),
+            b"syntax = \"proto3\";\n".as_slice().to_vec(),
+        );
+        let digest = compute_commit_digest(std::slice::from_ref(&file));
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "repl" },
+                "files": [{
+                    "path": file.0,
+                    "content": base64::engine::general_purpose::STANDARD.encode(&file.1),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        // A replicated push (as the sync worker sends it) stores the commit but
+        // must not queue another task.
+        let body2 = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "repl" },
+                "files": [{
+                    "path": "acme/repl/v1/repl.proto",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode(b"syntax = \"proto3\";\n// v2\n"),
+                }],
+            }],
+        });
+        let mut req = tdh::post(
+            format!(
+                "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                fx.repo_key
+            ),
+            "application/json",
+            bytes::Bytes::from(serde_json::to_vec(&body2).unwrap()),
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, resp) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated push must succeed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+
+        // #4889: the `_labels` row must carry real bytes so the sync worker can
+        // transfer it, and the label move must be queued to the push peer. The
+        // replicated push above must not queue another task.
+        let (label_size, label_checksum, label_key): (i64, String, String) = sqlx::query_as(
+            "SELECT size_bytes, checksum_sha256, storage_key FROM artifacts \
+             WHERE repository_id = $1 AND path = 'modules/acme/repl/_labels'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("load _labels row");
+        assert!(label_size > 0, "the _labels document must have bytes");
+        assert_ne!(label_checksum, "none");
+        let stored = tokio::fs::read(fx.storage_dir.join(&label_key))
+            .await
+            .expect("read the stored _labels document");
+        let stored: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert!(stored["labels"]["main"].is_string());
+
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec![
+                "modules/acme/repl/_labels".to_string(),
+                format!("modules/acme/repl/commits/{digest}"),
+            ],
+            "the client push queues the commit and the label index; \
+             the replicated push must not queue another task"
+        );
+    }
+
+    /// #4916: every label move stores a new content-addressed JSON document.
+    /// The superseded object must be reclaimed once no live row names it, and
+    /// the document must carry a monotonic revision for peer conflict
+    /// resolution.
+    #[tokio::test]
+    async fn save_label_index_reclaims_superseded_document_4916() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let module = "acme/labels";
+        let mut labels = serde_json::Map::new();
+        labels.insert("main".to_string(), serde_json::json!("commit-a"));
+        save_label_index(
+            &fx.state,
+            &repo,
+            module,
+            &labels,
+            fx.user_id,
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("first label move");
+
+        let label_path = build_label_path(module);
+        let (first_key, first_metadata): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT a.storage_key, am.metadata FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&label_path)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("first label row");
+        let first_object = fx.storage_dir.join(&first_key);
+        assert!(
+            tokio::fs::metadata(&first_object).await.is_ok(),
+            "the first label document must be stored"
+        );
+        assert_eq!(first_metadata["revision"], 1);
+
+        labels.insert("main".to_string(), serde_json::json!("commit-b"));
+        save_label_index(
+            &fx.state,
+            &repo,
+            module,
+            &labels,
+            fx.user_id,
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("second label move");
+
+        let (second_key, second_metadata, second_size): (String, serde_json::Value, i64) =
+            sqlx::query_as(
+                "SELECT a.storage_key, am.metadata, a.size_bytes FROM artifacts a \
+                 JOIN artifact_metadata am ON am.artifact_id = a.id \
+                 WHERE a.repository_id = $1 AND a.path = $2",
+            )
+            .bind(fx.repo_id)
+            .bind(&label_path)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("second label row");
+        let stored = tokio::fs::read(fx.storage_dir.join(&second_key))
+            .await
+            .expect("read the current label document");
+        fx.teardown().await;
+
+        assert_ne!(first_key, second_key, "a label move writes a new document");
+        assert_eq!(second_metadata["revision"], 2);
+        assert_eq!(second_metadata["labels"]["main"], "commit-b");
+        assert_eq!(second_size, stored.len() as i64);
+        assert!(
+            tokio::fs::metadata(&first_object).await.is_err(),
+            "the superseded label document must not be left behind"
+        );
+        let stored: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(stored["labels"]["main"], "commit-b");
+        assert_eq!(stored["revision"], 2);
+    }
+
+    /// #4916: a label document replicated to a peer arrives byte for byte.
+    /// The source's stored JSON is what the sync worker sends; the peer must
+    /// store exactly those bytes (same sha256 and size) with the same label
+    /// map and revision, and a later move must replace it the same way.
+    #[tokio::test]
+    async fn replicated_label_document_round_trips_byte_exact_4916() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use sha2::{Digest, Sha256};
+
+        let Some(source) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let Some(peer) = tdh::Fixture::setup("local", "protobuf").await else {
+            source.teardown().await;
+            return;
+        };
+        let repo = source.repo_info("local", None);
+        let module = "acme/roundtrip";
+        let label_path = build_label_path(module);
+        let row_sql = "SELECT a.storage_key, a.size_bytes, a.checksum_sha256, am.metadata \
+                       FROM artifacts a JOIN artifact_metadata am ON am.artifact_id = a.id \
+                       WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false";
+        let mut labels = serde_json::Map::new();
+        let mut rounds = Vec::new();
+        for (revision, commit) in [(1, "commit-a"), (2, "commit-b")] {
+            labels.insert("main".to_string(), serde_json::json!(commit));
+            labels.insert(format!("v{revision}"), serde_json::json!(commit));
+            save_label_index(
+                &source.state,
+                &repo,
+                module,
+                &labels,
+                source.user_id,
+                &HeaderMap::new(),
+            )
+            .await
+            .expect("label move");
+            let (key, size, sha, metadata): (String, i64, String, serde_json::Value) =
+                sqlx::query_as(row_sql)
+                    .bind(source.repo_id)
+                    .bind(&label_path)
+                    .fetch_one(&source.pool)
+                    .await
+                    .expect("source label row");
+            let sent = tokio::fs::read(source.storage_dir.join(&key))
+                .await
+                .expect("source label document");
+
+            // What the sync worker sends: the stored bytes, their sha256, and
+            // the `protobuf` metadata document.
+            let (status, body) = peer
+                .chunked_upload_as(
+                    tdh::admin_auth(peer.user_id, &peer.username),
+                    &label_path,
+                    &sent,
+                    serde_json::json!({
+                        "artifact_name": module,
+                        "artifact_version": "_labels",
+                        "artifact_metadata_format": "protobuf",
+                        "artifact_metadata": metadata,
+                    }),
+                    true,
+                )
+                .await;
+            let (peer_key, peer_size, peer_sha, peer_metadata): (
+                String,
+                i64,
+                String,
+                serde_json::Value,
+            ) = sqlx::query_as(row_sql)
+                .bind(peer.repo_id)
+                .bind(&label_path)
+                .fetch_one(&peer.pool)
+                .await
+                .expect("peer label row");
+            let received = tokio::fs::read(peer.storage_dir.join(&peer_key))
+                .await
+                .expect("peer label document");
+            rounds.push((
+                revision,
+                status,
+                body,
+                sent,
+                size,
+                sha,
+                metadata,
+                received,
+                peer_size,
+                peer_sha,
+                peer_metadata,
+            ));
+        }
+        sqlx::query("DELETE FROM upload_sessions WHERE repository_id = $1")
+            .bind(peer.repo_id)
+            .execute(&peer.pool)
+            .await
+            .ok();
+        source.teardown().await;
+        peer.teardown().await;
+
+        for (
+            revision,
+            status,
+            body,
+            sent,
+            size,
+            sha,
+            metadata,
+            received,
+            peer_size,
+            peer_sha,
+            peer_metadata,
+        ) in rounds
+        {
+            assert!(
+                status.is_success(),
+                "revision {revision}: {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(received, sent, "revision {revision}: bytes must match");
+            assert_eq!(peer_size, size);
+            assert_eq!(peer_size, sent.len() as i64);
+            assert_eq!(peer_sha.trim(), sha.trim());
+            assert_eq!(peer_sha.trim(), format!("{:x}", Sha256::digest(&sent)));
+            assert_eq!(peer_metadata, metadata);
+            assert_eq!(peer_metadata["revision"], revision);
+            let doc: serde_json::Value = serde_json::from_slice(&received).unwrap();
+            assert_eq!(doc["labels"], peer_metadata["labels"]);
+        }
+    }
+
+    /// #4921: a pushed commit must be accepted by the receiving peer. The
+    /// sync worker sends the row's `checksum_sha256` with the stored bundle,
+    /// and the peer's upload session verifies the bytes against it; before
+    /// the fix the row held the commit digest and every push was refused 409
+    /// "checksum mismatch". This replays the worker's session against a
+    /// second repository (the peer) with the source row's values.
+    #[tokio::test]
+    async fn protobuf_commit_push_is_accepted_by_peer_4921() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::Extension;
+        use base64::Engine;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let Some(peer) = tdh::Fixture::setup("local", "protobuf").await else {
+            fx.teardown().await;
+            return;
+        };
+
+        let file = (
+            "acme/pushed/v1/pushed.proto".to_string(),
+            b"syntax = \"proto3\";\npackage acme.pushed.v1;\n"
+                .as_slice()
+                .to_vec(),
+        );
+        let digest = compute_commit_digest(std::slice::from_ref(&file));
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "pushed" },
+                "files": [{
+                    "path": file.0,
+                    "content": base64::engine::general_purpose::STANDARD.encode(&file.1),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        // What the sync worker reads for the push task.
+        let (path, name, version, size, checksum, storage_key, content_type, metadata): (
+            String,
+            String,
+            Option<String>,
+            i64,
+            String,
+            String,
+            String,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT a.path, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+                    a.storage_key, a.content_type, am.metadata \
+             FROM artifacts a LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("modules/acme/pushed/commits/{digest}"))
+        .fetch_one(&fx.pool)
+        .await
+        .expect("load commit row");
+        let stored = tokio::fs::read(fx.storage_dir.join(&storage_key))
+            .await
+            .expect("read the stored commit bundle");
+        assert_eq!(version.as_deref(), Some(digest.as_str()));
+        assert_eq!(size, stored.len() as i64);
+
+        let mut auth = tdh::make_auth(peer.user_id, &peer.username);
+        auth.is_admin = true;
+        let upload_app = || {
+            crate::api::handlers::upload::router()
+                .with_state(peer.state.clone())
+                .layer(Extension::<crate::api::middleware::auth::AuthExtension>(
+                    auth.clone(),
+                ))
+        };
+        let replication = |mut req: axum::http::Request<axum::body::Body>| {
+            req.headers_mut().insert(
+                "x-artifact-keeper-replication",
+                axum::http::HeaderValue::from_static("true"),
+            );
+            req
+        };
+
+        let session_body = serde_json::json!({
+            "repository_key": peer.repo_key,
+            "artifact_path": path,
+            "artifact_name": name,
+            "artifact_version": version,
+            "artifact_metadata_format": "protobuf",
+            "artifact_metadata": metadata,
+            "total_size": size,
+            "checksum_sha256": checksum.trim(),
+            "chunk_size": 8 * 1024 * 1024,
+            "content_type": content_type,
+        });
+        let (status, resp) = tdh::send(
+            upload_app(),
+            replication(tdh::post(
+                "/".to_string(),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&session_body).unwrap()),
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "create session: {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let session: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        let session_id = session["session_id"].as_str().unwrap().to_string();
+
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{session_id}"))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", stored.len() - 1, stored.len()),
+            )
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(stored.clone()))
+            .unwrap();
+        let (status, resp) = tdh::send(upload_app(), replication(req)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "chunk PATCH: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{session_id}/complete"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (complete_status, complete_resp) = tdh::send(upload_app(), replication(req)).await;
+
+        let peer_row: Option<(Option<String>, String)> = sqlx::query_as(
+            "SELECT version, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(peer.repo_id)
+        .bind(&path)
+        .fetch_optional(&peer.pool)
+        .await
+        .expect("load peer row");
+
+        peer.teardown().await;
+        fx.teardown().await;
+
+        assert_eq!(
+            complete_status,
+            StatusCode::OK,
+            "the peer must accept the pushed commit: {}",
+            String::from_utf8_lossy(&complete_resp)
+        );
+        let (peer_version, peer_checksum) = peer_row.expect("the peer holds the commit");
+        assert_eq!(peer_version.as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            peer_checksum.trim(),
+            format!("{:x}", Sha256::digest(&stored)),
+            "the peer row carries the sha256 of the bundle"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2776,5 +3588,328 @@ mod catalog_registration_tests {
         let row = row.expect("a protobuf upload must write a packages row (#3659)");
         assert_eq!(row.version, digest);
         assert_eq!(row.versions, vec![digest]);
+    }
+
+    /// #4422 review: a `buf push` past the repository quota answers the
+    /// Connect `resource_exhausted` error with status 507 and writes no row.
+    #[tokio::test]
+    async fn module_upload_refused_by_quota_answers_connect_507_4422() {
+        use base64::Engine;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET quota_bytes = 1 WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "quota" },
+                "files": [{
+                    "path": "acme/quota/v1/q.proto",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode(b"syntax = \"proto3\";\n"),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        fx.teardown().await;
+
+        let resp: serde_json::Value = serde_json::from_slice(&resp).expect("connect error json");
+        assert_eq!(
+            status,
+            axum::http::StatusCode::INSUFFICIENT_STORAGE,
+            "{resp}"
+        );
+        assert_eq!(resp["code"], "resource_exhausted", "{resp}");
+        assert_eq!(resp["message"], "Repository storage quota exceeded");
+        assert_eq!(rows, 0);
+    }
+}
+
+/// #3919 review (B1): a protobuf commit row written before #4921 records the
+/// COMMIT digest (over file paths + contents), not the SHA-256 of the stored
+/// gzip bundle. Download verification must not abort those downloads.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+pub(crate) mod integrity_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Push one module through the real BSR upload route and return its
+    /// commit digest (the artifact row's `version`).
+    pub(crate) async fn push_module(fx: &tdh::Fixture) -> String {
+        use base64::Engine;
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "integrity" },
+                "files": [{
+                    "path": "acme/integrity/v1/thing.proto",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode(b"syntax = \"proto3\";\nmessage Thing {}\n"),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        sqlx::query_scalar(
+            "SELECT version FROM artifacts \
+             WHERE repository_id = $1 AND name = 'acme/integrity' AND version <> '_labels'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("commit row")
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — collects a small test bundle to
+    // assert it was delivered in full (#1608).
+    async fn protobuf_commit_bundle_downloads_in_full_with_verification_on() {
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        assert!(fx.state.config.download_verify_checksums);
+        let digest = push_module(&fx).await;
+        // Since #4921 a new commit row records the bundle's sha256; rows
+        // written before that still hold the commit digest. Put the row in
+        // that legacy shape: its download must not be aborted either.
+        sqlx::query(
+            "UPDATE artifacts SET checksum_sha256 = version \
+             WHERE repository_id = $1 AND version = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&digest)
+        .execute(&fx.pool)
+        .await
+        .expect("legacy checksum");
+        let (size, recorded): (i64, String) = sqlx::query_as(
+            "SELECT size_bytes, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND version = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&digest)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("row");
+
+        use tower::ServiceExt;
+        let resp = fx
+            .router_with_auth(crate::api::handlers::repositories::download_router())
+            .oneshot(tdh::get(format!(
+                "/{}/download/modules/acme/integrity/commits/{digest}",
+                fx.repo_key
+            )))
+            .await
+            .expect("respond");
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let body = body.expect("a protobuf commit bundle must download completely");
+        assert_eq!(body.len() as i64, size);
+        // Pin the premise: the recorded checksum is NOT the bundle's digest.
+        use sha2::Digest;
+        assert_ne!(recorded.trim(), hex::encode(sha2::Sha256::digest(&body)));
+    }
+
+    /// #3910 review (B1): the scrub must not flag protobuf commit bundles as
+    /// corrupt (their row records the commit digest, not the bundle's).
+    #[tokio::test]
+    async fn scrub_reports_nothing_for_protobuf_commit_bundles() {
+        use crate::services::storage_scrub_service::{ScrubOptions, StorageScrubService};
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        push_module(&fx).await;
+        let res = StorageScrubService::new(fx.pool.clone(), fx.state.storage_registry.clone())
+            .run(&ScrubOptions {
+                max_objects: 100,
+                max_bytes: 1 << 30,
+                repair: true,
+                repository_id: Some(fx.repo_id),
+            })
+            .await
+            .expect("scrub run");
+        let findings: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM storage_scrub_findings WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count findings");
+        fx.teardown().await;
+
+        assert_eq!(res.corrupt + res.missing + res.repaired, 0, "{res:?}");
+        assert!(res.unverifiable >= 1, "{res:?}");
+        assert_eq!(findings, 0);
+    }
+}
+
+/// #5197: a `Download` naming a module but no commit or label means "latest
+/// commit". The `_labels` index shares the module's `name`, so the latest-row
+/// query has to skip it.
+#[cfg(test)]
+mod download_latest_commit_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// Push `proto` to `acme/latest` through the real upload route.
+    async fn push(fx: &tdh::Fixture, proto: &str) {
+        use base64::Engine;
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "latest" },
+                "files": [{
+                    "path": "acme/latest/v1/thing.proto",
+                    "content": base64::engine::general_purpose::STANDARD.encode(proto),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    /// `Download` naming the module with neither a commit nor a label.
+    async fn download_latest(fx: &tdh::Fixture) -> (StatusCode, serde_json::Value, String) {
+        let body = serde_json::json!({
+            "values": [{ "resourceRef": { "owner": "acme", "module": "latest" } }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.DownloadService/Download",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&resp).into_owned();
+        (
+            status,
+            serde_json::from_slice(&resp).unwrap_or(serde_json::Value::Null),
+            text,
+        )
+    }
+
+    /// The module's rows, newest `created_at` first: `(version, id)`.
+    async fn rows_newest_first(fx: &tdh::Fixture) -> Vec<(String, uuid::Uuid)> {
+        sqlx::query_as(
+            "SELECT version, id FROM artifacts \
+             WHERE repository_id = $1 AND name = 'acme/latest' AND is_deleted = false \
+             ORDER BY created_at DESC",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read module rows")
+    }
+
+    fn file_content(resp: &serde_json::Value) -> Vec<u8> {
+        use base64::Engine;
+        let content = resp["contents"][0]["files"][0]["content"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no file in {resp}"));
+        base64::engine::general_purpose::STANDARD
+            .decode(content)
+            .expect("base64 file content")
+    }
+
+    /// One commit: the `_labels` row written right after it is the newest row.
+    #[tokio::test]
+    async fn download_without_ref_returns_the_only_commit_5197() {
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        push(&fx, "syntax = \"proto3\";\nmessage One {}\n").await;
+        let rows = rows_newest_first(&fx).await;
+        let (status, resp, text) = download_latest(&fx).await;
+        fx.teardown().await;
+
+        // The premise of the bug: this ordering is what the query walks.
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].0, "_labels", "{rows:?}");
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(resp["contents"][0]["commit"]["id"], rows[1].1.to_string());
+        assert_eq!(
+            file_content(&resp),
+            b"syntax = \"proto3\";\nmessage One {}\n"
+        );
+    }
+
+    /// A second distinct commit is newer than the `_labels` row, whose upsert
+    /// keeps its `created_at`. Latest must still mean that second commit.
+    #[tokio::test]
+    async fn download_without_ref_returns_the_newest_of_two_commits_5197() {
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        push(&fx, "syntax = \"proto3\";\nmessage One {}\n").await;
+        push(&fx, "syntax = \"proto3\";\nmessage Two {}\n").await;
+        let rows = rows_newest_first(&fx).await;
+        let (status, resp, text) = download_latest(&fx).await;
+        fx.teardown().await;
+
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_ne!(rows[0].0, "_labels", "{rows:?}");
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(resp["contents"][0]["commit"]["id"], rows[0].1.to_string());
+        assert_eq!(
+            file_content(&resp),
+            b"syntax = \"proto3\";\nmessage Two {}\n"
+        );
     }
 }

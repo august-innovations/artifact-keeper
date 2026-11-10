@@ -23,14 +23,15 @@ enum ResolverMode {
     /// but keep metadata/loopback/link-local blocked.
     TrustedInternal,
     /// Webhook delivery target: private/CGNAT/ULA permitted only when
-    /// `WEBHOOK_ALLOW_PRIVATE_IPS` (or the shared
-    /// `AK_SSRF_ALLOW_PRIVATE_CIDRS` allowlist) opts the address in;
-    /// otherwise identical to [`ResolverMode::Upstream`].
+    /// `WEBHOOK_ALLOW_PRIVATE_IPS` or the shared
+    /// `AK_SSRF_ALLOW_PRIVATE_CIDRS` allowlist opts the address in (the two
+    /// are additive here, #4428); otherwise identical to
+    /// [`ResolverMode::Upstream`].
     Webhook,
     /// SSO/OIDC discovery-token-JWKS-userinfo fetch against a configured
     /// IdP: private/CGNAT/ULA permitted only when `SSO_ALLOW_PRIVATE_IPS`
-    /// (or `AK_SSRF_ALLOW_PRIVATE_CIDRS`) opts the address in; otherwise
-    /// identical to [`ResolverMode::Upstream`].
+    /// or `AK_SSRF_ALLOW_PRIVATE_CIDRS` opts the address in (the two are
+    /// additive, #4474); otherwise identical to [`ResolverMode::Upstream`].
     SsoDiscovery,
 }
 
@@ -209,18 +210,33 @@ pub fn ssrf_guard_resolver_internal() -> Arc<dyn Resolve> {
 
 /// `Arc<dyn Resolve>` for webhook-delivery clients: private/CGNAT/ULA
 /// targets pass only when the operator has opted in via
-/// `WEBHOOK_ALLOW_PRIVATE_IPS` or `AK_SSRF_ALLOW_PRIVATE_CIDRS`; the
-/// metadata/loopback/link-local hard-blocks always apply (issue #2380).
+/// `WEBHOOK_ALLOW_PRIVATE_IPS` or `AK_SSRF_ALLOW_PRIVATE_CIDRS` (either
+/// suffices: the toggle is not switched off by a configured CIDR list,
+/// #4428); the metadata/loopback/link-local hard-blocks always apply
+/// (issue #2380).
 pub fn ssrf_guard_resolver_webhook() -> Arc<dyn Resolve> {
     Arc::new(SsrfGuardResolver::with_mode(ResolverMode::Webhook))
 }
 
 /// `Arc<dyn Resolve>` for SSO/OIDC-fetch clients: private/CGNAT/ULA
 /// targets pass only when the operator has opted in via
-/// `SSO_ALLOW_PRIVATE_IPS` or `AK_SSRF_ALLOW_PRIVATE_CIDRS`; the
-/// metadata/loopback/link-local hard-blocks always apply (issue #2380).
+/// `SSO_ALLOW_PRIVATE_IPS` or `AK_SSRF_ALLOW_PRIVATE_CIDRS` (either
+/// suffices, #4474); the metadata/loopback/link-local hard-blocks always
+/// apply (issue #2380).
 pub fn ssrf_guard_resolver_sso() -> Arc<dyn Resolve> {
     Arc::new(SsrfGuardResolver::with_mode(ResolverMode::SsoDiscovery))
+}
+
+impl ResolverMode {
+    /// The `surface` label of `ak_ssrf_blocks_total` for this mode (#4676).
+    fn ssrf_surface(self) -> &'static str {
+        match self {
+            ResolverMode::Upstream => "upstream",
+            ResolverMode::TrustedInternal => "internal",
+            ResolverMode::Webhook => "webhook",
+            ResolverMode::SsoDiscovery => "sso",
+        }
+    }
 }
 
 /// True when a resolved IP must be dropped for the given [`ResolverMode`].
@@ -249,9 +265,35 @@ fn filter_allowed(
         .collect()
 }
 
+/// A host the resolver refuses before any lookup, with the ordinary
+/// connect-time SSRF refusal (#5459). `env_proxy_guard` sends a request here
+/// to obtain a `reqwest::Error` for a destination it refused before sending
+/// (`reqwest` has no public constructor). `.invalid` (RFC 2606) never
+/// resolves, so nothing leaves the process. The caller counts the refusal.
+pub(crate) const REFUSED_DESTINATION_PROXY_HOST: &str = "ssrf-refused.artifact-keeper.invalid";
+
+/// The connect-time refusal error, worded so
+/// [`crate::services::ssrf_refusal::is_ssrf_refusal_error`] recognizes it.
+fn connect_refusal() -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "all resolved addresses {}",
+            crate::services::ssrf_refusal::CONNECT_REFUSAL_PHRASE
+        ),
+    ))
+}
+
 impl Resolve for SsrfGuardResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let mode = self.mode;
+        if name
+            .as_str()
+            .eq_ignore_ascii_case(REFUSED_DESTINATION_PROXY_HOST)
+        {
+            // Counted by the caller that refused the destination (#5459).
+            return Box::pin(async { Err(connect_refusal()) });
+        }
         // Exempt the configured egress-proxy host (issue #2570): matched by
         // EXACT full-host equality BEFORE the mode-specific filter. Computed
         // here (sync, outside the future) so no reference into `self` is held.
@@ -281,11 +323,8 @@ impl Resolve for SsrfGuardResolver {
                     mode = ?mode,
                     "SSRF DNS guard blocked all resolved addresses for host"
                 );
-                let err: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "all resolved addresses blocked by SSRF policy",
-                ));
-                return Err(err);
+                crate::services::metrics_service::record_ssrf_block(mode.ssrf_surface());
+                return Err(connect_refusal());
             }
             let addrs: Addrs = Box::new(allowed.into_iter());
             Ok(addrs)
@@ -379,6 +418,71 @@ mod tests {
             result.is_err(),
             "localhost must be refused by the SSRF resolver"
         );
+    }
+
+    /// #4676: a connect-time refusal (every resolved address blocked) is an
+    /// SSRF block too, counted under the resolver's surface.
+    #[test]
+    fn resolver_refusal_is_counted_as_an_ssrf_block_4676() {
+        use crate::services::metrics_service::capture_counters_async;
+        let ((), counted) = capture_counters_async(|| async {
+            let refuse = |resolver: Arc<dyn Resolve>| async move {
+                let name: Name = "169.254.169.254".parse().expect("valid dns name");
+                assert!(resolver.resolve(name).await.is_err());
+            };
+            refuse(Arc::new(SsrfGuardResolver::default())).await;
+            refuse(ssrf_guard_resolver_webhook()).await;
+            refuse(ssrf_guard_resolver_sso()).await;
+            refuse(ssrf_guard_resolver_internal()).await;
+        });
+        for surface in ["upstream", "webhook", "sso", "internal"] {
+            assert_eq!(
+                counted.get("ak_ssrf_blocks_total", &[("surface", surface)]),
+                1,
+                "{surface}"
+            );
+        }
+    }
+
+    /// #5459: the refused-destination host is refused by every resolver mode
+    /// before any lookup, with the standard connect-time refusal wording,
+    /// even when the exempt set names it. The caller counts the refusal, so
+    /// the resolver does not count it again.
+    #[test]
+    fn refused_destination_proxy_host_is_refused_without_lookup_5459() {
+        use crate::services::metrics_service::capture_counters_async;
+        let ((), counted) = capture_counters_async(|| async {
+            for mode in [
+                ResolverMode::Upstream,
+                ResolverMode::TrustedInternal,
+                ResolverMode::Webhook,
+                ResolverMode::SsoDiscovery,
+            ] {
+                let resolver = SsrfGuardResolver {
+                    mode,
+                    exempt_proxy_hosts: exempt_set(&[REFUSED_DESTINATION_PROXY_HOST]),
+                };
+                let name: Name = REFUSED_DESTINATION_PROXY_HOST
+                    .to_ascii_uppercase()
+                    .parse()
+                    .expect("valid dns name");
+                let err = match resolver.resolve(name).await {
+                    Ok(_) => panic!("{mode:?} resolved the refused-destination host"),
+                    Err(e) => e,
+                };
+                assert!(
+                    crate::services::ssrf_refusal::is_ssrf_refusal_error(err.as_ref()),
+                    "{mode:?}: {err}"
+                );
+            }
+        });
+        for surface in ["upstream", "internal", "webhook", "sso"] {
+            assert_eq!(
+                counted.get("ak_ssrf_blocks_total", &[("surface", surface)]),
+                0,
+                "{surface}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -506,6 +610,38 @@ mod tests {
                 "sso mode must STILL drop the private address (webhook toggle must not leak)"
             );
         });
+    }
+
+    /// #4428 / #4474: the webhook and SSO resolver modes honour their
+    /// toggles even when the shared `AK_SSRF_ALLOW_PRIVATE_CIDRS` list is
+    /// configured and does not cover the address; upstream keeps the list
+    /// authoritative under the same environment.
+    #[test]
+    fn webhook_mode_toggle_is_additive_to_shared_cidr_list() {
+        with_toggles(
+            &[
+                ("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.244.0.0/16"),
+                ("WEBHOOK_ALLOW_PRIVATE_IPS", "true"),
+                ("SSO_ALLOW_PRIVATE_IPS", "true"),
+                ("UPSTREAM_ALLOW_PRIVATE_IPS", "true"),
+            ],
+            || {
+                let outside: SocketAddr = "10.0.0.5:0".parse().unwrap();
+                let inside: SocketAddr = "10.244.0.5:0".parse().unwrap();
+                for mode in [ResolverMode::Webhook, ResolverMode::SsoDiscovery] {
+                    assert_eq!(
+                        filter_allowed(mode, [outside, inside]),
+                        vec![outside, inside],
+                        "{mode:?} must keep a private address outside the CIDR list"
+                    );
+                }
+                assert_eq!(
+                    filter_allowed(ResolverMode::Upstream, [outside, inside]),
+                    vec![inside],
+                    "upstream mode must keep the CIDR list authoritative"
+                );
+            },
+        );
     }
 
     /// SSO mode with no toggle set must drop a private address.

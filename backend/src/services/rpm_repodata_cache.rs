@@ -41,23 +41,54 @@
 //! so a client that fetches the set against unchanged state always sees
 //! coherent checksums.
 //!
+//! Caller visibility (#4346): a virtual repository's document describes only
+//! the members the CALLER may read, so two callers can be owed different
+//! documents for one virtual/root. The cache key therefore carries the sorted
+//! authorized member-id set (the fingerprint's `repo_ids`) next to the
+//! repository id and root: callers with different visibility never share an
+//! entry, while callers with the same visibility (every anonymous client, the
+//! authenticated baseline, holders of the same grants) share one render. The
+//! rendered bytes are a pure function of that member set's state, so the
+//! #2636 reproducibility contract holds per set, and `repomd.xml.asc` signs the
+//! bytes of exactly the document the same caller is served.
+//!
 //! Bounds: entry count and total byte budget are both capped; eviction is
-//! oldest-render-first. One entry per repository/root, so the worst case is
-//! `min(MAX_ENTRIES, active RPM roots)` rendered sets. Follow-ups tracked on
-//! #2521: a durable cross-replica object store for prebuilt revisions and the
-//! same treatment for the PyPI/Helm/Composer root indexes.
+//! oldest-render-first. Each repository/root keeps at most
+//! [`RPM_REPODATA_CACHE_MAX_MEMBER_SETS`] member sets (a hosted repository has
+//! exactly one), so the worst case is still `MAX_ENTRIES` rendered sets and one
+//! virtual cannot crowd every other root out of the cache. The mechanism
+//! (fingerprint check, single-flight, bounds, metrics) lives in the
+//! format-agnostic [`super::repo_metadata_revision_cache`] (#4174); this
+//! module keeps the RPM types and limits.
+//!
+//! Precomputed revisions (#4544): a hosted repository in the default
+//! `repodata_mode` (`precomputed`) does not render on request once a root has
+//! been built. The background builder
+//! ([`super::rpm_repodata_builder`]) renders each changed root once, stores
+//! the documents in the repository's storage under
+//! [`revision_prefix`], and records the revision in `rpm_repodata_roots`; a
+//! request then serves a [`StoredRepodata`] (`repomd.xml` from the database
+//! row, the compressed documents streamed from storage) on every replica,
+//! with no fingerprint query and no render. That trades read-your-writes for
+//! a bounded delay (the builder's debounce) and is why this in-process cache
+//! now only serves virtual repositories, `repodata_mode: on_request`
+//! repositories and roots that have not been built yet. The same treatment
+//! for the PyPI/Helm/Composer root indexes is tracked on #2521.
 
-use std::collections::HashMap;
 use std::future::Future;
-use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
+
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+
+use super::repo_metadata_revision_cache::{
+    CachedRender, Fingerprint, RepoMetadataRevisionCache, RevisionCacheConfig,
+};
 
 /// Soft cap on cached roots. Each repository/root holds exactly one entry
 /// (its current revision), so this bounds the number of distinct RPM roots
@@ -71,20 +102,34 @@ pub const RPM_REPODATA_CACHE_MAX_ENTRIES: usize = 32;
 /// over-budget repository still gets warm-request behaviour).
 pub const RPM_REPODATA_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
+/// Most distinct authorized member sets cached for one repository/root
+/// (#4346). A virtual's callers fall into few visibility classes (anonymous,
+/// the authenticated baseline, a handful of grant sets); beyond this the
+/// oldest set for that root is evicted first, so a virtual with many grant
+/// sets re-renders rather than evicting other repositories.
+pub const RPM_REPODATA_CACHE_MAX_MEMBER_SETS: usize = 4;
+
 /// Identity of the repository state a rendered set was built from.
 ///
-/// * `repo_ids` — the sorted set of repositories the render covers (one id
+/// * `repo_ids`: the sorted set of repositories the render covers (one id
 ///   for hosted repos, the member ids for virtual repos), so a virtual
 ///   membership change rotates the fingerprint even when counts collide.
-/// * `live_rpm_count` — live `.rpm` rows across `repo_ids`; moves on upload,
+///   It is also the cache partition (#4346).
+/// * `live_rpm_count`: live `.rpm` rows across `repo_ids`; moves on upload,
 ///   delete and promotion.
-/// * `latest_update` — `MAX(updated_at)` over those rows; moves on upload
+/// * `latest_update`: `MAX(updated_at)` over those rows; moves on upload
 ///   and on any row-touching mutation. `None` for an empty repository.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepodataFingerprint {
     pub repo_ids: Vec<Uuid>,
     pub live_rpm_count: i64,
     pub latest_update: Option<DateTime<Utc>>,
+}
+
+impl Fingerprint for RepodataFingerprint {
+    fn partition(&self) -> Vec<Uuid> {
+        self.repo_ids.clone()
+    }
 }
 
 /// One immutable rendered repodata set: the manifest plus the compressed
@@ -117,10 +162,61 @@ impl RenderedRepodata {
     }
 }
 
-struct CacheEntry {
-    fingerprint: RepodataFingerprint,
-    rendered: Arc<RenderedRepodata>,
-    rendered_at: Instant,
+impl CachedRender for RenderedRepodata {
+    fn weight_bytes(&self) -> usize {
+        self.total_bytes()
+    }
+
+    fn cacheable(&self) -> bool {
+        self.cacheable
+    }
+
+    fn valid_until(&self) -> Option<Instant> {
+        self.valid_until
+    }
+}
+
+/// File names of a stored revision, as served under `repodata/`.
+/// `updateinfo.xml.gz` is constant and rendered per request.
+pub const STORED_REPODATA_FILES: [&str; 4] = [
+    "repomd.xml",
+    "primary.xml.gz",
+    "filelists.xml.gz",
+    "other.xml.gz",
+];
+
+/// Storage key prefix of revision `revision` of `root` in `repo_id`:
+/// `repodata/<repo>/<root>/<rev>`, or `repodata/<repo>/<rev>` for the
+/// depth-zero root. The file name is always the last segment and the
+/// revision the one before it, so no root can alias another root's revision.
+pub fn revision_prefix(repo_id: Uuid, root: &str, revision: i64) -> String {
+    if root.is_empty() {
+        format!("repodata/{repo_id}/{revision}")
+    } else {
+        format!("repodata/{repo_id}/{root}/{revision}")
+    }
+}
+
+/// The revision a precomputed root currently serves (#4544).
+#[derive(Clone, Debug)]
+pub struct StoredRepodata {
+    pub revision: i64,
+    /// The revision's `repomd.xml`, kept on the database row so the most
+    /// polled document (and its detached signature) needs no storage read.
+    pub repomd_xml: Bytes,
+    /// Where the documents live: the repository's storage at build time.
+    pub location: crate::storage::StorageLocation,
+    /// [`revision_prefix`] of this revision.
+    pub key_prefix: String,
+    /// Byte sizes of the stored documents, by file name.
+    pub sizes: std::collections::HashMap<String, u64>,
+}
+
+impl StoredRepodata {
+    /// Storage key of `file` (one of [`STORED_REPODATA_FILES`]).
+    pub fn key(&self, file: &str) -> String {
+        format!("{}/{file}", self.key_prefix)
+    }
 }
 
 /// How long an incomplete (non-`cacheable`) render is served before the
@@ -130,18 +226,10 @@ struct CacheEntry {
 pub const INCOMPLETE_RENDER_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Fingerprint-validated, single-flight cache of rendered RPM repodata sets,
-/// keyed by the serving repository's id and relative metadata root.
-pub struct RpmRepodataCache {
-    entries: RwLock<HashMap<(Uuid, String), CacheEntry>>,
-    /// Fixed stripes bound lock memory even for concurrent arbitrary empty roots.
-    /// A repository/root always selects the same stripe; collisions only serialize.
-    render_locks: Vec<Mutex<()>>,
-    /// Number of full renders performed. Observability + the test hook that
-    /// proves warm requests do not rebuild.
-    renders: AtomicU64,
-    max_entries: usize,
-    max_bytes: usize,
-}
+/// keyed by the serving repository's id, relative metadata root (the scope)
+/// and the caller-authorized member set (the partition, #4346). The
+/// mechanism is the shared [`RepoMetadataRevisionCache`] (#4174).
+pub type RpmRepodataCache = RepoMetadataRevisionCache<RepodataFingerprint, RenderedRepodata>;
 
 impl Default for RpmRepodataCache {
     fn default() -> Self {
@@ -155,20 +243,15 @@ impl RpmRepodataCache {
     }
 
     pub fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
-        Self {
-            entries: RwLock::new(HashMap::new()),
-            render_locks: (0..RPM_REPODATA_CACHE_MAX_ENTRIES)
-                .map(|_| Mutex::new(()))
-                .collect(),
-            renders: AtomicU64::new(0),
-            max_entries: max_entries.max(1),
+        Self::with_config(RevisionCacheConfig {
+            format: "rpm",
+            scope_kind: "root",
+            max_entries,
             max_bytes,
-        }
-    }
-
-    /// Total full renders performed since startup.
-    pub fn renders(&self) -> u64 {
-        self.renders.load(Ordering::Relaxed)
+            max_partitions_per_scope: RPM_REPODATA_CACHE_MAX_MEMBER_SETS,
+            lock_stripes: RPM_REPODATA_CACHE_MAX_ENTRIES,
+            incomplete_ttl: INCOMPLETE_RENDER_TTL,
+        })
     }
 
     /// The cached set for `repo_id`, but only when it was rendered from
@@ -187,19 +270,7 @@ impl RpmRepodataCache {
         root: &str,
         fingerprint: &RepodataFingerprint,
     ) -> Option<Arc<RenderedRepodata>> {
-        let entries = self.entries.read().await;
-        let entry = entries.get(&(repo_id, root.to_owned()))?;
-        let fresh = (entry.rendered.cacheable
-            || entry.rendered_at.elapsed() < INCOMPLETE_RENDER_TTL)
-            && entry
-                .rendered
-                .valid_until
-                .is_none_or(|t| Instant::now() < t);
-        if entry.fingerprint == *fingerprint && fresh {
-            Some(entry.rendered.clone())
-        } else {
-            None
-        }
+        self.lookup_scoped(repo_id, root, fingerprint).await
     }
 
     /// Serve the set for `(repo_id, fingerprint)`, rendering at most once per
@@ -235,63 +306,8 @@ impl RpmRepodataCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<RenderedRepodata, E>>,
     {
-        if let Some(hit) = self.lookup_at(repo_id, root, &fingerprint).await {
-            return Ok(hit);
-        }
-        let key = (repo_id, root.to_owned());
-        let lock = self.render_lock(&key);
-        let _guard = lock.lock().await;
-        // Re-check: the leader that held the lock may have rendered exactly
-        // this state while we waited.
-        if let Some(hit) = self.lookup_at(repo_id, root, &fingerprint).await {
-            return Ok(hit);
-        }
-        let rendered = Arc::new(render().await?);
-        self.renders.fetch_add(1, Ordering::Relaxed);
-        self.insert(key, fingerprint, rendered.clone()).await;
-        Ok(rendered)
-    }
-
-    fn render_lock(&self, key: &(Uuid, String)) -> &Mutex<()> {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
-        &self.render_locks[hasher.finish() as usize % self.render_locks.len()]
-    }
-
-    async fn insert(
-        &self,
-        key: (Uuid, String),
-        fingerprint: RepodataFingerprint,
-        rendered: Arc<RenderedRepodata>,
-    ) {
-        let mut entries = self.entries.write().await;
-        entries.insert(
-            key,
-            CacheEntry {
-                fingerprint,
-                rendered,
-                rendered_at: Instant::now(),
-            },
-        );
-        // Enforce the entry cap and the byte budget, oldest render first. The
-        // just-inserted entry is the newest, so it survives unless it is the
-        // only one left — a single over-budget repository still gets cached.
-        loop {
-            let over_entries = entries.len() > self.max_entries;
-            let total: usize = entries.values().map(|e| e.rendered.total_bytes()).sum();
-            let over_bytes = total > self.max_bytes && entries.len() > 1;
-            if !over_entries && !over_bytes {
-                break;
-            }
-            let Some(oldest) = entries
-                .iter()
-                .max_by_key(|(_, e)| e.rendered_at.elapsed())
-                .map(|(id, _)| id.clone())
-            else {
-                break;
-            };
-            entries.remove(&oldest);
-        }
+        self.get_or_render_scoped(repo_id, root, fingerprint, render)
+            .await
     }
 }
 
@@ -346,6 +362,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn revision_keys_never_alias_across_roots_4544() {
+        let repo = Uuid::nil();
+        assert_eq!(revision_prefix(repo, "", 7), format!("repodata/{repo}/7"));
+        assert_eq!(
+            revision_prefix(repo, "el9/x86_64", 7),
+            format!("repodata/{repo}/el9/x86_64/7")
+        );
+        // A depth-one root named like a revision: the file name is always the
+        // last segment and the revision the one before it, so the keys differ.
+        for file in STORED_REPODATA_FILES {
+            assert_ne!(
+                format!("{}/{file}", revision_prefix(repo, "7", 1)),
+                format!("{}/{file}", revision_prefix(repo, "", 7))
+            );
+        }
+    }
+
     fn rendered(tag: &str) -> RenderedRepodata {
         RenderedRepodata {
             repomd_xml: Bytes::copy_from_slice(format!("repomd-{tag}").as_bytes()),
@@ -385,7 +419,7 @@ mod tests {
             .entries
             .write()
             .await
-            .get_mut(&(repo, String::new()))
+            .get_mut(&(repo, String::new(), vec![repo]))
             .unwrap()
             .rendered = Arc::new({
             let mut r = rendered("r");
@@ -434,7 +468,7 @@ mod tests {
         // Age the entry past the TTL: the next request renders again.
         {
             let mut entries = cache.entries.write().await;
-            let e = entries.get_mut(&(repo, String::new())).unwrap();
+            let e = entries.get_mut(&(repo, String::new(), vec![repo])).unwrap();
             e.rendered_at = Instant::now()
                 .checked_sub(INCOMPLETE_RENDER_TTL + std::time::Duration::from_secs(1))
                 .expect("monotonic clock past the TTL");
@@ -449,7 +483,7 @@ mod tests {
         // A complete render never expires by age.
         {
             let mut entries = cache.entries.write().await;
-            let e = entries.get_mut(&(repo, String::new())).unwrap();
+            let e = entries.get_mut(&(repo, String::new(), vec![repo])).unwrap();
             e.rendered_at = Instant::now()
                 .checked_sub(INCOMPLETE_RENDER_TTL * 2)
                 .expect("monotonic clock past the TTL");
@@ -647,6 +681,192 @@ mod tests {
                 .await
                 .is_some(),
             "the newest entry must always survive"
+        );
+    }
+
+    /// Two callers of one virtual with different authorized member sets get
+    /// separate entries and never each other's render (#4346).
+    #[tokio::test]
+    async fn member_sets_of_one_root_never_share_an_entry_4346() {
+        let cache = RpmRepodataCache::new();
+        let virt = Uuid::new_v4();
+        let public = Uuid::new_v4();
+        let private = Uuid::new_v4();
+        let mut both = vec![public, private];
+        both.sort_unstable();
+
+        let anon = cache
+            .get_or_render::<(), _, _>(virt, fp(1, 100, vec![public]), || async {
+                Ok(rendered("anon"))
+            })
+            .await
+            .unwrap();
+        let admin = cache
+            .get_or_render::<(), _, _>(virt, fp(1, 100, both.clone()), || async {
+                Ok(rendered("admin"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(anon.repomd_xml, Bytes::from_static(b"repomd-anon"));
+        assert_eq!(admin.repomd_xml, Bytes::from_static(b"repomd-admin"));
+        assert_eq!(cache.renders(), 2);
+        // Both stay warm side by side: neither render replaced the other.
+        let again = cache
+            .get_or_render::<(), _, _>(virt, fp(1, 100, vec![public]), || async {
+                Ok(rendered("wrong"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(again.repomd_xml, Bytes::from_static(b"repomd-anon"));
+        assert!(cache.lookup(virt, &fp(1, 100, both)).await.is_some());
+        assert_eq!(cache.renders(), 2);
+    }
+
+    /// One repository/root keeps at most `RPM_REPODATA_CACHE_MAX_MEMBER_SETS`
+    /// member sets, evicting its own oldest set rather than other roots.
+    #[tokio::test]
+    async fn member_sets_per_root_are_capped_4346() {
+        let cache = RpmRepodataCache::new();
+        let other = Uuid::new_v4();
+        cache
+            .get_or_render::<(), _, _>(other, fp(1, 100, vec![other]), || async {
+                Ok(rendered("other"))
+            })
+            .await
+            .unwrap();
+        let virt = Uuid::new_v4();
+        let sets: Vec<Vec<Uuid>> = (0..RPM_REPODATA_CACHE_MAX_MEMBER_SETS + 2)
+            .map(|_| vec![Uuid::new_v4()])
+            .collect();
+        for set in &sets {
+            cache
+                .get_or_render::<(), _, _>(virt, fp(1, 100, set.clone()), || async {
+                    Ok(rendered("set"))
+                })
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let entries = cache.entries.read().await;
+        let virt_sets = entries.keys().filter(|k| k.0 == virt).count();
+        assert_eq!(virt_sets, RPM_REPODATA_CACHE_MAX_MEMBER_SETS);
+        assert!(entries.contains_key(&(other, String::new(), vec![other])));
+        assert!(!entries.contains_key(&(virt, String::new(), sets[0].clone())));
+        assert!(entries.contains_key(&(virt, String::new(), sets.last().unwrap().clone())));
+    }
+
+    /// Renders of different member sets of ONE root never run in parallel
+    /// (#4346): the single-flight lock is per repository/root, so a caller
+    /// rotating its authorized set cannot fan out concurrent full renders.
+    #[tokio::test]
+    async fn member_sets_of_one_root_render_serially_4346() {
+        let cache = Arc::new(RpmRepodataCache::new());
+        let virt = Uuid::new_v4();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let cache = cache.clone();
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            let set = vec![Uuid::new_v4()];
+            tasks.push(tokio::spawn(async move {
+                cache
+                    .get_or_render::<(), _, _>(virt, fp(1, 100, set), || async move {
+                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_in_flight.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        Ok(rendered("set"))
+                    })
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(cache.renders(), 6, "each member set renders once");
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            1,
+            "renders of one root must not overlap across member sets"
+        );
+    }
+
+    /// The RPM cache reports through the shared revision-cache metrics
+    /// (#4174): a burst of cold requests for one root state is one
+    /// `ak_repo_metadata_regenerations_total{format="rpm",scope="root"}`
+    /// sample, and the repeat request is a hit.
+    #[tokio::test]
+    async fn rpm_renders_report_shared_regeneration_metric_4174() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let cache = Arc::new(RpmRepodataCache::new());
+        let repo = Uuid::new_v4();
+        let tasks: Vec<_> = (0..20)
+            .map(|_| {
+                let cache = cache.clone();
+                tokio::spawn(async move {
+                    cache
+                        .get_or_render_at::<(), _, _>(
+                            repo,
+                            "el9",
+                            fp(3, 100, vec![repo]),
+                            || async {
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                Ok(rendered("v1"))
+                            },
+                        )
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        cache
+            .get_or_render_at::<(), _, _>(repo, "el9", fp(3, 100, vec![repo]), || async {
+                Ok(rendered("v2"))
+            })
+            .await
+            .unwrap();
+
+        // One snapshot: a `DebuggingRecorder` snapshot resets counters.
+        let snapshot = snapshotter.snapshot().into_vec();
+        let counter = |name: &str, label: (&str, &str)| -> u64 {
+            snapshot
+                .iter()
+                .filter(|(key, ..)| {
+                    key.key().name() == name
+                        && key
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == "format" && l.value() == "rpm")
+                        && key
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == label.0 && l.value() == label.1)
+                })
+                .map(|(.., value)| match value {
+                    DebugValue::Counter(n) => *n,
+                    other => panic!("expected a counter, got {other:?}"),
+                })
+                .sum()
+        };
+        assert_eq!(
+            counter("ak_repo_metadata_regenerations_total", ("scope", "root")),
+            1,
+            "20 cold requests for one state are one regeneration"
+        );
+        assert_eq!(
+            counter("ak_repo_metadata_cache_requests_total", ("result", "hit")),
+            1
         );
     }
 }

@@ -145,9 +145,11 @@ fn parse_peer_status(s: &str) -> Option<PeerStatus> {
 )]
 async fn list_peers(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(peer_id): Path<Uuid>,
     Query(query): Query<ListPeersQuery>,
 ) -> Result<Json<Vec<PeerResponse>>> {
+    auth.require_admin()?;
     let service = PeerService::new(state.db.clone());
     let status_filter = query.status.as_ref().and_then(|s| parse_peer_status(s));
     let peers = service.list_peers(peer_id, status_filter).await?;
@@ -189,8 +191,10 @@ async fn list_peers(
 )]
 async fn discover_peers(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(peer_id): Path<Uuid>,
 ) -> Result<Json<Vec<DiscoverablePeerResponse>>> {
+    auth.require_admin()?;
     let service = PeerService::new(state.db.clone());
     let peers = service.discover_peers(peer_id).await?;
 
@@ -220,6 +224,7 @@ async fn discover_peers(
     request_body = ProbeBody,
     responses(
         (status = 200, description = "Probe result recorded", body = PeerResponse),
+        (status = 403, description = "Caller is not an administrator"),
         (status = 400, description = "target_peer_id equals the source peer id"),
         (status = 404, description = "Source or target peer instance not found"),
     ),
@@ -227,9 +232,16 @@ async fn discover_peers(
 )]
 async fn probe_peer(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(peer_id): Path<Uuid>,
     Json(body): Json<ProbeBody>,
 ) -> Result<Json<PeerResponse>> {
+    // Probe results (latency, bandwidth) feed peer and chunk-source
+    // selection, so recording one is federation administration, admin-only
+    // like `mark_unreachable` and `update_network_profile`
+    // (GHSA-mvmh-g8wm-r3cp).
+    auth.require_admin()?;
+
     // A peer cannot probe a connection to itself. The `peer_connections`
     // table enforces this with a CHECK (`source_peer_id != target_peer_id`),
     // which previously surfaced as an opaque 500 DATABASE_ERROR. Reject it up
@@ -312,8 +324,10 @@ async fn mark_unreachable(
 )]
 async fn get_chunk_availability(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<ChunkAvailabilityResponse>> {
+    auth.require_admin()?;
     let row = sqlx::query!(
         r#"
         SELECT peer_instance_id, artifact_id, chunk_bitmap, total_chunks, available_chunks
@@ -383,8 +397,10 @@ async fn update_chunk_availability(
 )]
 async fn get_peers_with_chunks(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<ChunkAvailabilityResponse>>> {
+    auth.require_admin()?;
     let service = TransferService::new(state.db.clone());
     let peers = service.get_peers_with_chunks(artifact_id, peer_id).await?;
 
@@ -419,8 +435,10 @@ async fn get_peers_with_chunks(
 )]
 async fn get_scored_peers(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<ScoredPeerResponse>>> {
+    auth.require_admin()?;
     let service = PeerService::new(state.db.clone());
     let peers = service
         .get_scored_peers_for_artifact(peer_id, artifact_id)
@@ -453,16 +471,24 @@ async fn get_scored_peers(
     request_body = NetworkProfileBody,
     responses(
         (status = 200, description = "Network profile updated"),
+        (status = 400, description = "Invalid peer ID or network profile"),
+        (status = 404, description = "Peer instance not found"),
     ),
     security(("bearer_auth" = []))
 )]
 async fn update_network_profile(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    Path(peer_id): Path<Uuid>,
+    Path(peer_id): Path<String>,
     Json(body): Json<NetworkProfileBody>,
 ) -> Result<()> {
     auth.require_admin()?;
+    // Parse the path parameter here instead of relying on `Path<Uuid>`: its
+    // rejection body echoes axum's raw extractor error, which leaked internal
+    // details through the previously miswired route (#4884). A plain 400 from
+    // `AppError` keeps the contract consistent with every other handler error.
+    let peer_id = Uuid::parse_str(&peer_id)
+        .map_err(|_| crate::error::AppError::Validation("Invalid peer id".to_string()))?;
     // Parse time strings if provided
     let window_start = body
         .sync_window_start
@@ -482,7 +508,7 @@ async fn update_network_profile(
             crate::error::AppError::Validation(format!("Invalid sync_window_end: {}", e))
         })?;
 
-    sqlx::query!(
+    let result = sqlx::query!(
         r#"
         UPDATE peer_instances SET
             max_bandwidth_bps = COALESCE($2, max_bandwidth_bps),
@@ -503,6 +529,12 @@ async fn update_network_profile(
     .execute(&state.db)
     .await
     .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+
+    if result.rows_affected() == 0 {
+        return Err(crate::error::AppError::NotFound(
+            "Peer instance not found".to_string(),
+        ));
+    }
 
     Ok(())
 }
@@ -995,7 +1027,9 @@ mod tests {
             // Mirror the production mount point: peer_router() lives under
             // /:id/connections.
             let router = Router::new().nest("/:id/connections", super::super::peer_router());
-            tdh::router_with_auth(router, state, tdh::make_auth(Uuid::new_v4(), "fed.admin"))
+            // Probing is admin-only (GHSA-mvmh-g8wm-r3cp); these tests cover
+            // the handler's validation, so they probe as an administrator.
+            tdh::router_with_auth_ext(router, state, tdh::admin_auth(Uuid::new_v4(), "fed.admin"))
         }
 
         /// Drive the probe handler: POST `{target_peer_id, latency_ms}` to
@@ -1126,8 +1160,8 @@ mod tests {
         }
 
         fn profile_app(state: crate::api::SharedState, auth: AuthExtension) -> Router {
-            // network_profile_router()'s handler extracts Path<Uuid>, so mount it
-            // behind a `/:id` prefix to supply the peer id.
+            // network_profile_router()'s handler reads the peer id from the
+            // `/:id` segment, so mount it behind that prefix.
             let router = Router::new().nest("/:id", super::super::network_profile_router());
             tdh::router_with_auth_ext(router, state, auth)
         }
@@ -1226,6 +1260,56 @@ mod tests {
 
             let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
                 .bind(peer)
+                .execute(&pool)
+                .await;
+        }
+
+        /// GHSA-mvmh-g8wm-r3cp #8: probe results feed peer and chunk-source
+        /// selection, so recording one is admin-only like the other mutating
+        /// peer routes. The handler used to extract no identity at all.
+        #[tokio::test]
+        async fn probe_peer_is_admin_only() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-authz");
+            let source = tdh::register_test_peer(&pool, "authz-probe", "src").await;
+            let target = tdh::register_test_peer(&pool, "authz-probe", "dst").await;
+            let probe = |auth: AuthExtension| {
+                let app = conn_app(state.clone(), auth);
+                let body = format!("{{\"target_peer_id\":\"{target}\",\"latency_ms\":1}}");
+                async move {
+                    tdh::send(
+                        app,
+                        tdh::post(
+                            format!("/{source}/connections/probe"),
+                            "application/json",
+                            Bytes::from(body),
+                        ),
+                    )
+                    .await
+                    .0
+                }
+            };
+            let recorded = || async {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM peer_connections \
+                     WHERE source_peer_id = $1 AND target_peer_id = $2",
+                )
+                .bind(source)
+                .bind(target)
+                .fetch_one(&pool)
+                .await
+                .expect("count probe rows")
+            };
+
+            assert_eq!(probe(non_admin()).await, StatusCode::FORBIDDEN);
+            assert_eq!(recorded().await, 0, "a refused probe must record nothing");
+            assert_eq!(probe(admin()).await, StatusCode::OK);
+            assert_eq!(recorded().await, 1);
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = ANY($1)")
+                .bind(vec![source, target])
                 .execute(&pool)
                 .await;
         }

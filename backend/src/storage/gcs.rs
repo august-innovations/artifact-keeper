@@ -199,16 +199,69 @@ fn is_transient_status(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
 }
 
-/// Map a failed upstream status to the right `AppError`. Transient statuses
-/// (429/5xx) become `ServiceUnavailable` (HTTP 503, retryable by callers);
-/// everything else stays `Storage` (HTTP 500).
+/// GCS error `reason`s that mean "retry later": rate limits, and
+/// `quotaExceeded`, which GCS also answers for API-usage quotas, so it is not
+/// proof the bucket is full (#5650 review).
+const GCS_RETRYABLE_REASONS: &[&str] = &[
+    "quotaExceeded",
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+];
+
+/// The `reason` of each entry in a GCS JSON error body
+/// (`{"error":{"errors":[{"reason":...}]}}`). Only these exact values are
+/// read, never the rest of the body, which can quote the object name.
+fn gcs_error_reasons(body: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.pointer("/error/errors").cloned())
+        .and_then(|errors| errors.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| e.get("reason").and_then(|r| r.as_str()).map(str::to_string))
+        .collect()
+}
+
+/// Map a failed upstream status to the right `AppError` (#5649, #5650): 507
+/// is out of space (`507 STORAGE_FULL`); a transient status (429/5xx) or a
+/// rate / usage-quota `reason` is retryable (`503 STORAGE_UNAVAILABLE`);
+/// everything else stays `Storage` (500). The body is kept for the log only:
+/// a classified error answers the client with a fixed message.
 fn map_status_error(status: u16, context: &str, body: &str) -> AppError {
+    use crate::storage::StorageFailure;
     let msg = format!("{} (status {}): {}", context, status, body);
-    if is_transient_status(status) {
-        AppError::ServiceUnavailable(msg)
+    let class = if status == 507 {
+        Some(StorageFailure::Full)
+    } else if is_transient_status(status)
+        || gcs_error_reasons(body)
+            .iter()
+            .any(|r| GCS_RETRYABLE_REASONS.contains(&r.as_str()))
+    {
+        Some(StorageFailure::Unavailable)
     } else {
-        AppError::Storage(msg)
+        None
+    };
+    match class {
+        Some(class) => AppError::Storage(class.tag(msg)),
+        None => AppError::Storage(msg),
     }
+}
+
+/// A GCS failure that is retryable without a response to classify (a
+/// network error mid-upload, exhausted chunk retries): `503
+/// STORAGE_UNAVAILABLE`, with `message` kept for the log.
+fn gcs_unavailable(message: String) -> AppError {
+    AppError::Storage(crate::storage::StorageFailure::Unavailable.tag(message))
+}
+
+/// Map a reqwest error to a storage error without the request URL. A
+/// transport error names the URL it was sending to, which carries the
+/// endpoint host, the bucket and the object key; that text reaches API
+/// responses and the health check, so only the operation and the error kind
+/// are kept.
+fn request_error(operation: &str, e: reqwest::Error) -> AppError {
+    // #5649: a refused connection or a timeout is tagged unavailable (503).
+    crate::storage::failure::transport_storage_error(operation, e)
 }
 
 /// Check that an HTTP response indicates success; return an error with context otherwise.
@@ -360,15 +413,13 @@ impl GcsTokenProvider {
             ])
             .send()
             .await
-            .map_err(|e| {
-                AppError::Storage(format!("Failed to exchange JWT for access token: {}", e))
-            })?;
+            .map_err(|e| request_error("Failed to exchange JWT for access token", e))?;
 
         let response = require_success(response, "Google token endpoint error").await?;
         let token_resp: TokenResponse = response
             .json()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to parse token response: {}", e)))?;
+            .map_err(|e| request_error("Failed to parse token response", e))?;
 
         Ok((token_resp.access_token, token_resp.expires_in))
     }
@@ -381,13 +432,13 @@ impl GcsTokenProvider {
             .header("Metadata-Flavor", "Google")
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to fetch GCP access token: {}", e)))?;
+            .map_err(|e| request_error("Failed to fetch GCP access token", e))?;
 
         let response = require_success(response, "GCP metadata server error").await?;
         let token_resp: TokenResponse = response
             .json()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to parse GCP token response: {}", e)))?;
+            .map_err(|e| request_error("Failed to parse GCP token response", e))?;
 
         Ok((token_resp.access_token, token_resp.expires_in))
     }
@@ -410,7 +461,7 @@ impl GcsTokenProvider {
 /// metadata endpoint must always be dialed directly, never via an egress
 /// proxy.
 fn metadata_server_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::services::http_client::plain_client_builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -620,8 +671,13 @@ impl GcsBackend {
         // single-shot puts of single-MB OCI layers. JWT token exchange
         // (service-account-key mode) rides this client too; ADC metadata
         // token fetches do NOT (see metadata_server_client).
+        // #5649: one connection attempt is bounded by
+        // STORAGE_CONNECT_TIMEOUT_SECS on both clients, so a stopped endpoint
+        // is reported unavailable instead of stalling for the whole timeout.
+        let connect_timeout = crate::storage::StorageTimeouts::from_env().connect;
         let client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(30))
+            .connect_timeout(connect_timeout)
             .build()
             .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
 
@@ -631,6 +687,7 @@ impl GcsBackend {
         // object can legitimately run long.
         let stream_client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(1800))
+            .connect_timeout(connect_timeout)
             .build()
             .map_err(|e| {
                 AppError::Storage(format!("Failed to create streaming HTTP client: {}", e))
@@ -803,7 +860,7 @@ impl GcsBackend {
             .body(content)
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS upload failed: {}", e)))
+            .map_err(|e| request_error("GCS upload failed", e))
     }
 
     /// GET request with bearer auth. Caller provides the full URL.
@@ -815,7 +872,7 @@ impl GcsBackend {
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS request failed: {}", e)))
+            .map_err(|e| request_error("GCS request failed", e))
     }
 
     /// GET request on the long-timeout streaming client. Used only by
@@ -829,7 +886,7 @@ impl GcsBackend {
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS request failed: {}", e)))
+            .map_err(|e| request_error("GCS request failed", e))
     }
 
     /// Ranged GET request with bearer auth. Caller provides the full URL.
@@ -846,7 +903,7 @@ impl GcsBackend {
             .header(reqwest::header::RANGE, range_header)
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS ranged request failed: {}", e)))
+            .map_err(|e| request_error("GCS ranged request failed", e))
     }
 
     /// DELETE request with bearer auth via the JSON API metadata URL.
@@ -859,7 +916,7 @@ impl GcsBackend {
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS delete failed: {}", e)))
+            .map_err(|e| request_error("GCS delete failed", e))
     }
 
     // ---- Fallback helpers ----
@@ -901,7 +958,7 @@ impl GcsBackend {
                 let bytes = response
                     .bytes()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
+                    .map_err(|e| request_error("Failed to read response", e))?;
                 return Ok(Some(bytes));
             }
         }
@@ -934,7 +991,7 @@ impl GcsBackend {
                 let bytes = response
                     .bytes()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
+                    .map_err(|e| request_error("Failed to read response", e))?;
                 return Ok(Some(bytes));
             }
         }
@@ -971,9 +1028,21 @@ impl GcsBackend {
 
     /// List objects with optional prefix. Handles pagination via `nextPageToken`.
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        Ok(self
+            .list_with_modified(prefix)
+            .await?
+            .into_iter()
+            .map(|l| l.key)
+            .collect())
+    }
+
+    /// [`Self::list`] that also carries each object's `updated` time.
+    pub async fn list_with_modified(&self, prefix: Option<&str>) -> Result<Vec<super::ListedKey>> {
         #[derive(serde::Deserialize)]
         struct GcsObject {
             name: String,
+            #[serde(default)]
+            updated: Option<String>,
         }
         #[derive(serde::Deserialize)]
         struct GcsListResponse {
@@ -1014,14 +1083,24 @@ impl GcsBackend {
                 .header("Authorization", format!("Bearer {}", token))
                 .send()
                 .await
-                .map_err(|e| AppError::Storage(format!("GCS list failed: {}", e)))?;
+                .map_err(|e| request_error("GCS list failed", e))?;
 
             let response = require_success(response, "GCS list failed").await?;
-            let list_response: GcsListResponse = response.json().await.map_err(|e| {
-                AppError::Storage(format!("Failed to parse GCS list response: {}", e))
-            })?;
+            let list_response: GcsListResponse = response
+                .json()
+                .await
+                .map_err(|e| request_error("Failed to parse GCS list response", e))?;
 
-            all_keys.extend(list_response.items.into_iter().map(|o| o.name));
+            all_keys.extend(list_response.items.into_iter().map(|o| {
+                super::ListedKey {
+                    key: o.name,
+                    last_modified: o
+                        .updated
+                        .as_deref()
+                        .and_then(|u| chrono::DateTime::parse_from_rfc3339(u).ok())
+                        .map(|d| d.with_timezone(&chrono::Utc)),
+                }
+            }));
 
             match list_response.next_page_token {
                 Some(pt) => page_token = Some(pt),
@@ -1048,7 +1127,7 @@ impl GcsBackend {
             .header("Content-Length", "0")
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS rewrite failed: {}", e)))
+            .map_err(|e| request_error("GCS rewrite failed", e))
     }
 
     /// Copy an object within the same bucket.
@@ -1088,9 +1167,10 @@ impl GcsBackend {
             }
 
             let response = require_success(response, "GCS rewrite failed").await?;
-            let rewrite: RewriteResponse = response.json().await.map_err(|e| {
-                AppError::Storage(format!("Failed to parse GCS rewrite response: {}", e))
-            })?;
+            let rewrite: RewriteResponse = response
+                .json()
+                .await
+                .map_err(|e| request_error("Failed to parse GCS rewrite response", e))?;
 
             match interpret_rewrite_step(rewrite)? {
                 RewriteStep::Done => return Ok(()),
@@ -1119,9 +1199,10 @@ impl GcsBackend {
         }
         let response = require_success(response, "GCS size request failed").await?;
 
-        let metadata: GcsObjectMetadata = response.json().await.map_err(|e| {
-            AppError::Storage(format!("Failed to parse GCS object metadata: {}", e))
-        })?;
+        let metadata: GcsObjectMetadata = response
+            .json()
+            .await
+            .map_err(|e| request_error("Failed to parse GCS object metadata", e))?;
 
         metadata
             .size
@@ -1245,7 +1326,7 @@ impl GcsBackend {
             .body(Vec::<u8>::new())
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS resumable initiate failed: {}", e)))?;
+            .map_err(|e| request_error("GCS resumable initiate failed", e))?;
 
         if !init_response.status().is_success() {
             let status = init_response.status().as_u16();
@@ -1285,7 +1366,7 @@ impl GcsBackend {
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "GCS resumable session abort request failed");
+                tracing::warn!(error = %e.without_url(), "GCS resumable session abort request failed");
             }
         }
     }
@@ -1309,7 +1390,12 @@ impl GcsBackend {
             .header("Content-Range", content_range(0, 0, total))
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS resumable status query failed: {}", e)))?;
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "GCS resumable status query failed: {}",
+                    e.without_url()
+                ))
+            })?;
 
         let status = resp.status().as_u16();
         if resp.status().is_success() {
@@ -1373,9 +1459,10 @@ impl GcsBackend {
             .send()
             .await
             .map_err(|e| {
-                AppError::ServiceUnavailable(format!(
+                gcs_unavailable(format!(
                     "GCS resumable finalize (range {}) network error: {}",
-                    range, e
+                    range,
+                    e.without_url()
                 ))
             })?;
 
@@ -1458,14 +1545,16 @@ impl GcsBackend {
                 }
                 Err(e) => {
                     if attempt < CHUNK_MAX_ATTEMPTS {
-                        last_err = Some(AppError::ServiceUnavailable(format!(
+                        last_err = Some(gcs_unavailable(format!(
                             "GCS resumable PUT (range {}) network error: {}",
-                            range, e
+                            range,
+                            e.without_url()
                         )));
                     } else {
-                        return Err(AppError::ServiceUnavailable(format!(
+                        return Err(gcs_unavailable(format!(
                             "GCS resumable PUT (range {}) network error: {}",
-                            range, e
+                            range,
+                            e.without_url()
                         )));
                     }
                 }
@@ -1510,9 +1599,8 @@ impl GcsBackend {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| {
-            AppError::ServiceUnavailable("GCS resumable PUT exhausted retries".to_string())
-        }))
+        Err(last_err
+            .unwrap_or_else(|| gcs_unavailable("GCS resumable PUT exhausted retries".to_string())))
     }
 
     /// Drive the resumable upload loop after the session is initiated.
@@ -1602,12 +1690,16 @@ impl GcsBackend {
 
 #[async_trait]
 impl StorageBackend for GcsBackend {
+    async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+        GcsBackend::size(self, key).await.map(Some)
+    }
+
     /// `exists` also probes the Artifactory fallback key in migration mode.
     fn exists_may_match_fallback_key(&self) -> bool {
         self.path_format.has_fallback()
     }
 
-    #[tracing::instrument(skip(self, content), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "put"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, content), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let response = self.authorized_put(key, content).await?;
         require_success(response, "GCS upload failed").await?;
@@ -1639,7 +1731,7 @@ impl StorageBackend for GcsBackend {
     ///
     /// On any error after the session is initiated the session is aborted with
     /// a best-effort DELETE so GCS does not retain an orphaned upload session.
-    #[tracing::instrument(skip(self, stream), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "put_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, stream), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "put_stream"))]
     async fn put_stream(
         &self,
         key: &str,
@@ -1702,7 +1794,7 @@ impl StorageBackend for GcsBackend {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get"))]
     async fn get(&self, key: &str) -> Result<Bytes> {
         let url = self.object_download_url(key);
         let response = self.authorized_get(&url).await?;
@@ -1713,7 +1805,7 @@ impl StorageBackend for GcsBackend {
             return response
                 .bytes()
                 .await
-                .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)));
+                .map_err(|e| request_error("Failed to read response", e));
         }
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -1728,7 +1820,7 @@ impl StorageBackend for GcsBackend {
         unreachable!()
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_range"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_range"))]
     async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -1744,7 +1836,7 @@ impl StorageBackend for GcsBackend {
             return response
                 .bytes()
                 .await
-                .map_err(|e| AppError::Storage(format!("Failed to read range response: {}", e)));
+                .map_err(|e| request_error("Failed to read range response", e));
         }
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -1771,15 +1863,15 @@ impl StorageBackend for GcsBackend {
     /// read buffer (~64 KiB) instead of object-size.
     // The span covers GET initiation (time-to-first-byte); the body transfer
     // happens later as the caller polls the returned stream.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_stream"))]
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let url = self.object_download_url(key);
         let response = self.authorized_get_stream(&url).await?;
 
         if response.status().is_success() {
-            let stream = response.bytes_stream().map(|r| {
-                r.map_err(|e| AppError::Storage(format!("GCS stream chunk read failed: {}", e)))
-            });
+            let stream = response
+                .bytes_stream()
+                .map(|r| r.map_err(|e| request_error("GCS stream chunk read failed", e)));
             return Ok(Box::pin(stream));
         }
 
@@ -1797,7 +1889,21 @@ impl StorageBackend for GcsBackend {
         unreachable!()
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "exists"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "exists_at_exact_key"))]
+    async fn exists_at_exact_key(&self, key: &str) -> Result<bool> {
+        let url = self.object_metadata_url(key);
+        let response = self.authorized_get(&url).await?;
+        if response.status().is_success() {
+            return Ok(true);
+        }
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        require_success(response, "GCS exists check failed").await?;
+        unreachable!()
+    }
+
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let url = self.object_metadata_url(key);
         let response = self.authorized_get(&url).await?;
@@ -1814,7 +1920,7 @@ impl StorageBackend for GcsBackend {
         unreachable!()
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "delete"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "delete"))]
     async fn delete(&self, key: &str) -> Result<()> {
         let response = self.authorized_delete(key).await?;
 
@@ -1826,7 +1932,7 @@ impl StorageBackend for GcsBackend {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "copy"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "copy"))]
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         GcsBackend::copy(self, source, dest).await
     }
@@ -1837,7 +1943,7 @@ impl StorageBackend for GcsBackend {
     /// Returns `Ok(None)` for a missing object so the freshness probe can
     /// fall through to the slow path without losing the I/O-error
     /// distinction.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "head_etag"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "head_etag"))]
     async fn head_etag(&self, key: &str) -> Result<Option<String>> {
         let url = self.object_metadata_url(key);
         let response = self.authorized_get(&url).await?;
@@ -1859,7 +1965,7 @@ impl StorageBackend for GcsBackend {
         let meta: ObjectMeta = response
             .json()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS head_etag: parse metadata json: {}", e)))?;
+            .map_err(|e| request_error("GCS head_etag: parse metadata json", e))?;
         Ok(meta.etag)
     }
 
@@ -1867,7 +1973,14 @@ impl StorageBackend for GcsBackend {
         matches!(self.auth, GcsAuthMode::ServiceAccountKey { .. }) && self.config.redirect_downloads
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_presigned_url"))]
+    /// GCS resumable uploads stream from the request body to the bucket
+    /// without a local file, so a chunked completion can assemble straight
+    /// into a staging object (#3916).
+    fn supports_streamed_assembly(&self) -> bool {
+        true
+    }
+
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_presigned_url"))]
     async fn get_presigned_url(
         &self,
         key: &str,
@@ -1896,7 +2009,11 @@ impl StorageBackend for GcsBackend {
         }))
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "health_check"))]
+    async fn list_keys(&self, prefix: &str) -> Result<Option<Vec<super::ListedKey>>> {
+        self.list_with_modified(Some(prefix)).await.map(Some)
+    }
+
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "health_check"))]
     async fn health_check(&self) -> Result<()> {
         // GET the metadata of a sentinel object (`.health-probe`). This exercises
         // the same object-level permission the backend actually uses at runtime
@@ -2080,28 +2197,61 @@ mod tests {
         assert!(!is_transient_status(404));
     }
 
+    /// #5649 review: a transient status answers `503 STORAGE_UNAVAILABLE`
+    /// with a fixed message, no longer `SERVICE_UNAVAILABLE` echoing the GCS
+    /// body.
     #[test]
-    fn test_map_status_error_transient_is_service_unavailable() {
-        assert!(matches!(
-            map_status_error(503, "ctx", "body"),
-            AppError::ServiceUnavailable(_)
-        ));
-        assert!(matches!(
-            map_status_error(429, "ctx", "body"),
-            AppError::ServiceUnavailable(_)
-        ));
+    fn test_map_status_error_transient_is_storage_unavailable() {
+        use crate::storage::StorageFailure;
+        for status in [503, 429, 500] {
+            let err =
+                map_status_error(status, "ctx", "{\"error\":{\"message\":\"secret-object\"}}");
+            assert_eq!(
+                err.storage_failure(),
+                Some(StorageFailure::Unavailable),
+                "{err}"
+            );
+            let response = axum::response::IntoResponse::into_response(err);
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
     }
 
     #[test]
     fn test_map_status_error_permanent_is_storage() {
-        assert!(matches!(
-            map_status_error(400, "ctx", "body"),
-            AppError::Storage(_)
-        ));
-        assert!(matches!(
-            map_status_error(403, "ctx", "body"),
-            AppError::Storage(_)
-        ));
+        for status in [400, 403] {
+            let err = map_status_error(status, "ctx", "body");
+            assert!(matches!(err, AppError::Storage(_)));
+            assert_eq!(err.storage_failure(), None);
+        }
+    }
+
+    /// #5650 review: only 507 is "full". `quotaExceeded` is also GCS's answer
+    /// to an API-usage quota, so it is retryable (503), not 507; and a body
+    /// that merely quotes a reason (an object named after one) is neither.
+    #[test]
+    fn test_map_status_error_out_of_space_is_full_5650() {
+        use crate::storage::StorageFailure;
+        let insufficient = map_status_error(507, "GCS upload", "");
+        assert_eq!(insufficient.storage_failure(), Some(StorageFailure::Full));
+        let quota = map_status_error(
+            403,
+            "GCS upload",
+            r#"{"error":{"errors":[{"reason":"quotaExceeded"}]}}"#,
+        );
+        assert_eq!(
+            quota.storage_failure(),
+            Some(StorageFailure::Unavailable),
+            "{quota}"
+        );
+        let spoof = map_status_error(
+            403,
+            "GCS upload",
+            r#"{"error":{"errors":[{"reason":"forbidden","message":"quotaExceeded.bin"}]}}"#,
+        );
+        assert_eq!(spoof.storage_failure(), None, "{spoof}");
     }
 
     #[tokio::test]
@@ -3714,6 +3864,41 @@ mod tests {
         assert!(!backend.exists("missing.txt").await.unwrap());
     }
 
+    /// #4980: the upload commit guard's presence check never answers from the
+    /// migration fallback key.
+    #[tokio::test]
+    async fn test_exists_at_exact_key_ignores_the_migration_fallback_4980() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/storage/v1/b/.*/o/repos%2Fgeneric%2Fabcdefabcdef",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/storage/v1/b/.*/o/ab%2Fabcdefabcdef"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let backend =
+            mock_backend_with_path_format(&server.uri(), StoragePathFormat::Migration).await;
+        let key = format!("repos/generic/{checksum}");
+        assert!(StorageBackendTrait::exists(&backend, &key).await.unwrap());
+        assert!(
+            !StorageBackendTrait::exists_at_exact_key(&backend, &key)
+                .await
+                .unwrap(),
+            "only the canonical key may answer the exact presence check"
+        );
+    }
+
     #[tokio::test]
     async fn test_exists_surfaces_migration_fallback_operational_error() {
         use wiremock::matchers::{method, path_regex};
@@ -3741,7 +3926,10 @@ mod tests {
         assert!(
             matches!(
                 &result,
-                Err(AppError::ServiceUnavailable(message)) if message.contains("503")
+                Err(err @ AppError::Storage(message))
+                    if message.contains("503")
+                        && err.storage_failure()
+                            == Some(crate::storage::StorageFailure::Unavailable)
             ),
             "fallback operational failures must not become false misses: {result:?}"
         );
@@ -4348,5 +4536,113 @@ mod tests {
             "expected storage error mentioning 403, got: {:?}",
             err
         );
+    }
+
+    /// A resumable session URI authorizes uploads to the session by itself,
+    /// so a transport error must not repeat it in the returned message.
+    #[tokio::test]
+    async fn test_resumable_session_errors_omit_the_session_url() {
+        let backend = mock_backend("http://127.0.0.1:0").await;
+        // Port 0 cannot be connected to, so each request fails in transport.
+        let session_url = "http://127.0.0.1:0/upload/storage/v1/b/test-bucket/o?uploadType=resumable&upload_id=session-capability";
+
+        let status_err = backend
+            .query_resumable_offset(session_url, Some(10))
+            .await
+            .expect_err("status query fails");
+        let finalize_err = backend
+            .finalize_resumable(session_url, 10)
+            .await
+            .expect_err("finalize fails");
+        for message in [status_err.to_string(), finalize_err.to_string()] {
+            assert!(
+                !message.contains("upload_id"),
+                "error message must not carry the session URL: {message}"
+            );
+        }
+    }
+
+    /// A transport error names the URL it was sending to: the endpoint host,
+    /// the bucket and the object key. The returned error reaches the health
+    /// check and API error bodies, so it must name only the operation.
+    #[tokio::test]
+    async fn test_request_errors_omit_the_request_url() {
+        let bucket = "url-redaction-probe-bucket";
+        let key = "oci-uploads/url-redaction-probe-key";
+        // Port 1 on loopback has no listener, so every request fails in
+        // transport, the way a dead or mistyped GCS_ENDPOINT does.
+        let backend = GcsBackend::new(GcsConfig {
+            bucket: bucket.to_string(),
+            project_id: None,
+            service_account_email: None,
+            private_key: None,
+            redirect_downloads: false,
+            signed_url_expiry: Duration::from_secs(3600),
+            path_format: StoragePathFormat::Native,
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+        })
+        .await
+        .expect("backend builds");
+
+        let mut messages = vec![
+            backend
+                .put(key, Bytes::from_static(b"x"))
+                .await
+                .expect_err("put fails")
+                .to_string(),
+            backend.get(key).await.expect_err("get fails").to_string(),
+            backend
+                .get_range(key, 0, 1)
+                .await
+                .expect_err("get_range fails")
+                .to_string(),
+            backend
+                .exists(key)
+                .await
+                .expect_err("exists fails")
+                .to_string(),
+            backend
+                .delete(key)
+                .await
+                .expect_err("delete fails")
+                .to_string(),
+            backend
+                .copy(key, "oci-uploads/url-redaction-probe-dest")
+                .await
+                .expect_err("copy fails")
+                .to_string(),
+            backend
+                .list_keys("oci-uploads/")
+                .await
+                .expect_err("list fails")
+                .to_string(),
+            backend
+                .health_check()
+                .await
+                .expect_err("health check fails")
+                .to_string(),
+        ];
+        match backend.get_stream(key).await {
+            Ok(_) => panic!("get_stream must fail"),
+            Err(e) => messages.push(e.to_string()),
+        }
+        let chunk: BoxStream<'static, Result<Bytes>> =
+            futures::stream::iter(vec![Ok(Bytes::from_static(b"x"))]).boxed();
+        messages.push(
+            backend
+                .put_stream(key, chunk)
+                .await
+                .expect_err("put_stream fails")
+                .to_string(),
+        );
+
+        for message in messages {
+            for secret in ["127.0.0.1", bucket, "url-redaction-probe", "http://"] {
+                assert!(
+                    !message.contains(secret),
+                    "error message must not carry the request URL ({secret}): {message}"
+                );
+            }
+        }
     }
 }

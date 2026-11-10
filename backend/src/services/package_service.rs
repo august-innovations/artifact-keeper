@@ -117,11 +117,250 @@ pub fn live_package_version_predicate() -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Catalog download counts (#5346)
+// ---------------------------------------------------------------------------
+//
+// The `packages.download_count` / `package_versions.download_count` columns
+// (migration 019) were never written, so every package reported 0. The counts
+// are computed at read time from the download history the serve paths already
+// record instead: `download_statistics` (hosted, one row per served body,
+// written off the hot path by the batched download-event dispatcher, #2522)
+// and `proxy_download_statistics` (Remote pull-through serves, #2270/#4539).
+// Nothing is added to the download path, and the counts cannot drift from the
+// artifact download stats because they are the same rows.
+//
+// The stored columns stay (a 1.11 pod in a rolling upgrade still selects
+// them) but are no longer read.
+
+/// SQL expression for one `package_versions` row's download count (#5346).
+/// Expects `pv`, `p` and `r` in scope.
+///
+/// Hosted serves: the `download_statistics` rows of the version's artifacts in
+/// the package's repository, i.e. the artifact carrying the version's
+/// representative checksum (the catalog's liveness join, #3660) plus every
+/// artifact recorded under the package's name and the version (the other
+/// files of a multi-file version, such as a Hugging Face model revision). It is
+/// the sum of the download counts the artifact pages show for those files.
+///
+/// Remote serves: the `proxy_download_statistics` rows of the repository that
+/// carry the version's digest (#4542), plus older rows with no digest of their
+/// own that still link to a cached object with it (the same two arms the
+/// blast-radius report reads).
+///
+/// `NULL` means "not tracked": a Remote version cataloged without a digest
+/// (a streamed Maven pull-through, whose checksum is unknown when the row is
+/// written) cannot be tied to any recorded serve, which is different from a
+/// real 0. Every lookup is indexed: `idx_artifacts_checksum` /
+/// `idx_artifacts_repo_name_version`, `idx_download_stats_artifact`,
+/// `idx_proxy_dl_stats_checksum`, `idx_proxy_cache_repo_checksum` and
+/// `idx_proxy_dl_stats_cache`.
+pub fn version_download_count_sql() -> &'static str {
+    r#"(CASE
+    WHEN r.repo_type = 'remote' AND COALESCE(pv.checksum_sha256, '') = '' THEN NULL
+    ELSE (
+        SELECT COUNT(*)
+        FROM download_statistics ds_pkg
+        WHERE ds_pkg.artifact_id IN (
+            SELECT a_dl.id
+            FROM artifacts a_dl
+            WHERE a_dl.repository_id = p.repository_id
+              AND (
+                    (pv.checksum_sha256 <> '' AND a_dl.checksum_sha256 = pv.checksum_sha256)
+                    OR (a_dl.name = p.name AND a_dl.version = pv.version)
+              )
+        )
+    ) + (
+        CASE WHEN r.repo_type = 'remote' THEN (
+            SELECT COUNT(*)
+            FROM proxy_download_statistics pd_pkg
+            WHERE pd_pkg.repository_id = p.repository_id
+              AND pd_pkg.checksum_sha256 = pv.checksum_sha256
+        ) + (
+            SELECT COUNT(*)
+            FROM proxy_download_statistics pd_pkg
+            JOIN proxy_cache_artifacts pc_pkg ON pc_pkg.id = pd_pkg.proxy_cache_id
+            WHERE pc_pkg.repository_id = p.repository_id
+              AND pc_pkg.checksum_sha256 = pv.checksum_sha256
+              AND pd_pkg.checksum_sha256 IS NULL
+        ) ELSE 0 END
+    )
+END)"#
+}
+
+/// Download counts of the packages in `package_ids` (#5346): the sum of their
+/// live versions' counts ([`version_download_count_sql`]), so a package
+/// reports the total of the versions its version list shows. One statement
+/// for a whole listing page. A package missing from the map, or mapped to
+/// `None`, is not tracked (a Remote package with no version digest).
+pub async fn package_download_counts(
+    db: &PgPool,
+    package_ids: &[Uuid],
+) -> sqlx::Result<std::collections::HashMap<Uuid, Option<i64>>> {
+    if package_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let sql = format!(
+        r#"
+        SELECT p.id, SUM({count})::BIGINT
+        FROM packages p
+        JOIN repositories r ON r.id = p.repository_id
+        JOIN package_versions pv ON pv.package_id = p.id
+        WHERE p.id = ANY($1)
+          AND {live}
+        GROUP BY p.id
+        "#,
+        count = version_download_count_sql(),
+        live = live_package_version_predicate(),
+    );
+    let rows: Vec<(Uuid, Option<i64>)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+        .bind(package_ids)
+        .fetch_all(db)
+        .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// [`package_download_counts`] of one package over only the live versions in
+/// `versions` (#5253: the MCP versions a caller may list). `None` when none of
+/// them is live, or none is tracked, as for a package with no counted version.
+pub async fn package_download_count_over_versions(
+    db: &PgPool,
+    package_id: Uuid,
+    versions: &[String],
+) -> sqlx::Result<Option<i64>> {
+    if versions.is_empty() {
+        return Ok(None);
+    }
+    let sql = format!(
+        r#"
+        SELECT SUM({count})::BIGINT
+        FROM packages p
+        JOIN repositories r ON r.id = p.repository_id
+        JOIN package_versions pv ON pv.package_id = p.id
+        WHERE p.id = $1
+          AND pv.version = ANY($2)
+          AND {live}
+        "#,
+        count = version_download_count_sql(),
+        live = live_package_version_predicate(),
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql))
+        .bind(package_id)
+        .bind(versions)
+        .fetch_one(db)
+        .await
+}
+
 /// Rows removed by [`prune_catalog_for_purged_artifact`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogPrune {
     pub versions_removed: u64,
     pub packages_removed: u64,
+}
+
+/// The newest of `versions` by the catalog's own ordering
+/// ([`version_compare`], the rule the publish upsert uses to move
+/// `packages.version` forward), with its size. `None` for an empty slice.
+pub fn newest_catalog_version(versions: &[(String, i64)]) -> Option<&(String, i64)> {
+    versions.iter().reduce(|best, v| {
+        if version_compare(&v.0, &best.0) > 0 {
+            v
+        } else {
+            best
+        }
+    })
+}
+
+/// What [`refresh_package_latest`] found and did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LatestRefresh {
+    /// The repository's format (`repository_format` as text), `None` when the
+    /// repository is gone. Returned so the delete hook can gate its npm-only
+    /// step without a round trip of its own.
+    pub format: Option<String>,
+    /// Whether `packages.version` was moved.
+    pub moved: bool,
+}
+
+/// Point the `(repository_id, name)` catalog row at its newest version that
+/// still has a live artifact (#5632).
+///
+/// `packages.version` is the "Latest" the catalog and the UI install snippet
+/// show, and the publish upsert only ever moves it forward. Both directions
+/// of a soft delete call this: a delete (the version may be gone, so Latest
+/// moves down to what is left) and a trash restore (the version is back, so
+/// Latest moves up to it again). The ordering is [`version_compare`], the
+/// publish upsert's own rule; liveness is the read paths' predicate. A row
+/// with no live version is left alone (the read paths hide it, and a restore
+/// re-points it), as are Remote repositories (#3660). The write is
+/// conditional on the version read, so a concurrent publish wins.
+///
+/// The row is found by `(repository_id, name)` (the `packages` unique key) and
+/// its versions by `package_id`, both indexed. Formats whose catalog name is
+/// not the artifact name (Maven's `groupId:artifactId`) find no row and are
+/// covered by the read-side backstop instead.
+pub async fn refresh_package_latest(
+    db: &PgPool,
+    repository_id: Uuid,
+    name: &str,
+) -> sqlx::Result<LatestRefresh> {
+    let row: Option<(String, String, Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "SELECT r.format::text, r.repo_type::text, p.id, p.version \
+         FROM repositories r \
+         LEFT JOIN packages p ON p.repository_id = r.id AND p.name = $2 \
+         WHERE r.id = $1",
+    )
+    .bind(repository_id)
+    .bind(name)
+    .fetch_optional(db)
+    .await?;
+    let Some((format, repo_type, package_id, current)) = row else {
+        return Ok(LatestRefresh::default());
+    };
+    let mut out = LatestRefresh {
+        format: Some(format),
+        moved: false,
+    };
+    let (Some(package_id), Some(current)) = (package_id, current) else {
+        return Ok(out);
+    };
+    if repo_type == "remote" {
+        return Ok(out);
+    }
+
+    let live_version = live_package_version_predicate();
+    let live: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
+        r#"
+        SELECT pv.version, pv.size_bytes
+        FROM package_versions pv
+        JOIN packages p ON p.id = pv.package_id
+        JOIN repositories r ON r.id = p.repository_id
+        WHERE pv.package_id = $1
+          AND {live_version}
+        "#
+    )))
+    .bind(package_id)
+    .fetch_all(db)
+    .await?;
+    let Some((newest, size)) = newest_catalog_version(&live) else {
+        return Ok(out);
+    };
+    if *newest == current {
+        return Ok(out);
+    }
+    out.moved = sqlx::query(
+        "UPDATE packages SET version = $3, size_bytes = $4, updated_at = NOW() \
+         WHERE id = $1 AND version = $2",
+    )
+    .bind(package_id)
+    .bind(&current)
+    .bind(newest)
+    .bind(size)
+    .execute(db)
+    .await?
+    .rows_affected()
+        > 0;
+    Ok(out)
 }
 
 /// Drop the catalog rows left behind by a HARD-deleted artifact (#3660).
@@ -132,8 +371,8 @@ pub struct CatalogPrune {
 /// `is_deleted`, and a restore must bring the catalog row back. Removing the
 /// row there would make a restore unrecoverable, so soft deletes are handled
 /// by the read-path filter ([`live_package_predicate`]) instead and only the
-/// storage GC's hard delete — the single reaper of soft-deleted `artifacts`
-/// rows — prunes.
+/// hard deletes of soft-deleted `artifacts` rows — storage GC and a trash
+/// purge — prune.
 ///
 /// The version row is kept while ANY `artifacts` row (live or soft-deleted)
 /// still carries the checksum, so purging one of several peers leaves the
@@ -592,7 +831,25 @@ impl PackageService {
                     )
                     .await
                 {
-                    Ok(_) => report.packages_registered += 1,
+                    Ok(_) => {
+                        report.packages_registered += 1;
+                        // #4633: the upsert just reset the version to this
+                        // one file's size; a Maven version is its files' sum,
+                        // as the publish path records it.
+                        if matches!(row.format.as_str(), "maven" | "gradle") {
+                            if let Some(directory) =
+                                crate::api::handlers::maven::maven_version_directory(&row.path)
+                            {
+                                self.try_set_version_size_to_directory_total(
+                                    row.repository_id,
+                                    &name,
+                                    &version,
+                                    directory,
+                                )
+                                .await;
+                            }
+                        }
+                    }
                     Err(e) => {
                         report.artifacts_failed += 1;
                         warn!("Catalog backfill failed for {name}@{version}: {e}");
@@ -681,6 +938,117 @@ impl PackageService {
         }
     }
 
+    /// Set the recorded size of a catalog version to the TOTAL of the live
+    /// artifact files stored directly under `directory` (#4633).
+    ///
+    /// A Maven version (GAV) is one directory holding several distinct files
+    /// (jar, pom, sources, javadoc, classifiers, `.module`), each registered
+    /// through [`Self::create_or_update_from_artifact`] with its own size. The
+    /// smallest-`(checksum, size)` guard there keeps ONE of those files as the
+    /// representative row, so the Packages page showed one file's size (often
+    /// the pom's few KB) for a version whose jar was megabytes. The files are
+    /// parts of the version, not alternative measurements of it, so the
+    /// version's size is their sum; a sum is order-independent too, so peers
+    /// that process the files in different orders still converge (#2110).
+    ///
+    /// `directory` is the version directory with its trailing `/`. Only files
+    /// directly inside it count (a deeper path is another coordinate), and
+    /// only rows that are not soft-deleted. Checksum sidecars and
+    /// `maven-metadata.xml` are row-less puts, so they never appear here.
+    ///
+    /// Call it right after each registration of a file of the version: the
+    /// registration may have reset the size to that one file, and this
+    /// recomputes it from the `artifacts` rows. The version row is locked
+    /// first and the total is read in a later statement, so two concurrent
+    /// uploads of files of one version serialize here and the second sees the
+    /// first's committed row; the last writer always records the full total.
+    /// The `packages` row is synchronized only while it still points at this
+    /// version, as [`Self::try_bump_version_size`] does.
+    ///
+    /// Like every catalog write it never creates a row and never fails the
+    /// publish: errors are logged and swallowed.
+    pub async fn try_set_version_size_to_directory_total(
+        &self,
+        repository_id: Uuid,
+        name: &str,
+        version: &str,
+        directory: &str,
+    ) {
+        if let Err(e) = self
+            .set_version_size_to_directory_total(repository_id, name, version, directory)
+            .await
+        {
+            warn!(
+                "Failed to set package size for {name}@{version} in repo {repository_id} to \
+                 its files' total: {e}"
+            );
+        }
+    }
+
+    async fn set_version_size_to_directory_total(
+        &self,
+        repository_id: Uuid,
+        name: &str,
+        version: &str,
+        directory: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.db.begin().await?;
+        let version_row: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT pv.id
+              FROM package_versions pv
+              JOIN packages p ON p.id = pv.package_id
+             WHERE p.repository_id = $1
+               AND p.name = $2
+               AND pv.version = $3
+               FOR UPDATE OF pv
+            "#,
+        )
+        .bind(repository_id)
+        .bind(name)
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(version_row) = version_row else {
+            return tx.commit().await;
+        };
+
+        // `idx_artifacts_repo_path_pattern` (migration 110) serves the
+        // left-anchored LIKE; the `strpos` arm keeps only direct children.
+        let pattern = format!("{}%", crate::api::handlers::escape_like_literal(directory));
+        sqlx::query(
+            r#"
+            WITH total AS (
+                SELECT COALESCE(SUM(a.size_bytes), 0)::BIGINT AS size_bytes
+                  FROM artifacts a
+                 WHERE a.repository_id = $1
+                   AND a.path LIKE $2 ESCAPE '\'
+                   AND strpos(substr(a.path, $3 + 1), '/') = 0
+                   AND a.is_deleted = false
+            ),
+            updated AS (
+                UPDATE package_versions pv
+                   SET size_bytes = total.size_bytes
+                  FROM total
+                 WHERE pv.id = $4
+                RETURNING pv.package_id, pv.version, pv.size_bytes
+            )
+            UPDATE packages
+               SET size_bytes = updated.size_bytes
+              FROM updated
+             WHERE packages.id = updated.package_id
+               AND packages.version = updated.version
+            "#,
+        )
+        .bind(repository_id)
+        .bind(&pattern)
+        .bind(directory.chars().count() as i32)
+        .bind(version_row)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
+    }
+
     /// Fire-and-forget wrapper that logs errors instead of propagating them.
     #[allow(clippy::too_many_arguments)]
     pub async fn try_create_or_update_from_artifact(
@@ -726,6 +1094,7 @@ impl PackageService {
 /// particular resolves display casing against the existing row (#3978), which
 /// a row-only walk cannot reproduce.
 pub const BACKFILL_FORMATS: &[&str] = &[
+    "agentplugins",
     "alpine",
     "cargo",
     "chef",
@@ -1203,6 +1572,86 @@ mod tests {
 mod catalog_maintenance_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+
+    /// #4633: a Maven version's size is the sum of the live files directly
+    /// in its version directory. A soft-deleted file, a file in a deeper
+    /// directory and a file in a directory that only matches as a LIKE
+    /// wildcard (`_`) do not count, and the admin catalog backfill, which
+    /// replays every file through the single-file upsert, ends on the sum too.
+    #[tokio::test]
+    async fn maven_version_size_is_the_total_of_its_directory_4633() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let rows: [(&str, i64, bool); 6] = [
+            ("org/x4633/lib/1_0/lib-1_0.jar", 1000, false),
+            ("org/x4633/lib/1_0/lib-1_0.pom", 20, false),
+            ("org/x4633/lib/1_0/lib-1_0-sources.jar", 300, false),
+            ("org/x4633/lib/1_0/lib-1_0-javadoc.jar", 4000, true),
+            ("org/x4633/lib/1_0/nested/extra.jar", 50000, false),
+            ("org/x4633/lib/1a0/lib-1a0.jar", 600000, false),
+        ];
+        for (i, (path, size, deleted)) in rows.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, is_deleted) \
+                 VALUES ($1, $2, 'lib', '1_0', $3, $4, 'application/octet-stream', $2, $5)",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .bind(size)
+            .bind(format!("{i:064}"))
+            .bind(deleted)
+            .execute(&pool)
+            .await
+            .expect("seed artifact");
+        }
+        let svc = PackageService::new(pool.clone());
+        // Register the version from its smallest file, as the old rule would
+        // have left it, then recompute.
+        svc.create_or_update_from_artifact(
+            repo_id,
+            "org.x4633:lib",
+            "1_0",
+            20,
+            &format!("{:064}", 1),
+            None,
+            None,
+        )
+        .await
+        .expect("register version");
+        svc.try_set_version_size_to_directory_total(
+            repo_id,
+            "org.x4633:lib",
+            "1_0",
+            "org/x4633/lib/1_0/",
+        )
+        .await;
+        let read = |pool: sqlx::PgPool| async move {
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT pv.size_bytes, p.size_bytes FROM packages p \
+                 JOIN package_versions pv ON pv.package_id = p.id \
+                 WHERE p.repository_id = $1 AND p.name = 'org.x4633:lib' AND pv.version = '1_0'",
+            )
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("catalog row")
+        };
+        let after_publish = read(pool.clone()).await;
+        let report = svc.backfill_catalog(Some(repo_id)).await;
+        let after_backfill = read(pool.clone()).await;
+
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+
+        assert_eq!(after_publish, (1320, 1320), "jar + pom + sources");
+        assert!(report.is_ok(), "{report:?}");
+        assert_eq!(
+            after_backfill.0, 1320,
+            "the backfill must end on the sum too"
+        );
+    }
 
     // -- backfill_catalog_coordinates (pure) --------------------------------
 

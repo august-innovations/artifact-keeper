@@ -9,15 +9,15 @@
 //!   GET  /hex/{repo_key}/names                         - List all package names
 //!   GET  /hex/{repo_key}/versions                      - List all packages with versions
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
-use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -351,21 +351,26 @@ async fn package_info(
             // upstream `Content-Encoding` is re-declared when present
             // (RFC 9110 §8.4, #3260) — nothing on this path decodes.
             let upstream_path = format!("packages/{}", name);
-            let (content, content_type, content_encoding) =
-                proxy_helpers::proxy_fetch_capped_encoded(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    &upstream_path,
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                )
-                .await?;
+            let proxy_helpers::CachedBody {
+                content,
+                content_type,
+                content_encoding,
+                stale_since,
+            } = proxy_helpers::proxy_fetch_capped_encoded(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &upstream_path,
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
             return Ok(proxy_helpers::forward_verbatim_metadata(
                 content,
                 content_type,
                 "application/json",
                 content_encoding,
+                stale_since,
             ));
         }
     }
@@ -439,12 +444,13 @@ async fn package_info(
                 state.proxy_service.as_deref(),
                 repo.id,
                 &upstream_path,
-                |content, content_type, content_encoding, _member_key| async move {
+                |content, content_type, content_encoding, stale_since, _member_key| async move {
                     Ok(proxy_helpers::forward_verbatim_metadata(
                         content,
                         content_type,
                         "application/json",
                         content_encoding,
+                        stale_since,
                     ))
                 },
             )
@@ -765,7 +771,7 @@ async fn virtual_local_owns_tarball_name(
     // The hex-specific work is parsing the tarball filename into a
     // package name; the DB lookup is shared with cargo / npm / pypi /
     // maven / rubygems.
-    proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, &pkg_name).await
+    proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, &pkg_name, "hex").await
 }
 
 /// Serve a tarball download restricted to the virtual repo's non-Remote
@@ -800,6 +806,9 @@ async fn serve_virtual_tarball_local_only(
         None,
         virtual_repo_id,
         upstream_path,
+        // No proxy, so no Remote member can win: nothing for the resolver to
+        // record (#3844).
+        None,
         move |member_id, location| {
             let state = state_arc.clone();
             let suffix = suffix.clone();
@@ -824,7 +833,8 @@ async fn publish_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
-    body: Bytes,
+    headers: HeaderMap,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "hex", "write:artifacts")?.user_id;
@@ -892,6 +902,26 @@ async fn publish_package(
             .into_response());
     }
 
+    // Record the facts the signed registry has to advertise for this release:
+    // the tarball's inner checksum and its declared requirements. Both are
+    // derivable from the bytes we already hold, so capturing them here keeps
+    // the read path from re-opening the tarball on every registry fetch.
+    //
+    // #2904: required, and checked BEFORE anything is stored. `inner_checksum`
+    // is a field the client copies into `mix.lock`, so a release without a
+    // usable CHECKSUM member can never be served (`package_info` fail-closes
+    // with a 500 on it). Accepting such a tarball only moved the failure to
+    // every later read; rejecting it here with a 422 tells the publisher now
+    // and leaves no artifact row or storage object behind.
+    let registry_facts = crate::util::bounded_archive::with_ingest_extraction(|| {
+        extract_registry_facts_from_tarball(&body)
+    })
+    .map_err(|e| e.into_response())?;
+    let (inner_checksum, requirements) = publishable_registry_facts(registry_facts)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e).into_response())?;
+    let hex_metadata =
+        build_hex_publish_metadata(&pkg_name, &pkg_version, &inner_checksum, &requirements);
+
     let filename = build_hex_filename(&pkg_name, &pkg_version);
 
     // Compute SHA256
@@ -911,41 +941,6 @@ async fn publish_package(
 
     let storage_key = build_hex_storage_key(&pkg_name, &pkg_version);
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
-
-    // Record the facts the signed registry has to advertise for this release:
-    // the tarball's inner checksum and its declared requirements. Both are
-    // derivable from the bytes we already hold, so capturing them here keeps
-    // the read path from re-opening the tarball on every registry fetch.
-    // Best-effort: a tarball that parsed well enough to publish but carries no
-    // CHECKSUM member still publishes, and the registry falls back to reading
-    // the stored bytes.
-    let registry_facts = crate::util::bounded_archive::with_ingest_extraction(|| {
-        extract_registry_facts_from_tarball(&body)
-    })
-    .map_err(|e| e.into_response())?;
-
-    let mut hex_metadata = build_hex_metadata(&pkg_name, &pkg_version);
-    match registry_facts {
-        Ok(facts) => {
-            if let Some(obj) = hex_metadata.as_object_mut() {
-                if let Some(inner) = facts.inner_checksum_hex {
-                    obj.insert("inner_checksum".to_string(), serde_json::json!(inner));
-                }
-                obj.insert(
-                    "requirements".to_string(),
-                    serde_json::json!(facts.dependencies),
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Hex publish: could not derive registry facts for {} {}: {}",
-                pkg_name,
-                pkg_version,
-                e
-            );
-        }
-    }
 
     let size_bytes = body.len() as i64;
 
@@ -969,6 +964,40 @@ async fn publish_package(
     // Store metadata
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "hex", &hex_metadata)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
+
+    // Catalog row + the one artifact.uploaded webhook event this publish fires
+    // (#3659, #3939). Not inside `insert_artifact`: its other callers already
+    // register, so emitting there would double-deliver.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "hex",
+        &pkg_name,
+        &pkg_version,
+        size_bytes,
+        &computed_sha256,
+        None,
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await;
 
     info!(
         "Hex publish: {} {} ({}) to repo {}",
@@ -1131,21 +1160,26 @@ async fn list_names(
         {
             // Verbatim pass-through: re-declare the upstream
             // `Content-Encoding` when present (RFC 9110 §8.4, #3260).
-            let (content, content_type, content_encoding) =
-                proxy_helpers::proxy_fetch_capped_encoded(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    "names",
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                )
-                .await?;
+            let proxy_helpers::CachedBody {
+                content,
+                content_type,
+                content_encoding,
+                stale_since,
+            } = proxy_helpers::proxy_fetch_capped_encoded(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                "names",
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
             return Ok(proxy_helpers::forward_verbatim_metadata(
                 content,
                 content_type,
                 "application/json",
                 content_encoding,
+                stale_since,
             ));
         }
     }
@@ -1164,21 +1198,25 @@ async fn list_names(
             state.proxy_service.as_deref(),
             repo.id,
             "names",
-            |bytes, _member_key| async move { parse_upstream_names(&bytes) },
+            |bytes, member_key| async move {
+                parse_member_document(&bytes, &member_key, "names", parse_upstream_names)
+            },
         )
         .await?;
-        for (_key, remote_names) in remote_results {
+        for (_key, remote_names) in remote_results.documents {
             merged.extend(remote_names);
         }
 
         let deduped = merge_and_sort_names(merged);
         let json = serde_json::json!(deduped);
 
-        return Ok(Response::builder()
+        let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&json).unwrap()))
-            .unwrap());
+            .unwrap();
+        remote_results.partial.mark(&mut response);
+        return Ok(response);
     }
 
     let json = serde_json::json!(names);
@@ -1293,21 +1331,26 @@ async fn list_versions(
         {
             // Verbatim pass-through: re-declare the upstream
             // `Content-Encoding` when present (RFC 9110 §8.4, #3260).
-            let (content, content_type, content_encoding) =
-                proxy_helpers::proxy_fetch_capped_encoded(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    "versions",
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                )
-                .await?;
+            let proxy_helpers::CachedBody {
+                content,
+                content_type,
+                content_encoding,
+                stale_since,
+            } = proxy_helpers::proxy_fetch_capped_encoded(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                "versions",
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
             return Ok(proxy_helpers::forward_verbatim_metadata(
                 content,
                 content_type,
                 "application/json",
                 content_encoding,
+                stale_since,
             ));
         }
     }
@@ -1324,21 +1367,25 @@ async fn list_versions(
             state.proxy_service.as_deref(),
             repo.id,
             "versions",
-            |bytes, _member_key| async move { parse_upstream_versions(&bytes) },
+            |bytes, member_key| async move {
+                parse_member_document(&bytes, &member_key, "versions", parse_upstream_versions)
+            },
         )
         .await?;
-        for (_key, remote_versions) in remote_results {
+        for (_key, remote_versions) in remote_results.documents {
             for (name, versions) in remote_versions {
                 merged.entry(name).or_default().extend(versions);
             }
         }
 
         let result = build_versions_response(merged);
-        return Ok(Response::builder()
+        let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&result).unwrap()))
-            .unwrap());
+            .unwrap();
+        remote_results.partial.mark(&mut response);
+        return Ok(response);
     }
 
     let result: Vec<serde_json::Value> = packages
@@ -1546,11 +1593,40 @@ async fn query_local_member_versions(
     Ok(packages)
 }
 
+/// Parse one Remote member's `/names` or `/versions` body for a virtual merge.
+///
+/// A member backed by the real registry (`repo.hex.pm`) serves a gzipped,
+/// signed protobuf there, not the JSON this merge reads (#4629). It publishes
+/// no JSON document at all, so it contributes nothing, exactly like a member
+/// that answers 404. Any other body that does not parse still fails the merge
+/// naming the member (#4192), or is reported missing when the virtual allows
+/// partial merges.
+#[allow(clippy::result_large_err)]
+fn parse_member_document<T: Default>(
+    bytes: &[u8],
+    member_key: &str,
+    resource: &str,
+    parse: fn(&[u8]) -> Result<T, Response>,
+) -> Result<T, Response> {
+    match parse(bytes) {
+        Ok(document) => Ok(document),
+        Err(_) if hex_registry::is_registry_resource(bytes) => {
+            info!(
+                member = member_key,
+                resource,
+                "virtual hex member serves the signed registry, not JSON; it contributes nothing to the merge"
+            );
+            Ok(T::default())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Parse an upstream JSON names response.
 ///
 /// Artifact Keeper hex repos return a JSON array of strings: `["phoenix", "ecto"]`.
-/// If the upstream returns non-JSON (e.g. hex.pm's signed protobuf), parsing
-/// fails gracefully and the member is skipped by `collect_virtual_metadata`.
+/// A body that is not JSON is an error here; [`parse_member_document`] decides
+/// whether that is a registry member contributing nothing or a merge failure.
 #[allow(clippy::result_large_err)]
 fn parse_upstream_names(bytes: &[u8]) -> Result<Vec<String>, Response> {
     serde_json::from_slice::<Vec<String>>(bytes).map_err(|_| {
@@ -1707,6 +1783,21 @@ fn extract_registry_facts_from_tarball(data: &[u8]) -> Result<HexRegistryFacts, 
     })
 }
 
+/// The registry facts a publish must carry (#2904): a tarball whose facts
+/// cannot be read, or that has no `CHECKSUM` member, is refused with the
+/// returned message. A malformed CHECKSUM is already an `Err` from
+/// [`extract_registry_facts_from_tarball`].
+fn publishable_registry_facts(
+    facts: Result<HexRegistryFacts, String>,
+) -> Result<(String, Vec<hex_registry::HexDependency>), String> {
+    let facts = facts.map_err(|e| format!("Invalid hex tarball: {}", e))?;
+    let inner = facts.inner_checksum_hex.ok_or_else(|| {
+        "Invalid hex tarball: no CHECKSUM member; build the package with `mix hex.build`"
+            .to_string()
+    })?;
+    Ok((inner, facts.dependencies))
+}
+
 /// Extract a string value from Erlang term format metadata.
 ///
 /// Hex metadata.config uses Erlang term format like:
@@ -1773,6 +1864,25 @@ fn build_hex_metadata(name: &str, version: &str) -> serde_json::Value {
     })
 }
 
+/// [`build_hex_metadata`] plus the registry facts recorded at publish, which
+/// `release_facts_from_metadata` reads back on the fast path.
+fn build_hex_publish_metadata(
+    name: &str,
+    version: &str,
+    inner_checksum: &str,
+    requirements: &[hex_registry::HexDependency],
+) -> serde_json::Value {
+    let mut metadata = build_hex_metadata(name, version);
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert(
+            "inner_checksum".to_string(),
+            serde_json::json!(inner_checksum),
+        );
+        obj.insert("requirements".to_string(), serde_json::json!(requirements));
+    }
+    metadata
+}
+
 /// Build the JSON publish response.
 fn build_hex_publish_response(repo_key: &str, name: &str, version: &str) -> serde_json::Value {
     serde_json::json!({
@@ -1802,6 +1912,7 @@ fn build_hex_release_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     // -----------------------------------------------------------------------
     // #3718: the signed-registry 500s must not echo the service error
@@ -2179,8 +2290,10 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_registry_facts_without_checksum_member_is_not_fatal() {
-        // Publish must still succeed; the registry re-derives from the bytes.
+    fn test_extract_registry_facts_without_checksum_member_reports_none() {
+        // The parser itself only reports the member as absent: the read-path
+        // backfill (`resolve_release_facts`) needs that distinction for
+        // releases stored before #2904. Refusing it is the publish path's job.
         let metadata = br#"{<<"name">>,<<"a">>}.
 {<<"version">>,<<"1.0.0">>}.
 {<<"requirements">>,[]}.
@@ -2189,6 +2302,57 @@ mod tests {
         let facts = extract_registry_facts_from_tarball(&tar).unwrap();
         assert!(facts.inner_checksum_hex.is_none());
         assert!(facts.dependencies.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // publishable_registry_facts / build_hex_publish_metadata (#2904)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_publishable_registry_facts_rejects_missing_checksum_member() {
+        let metadata = br#"{<<"name">>,<<"a">>}.
+{<<"version">>,<<"1.0.0">>}.
+"#;
+        let tar = build_tar(&[("metadata.config", metadata)]);
+        let err = publishable_registry_facts(extract_registry_facts_from_tarball(&tar))
+            .expect_err("a tarball without CHECKSUM must not be publishable (#2904)");
+        assert!(err.contains("CHECKSUM"), "{err}");
+    }
+
+    #[test]
+    fn test_publishable_registry_facts_rejects_unparseable_facts() {
+        let err = publishable_registry_facts(Err("bad digest".to_string())).unwrap_err();
+        assert_eq!(err, "Invalid hex tarball: bad digest");
+    }
+
+    #[test]
+    fn test_publishable_registry_facts_returns_checksum_and_requirements() {
+        let metadata = br#"{<<"name">>,<<"dep_pkg">>}.
+{<<"version">>,<<"2.1.0">>}.
+{<<"requirements">>,[[{<<"name">>,<<"jason">>},{<<"app">>,<<"jason">>},{<<"optional">>,false},{<<"requirement">>,<<"~> 1.4">>},{<<"repository">>,<<"hexpm">>}]]}.
+"#;
+        let tar = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata),
+        ]);
+        let (inner, deps) =
+            publishable_registry_facts(extract_registry_facts_from_tarball(&tar)).unwrap();
+        assert_eq!(inner, REAL_CHECKSUM);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].package, "jason");
+    }
+
+    #[test]
+    fn test_build_hex_publish_metadata_round_trips_through_fast_path() {
+        let meta = build_hex_publish_metadata("a", "1.0.0", REAL_CHECKSUM, &[]);
+        assert_eq!(meta["format"], "hex");
+        assert_eq!(meta["filename"], "a-1.0.0.tar");
+        assert_eq!(meta["inner_checksum"], REAL_CHECKSUM);
+        assert_eq!(meta["requirements"], serde_json::json!([]));
+        // What publish records is exactly what the registry's fast path reads.
+        let (inner, deps) = release_facts_from_metadata(Some(&meta)).unwrap();
+        assert_eq!(inner.len(), 32);
+        assert!(deps.is_empty());
     }
 
     #[test]
@@ -2961,6 +3125,62 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // parse_member_document (#4629)
+    // -----------------------------------------------------------------------
+
+    fn hexpm_registry_blob() -> Vec<u8> {
+        let payload = hex_registry::encode_names_payload("hexpm", &[]);
+        hex_registry::signed_gzip(payload, vec![0u8; 256]).unwrap()
+    }
+
+    #[test]
+    fn test_parse_member_document_registry_member_contributes_no_names_4629() {
+        let names = parse_member_document(
+            &hexpm_registry_blob(),
+            "hexpm-remote",
+            "names",
+            parse_upstream_names,
+        )
+        .expect("a repo.hex.pm member must not fail the merge");
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn test_parse_member_document_registry_member_contributes_no_versions_4629() {
+        let versions = parse_member_document(
+            &hexpm_registry_blob(),
+            "hexpm-remote",
+            "versions",
+            parse_upstream_versions,
+        )
+        .expect("a repo.hex.pm member must not fail the merge");
+        assert!(versions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_member_document_still_merges_json_members_4629() {
+        let names = parse_member_document(
+            br#"["phoenix","ecto"]"#,
+            "ak-remote",
+            "names",
+            parse_upstream_names,
+        )
+        .unwrap();
+        assert_eq!(names, vec!["phoenix", "ecto"]);
+    }
+
+    #[test]
+    fn test_parse_member_document_unparseable_body_still_fails_the_merge_4192() {
+        let result = parse_member_document(
+            b"<html>502 Bad Gateway</html>",
+            "broken-remote",
+            "names",
+            parse_upstream_names,
+        );
+        assert_eq!(result.unwrap_err().status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // -----------------------------------------------------------------------
     // parse_upstream_versions
     // -----------------------------------------------------------------------
 
@@ -3136,8 +3356,21 @@ mod tests {
 
     use crate::api::handlers::test_db_helpers as tdh;
 
+    /// POST `tar_data` to the fixture repo's publish route as the fixture user.
+    async fn publish_hex(f: &tdh::Fixture, tar_data: Vec<u8>) -> (StatusCode, bytes::Bytes) {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/publish", f.repo_key))
+            .body(axum::body::Body::from(tar_data))
+            .unwrap();
+        tdh::send(f.router_with_auth(super::router()), req).await
+    }
+
     /// #2561: an authenticated hex publish decodes the outer tarball through
     /// the permit-scoped decode (uncontended) and stores the package.
+    ///
+    /// Also #3939: it registers the catalog row and fires exactly one
+    /// `artifact.uploaded` (a hex publish used to fire none).
     #[tokio::test]
     async fn test_hex_publish_succeeds_2561() {
         let Some(f) = tdh::Fixture::setup("local", "hex").await else {
@@ -3146,29 +3379,145 @@ mod tests {
         let metadata = r#"{<<"name">>, <<"pushpkg">>}.
 {<<"version">>, <<"1.2.3">>}.
 "#;
-        let data = metadata.as_bytes();
-        let mut builder = tar::Builder::new(Vec::new());
-        let mut header = tar::Header::new_gnu();
-        header.set_path("metadata.config").unwrap();
-        header.set_size(data.len() as u64);
-        header.set_cksum();
-        builder.append(&header, data).unwrap();
-        let tar_data = builder.into_inner().unwrap();
+        let tar_data = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
 
-        let app = f.router_with_auth(super::router());
-        let req = axum::http::Request::builder()
-            .method("POST")
-            .uri(format!("/{}/publish", f.repo_key))
-            .body(axum::body::Body::from(tar_data))
-            .unwrap();
-        let (status, body) = tdh::send(app, req).await;
+        let mut events = f.state.event_bus.subscribe();
+        let (status, body) = publish_hex(&f, tar_data).await;
         assert!(
             status.is_success(),
             "hex publish must succeed: {} {:?}",
             status,
             String::from_utf8_lossy(&body[..])
         );
+        tdh::assert_one_artifact_uploaded(&mut events, &f.pool, f.repo_id, "pushpkg", "1.2.3")
+            .await;
+        let row = tdh::catalog_row(&f.pool, f.repo_id, "pushpkg").await;
         f.teardown().await;
+        assert!(row.is_some(), "a hex publish must write a packages row");
+    }
+
+    /// #4725: a hosted hex publish must queue a push sync task for a
+    /// subscribed push peer, and a publish arriving as peer replication must
+    /// not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn hex_publish_queues_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "hex").await;
+
+        let metadata = r#"{<<"name">>, <<"pushsync">>}.
+{<<"version">>, <<"1.0.0">>}.
+"#;
+        let tar_data = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
+        let (status, body) = publish_hex(&f, tar_data).await;
+        assert!(
+            status.is_success(),
+            "hex publish must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated publish (as the sync worker sends it) stores the
+        // package but must not queue another task.
+        let metadata = r#"{<<"name">>, <<"pushsync">>}.
+{<<"version">>, <<"2.0.0">>}.
+"#;
+        let tar_data = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/publish", f.repo_key))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(tar_data))
+            .unwrap();
+        let (status, body) = tdh::send(f.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated hex publish must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["pushsync/1.0.0/pushsync-1.0.0.tar".to_string()],
+            "only the client publish queues a push task; the replicated one must not"
+        );
+    }
+
+    /// #2904: a tarball whose CHECKSUM member is missing or malformed can never
+    /// be served by the registry, so publish refuses it with 422 up front and
+    /// leaves NOTHING behind: no artifacts row, no storage object, no event.
+    /// Before, the bytes were stored and the row written, and every later
+    /// `/packages/{name}` read failed with a 500.
+    #[tokio::test]
+    async fn test_hex_publish_rejects_tarball_without_usable_checksum_2904() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        let metadata = r#"{<<"name">>, <<"nosum">>}.
+{<<"version">>, <<"0.1.0">>}.
+"#;
+        let missing = build_tar(&[("metadata.config", metadata.as_bytes())]);
+        let malformed = build_tar(&[
+            ("CHECKSUM", b"not-a-valid-digest"),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
+
+        let mut events = f.state.event_bus.subscribe();
+        let mut outcomes = Vec::new();
+        for tar_data in [missing, malformed] {
+            let (status, body) = publish_hex(&f, tar_data).await;
+            outcomes.push((status, String::from_utf8_lossy(&body).into_owned()));
+        }
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("count artifacts");
+        let stored = walkdir_file_count(&f.storage_dir);
+        let emitted = std::iter::from_fn(|| events.try_recv().ok()).count();
+        f.teardown().await;
+
+        for (status, body) in &outcomes {
+            assert_eq!(*status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+            assert!(body.contains("CHECKSUM"), "the 422 must say why: {body}");
+        }
+        assert_eq!(rows, 0, "a refused publish must not write an artifacts row");
+        assert_eq!(stored, 0, "a refused publish must not store any bytes");
+        assert_eq!(emitted, 0, "a refused publish must not emit any event");
+    }
+
+    /// Regular files under `dir`, recursively (0 when it does not exist).
+    fn walkdir_file_count(dir: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    walkdir_file_count(&p)
+                } else {
+                    1
+                }
+            })
+            .sum()
     }
 
     #[tokio::test]

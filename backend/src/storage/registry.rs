@@ -13,7 +13,7 @@ use crate::error::{AppError, Result};
 use crate::storage::filesystem::FilesystemStorage;
 
 /// A resolved storage location carrying the backend name and base path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageLocation {
     /// Backend identifier (e.g. "filesystem", "s3-primary", "gcs-archive").
     pub backend: String,
@@ -38,6 +38,18 @@ pub struct StorageRegistry {
     /// to the same file through both handles (#3368) — the filesystem
     /// counterpart of the `S3_PREFIX` split.
     filesystem_bucket_root: Option<std::path::PathBuf>,
+    /// Backends that were *configured* but failed to initialize at startup and
+    /// were skipped, keyed by backend name and carrying the configuration
+    /// error that caused the skip (#4530).
+    ///
+    /// This is deliberately distinct from a backend that was never configured:
+    /// an absent name means "not set up on this deployment", while a name here
+    /// means "the operator asked for this backend and its configuration is
+    /// broken". Repositories whose `storage_backend` is one of these would
+    /// otherwise fail every request with a generic 500 `STORAGE_ERROR` naming
+    /// nothing; recording the reason lets [`Self::backend_for`] answer a 503
+    /// that names the backend and the configuration error instead.
+    skipped_backends: HashMap<String, String>,
 }
 
 impl StorageRegistry {
@@ -54,6 +66,7 @@ impl StorageRegistry {
             backends,
             default_backend,
             filesystem_bucket_root: None,
+            skipped_backends: HashMap::new(),
         }
     }
 
@@ -65,11 +78,42 @@ impl StorageRegistry {
         self
     }
 
+    /// The global filesystem storage root (`STORAGE_PATH`), when one was
+    /// supplied via [`Self::with_filesystem_bucket_root`].
+    pub fn filesystem_bucket_root(&self) -> Option<&std::path::Path> {
+        self.filesystem_bucket_root.as_deref()
+    }
+
+    /// Record that `name` was configured but could not be initialized at
+    /// startup, with `error` the configuration error that caused the skip
+    /// (#4530).
+    ///
+    /// The registry has no way to construct the failed backend, so this is
+    /// how the startup skip becomes visible to the request path
+    /// ([`Self::backend_for`] answers 503 naming it) and to `/health`
+    /// ([`Self::skipped_backends`] reports it as degraded) rather than being
+    /// a single WARN nobody reads.
+    pub fn record_skipped_backend(&mut self, name: impl Into<String>, error: impl Into<String>) {
+        self.skipped_backends.insert(name.into(), error.into());
+    }
+
+    /// The backends that were configured but skipped at startup, with the
+    /// configuration error for each (#4530).
+    pub fn skipped_backends(&self) -> &HashMap<String, String> {
+        &self.skipped_backends
+    }
+
     /// Resolve a `StorageLocation` to a concrete backend instance.
     ///
     /// For `"filesystem"` locations a fresh `FilesystemStorage` is created using
     /// the location's path. All other backend names are looked up in the
     /// registry's map of shared instances.
+    ///
+    /// A backend that was configured but skipped at startup (#4530) answers a
+    /// [`AppError::ServiceUnavailable`] naming the backend (the configuration
+    /// error itself stays on `/health` and in the log), so a repository on it
+    /// fails with a 503 that says why instead of a generic 500 `STORAGE_ERROR`. An unknown name that was
+    /// never configured stays a [`AppError::Storage`].
     pub fn backend_for(&self, location: &StorageLocation) -> Result<Arc<dyn StorageBackend>> {
         if location.backend == "filesystem" {
             let fs = FilesystemStorage::new(&location.path);
@@ -77,6 +121,18 @@ impl StorageRegistry {
                 Some(root) => fs.with_bucket_root(root),
                 None => fs,
             }));
+        }
+
+        if self.skipped_backends.contains_key(&location.backend) {
+            // The configuration error itself is NOT in this message: it goes to
+            // every client of the repository, anonymous ones included, and can
+            // name internal endpoints. Operators read it on `/health` and in
+            // the startup ERROR log.
+            return Err(AppError::ServiceUnavailable(format!(
+                "storage backend '{}' is unavailable: it was configured but skipped at startup \
+                 because of a configuration error",
+                location.backend
+            )));
         }
 
         self.backends
@@ -126,6 +182,7 @@ pub fn backend_is_repo_isolated(backend: &str) -> bool {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use axum::http::StatusCode;
     use bytes::Bytes;
 
     /// Minimal mock backend for testing registry lookups.
@@ -447,6 +504,147 @@ mod tests {
             Ok(_) => panic!("expected error"),
         };
         assert!(msg.contains("nonexistent-backend"));
+    }
+
+    // -- #4530: a skipped-at-startup backend must answer 503, not 500 --------
+
+    /// Read the HTTP status and JSON `code` from a `backend_for` error without
+    /// depending on `AppError`'s private mapping, exactly as a client sees
+    /// them. Consumes the error, so it does not need `AppError: Clone`.
+    #[allow(clippy::disallowed_methods)] // STREAMING-EXEMPT: test reads a small, bounded error body
+    async fn status_and_code_of(result: Result<Arc<dyn StorageBackend>>) -> (StatusCode, String) {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        let err = match result {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        let response = err.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        (
+            status,
+            json["code"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// A backend that was configured but skipped at startup resolves to a
+    /// `ServiceUnavailable` (503) whose message names the backend AND the
+    /// configuration error — instead of the generic 500 `STORAGE_ERROR` an
+    /// unregistered name produces. This is the request-path half of #4530:
+    /// a repository on a skipped secondary backend must say why.
+    #[tokio::test]
+    async fn test_backend_for_skipped_backend_is_service_unavailable_4530() {
+        let mut registry = make_registry();
+        registry.record_skipped_backend(
+            "s3",
+            "Configuration error: S3_PUBLIC_ENDPOINT=\"ftp://s3.example.com/sub\" is invalid: \
+             the scheme must be http or https",
+        );
+
+        let loc = StorageLocation {
+            backend: "s3".to_string(),
+            path: "repo/w5b-s3".to_string(),
+        };
+        let result = registry.backend_for(&loc);
+        assert!(result.is_err(), "a skipped backend must not resolve");
+
+        // Inspect the message before the assertion consumes the error.
+        let msg = match &result {
+            Ok(_) => unreachable!(),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("s3"), "message must name the backend: {msg}");
+        assert!(
+            msg.contains("skipped at startup"),
+            "message must say the backend was skipped: {msg}"
+        );
+        assert!(
+            !msg.contains("S3_PUBLIC_ENDPOINT") && !msg.contains("s3.example.com"),
+            "the client-facing message must not carry the configuration error: {msg}"
+        );
+
+        assert_eq!(
+            status_and_code_of(result).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SERVICE_UNAVAILABLE".to_string()
+            ),
+            "a skipped backend must be a 503, not a 500 STORAGE_ERROR (#4530)"
+        );
+    }
+
+    /// The negative control: a name that was NEVER configured still resolves
+    /// to the plain `Storage` error (500), because it is not a startup skip.
+    /// Only a *configured but broken* backend becomes a 503.
+    #[tokio::test]
+    async fn test_backend_for_never_configured_backend_still_storage_error_4530() {
+        let registry = make_registry();
+        let loc = StorageLocation {
+            backend: "azure".to_string(),
+            path: "repo/x".to_string(),
+        };
+        let result = registry.backend_for(&loc);
+        assert!(result.is_err(), "an unregistered backend must not resolve");
+
+        assert_eq!(
+            status_and_code_of(result).await,
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STORAGE_ERROR".to_string()
+            ),
+            "a backend that was never configured must keep its historic 500 mapping"
+        );
+    }
+
+    /// The skipped set is reported (for `/health`) with the error attached, and
+    /// a registered backend is unaffected by another name being skipped.
+    #[test]
+    fn test_skipped_backends_reports_names_and_errors_4530() {
+        let mut registry = make_registry();
+        assert!(
+            registry.skipped_backends().is_empty(),
+            "a healthy registry reports no skipped backends"
+        );
+
+        registry.record_skipped_backend("s3", "S3_PUBLIC_ENDPOINT is invalid");
+        registry.record_skipped_backend("gcs", "GCS_PROJECT_ID not set");
+
+        let skipped = registry.skipped_backends();
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(
+            skipped.get("s3").map(String::as_str),
+            Some("S3_PUBLIC_ENDPOINT is invalid")
+        );
+        assert_eq!(
+            skipped.get("gcs").map(String::as_str),
+            Some("GCS_PROJECT_ID not set")
+        );
+
+        // A *registered* backend still resolves even when a sibling is skipped.
+        let loc = StorageLocation {
+            backend: "s3-primary".to_string(),
+            path: "repo/maven".to_string(),
+        };
+        assert!(
+            registry.backend_for(&loc).is_ok(),
+            "skipping one backend must not break a registered sibling"
+        );
+    }
+
+    /// A later `record_skipped_backend` for the same name replaces the earlier
+    /// error, so a redirect/retry at startup cannot leave two reasons to fight.
+    #[test]
+    fn test_record_skipped_backend_replaces_a_previous_reason_4530() {
+        let mut registry = make_registry();
+        registry.record_skipped_backend("s3", "first reason");
+        registry.record_skipped_backend("s3", "second reason");
+        assert_eq!(registry.skipped_backends().len(), 1);
+        assert_eq!(
+            registry.skipped_backends().get("s3").map(String::as_str),
+            Some("second reason")
+        );
     }
 
     #[tokio::test]
