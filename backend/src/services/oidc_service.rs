@@ -1023,6 +1023,8 @@ mod tests {
             npm_packument_cache_fresh_ttl_secs: 300,
             npm_packument_cache_stale_max_secs: 86_400,
             npm_packument_cache_redis_url: None,
+            npm_packument_cache_age_gated_ttl_secs:
+                crate::services::npm_packument_cache::NPM_PACKUMENT_AGE_GATED_TTL_DEFAULT_SECS,
             npm_attestation_negative_cache_enabled: true,
             npm_attestation_negative_cache_ttl_secs: 86_400,
             pypi_simple_cache_ttl_secs: 60,
@@ -1170,6 +1172,8 @@ mod tests {
             npm_packument_cache_fresh_ttl_secs: 300,
             npm_packument_cache_stale_max_secs: 86_400,
             npm_packument_cache_redis_url: None,
+            npm_packument_cache_age_gated_ttl_secs:
+                crate::services::npm_packument_cache::NPM_PACKUMENT_AGE_GATED_TTL_DEFAULT_SECS,
             npm_attestation_negative_cache_enabled: true,
             npm_attestation_negative_cache_ttl_secs: 86_400,
             pypi_simple_cache_ttl_secs: 60,

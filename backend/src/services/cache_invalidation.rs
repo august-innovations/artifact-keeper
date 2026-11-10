@@ -126,6 +126,9 @@ pub struct CacheInvalidationHandles {
     /// npm computed-packument cache (#2490). `None` when the cache is
     /// disabled; the event is then a no-op on this replica.
     pub npm_packument_cache: Option<Arc<NpmPackumentCache>>,
+    /// Short-TTL cache for age-gated packuments; invalidated alongside
+    /// `npm_packument_cache`.
+    pub npm_age_gated_packument_cache: Option<Arc<NpmPackumentCache>>,
 }
 
 /// Parse one notification payload into an [`InvalidationEvent`].
@@ -171,7 +174,13 @@ pub async fn apply_invalidation_event(
             handles.permission_service.invalidate_cache();
         }
         InvalidationEvent::NpmPackumentInvalidated { repo_keys, package } => {
-            if let Some(cache) = handles.npm_packument_cache.as_ref() {
+            for cache in [
+                handles.npm_packument_cache.as_ref(),
+                handles.npm_age_gated_packument_cache.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 for repo_key in repo_keys {
                     cache.invalidate_package(repo_key, package).await;
                 }
@@ -510,6 +519,7 @@ mod tests {
             repo_miss_cache: Arc::new(RwLock::new(HashMap::new())),
             permission_service: lazy_permission_service(),
             npm_packument_cache: None,
+            npm_age_gated_packument_cache: None,
         }
     }
 

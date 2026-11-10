@@ -1,0 +1,5 @@
+---
+section: Changed
+issues: [#9]
+---
+- **Age-gated npm packuments are cached for 60 seconds instead of recomputed on every request** (#9). A remote repository with the age gate, or a virtual repository with an age-gated member, used to skip the computed-packument cache, so every metadata request, including one that ended in a 304, repeated the member and policy lookups, the age-gate filter, the JSON rewrite and the ETag hash. These repositories now use a separate in-process cache that stores the filtered view for `NPM_PACKUMENT_CACHE_AGE_GATED_TTL_SECS` (default 60) with no stale window. A version that ages past the gate, or a review decision, appears at most one TTL late. Local npm writes and the cross-replica invalidation fanout drop these entries too. Set the variable to `0` to restore per-request computation. Clients of these repositories keep `private, no-cache`.

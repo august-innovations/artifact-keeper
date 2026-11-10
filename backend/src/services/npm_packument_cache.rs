@@ -72,6 +72,12 @@ pub const NPM_PACKUMENT_FRESH_TTL_DEFAULT_SECS: u64 =
 /// when the background refresh keeps failing.
 pub const NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS: u64 = 86_400;
 
+/// Default window for age-gated packuments. An age-gated packument is a
+/// time-dependent view (a version appears once it ages past the threshold), so
+/// it is cached for this long with no stale window: an aged-in version or a
+/// review decision shows up at most this late.
+pub const NPM_PACKUMENT_AGE_GATED_TTL_DEFAULT_SECS: u64 = 60;
+
 /// Soft cap on in-process cache entries, mirroring
 /// [`crate::api::SIGNED_RELEASE_CACHE_MAX_ENTRIES`]. A large install
 /// re-resolve touches ~1k packuments; four variants each (full/corgi x
@@ -1174,6 +1180,25 @@ impl NpmPackumentCache {
                 None => Arc::new(InProcessPackumentCache::new(stale_max)),
             };
         Some(Arc::new(Self::new(backend, fresh_ttl)))
+    }
+
+    /// Build the cache for age-gated packuments, or `None` when the cache is
+    /// disabled or `NPM_PACKUMENT_CACHE_AGE_GATED_TTL_SECS=0`.
+    ///
+    /// In-process only, with the fresh window equal to the expiry, so an entry
+    /// is never served stale: the filtered view a client sees is at most `ttl`
+    /// old. It is a separate instance so its short expiry also bounds memory
+    /// to the packages requested within the last window.
+    pub fn age_gated_from_config(config: &Config) -> Option<Arc<Self>> {
+        if !config.npm_packument_cache_enabled || config.npm_packument_cache_age_gated_ttl_secs == 0
+        {
+            return None;
+        }
+        let ttl = Duration::from_secs(config.npm_packument_cache_age_gated_ttl_secs);
+        Some(Arc::new(Self::new(
+            Arc::new(InProcessPackumentCache::new(ttl)),
+            ttl,
+        )))
     }
 
     /// Look up an entry and classify its freshness.
@@ -2938,5 +2963,38 @@ mod tests {
         config.npm_packument_cache_redis_url = Some("definitely not a redis url".to_string());
         // Must not panic or return None: it degrades to the in-process backend.
         assert!(NpmPackumentCache::from_config(&config).is_some());
+    }
+
+    #[tokio::test]
+    async fn age_gated_from_config_respects_enable_flag_and_zero_ttl() {
+        let mut config = Config::test_config();
+        assert_eq!(
+            config.npm_packument_cache_age_gated_ttl_secs,
+            NPM_PACKUMENT_AGE_GATED_TTL_DEFAULT_SECS
+        );
+        let cache = NpmPackumentCache::age_gated_from_config(&config).expect("on by default");
+        cache.store("k", entry(b"{}")).await;
+        assert_eq!(cache.lookup("k").await.unwrap().1, Freshness::Fresh);
+
+        config.npm_packument_cache_age_gated_ttl_secs = 0;
+        assert!(NpmPackumentCache::age_gated_from_config(&config).is_none());
+
+        config.npm_packument_cache_age_gated_ttl_secs = 60;
+        config.npm_packument_cache_enabled = false;
+        assert!(NpmPackumentCache::age_gated_from_config(&config).is_none());
+    }
+
+    #[tokio::test]
+    async fn age_gated_cache_expires_at_ttl_without_a_stale_window() {
+        let mut config = Config::test_config();
+        config.npm_packument_cache_age_gated_ttl_secs = 1;
+        let cache = NpmPackumentCache::age_gated_from_config(&config).expect("enabled");
+        cache.store("k", entry(b"{}")).await;
+        assert_eq!(cache.lookup("k").await.unwrap().1, Freshness::Fresh);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(
+            cache.lookup("k").await.is_none(),
+            "an age-gated entry must expire at the TTL instead of serving stale"
+        );
     }
 }
