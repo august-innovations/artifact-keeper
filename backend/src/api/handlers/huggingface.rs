@@ -34,6 +34,7 @@ use tracing::info;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
+use crate::services::age_gate_service::AgeGateService;
 use crate::services::proxy_service::UPSTREAM_COMMIT_HEADER;
 
 // ---------------------------------------------------------------------------
@@ -61,10 +62,9 @@ const MAX_PATH_LEN: usize = 2036;
 /// The shared upstream client sets only `connect_timeout` and a per-frame
 /// `read_timeout` (see `services::http_client`), so a model-info endpoint that
 /// trickles bytes has no *total* bound and can stall a file download far longer
-/// than the download itself would take. This fallback exists purely to recover
-/// a metadata header, so it gets its own hard ceiling and gives up quietly
-/// rather than holding the client's file response hostage.
-const COMMIT_SHA_FALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
+/// than the download itself would take. Bound the metadata lookup separately
+/// from the file fetch.
+const COMMIT_SHA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Read-path input validation
@@ -651,10 +651,10 @@ async fn proxy_hf_metadata_json(
     ))
 }
 
-/// Last-resort recovery of upstream's commit sha for `(model_id, revision)`,
-/// read out of the model-info document's `"sha"` field.
+/// Read the upstream commit SHA for `(model_id, revision)` from model info.
+/// Age-gated downloads use it to pin the upstream request before serving.
 ///
-/// **This is a fallback, and only a fallback.** `ProxyService` now captures
+/// For ungated downloads this is a header fallback. `ProxyService` captures
 /// upstream's own `X-Repo-Commit` response header, stores it in the cache
 /// sidecar next to the bytes it describes, and replays it on cache hits and
 /// stale-if-error serves; `build_streaming_response_with_disposition` emits it.
@@ -678,10 +678,8 @@ async fn proxy_hf_metadata_json(
 /// contain the bytes just served - and `huggingface_hub` would then file those
 /// bytes under the wrong snapshot directory.
 ///
-/// Returns `None` when the repo isn't Remote, has no upstream/proxy wired up, or
-/// the fetch fails, times out, or doesn't parse. Never propagates an error:
-/// losing a metadata header degrades `hf download` to its
-/// no-header path, whereas failing the request loses the file.
+/// Returns `None` if the upstream is unavailable or the metadata cannot be
+/// fetched or parsed. An age-gated download requires a valid commit.
 async fn fetch_upstream_commit_sha(
     state: &SharedState,
     repo: &RepoInfo,
@@ -709,15 +707,15 @@ async fn fetch_upstream_commit_sha(
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     );
 
-    // Own deadline, not the shared client's: see `COMMIT_SHA_FALLBACK_TIMEOUT`.
-    let bytes = match tokio::time::timeout(COMMIT_SHA_FALLBACK_TIMEOUT, fetch).await {
+    // Own deadline, not the shared client's: see `COMMIT_SHA_LOOKUP_TIMEOUT`.
+    let bytes = match tokio::time::timeout(COMMIT_SHA_LOOKUP_TIMEOUT, fetch).await {
         Ok(Ok((bytes, _content_type))) => bytes,
         Ok(Err(_response)) => {
             tracing::debug!(
                 repo_key = %repo.key,
                 model_id,
                 revision,
-                "upstream model-info lookup failed; serving the file without X-Repo-Commit"
+                "upstream model-info lookup failed"
             );
             return None;
         }
@@ -726,9 +724,8 @@ async fn fetch_upstream_commit_sha(
                 repo_key = %repo.key,
                 model_id,
                 revision,
-                timeout_secs = COMMIT_SHA_FALLBACK_TIMEOUT.as_secs(),
-                "upstream model-info lookup exceeded its deadline; serving the file \
-                 without X-Repo-Commit"
+                timeout_secs = COMMIT_SHA_LOOKUP_TIMEOUT.as_secs(),
+                "upstream model-info lookup exceeded its deadline"
             );
             return None;
         }
@@ -908,6 +905,44 @@ async fn virtual_member_checksum(
     }
 }
 
+async fn gated_download_commit(
+    state: &SharedState,
+    repo: &RepoInfo,
+    model_id: &str,
+    revision: &str,
+) -> Result<String, Response> {
+    let params = proxy_helpers::age_gate_params(repo);
+    AgeGateService::require_enforceable(&params).map_err(IntoResponse::into_response)?;
+    let unavailable = || proxy_helpers::age_gate_unavailable_response(&repo.key, model_id);
+    let service = state.age_gate_service.as_deref().ok_or_else(unavailable)?;
+    let commit = fetch_upstream_commit_sha(state, repo, model_id, revision)
+        .await
+        .filter(|sha| {
+            sha.len() == 40
+                && sha
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+        .ok_or_else(unavailable)?;
+    let basis = service
+        .download_basis(&params, model_id, &commit, None, true)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    if let Some(blocked) =
+        proxy_helpers::enforce_age_gate(Some(service), &params, model_id, &commit, basis).await?
+    {
+        // A different commit is never a valid substitute for a snapshot.
+        return Err(proxy_helpers::age_gate_blocked_response(
+            blocked.review_id,
+            model_id,
+            &commit,
+            params.age_gate_min_age_days,
+            basis.map(|seen| AgeGateService::package_age_days(seen, chrono::Utc::now())),
+        ));
+    }
+    Ok(commit)
+}
+
 // ---------------------------------------------------------------------------
 // GET /huggingface/{repo_key}/{model_id}/resolve/{revision}/{filename} — Download file
 // ---------------------------------------------------------------------------
@@ -964,6 +999,54 @@ async fn download_file_impl(
     // read and write can never diverge on what they accept (#2915).
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
+    if repo.repo_type == "remote" && repo.age_gate_enabled {
+        if model_id.split('/').count() > 2
+            || model_id.split('/').any(|segment| {
+                segment.is_empty()
+                    || segment == "."
+                    || !segment
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            })
+        {
+            return Err((StatusCode::BAD_REQUEST, "Invalid model ID").into_response());
+        }
+        let commit = gated_download_commit(&state, &repo, &model_id, &revision).await?;
+        let filename = filename
+            .split('/')
+            .map(encode_upstream_revision)
+            .collect::<Vec<_>>()
+            .join("/");
+        let upstream_path = format!("{model_id}/resolve/{commit}/{filename}");
+        let mut response = proxy_helpers::try_remote_or_virtual_download(
+            &state,
+            auth.as_ref(),
+            &repo,
+            &ctx,
+            proxy_helpers::DownloadResponseOpts::new(
+                &upstream_path,
+                proxy_helpers::VirtualLookup::ExactPath(&artifact_path),
+                "application/octet-stream",
+                None,
+            ),
+        )
+        .await?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found").into_response())?;
+        if response
+            .headers()
+            .get(UPSTREAM_COMMIT_HEADER)
+            .is_some_and(|upstream_commit| upstream_commit.as_bytes() != commit.as_bytes())
+        {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "Upstream returned a different commit",
+            )
+                .into_response());
+        }
+        insert_header_if_valid(&mut response, UPSTREAM_COMMIT_HEADER, &commit);
+        return Ok(response);
+    }
 
     // Runtime query rather than `sqlx::query!` so `checksum_sha256` can be read
     // alongside the storage key in a single round trip; this is the same
@@ -2804,6 +2887,89 @@ mod tests {
             .await
             .expect("collect resolve body");
         assert_eq!(&body[..], &payload[..]);
+    }
+
+    #[tokio::test]
+    async fn gated_huggingface_download_ages_the_commit_and_serves_only_that_commit() {
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let commit = "a".repeat(40);
+        Mock::given(method("GET"))
+            .and(wm_path("/api/models/org/model/revision/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": commit,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/org/model/resolve/{commit}/config.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(wm_path("/org/model/resolve/main/config.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = true, \
+             age_gate_mode = 'first_seen', age_gate_min_age_days = 7 WHERE id = $2",
+        )
+        .bind(server.uri())
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .expect("configure the remote");
+        let cache = tempfile::tempdir().expect("cache");
+        let storage = cache.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(f.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy_and_age_gate(f.pool.clone(), storage, proxy);
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let generic = tdh::router_with_auth(
+            crate::api::handlers::repositories::download_router(),
+            state.clone(),
+            auth.clone(),
+        );
+        let generic_uri = format!(
+            "/{}/download/org/model/resolve/main/config.json",
+            f.repo_key
+        );
+        let denied = generic.oneshot(tdh::get(generic_uri)).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let app = tdh::router_with_auth(super::router(), state, auth);
+        let uri = format!("/{}/org/model/resolve/main/config.json", f.repo_key);
+
+        let head = axum::http::Request::head(uri.as_str())
+            .body(Body::empty())
+            .unwrap();
+        let blocked = app.clone().oneshot(head).await.unwrap();
+        assert_eq!(blocked.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+
+        let aged = sqlx::query(
+            "UPDATE age_gate_version_observations SET first_seen_at = NOW() - INTERVAL '8 days' \
+             WHERE repository_id = $1 AND package_name = 'org/model' AND package_version = $2",
+        )
+        .bind(f.repo_id)
+        .bind(&commit)
+        .execute(&f.pool)
+        .await
+        .expect("age the observed commit");
+        assert_eq!(aged.rows_affected(), 1);
+
+        let allowed = app.oneshot(tdh::get(uri)).await.unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(allowed.headers()[UPSTREAM_COMMIT_HEADER], commit.as_str());
+        drop(allowed);
+        f.teardown().await;
     }
 
     /// A Local/hosted HF repo's resolve must carry an ETag and `X-Repo-Commit`

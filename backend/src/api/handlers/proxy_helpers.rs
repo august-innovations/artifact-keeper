@@ -2739,9 +2739,13 @@ where
     let outcome = resolve_members_two_phase::<StreamingFetchResult, Response, _, _, _, _>(
         &members,
         |member| async move {
+            // Hugging Face age gating pins each ref to a commit before
+            // serving. Generic virtual resolution cannot pin a path per member.
+            let can_proxy = proxy_service.is_some()
+                && !(member.age_gate_enabled && member.format == RepositoryFormat::Huggingface);
             match virtual_member_fetch_strategy(
                 &member.repo_type,
-                proxy_service.is_some(),
+                can_proxy,
                 member.upstream_url.is_some(),
             ) {
                 VirtualMemberFetchStrategy::Local => {
@@ -2929,9 +2933,13 @@ where
     let outcome = resolve_members_two_phase::<(Response, Option<Uuid>), Response, _, _, _, _>(
         &members,
         |member| async move {
+            // Hugging Face age gating pins each ref to a commit before
+            // serving. Generic virtual resolution cannot pin a path per member.
+            let can_proxy = proxy_service.is_some()
+                && !(member.age_gate_enabled && member.format == RepositoryFormat::Huggingface);
             match virtual_member_fetch_strategy(
                 &member.repo_type,
-                proxy_service.is_some(),
+                can_proxy,
                 member.upstream_url.is_some(),
             ) {
                 VirtualMemberFetchStrategy::Local => {
@@ -7187,6 +7195,7 @@ pub(crate) fn age_gate_format_from_str(
         "go" => RepositoryFormat::Go,
         "vscode" => RepositoryFormat::Vscode,
         "cargo" => RepositoryFormat::Cargo,
+        "huggingface" => RepositoryFormat::Huggingface,
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
             RepositoryFormat::Npm
         }
@@ -17480,6 +17489,7 @@ mod tests {
             RepositoryFormat::Go,
             RepositoryFormat::Vscode,
             RepositoryFormat::Cargo,
+            RepositoryFormat::Huggingface,
         ] {
             let spec = crate::formats::age_gate_spec(&canonical)
                 .expect("format must carry an age-gate capability spec");

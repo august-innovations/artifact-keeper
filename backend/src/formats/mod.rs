@@ -437,6 +437,15 @@ static CARGO_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
     publish_time_resolver: true,
 };
 
+static HUGGINGFACE_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
+    canonical: RepositoryFormat::Huggingface,
+    label: "huggingface",
+    // The resolve handler evaluates and serves an immutable commit SHA.
+    immutable_coordinates: true,
+    // Git commit timestamps are controlled by the publisher.
+    publish_time_resolver: false,
+};
+
 /// Look up the age-gate capability spec for a repository format, collapsing
 /// protocol aliases (yarn/pnpm speak npm; poetry speaks PyPI) onto the
 /// canonical format that owns their policy. `None` means the format has no
@@ -452,6 +461,7 @@ pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormat
         RepositoryFormat::Go => Some(&GO_AGE_GATE_SPEC),
         RepositoryFormat::Vscode => Some(&VSCODE_AGE_GATE_SPEC),
         RepositoryFormat::Cargo => Some(&CARGO_AGE_GATE_SPEC),
+        RepositoryFormat::Huggingface => Some(&HUGGINGFACE_AGE_GATE_SPEC),
         _ => None,
     }
 }

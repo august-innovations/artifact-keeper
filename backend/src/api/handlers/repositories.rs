@@ -9327,6 +9327,15 @@ pub async fn download_artifact(
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
 
+    if repo.repo_type == RepositoryType::Remote
+        && repo.format == RepositoryFormat::Huggingface
+        && repo.age_gate_enabled
+    {
+        return Err(AppError::Authorization(
+            "Use the Hugging Face endpoint for age-gated downloads".to_string(),
+        ));
+    }
+
     // #3873: a Galaxy API read addressed through this route is answered by the
     // Galaxy handler, not by streaming the upstream's JSON -- whose pagination
     // links are root-relative to the upstream origin and leave the repository.
