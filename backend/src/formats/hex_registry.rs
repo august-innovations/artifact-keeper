@@ -183,6 +183,23 @@ pub fn signed_gzip(payload: Vec<u8>, signature: Vec<u8>) -> std::io::Result<Vec<
     encoder.finish()
 }
 
+/// True when `bytes` is a hex registry resource rather than a JSON document:
+/// the gzipped `Signed` envelope `repo.hex.pm` serves at `/names` and
+/// `/versions`, or that envelope already gunzipped by a transport that
+/// honoured a `Content-Encoding` (#4629).
+///
+/// A virtual's merge reads JSON from its members, so a Remote member backed
+/// by the real registry publishes no document the merge can read. That is the
+/// same shape as a member answering 404, not a failure. Callers try JSON
+/// FIRST and only ask this of a body that did not parse, so a JSON document
+/// that happens to begin with a newline is never mistaken for a protobuf.
+pub fn is_registry_resource(bytes: &[u8]) -> bool {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        return true;
+    }
+    pb::signed::Signed::decode(bytes).is_ok_and(|signed| !signed.payload.is_empty())
+}
+
 // ---------------------------------------------------------------------------
 // Tarball-derived facts
 // ---------------------------------------------------------------------------
@@ -657,6 +674,29 @@ mod tests {
         let signed = pb::signed::Signed::decode(&raw[..]).unwrap();
         let names = pb::names::Names::decode(&signed.payload[..]).unwrap();
         assert_eq!(names.packages[0].name, "dtf_marker");
+    }
+
+    #[test]
+    fn test_is_registry_resource_recognises_the_gzipped_envelope_4629() {
+        let payload = encode_names_payload("hexpm", &[]);
+        let out = signed_gzip(payload, vec![0u8; 256]).unwrap();
+        assert!(is_registry_resource(&out));
+    }
+
+    #[test]
+    fn test_is_registry_resource_recognises_an_already_gunzipped_envelope_4629() {
+        let signed = pb::signed::Signed {
+            payload: encode_names_payload("hexpm", &[]),
+            signature: Some(vec![0u8; 256]),
+        };
+        assert!(is_registry_resource(&signed.encode_to_vec()));
+    }
+
+    #[test]
+    fn test_is_registry_resource_rejects_text_and_empty_bodies_4629() {
+        assert!(!is_registry_resource(b""));
+        assert!(!is_registry_resource(b"not json at all"));
+        assert!(!is_registry_resource(b"<html>502 Bad Gateway</html>"));
     }
 
     // -----------------------------------------------------------------------

@@ -13,6 +13,7 @@
 //! hosted VSIX publishing and its existing clients continue using the legacy
 //! surface.
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -110,29 +111,37 @@ async fn resolve_vscode_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Re
 const GALLERY_METADATA_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// One gallery query can simultaneously retain wire bytes, a parsed JSON tree,
 /// and serialized output, so it charges a multiple of the wire cap against the
-/// shared metadata budget rather than the cap alone.
+/// metadata budget rather than the cap alone.
 ///
-/// The multiple is 1 (wire buffer) + 4 (parsed `serde_json::Value`) + 1
-/// (serialized response). The middle term is the only estimated one: a `Value`
-/// tree costs several times its wire bytes, and 4× is the same allowance the
-/// skeleton path already charges for serde's full materialization — see
-/// [`GALLERY_SKELETON_BUDGET_MULTIPLE`], whose 4× was derived from a measured
-/// document.
+/// The multiple is MEASURED (#3914), not estimated. Real Open VSX
+/// `extensionquery` responses (2026-10, open-vsx.org), parsed into a
+/// `serde_json::Value` and re-serialized under a counting allocator with this
+/// crate's serde_json features, peak at this many times their wire size,
+/// counting the wire buffer itself:
 ///
-/// It was 32×, which is the DOM cost of a document made almost entirely of
-/// one-byte values. The gallery protocol cannot produce that shape: every key
-/// is a fixed protocol name and every value a version string, URL, timestamp
-/// or statistic, and a real Open VSX detail query measures ~400 KiB — a fifth
-/// of the cap above, which is itself the bound this reservation multiplies. A
-/// worst case assumed two levels deep cost 64 MiB per in-flight query and
-/// admitted only 16 concurrent gallery queries against the shared 1 GiB budget,
-/// which is what let anonymous gallery reads park npm packument, PyPI index,
-/// Debian `Packages` and RPM `repomd` fetches behind them (#3255). At 6× the
-/// default budget admits ~85.
-const GALLERY_METADATA_BUDGET_MULTIPLE: usize = 6;
+/// | query                                   | wire     | peak / wire |
+/// |-----------------------------------------|----------|-------------|
+/// | detail, one extension, flags 914        | 25.7 KiB | 8.63×       |
+/// | search page of 50, flags 950            | 201 KiB  | 8.58×       |
+/// | search page of 100, flags 950           | 569 KiB  | 9.11×       |
+/// | full version history, flags 511         | 8.6 MiB  | 9.24×       |
+///
+/// The parsed tree alone is a steady ~6.3× of the wire bytes across shapes,
+/// and the serialized output plus its growth slack adds ~1.3-1.9×. 10× covers
+/// the largest measured peak with headroom for the URL rewrite lengthening
+/// the output. The previous 6× (1 + an assumed 4× tree + 1) undercounted the
+/// tree by half; the 32× before that assumed a document of one-byte values the
+/// protocol cannot produce (#3255).
+const GALLERY_METADATA_BUDGET_MULTIPLE: usize = 10;
 const GALLERY_METADATA_BUDGET_RESERVATION_BYTES: usize =
     GALLERY_METADATA_MAX_BYTES * GALLERY_METADATA_BUDGET_MULTIPLE;
-/// Longest a gallery request queues for its share of the shared
+/// Every gallery reservation is charged against this family's sub-budget as
+/// well as the shared budget (#3914), so a burst of anonymous gallery reads
+/// queues against the gallery's own share and can never hold more of the
+/// shared budget than that share.
+const GALLERY_METADATA_BUDGET_FAMILY: proxy_helpers::MetadataBudgetFamily =
+    proxy_helpers::MetadataBudgetFamily::VscodeGallery;
+/// Longest a gallery request queues for its share of the
 /// buffered-metadata budget before shedding.
 ///
 /// [`proxy_helpers::ProxyMetadataBudget::reserve`] otherwise waits without a
@@ -150,7 +159,7 @@ const GALLERY_QUERY_BODY_MAX_BYTES: usize = 1024 * 1024;
 /// headroom while still refusing an unbounded document.
 const GALLERY_SKELETON_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Skeleton bytes are deserialized into [`GallerySkeletonVersion`] rather than
-/// into a `serde_json::Value` tree, so the 32× DOM allowance behind
+/// into a `serde_json::Value` tree, so the parsed-tree allowance behind
 /// [`GALLERY_METADATA_BUDGET_RESERVATION_BYTES`] does not apply. The honest
 /// peak is still three things resident at once: the wire buffer (up to the
 /// cap), serde's full materialization of every version's `properties` into
@@ -224,6 +233,12 @@ const GALLERY_VERSIONS_PER_CHANNEL: usize = 30;
 /// many extensions are in flight so a client query cannot fan out into
 /// simultaneous upstream requests and budget reservations without limit.
 const GALLERY_COMPOSITION_CONCURRENCY: usize = 4;
+/// Peak gallery-family reservation held at once by ONE request: a full-width
+/// composition's concurrent skeleton fetches. The gallery sub-budget's default
+/// is floored here so a lone composed response never sheds against itself on
+/// a small shared budget (#3914).
+pub(crate) const GALLERY_PEAK_REQUEST_RESERVATION_BYTES: usize =
+    GALLERY_COMPOSITION_CONCURRENCY * GALLERY_SKELETON_BUDGET_RESERVATION_BYTES;
 /// Composed responses admitted at once.
 ///
 /// A composed page accumulates during the fan-out, before it can be charged
@@ -295,6 +310,104 @@ const GALLERY_SYNTHESIZED_ASSET_TYPES: [&str; 4] = [
 /// protocol round-trip" rule goproxy applies to `.zip` over `.mod`/`.info`.
 const GALLERY_VSIX_ASSET_TYPE: &str = "Microsoft.VisualStudio.Services.VSIXPackage";
 
+/// The gallery asset types that are display metadata (#4365 item 4): what
+/// VS Code and Open VSX fetch while rendering a listing or verifying a
+/// download, never code the editor runs. Only these stream unscanned on a
+/// repository that scans on proxy. The signature archive is listed because a
+/// client checks the package against it; it is not executable either.
+const GALLERY_DISPLAY_ASSET_TYPES: [&str; 8] = [
+    "Microsoft.VisualStudio.Code.Manifest",
+    "Microsoft.VisualStudio.Services.Content.Details",
+    "Microsoft.VisualStudio.Services.Content.Changelog",
+    "Microsoft.VisualStudio.Services.Content.License",
+    "Microsoft.VisualStudio.Services.Icons.Default",
+    "Microsoft.VisualStudio.Services.Icons.Small",
+    "Microsoft.VisualStudio.Services.VsixManifest",
+    "Microsoft.VisualStudio.Services.VsixSignature",
+];
+
+/// Prefix of a language pack's per-language translation asset type
+/// (`Microsoft.VisualStudio.Code.Translation.de`), display metadata
+/// (#4365 item 4).
+const GALLERY_TRANSLATION_ASSET_PREFIX: &str = "Microsoft.VisualStudio.Code.Translation.";
+
+/// What a requested gallery asset is served as (#4365 item 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GalleryAssetKind {
+    /// The extension package: scanned when the repository scans on proxy,
+    /// and counted as a download.
+    Package,
+    /// One of [`GALLERY_DISPLAY_ASSET_TYPES`]: streamed.
+    Display,
+    /// Anything else: refused (404) when the repository scans on proxy,
+    /// because it cannot be told apart from the package by name alone.
+    Other,
+}
+
+/// The canonical `(cache_key, scannable)` decision for a gallery asset
+/// (#4365 item 1): cached under `gallery/{publisher}/{name}/{version}/{platform}/{leaf}`
+/// (each segment percent-encoded), scannable exactly when it is the package.
+/// The decision is the asset type's, not the file name's, so it is passed in
+/// as `kind` from [`classify_gallery_asset_type`].
+fn gallery_asset_serve_key(
+    (publisher, name, version, target_platform): (&str, &str, &str, &str),
+    leaf: &str,
+    kind: GalleryAssetKind,
+) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::proxy_serve_key(
+        &format!(
+            "gallery/{}/{}/{}/{}/{leaf}",
+            urlencoding::encode(publisher),
+            urlencoding::encode(name),
+            urlencoding::encode(version),
+            urlencoding::encode(target_platform),
+        ),
+        |_| kind == GalleryAssetKind::Package,
+    )
+}
+
+/// Classify a requested gallery asset type and return the spelling it is
+/// fetched and cached under (#4365 item 4).
+///
+/// Open VSX and the Marketplace match asset types case-insensitively, so an
+/// exact-case comparison let `microsoft.visualstudio.services.vsixpackage`
+/// stream the package unscanned as a "display" asset. A known type is matched
+/// ignoring ASCII case and mapped to its canonical spelling, so every
+/// capitalisation shares one upstream URL, one cache entry and one decision.
+/// An unknown type keeps the requested spelling and is [`GalleryAssetKind::Other`].
+///
+/// Language-pack translations (`Microsoft.VisualStudio.Code.Translation.<lang>`,
+/// JSON strings VS Code renders) are display metadata too; the prefix is
+/// canonicalized and the language id kept as requested.
+fn classify_gallery_asset_type(asset_type: &str) -> (Cow<'_, str>, GalleryAssetKind) {
+    if asset_type.eq_ignore_ascii_case(GALLERY_VSIX_ASSET_TYPE) {
+        return (
+            Cow::Borrowed(GALLERY_VSIX_ASSET_TYPE),
+            GalleryAssetKind::Package,
+        );
+    }
+    if let Some(known) = GALLERY_DISPLAY_ASSET_TYPES
+        .iter()
+        .find(|known| asset_type.eq_ignore_ascii_case(known))
+    {
+        return (Cow::Borrowed(known), GalleryAssetKind::Display);
+    }
+    let prefix_len = GALLERY_TRANSLATION_ASSET_PREFIX.len();
+    if asset_type.len() > prefix_len
+        && asset_type.is_char_boundary(prefix_len)
+        && asset_type[..prefix_len].eq_ignore_ascii_case(GALLERY_TRANSLATION_ASSET_PREFIX)
+    {
+        return (
+            Cow::Owned(format!(
+                "{GALLERY_TRANSLATION_ASSET_PREFIX}{}",
+                &asset_type[prefix_len..]
+            )),
+            GalleryAssetKind::Display,
+        );
+    }
+    (Cow::Borrowed(asset_type), GalleryAssetKind::Other)
+}
+
 const DEFAULT_TARGET_PLATFORM: &str = "universal";
 
 #[derive(serde::Deserialize)]
@@ -320,13 +433,19 @@ struct GalleryAssetSource<'a> {
     /// [`proxy_gallery_asset`] does not re-run [`gallery_upstream`]'s
     /// `SELECT is_public` on the way to it (#3255).
     gallery_url: &'a str,
-    /// Are these bytes the extension PACKAGE (a `.vsix`)?
+    /// What these bytes are (#4365 item 4): the extension PACKAGE (a
+    /// `.vsix`), an allowlisted display asset, or an unknown asset type.
     ///
     /// Selects the scan-on-proxy gate in [`proxy_gallery_asset`]. Only the
-    /// package is code that runs in the developer's editor; the gallery's
-    /// other assets (icon, manifest, details/README, changelog) are display
-    /// metadata the client renders.
-    is_package: bool,
+    /// package is code that runs in the developer's editor; the allowlisted
+    /// assets (icon, manifest, details/README, changelog, license) are display
+    /// metadata the client renders, and an unknown type is refused while the
+    /// repository scans on proxy.
+    kind: GalleryAssetKind,
+    /// The shared helper's scan decision for this asset's cache key (#4365
+    /// item 1): what the gate is chosen on. `kind` only separates display
+    /// metadata (no policy read) from an unknown type (404 while scanning).
+    scannable: bool,
 }
 
 /// Parsed gallery metadata plus the reservation that covers the simultaneous
@@ -335,7 +454,7 @@ struct GalleryAssetSource<'a> {
 /// upstream read completes.
 struct BufferedGalleryQuery {
     value: serde_json::Value,
-    _budget_permit: tokio::sync::OwnedSemaphorePermit,
+    _budget_permit: proxy_helpers::MetadataBudgetPermit,
 }
 
 fn unsupported_gallery_repo_type(repo: &RepoInfo) -> Response {
@@ -563,9 +682,24 @@ fn is_safe_gallery_segment(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+/// A gallery coordinate a CLIENT sent (#4365 item 3): [`is_safe_gallery_segment`]
+/// plus the shared client-path rule
+/// ([`reject_ambiguous_client_path`](crate::services::proxy_service::reject_ambiguous_client_path)),
+/// so a `;`, a `%` that is not a valid `%XX` escape or a raw space is refused
+/// like a `?` or `#`. Each of these used to be percent-encoded into the
+/// upstream URL and cache key, giving one more spelling of a coordinate. No
+/// publisher id, extension name, version, platform or asset type contains
+/// them. Values read from upstream metadata keep the narrower
+/// [`is_safe_gallery_segment`] rule, so an odd upstream listing is not
+/// refused wholesale.
+fn is_safe_gallery_request_segment(value: &str) -> bool {
+    is_safe_gallery_segment(value)
+        && crate::services::proxy_service::reject_ambiguous_client_path(value, false).is_ok()
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_gallery_request_segment(value: &str) -> Result<(), Response> {
-    if is_safe_gallery_segment(value) {
+    if is_safe_gallery_request_segment(value) {
         Ok(())
     } else {
         Err((StatusCode::BAD_REQUEST, "Invalid VS Code gallery path").into_response())
@@ -823,7 +957,7 @@ async fn post_gallery_query(
     upstream_url: &str,
     body: Bytes,
     limits: proxy_helpers::MetadataWorkingSetLimits,
-) -> Result<Option<(Bytes, tokio::sync::OwnedSemaphorePermit)>, Response> {
+) -> Result<Option<(Bytes, proxy_helpers::MetadataBudgetPermit)>, Response> {
     // Validate client input before it is eligible to reach an upstream. This
     // also makes the contract explicit: the gateway forwards JSON semantics,
     // not arbitrary POST bytes.
@@ -881,6 +1015,7 @@ async fn fetch_gallery_query_bounded(
             max_bytes: GALLERY_METADATA_MAX_BYTES,
             reservation_bytes: GALLERY_METADATA_BUDGET_RESERVATION_BYTES,
             reservation_wait: Some(GALLERY_BUDGET_RESERVATION_WAIT),
+            family: Some(GALLERY_METADATA_BUDGET_FAMILY),
         },
     )
     .await?
@@ -1351,6 +1486,7 @@ async fn fetch_gallery_skeleton(
             max_bytes: GALLERY_SKELETON_MAX_BYTES,
             reservation_bytes: GALLERY_SKELETON_BUDGET_RESERVATION_BYTES,
             reservation_wait: Some(GALLERY_BUDGET_RESERVATION_WAIT),
+            family: Some(GALLERY_METADATA_BUDGET_FAMILY),
         },
     )
     .await?
@@ -1742,6 +1878,7 @@ async fn serve_composed_gallery_response(
     let _budget_permit = proxy_helpers::reserve_metadata_budget_bounded(
         GALLERY_COMPOSITION_BUDGET_RESERVATION_BYTES,
         Some(GALLERY_BUDGET_RESERVATION_WAIT),
+        Some(GALLERY_METADATA_BUDGET_FAMILY),
     )
     .await?;
     render_gallery_response(&mut composed, base_url, repo_key)
@@ -2548,12 +2685,10 @@ async fn gallery_vspackage(
         urlencoding::encode(&version),
         urlencoding::encode(target_platform.as_ref()),
     );
-    let cache_path = format!(
-        "gallery/{}/{}/{}/{}/vspackage",
-        urlencoding::encode(&publisher),
-        urlencoding::encode(&name),
-        urlencoding::encode(&version),
-        urlencoding::encode(target_platform.as_ref()),
+    let key = gallery_asset_serve_key(
+        (&publisher, &name, &version, target_platform.as_ref()),
+        "vspackage",
+        GalleryAssetKind::Package,
     );
     let upstream_asset_url = format!(
         "{}/{}",
@@ -2569,10 +2704,11 @@ async fn gallery_vspackage(
     };
     let source = GalleryAssetSource {
         upstream_url: &upstream_asset_url,
-        cache_path: &cache_path,
+        cache_path: &key.cache_key,
         default_content_type: "application/vsix",
         gallery_url: upstream_url,
-        is_package: true,
+        kind: GalleryAssetKind::Package,
+        scannable: key.scannable,
     };
     // The `vspackage` route is the extension package itself, so it always
     // counts (#3649).
@@ -2592,10 +2728,12 @@ async fn gallery_asset(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
+    let (asset_type, kind) = classify_gallery_asset_type(&asset_type);
+    let asset_type: &str = &asset_type;
     if repo.repo_type == RepositoryType::Local {
         gallery_gate(&state.db, &repo).await?;
         // A hosted version advertises only the package.
-        if asset_type != GALLERY_VSIX_ASSET_TYPE {
+        if kind != GalleryAssetKind::Package {
             return Err((StatusCode::NOT_FOUND, "Asset not found").into_response());
         }
         return hosted_vsix_redirect(&repo_key, &publisher, &name, &version);
@@ -2607,7 +2745,7 @@ async fn gallery_asset(
         name.as_str(),
         version.as_str(),
         target_platform.as_ref(),
-        asset_type.as_str(),
+        asset_type,
     ] {
         validate_gallery_request_segment(segment)?;
     }
@@ -2617,16 +2755,13 @@ async fn gallery_asset(
         &publisher,
         &name,
         &version,
-        &asset_type,
+        asset_type,
         target_platform.as_ref(),
     )?;
-    let cache_path = format!(
-        "gallery/{}/{}/{}/{}/asset-{:x}",
-        urlencoding::encode(&publisher),
-        urlencoding::encode(&name),
-        urlencoding::encode(&version),
-        urlencoding::encode(target_platform.as_ref()),
-        Sha256::digest(asset_type.as_bytes()),
+    let key = gallery_asset_serve_key(
+        (&publisher, &name, &version, target_platform.as_ref()),
+        &format!("asset-{:x}", Sha256::digest(asset_type.as_bytes())),
+        kind,
     );
     let coordinate = GalleryAssetCoordinate {
         repo_key: &repo_key,
@@ -2637,17 +2772,18 @@ async fn gallery_asset(
     };
     let source = GalleryAssetSource {
         upstream_url: &asset_url,
-        cache_path: &cache_path,
+        cache_path: &key.cache_key,
         default_content_type: "application/octet-stream",
         gallery_url: upstream_url,
-        is_package: asset_type == GALLERY_VSIX_ASSET_TYPE,
+        kind,
+        scannable: key.scannable,
     };
     // #3649: this route serves BOTH the extension package and the gallery
     // metadata assets VS Code fetches while rendering a listing (manifest,
     // details, icon). Only the package is a download; passing `None` for the
     // rest keeps an icon fetch from inflating the count, the same way nuget's
     // `proxy_v3_flatcontainer` passes `None` on its version-list arm.
-    let download_ctx = source.is_package.then_some(&ctx);
+    let download_ctx = (kind == GalleryAssetKind::Package).then_some(&ctx);
     proxy_gallery_asset(&state, &repo, &coordinate, &source, download_ctx).await
 }
 
@@ -2723,13 +2859,20 @@ async fn proxy_gallery_asset(
     //
     // Repositories that have not enabled scan-on-proxy skip this entirely and
     // keep the untouched streaming behavior.
-    if source.is_package
-        && crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-            .is_proxy_scan_enabled(repo.id)
-            .await
-            .unwrap_or(false)
-    {
-        let (action, severity_gate) = proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
+    //
+    // #4365 item 4: only the allowlisted display types skip the policy read.
+    // On a repository that scans on proxy an asset type that is neither the
+    // package nor on the allowlist is refused: by name alone it cannot be told
+    // apart from the package an upstream would serve for it.
+    let scan = if source.kind == GalleryAssetKind::Display {
+        None
+    } else {
+        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+    };
+    if let Some((action, severity_gate)) = scan {
+        if !source.scannable {
+            return Err((StatusCode::NOT_FOUND, "Asset not found").into_response());
+        }
         return serve_scanned_gallery_package(
             state,
             proxy,
@@ -2752,6 +2895,7 @@ async fn proxy_gallery_asset(
         source.cache_path,
         source.default_content_type,
         RepositoryFormat::Vscode,
+        ctx.is_some_and(|c| c.is_head),
     )
     .await?;
     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -2813,16 +2957,17 @@ fn build_scanned_gallery_response(
         .expect("valid scanned VSIX response")
 }
 
-/// Inline scan-and-block for a proxied VSIX (#3254).
+/// Inline scan-and-block for a proxied VSIX (#3254), on the generic gate
+/// ([`proxy_helpers::serve_scanned_proxy_file`], #4098).
 ///
 /// Runs ONLY when scan-on-proxy is enabled; the caller keeps the untouched
-/// streaming path otherwise. Flow mirrors npm and PyPI exactly: buffered capped
-/// fetch (cache-first, so a repeat pull is answered from the proxy cache with
-/// no upstream hit) -> content digest -> the shared digest-keyed verdict gate
-/// -> serve / 403 blocked / 423 locked per the repo's fail-open/closed action.
+/// streaming path otherwise. Same flow as npm and PyPI: buffered capped fetch
+/// (cache-first) -> content digest -> the shared digest-keyed verdict gate ->
+/// serve / 403 blocked / 423 locked per the repo's fail-open/closed action.
 ///
-/// The identity is [`ProxyScanIdentity::NotApplicable`]: a VSIX is a zip whose
-/// contents the CVE engine catalogs directly, and there is no
+/// The identity is [`proxy_helpers::ProxyScanIdentity::NotApplicable`]: a
+/// VSIX is a zip whose contents the CVE engine catalogs
+/// directly, and there is no
 /// [`crate::services::scanner_service::ComponentEcosystem`] to pin a
 /// `publisher.extension@version` coordinate to, so this format supplies no
 /// component to grade. That is the pre-#3003 posture the gate already
@@ -2839,141 +2984,94 @@ async fn serve_scanned_gallery_package(
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
 ) -> Result<Response, Response> {
     let filename = build_vsix_filename(coordinate.publisher, coordinate.name, coordinate.version);
-    let gated_repo = proxy_helpers::build_remote_repo_with_format(
-        repo.id,
-        coordinate.repo_key,
-        source.upstream_url,
-        RepositoryFormat::Vscode,
-    );
-    let (bytes, content_type, content_encoding) = match proxy
-        .fetch_artifact_with_cache_path_capped(
-            &gated_repo,
-            source.upstream_url,
-            source.cache_path,
-            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
-        )
-        .await
-    {
-        Ok(triple) => triple,
-        Err(error) if proxy_helpers::is_over_cap_error(&error) => {
-            // Over the byte cap: never buffer unbounded. Fail-closed withholds;
-            // fail-open falls back to the streaming path, loudly.
-            return match crate::services::proxy_scan_service::decide_inconclusive(action) {
-                crate::services::proxy_scan_service::InconclusiveOutcome::Locked => {
-                    tracing::warn!(
-                        repo_id = %repo.id, file = %filename,
-                        "proxied VSIX exceeds scan byte cap; fail-closed -> 423"
-                    );
-                    Err(proxy_helpers::scan_pending_locked_response(&filename))
-                }
-                crate::services::proxy_scan_service::InconclusiveOutcome::ServePending => {
-                    tracing::warn!(
-                        repo_id = %repo.id, file = %filename,
-                        "proxied VSIX exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
-                    );
-                    let mut response =
-                        proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
-                            proxy,
-                            repo.id,
-                            coordinate.repo_key,
-                            source.upstream_url,
-                            source.upstream_url,
-                            source.cache_path,
-                            source.default_content_type,
-                            RepositoryFormat::Vscode,
-                        )
-                        .await?;
-                    if let Some(ctx) = ctx {
-                        proxy_helpers::record_proxy_download(
-                            state,
-                            repo.id,
-                            coordinate.repo_key,
-                            source.cache_path,
-                            ctx,
-                        )
-                        .await;
-                    }
-                    response
-                        .headers_mut()
-                        .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
-                    Ok(response)
-                }
-            };
-        }
-        Err(error) => return Err(error.into_response()),
-    };
-
-    let digest = proxy_helpers::sha256_hex(&bytes);
-    let synthetic = vscode_synthetic_artifact(repo.id, &filename, &digest, bytes.len() as i64);
-    match proxy_helpers::gate_proxy_scan_serve(
-        state,
-        repo.id,
-        &filename,
-        &digest,
-        synthetic,
-        &bytes,
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id: repo.id,
+        repo_key: coordinate.repo_key,
+        fetch_base: source.upstream_url,
+        format: RepositoryFormat::Vscode,
+        source_path: source.upstream_url,
+        cache_path: source.cache_path,
+        filename: &filename,
         action,
         severity_gate,
-        proxy_helpers::ProxyScanIdentity::NotApplicable,
-        proxy_helpers::ProxyScanMode::File,
-    )
-    .await
-    {
-        proxy_helpers::ProxyScanServeOutcome::Deny(response) => Err(response),
-        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => {
-            if let Some(ctx) = ctx {
-                proxy_helpers::record_proxy_download(
-                    state,
-                    repo.id,
-                    coordinate.repo_key,
-                    source.cache_path,
-                    ctx,
-                )
-                .await;
-            }
-            Ok(build_scanned_gallery_response(
-                &filename,
-                bytes,
-                content_type,
-                content_encoding.as_deref(),
-                source.default_content_type,
-                &digest,
-                pending,
-            ))
-        }
-    }
+        ctx,
+    };
+    let package = VscodeScannedPackage {
+        proxy,
+        default_content_type: source.default_content_type,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &package).await
 }
 
-/// The scan identity for buffered VSIX bytes. The filename already encodes the
-/// full `publisher.extension-version.vsix` coordinate, which is what the
-/// proxy-scan listing renders; `version` stays `None` for the same reason npm's
-/// synthetic artifact leaves it unset, and the storage key is empty because
-/// nothing local owns these bytes.
-fn vscode_synthetic_artifact(
-    repo_id: uuid::Uuid,
-    filename: &str,
-    digest: &str,
-    size: i64,
-) -> crate::models::artifact::Artifact {
-    let now = Utc::now();
-    crate::models::artifact::Artifact {
-        id: uuid::Uuid::new_v4(),
-        repository_id: repo_id,
-        path: filename.to_string(),
-        name: filename.to_string(),
-        version: None,
-        size_bytes: size,
-        checksum_sha256: digest.to_string(),
-        checksum_md5: None,
-        checksum_sha1: None,
-        content_type: "application/vsix".to_string(),
-        storage_key: String::new(),
-        is_deleted: false,
-        uploaded_by: None,
-        quarantine_status: None,
-        quarantine_until: None,
-        created_at: now,
-        updated_at: now,
+/// The VS Code half of the generic proxy scan gate. The wrapper records the
+/// download on both serve arms, including
+/// [`proxy_helpers::ScannedProxyFile::serve_unscanned_stream`].
+struct VscodeScannedPackage<'a> {
+    proxy: &'a crate::services::proxy_service::ProxyService,
+    default_content_type: &'a str,
+}
+
+#[async_trait::async_trait]
+impl proxy_helpers::ScannedProxyFile for VscodeScannedPackage<'_> {
+    const LABEL: &'static str = "vsix";
+
+    /// The filename already encodes the full `publisher.extension-version.vsix`
+    /// coordinate, which is what the proxy-scan listing renders; the version
+    /// stays `None` for the same reason npm's synthetic artifact leaves it
+    /// unset.
+    fn synthetic_content_type(_filename: &str) -> String {
+        "application/vsix".to_string()
+    }
+
+    /// No coordinate to pin: a VSIX is a zip the CVE engine catalogs directly,
+    /// and no `ComponentEcosystem` names a `publisher.extension@version`.
+    fn identity(
+        &self,
+        _req: &proxy_helpers::ScannedProxyRequest<'_>,
+        _bytes: &Bytes,
+        _digest: &str,
+    ) -> proxy_helpers::ProxyScanIdentity {
+        proxy_helpers::ProxyScanIdentity::NotApplicable
+    }
+
+    async fn serve_unscanned_stream(
+        &self,
+        _state: &SharedState,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+    ) -> Result<Response, Response> {
+        // UNRECORDED-PROXY-SERVE: counted by the caller,
+        // `proxy_helpers::serve_scanned_proxy_file`, which records this
+        // fail-open fallback after it resolves (#4098). Needed because the
+        // #3446 gate attributes this call to the impl method around it.
+        proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+            self.proxy,
+            req.repo_id,
+            req.repo_key,
+            req.fetch_base,
+            req.source_path,
+            req.cache_path,
+            self.default_content_type,
+            RepositoryFormat::Vscode,
+            req.is_head(),
+        )
+        .await
+    }
+
+    fn scanned_response(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        body: proxy_helpers::ScannedProxyBody,
+        pending: bool,
+    ) -> Response {
+        build_scanned_gallery_response(
+            req.filename,
+            body.bytes,
+            body.content_type,
+            body.content_encoding.as_deref(),
+            self.default_content_type,
+            &body.digest,
+            pending,
+        )
     }
 }
 
@@ -3605,7 +3703,11 @@ async fn virtual_gallery_page(
     body: &Bytes,
 ) -> Result<serde_json::Value, Response> {
     let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-    let members = proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members).await;
+    // Fallible (#4308): this AGGREGATES the filtered set into one page, so the
+    // flattened empty set would render as "this gallery has no extensions"
+    // whenever the visibility query fails. A failed query is a server error.
+    let members =
+        proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members).await?;
     let request = serde_json::from_slice::<GalleryQueryRequest>(body).ok();
     let flags = request
         .as_ref()
@@ -3813,12 +3915,185 @@ fn legacy_download_upstream_path(
     for segment in [publisher, name, version] {
         validate_gallery_request_segment(segment)?;
     }
-    Ok(format!(
-        "extensions/{}/{}/{}/download",
-        urlencoding::encode(publisher),
-        urlencoding::encode(name),
-        urlencoding::encode(version),
+    // #4365 item 1: also the legacy route's proxy-cache key, so it goes
+    // through the shared helper (the route serves only the package).
+    Ok(
+        crate::services::proxy_service::route_package_serve_key(&format!(
+            "extensions/{}/{}/{}/download",
+            urlencoding::encode(publisher),
+            urlencoding::encode(name),
+            urlencoding::encode(version),
+        ))
+        .cache_key,
+    )
+}
+
+/// The coordinate of one legacy `/extensions/.../download` VSIX request.
+struct LegacyVsixRequest<'a> {
+    /// Upstream path, also the proxy-cache key the streaming route uses.
+    upstream_path: &'a str,
+    filename: &'a str,
+    ctx: &'a crate::api::middleware::download_telemetry::DownloadContext,
+}
+
+/// The legacy route's scanned Remote serve (#4099): the gallery's
+/// [`VscodeScannedPackage`] over the legacy upstream path, cached under the
+/// same key the streaming route commits to.
+async fn serve_scanned_legacy_vsix(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    legacy: &LegacyVsixRequest<'_>,
+    (action, severity_gate): (
+        crate::services::proxy_scan_service::ProxyScanAction,
+        crate::services::proxy_scan_service::ProxySeverityGate,
+    ),
+) -> Result<Response, Response> {
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: RepositoryFormat::Vscode,
+        source_path: legacy.upstream_path,
+        cache_path: legacy.upstream_path,
+        filename: legacy.filename,
+        action,
+        severity_gate,
+        ctx: Some(legacy.ctx),
+    };
+    let package = VscodeScannedPackage {
+        proxy,
+        default_content_type: "application/octet-stream",
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &package).await
+}
+
+/// The legacy route's Virtual walk with scan-on-proxy (#4099).
+///
+/// `None` when no member the caller may read has scanning enabled under the
+/// stricter-of-two policy: the caller then takes the untouched resolver.
+/// Otherwise members are walked in strict priority order. Runs of members
+/// that do not scan (hosted members, unscanned remotes) go through the shared
+/// resolver exactly as before; each scanning Remote member is served through
+/// the generic gate under its own context, where a 403 (vulnerable), 409
+/// (quarantine hold) or 423 (inconclusive, fail-closed) is definitive and any
+/// other failure falls through to the next member — so neither a
+/// lower-priority remote can shadow a hosted copy nor an unscanned path serve
+/// a scanning member's bytes.
+async fn serve_scanned_legacy_virtual_vsix(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    virtual_id: uuid::Uuid,
+    legacy: &LegacyVsixRequest<'_>,
+    extension_id: &str,
+    version: &str,
+) -> Option<Result<Response, Response>> {
+    let proxy = state.proxy_service.as_deref()?;
+    let members = match proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_id).await
+    {
+        Ok(members) => members,
+        Err(resp) => return Some(Err(resp)),
+    };
+    // One batched read for the virtual and its Remote members; an unreadable
+    // config fails the walk closed with a 503 (#4365 item 5).
+    let policies =
+        match proxy_helpers::virtual_member_scan_policies(&state.db, virtual_id, &members).await {
+            Ok(policies) => policies,
+            Err(resp) => return Some(Err(resp)),
+        };
+    if policies.iter().all(Option::is_none) {
+        return None;
+    }
+
+    let mut failures = proxy_helpers::MemberWalkFailures::default();
+    let mut unscanned = Vec::new();
+    for (member, policy) in members.into_iter().zip(policies) {
+        let Some(policy) = policy else {
+            unscanned.push(member);
+            continue;
+        };
+        let run = std::mem::take(&mut unscanned);
+        if let Some(served) = failures.run_answer(
+            resolve_legacy_vsix_unscanned(state, proxy, run, legacy, extension_id, version).await,
+        ) {
+            return Some(served);
+        }
+        let upstream_url = member.upstream_url.as_deref().unwrap_or_default();
+        match serve_scanned_legacy_vsix(
+            state,
+            proxy,
+            member.id,
+            &member.key,
+            upstream_url,
+            legacy,
+            policy,
+        )
+        .await
+        {
+            Ok(resp) => return Some(Ok(resp)),
+            // 403 vulnerable / 409 quarantine hold / 423 inconclusive are this
+            // member's verdict on bytes it holds: final, never a miss.
+            Err(resp)
+                if proxy_helpers::is_member_policy_block_response(&resp)
+                    || resp.status() == StatusCode::LOCKED =>
+            {
+                return Some(Err(resp))
+            }
+            Err(resp) => {
+                failures.note(&resp);
+                tracing::debug!(
+                    member_key = %member.key, status = %resp.status(),
+                    "scanned legacy VSIX member did not serve; trying next member"
+                );
+            }
+        }
+    }
+    Some(failures.finish(
+        resolve_legacy_vsix_unscanned(state, proxy, unscanned, legacy, extension_id, version).await,
     ))
+}
+
+/// One run of non-scanning members through the shared resolver. `None` is a
+/// miss (try the next member); a hit or a member's own policy block is final.
+async fn resolve_legacy_vsix_unscanned(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    members: Vec<crate::models::repository::Repository>,
+    legacy: &LegacyVsixRequest<'_>,
+    extension_id: &str,
+    version: &str,
+) -> Option<Result<Response, Response>> {
+    if members.is_empty() {
+        return None;
+    }
+    let result = proxy_helpers::resolve_virtual_download_from_members(
+        members,
+        Some(proxy),
+        legacy.upstream_path,
+        Some(legacy.ctx),
+        |member_id, location| async move {
+            proxy_helpers::local_fetch_by_name_version(
+                &state.db,
+                state,
+                member_id,
+                &location,
+                extension_id,
+                version,
+            )
+            .await
+        },
+    )
+    .await;
+    match result {
+        Ok(result) => Some(proxy_helpers::stream_fetch_result(
+            result,
+            "application/octet-stream",
+            None,
+        )),
+        Err(resp) => proxy_helpers::unscanned_run_failure(resp),
+    }
 }
 
 async fn download_vsix(
@@ -3876,6 +4151,29 @@ async fn download_vsix(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
+                    // #4099: the legacy route is a second door to the same
+                    // VSIX, so scan-on-proxy gates it exactly as it gates the
+                    // gallery package route.
+                    if let Some((action, severity_gate)) =
+                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+                    {
+                        let filename = build_vsix_filename(&publisher, &name, &version);
+                        let legacy = LegacyVsixRequest {
+                            upstream_path: &upstream_path,
+                            filename: &filename,
+                            ctx: &ctx,
+                        };
+                        return serve_scanned_legacy_vsix(
+                            &state,
+                            proxy,
+                            repo.id,
+                            &repo_key,
+                            upstream_url,
+                            &legacy,
+                            (action, severity_gate),
+                        )
+                        .await;
+                    }
                     // #1608 Phase 4: stream the extension archive (.vsix) to the
                     // client while teeing to the proxy cache, instead of
                     // buffering the whole extension in memory. Single-flight via
@@ -3887,6 +4185,7 @@ async fn download_vsix(
                         upstream_url,
                         &upstream_path,
                         "application/octet-stream",
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -3908,6 +4207,24 @@ async fn download_vsix(
             }
             // Virtual repo: try each member in priority order
             if repo.repo_type == RepositoryType::Virtual {
+                let filename = build_vsix_filename(&publisher, &name, &version);
+                let legacy = LegacyVsixRequest {
+                    upstream_path: &upstream_path,
+                    filename: &filename,
+                    ctx: &ctx,
+                };
+                if let Some(scanned) = serve_scanned_legacy_virtual_vsix(
+                    &state,
+                    auth.as_ref(),
+                    repo.id,
+                    &legacy,
+                    &extension_id,
+                    &version,
+                )
+                .await
+                {
+                    return scanned;
+                }
                 let db = state.db.clone();
                 let vname = extension_id.clone();
                 let vversion = version.clone();
@@ -3917,6 +4234,7 @@ async fn download_vsix(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -3986,7 +4304,7 @@ async fn publish_extension(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "vscode", "write:artifacts")?.user_id;
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
@@ -3996,6 +4314,13 @@ async fn publish_extension(
     if body.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty VSIX file").into_response());
     }
+
+    // #4673: entry names that would escape a client's extraction directory
+    // are refused before anything else, as a 400 VALIDATION_ERROR, whether or
+    // not the archive carries a usable manifest.
+    bounded_archive::with_ingest_extraction(|| vscode_extensions::reject_unsafe_entry_names(&body))
+        .and_then(|checked| checked)
+        .map_err(|e| e.into_response())?;
 
     // The archive is the source of truth (#3961); the `x-*` headers only assert.
     let manifest = match bounded_archive::with_ingest_extraction(|| {
@@ -4067,6 +4392,16 @@ async fn publish_extension(
         return Err((StatusCode::CONFLICT, "Extension version already exists").into_response());
     }
 
+    // Refuse an over-quota upload before a soft-deleted row at this path is
+    // purged (#4422).
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        body.len() as i64,
+    )
+    .await?;
+
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the file
@@ -4088,6 +4423,13 @@ async fn publish_extension(
 
     let size_bytes = body.len() as i64;
 
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -4107,12 +4449,20 @@ async fn publish_extension(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     let _ = sqlx::query!(
         r#"
@@ -4146,6 +4496,18 @@ async fn publish_extension(
         size_bytes,
         &computed_sha256,
         manifest.description.as_deref(),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers now that the row, its metadata
+    // and its catalog entry are committed.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -5119,6 +5481,82 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #3914: gallery queries draw from their own sub-budget. Saturating it
+    /// sheds the next gallery read with the budget's 503 while the shared
+    /// budget is still free, and a full-size npm packument reservation
+    /// against the shared budget is still admitted at the same moment.
+    #[tokio::test]
+    async fn gallery_query_sheds_on_its_own_sub_budget_without_starving_npm() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (state, _cache) =
+            rewire_remote_gallery(&fx, "https://open-vsx.example/vscode/gallery").await;
+        let gallery = proxy_helpers::metadata_sub_budget(GALLERY_METADATA_BUDGET_FAMILY);
+        let held = gallery
+            .budget()
+            .try_reserve(gallery.budget().total_bytes())
+            .expect("the gallery sub-budget is unreserved at the start of this test process");
+        assert_eq!(gallery.saturation(), 1.0);
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::post(
+                format!("/{}/gallery/extensionquery", fx.repo_key),
+                "application/json",
+                Bytes::from_static(b"{\"filters\":[],\"flags\":0}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            String::from_utf8_lossy(&body).contains("Buffered metadata budget"),
+            "the shed must be the budget's own 503: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let shared = proxy_helpers::proxy_metadata_budget();
+        assert_eq!(
+            shared.available_bytes(),
+            shared.total_bytes(),
+            "a gallery read queued on its own share holds none of the shared budget"
+        );
+        let npm = shared
+            .try_reserve(proxy_helpers::LARGE_METADATA_MAX_BYTES)
+            .expect("an npm packument is admitted while the gallery sub-budget is saturated");
+        drop((npm, held));
+        fx.teardown().await;
+    }
+
+    #[test]
+    fn gallery_sub_budget_fits_one_full_width_composition_and_spares_other_formats() {
+        let total = proxy_helpers::DEFAULT_PROXY_METADATA_BUDGET_BYTES;
+        let share =
+            proxy_helpers::metadata_sub_budget_bytes(GALLERY_METADATA_BUDGET_FAMILY, None, total);
+        assert_eq!(share, 384 * 1024 * 1024);
+        assert!(
+            GALLERY_PEAK_REQUEST_RESERVATION_BYTES <= share,
+            "one composed response's concurrent skeleton fetches fit the gallery share, \
+             so a lone composition never sheds against itself"
+        );
+        assert!(GALLERY_COMPOSITION_BUDGET_RESERVATION_BYTES <= share);
+        assert!(
+            (total - share) / proxy_helpers::LARGE_METADATA_MAX_BYTES >= 5,
+            "at least five worst-case buffers stay available to every other format"
+        );
+        // A shrunken shared budget still fits one full-width composition.
+        for small in [300 * 1024 * 1024, 512 * 1024 * 1024, 682 * 1024 * 1024] {
+            let share = proxy_helpers::metadata_sub_budget_bytes(
+                GALLERY_METADATA_BUDGET_FAMILY,
+                None,
+                small,
+            );
+            assert!(GALLERY_PEAK_REQUEST_RESERVATION_BYTES <= share, "{small}");
+        }
+    }
+
     #[tokio::test]
     async fn gallery_age_gate_without_service_fails_closed_for_metadata_and_delivery() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -5265,10 +5703,21 @@ mod tests {
     #[test]
     fn legacy_download_upstream_path_validates_then_percent_encodes() {
         assert_eq!(
-            legacy_download_upstream_path("Publisher Name", "My Extension", "1.0.0+build").unwrap(),
-            "extensions/Publisher%20Name/My%20Extension/1.0.0%2Bbuild/download"
+            legacy_download_upstream_path("Publisher", "my-extension", "1.0.0+build").unwrap(),
+            "extensions/Publisher/my-extension/1.0.0%2Bbuild/download"
         );
-        assert!(legacy_download_upstream_path("bad?publisher", "extension", "1.0.0").is_err());
+        // #4365 item 3: none of these is a gallery coordinate character.
+        for (publisher, name, version) in [
+            ("bad?publisher", "extension", "1.0.0"),
+            ("Publisher Name", "extension", "1.0.0"),
+            ("publisher", "extension;jsessionid=1", "1.0.0"),
+            ("publisher", "extension", "1.0.0%zz"),
+        ] {
+            assert!(
+                legacy_download_upstream_path(publisher, name, version).is_err(),
+                "{publisher}/{name}/{version}"
+            );
+        }
     }
 
     #[test]
@@ -5406,6 +5855,18 @@ mod tests {
             "Microsoft.VisualStudio.Services.VSIXPackage"
         ));
         assert!(is_safe_gallery_segment("linux-x64"));
+        // #4365 item 3: a client-sent coordinate also refuses what the shared
+        // client-path rule refuses; a valid escape is still a coordinate.
+        for value in ["a;b", "a%", "a%zz", "a b", "a\tb", "a?b"] {
+            assert!(!is_safe_gallery_request_segment(value), "{value:?}");
+        }
+        for value in [
+            "Microsoft.VisualStudio.Services.VSIXPackage",
+            "1.0.0+build",
+            "a%2Bb",
+        ] {
+            assert!(is_safe_gallery_request_segment(value), "{value:?}");
+        }
         // A coordinate is also a cache-path component, and a component past the
         // filesystem name limit is a storage error waiting to happen.
         assert!(is_safe_gallery_segment(&"x".repeat(255)));
@@ -5425,21 +5886,24 @@ mod tests {
             "gallery responses use the conservative gallery-specific wire cap"
         );
         assert_eq!(
-            GALLERY_METADATA_BUDGET_MULTIPLE, 6,
-            "wire buffer + parsed serde_json tree + serialized response, not a one-byte-value worst case"
+            GALLERY_METADATA_BUDGET_MULTIPLE, 10,
+            "wire buffer + parsed serde_json tree + serialized response, measured \
+             at up to 9.24x on real Open VSX responses (#3914)"
         );
         assert_eq!(
             GALLERY_METADATA_BUDGET_RESERVATION_BYTES,
             GALLERY_METADATA_MAX_BYTES * GALLERY_METADATA_BUDGET_MULTIPLE
         );
-        assert_eq!(GALLERY_METADATA_BUDGET_RESERVATION_BYTES, 12 * 1024 * 1024);
+        assert_eq!(GALLERY_METADATA_BUDGET_RESERVATION_BYTES, 20 * 1024 * 1024);
+        let gallery_share = proxy_helpers::metadata_sub_budget_bytes(
+            GALLERY_METADATA_BUDGET_FAMILY,
+            None,
+            proxy_helpers::DEFAULT_PROXY_METADATA_BUDGET_BYTES,
+        );
         assert_eq!(
-            proxy_helpers::DEFAULT_PROXY_METADATA_BUDGET_BYTES
-                / GALLERY_METADATA_BUDGET_RESERVATION_BYTES,
-            85,
-            "the default shared budget admits 85 cap-sized gallery queries; at the \
-             assumed 32x it admitted 16, which is what let gallery reads park \
-             every other format's buffered metadata fetch behind them (#3255)"
+            gallery_share / GALLERY_METADATA_BUDGET_RESERVATION_BYTES,
+            19,
+            "the default gallery sub-budget admits 19 cap-sized gallery queries at once (#3914)"
         );
 
         let budget =
@@ -7321,6 +7785,196 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// Seed a vulnerable verdict for `bytes` (#4099 legacy-route tests).
+    async fn seed_vulnerable_verdict(
+        pool: &sqlx::PgPool,
+        bytes: &[u8],
+        repo_id: uuid::Uuid,
+    ) -> String {
+        let digest = proxy_helpers::sha256_hex(&Bytes::copy_from_slice(bytes));
+        crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+        digest
+    }
+
+    async fn drop_verdict(pool: &sqlx::PgPool, digest: &str) {
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(digest)
+            .execute(pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+    }
+
+    /// #4099: the legacy `/extensions/.../download` route is a second door to
+    /// the same VSIX, so scan-on-proxy must gate it on a Remote exactly as it
+    /// gates the gallery package route.
+    #[tokio::test]
+    async fn legacy_remote_download_honors_scan_on_proxy() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let vsix = format!("legacy-vulnerable-vsix-{}", uuid::Uuid::new_v4()).into_bytes();
+        Mock::given(method("GET"))
+            .and(path("/extensions/acme/legacy/1.0.0/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vsix.clone()))
+            .mount(&server)
+            .await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let digest = seed_vulnerable_verdict(&fx.pool, &vsix, fx.repo_id).await;
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{}/extensions/acme/legacy/1.0.0/download",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "scan_blocked");
+        assert_eq!(body["file"], "acme.legacy-1.0.0.vsix");
+
+        drop_verdict(&fx.pool, &digest).await;
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// #4099: the legacy route's Virtual branch scans a scanning member's bytes
+    /// instead of streaming them through the shared resolver, and still serves
+    /// a clean extension.
+    #[tokio::test]
+    async fn legacy_virtual_download_honors_member_scan_on_proxy() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bad = format!("legacy-virtual-bad-vsix-{}", uuid::Uuid::new_v4()).into_bytes();
+        let good = format!("legacy-virtual-good-vsix-{}", uuid::Uuid::new_v4()).into_bytes();
+        Mock::given(method("GET"))
+            .and(path("/extensions/acme/bad/1.0.0/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bad.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/extensions/acme/good/1.0.0/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(good.clone()))
+            .mount(&server)
+            .await;
+        let (remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "vscode", &server.uri()).await;
+        // Fail-open so the clean (unknown-digest) pull is served, loudly pending.
+        tdh::enable_proxy_scan(&fx.pool, remote_id, "fail_open").await;
+        let digest = seed_vulnerable_verdict(&fx.pool, &bad, remote_id).await;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+        let get = |name: &str| {
+            tdh::get(format!(
+                "/{virtual_key}/extensions/acme/{name}/1.0.0/download"
+            ))
+        };
+
+        let (status, _) =
+            tdh::send(tdh::router_anon(super::router(), state.clone()), get("bad")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "vulnerable member bytes are blocked"
+        );
+
+        let (status, body) = tdh::send(tdh::router_anon(super::router(), state), get("good")).await;
+        assert_eq!(status, StatusCode::OK, "a clean extension still serves");
+        assert_eq!(&body[..], &good[..]);
+
+        drop_verdict(&fx.pool, &digest).await;
+        drop(server);
+        tdh::cleanup_member_repo(&fx.pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&fx.pool, virtual_id, dir.path()).await;
+        fx.teardown().await;
+    }
+
+    /// A scanning member's quarantine hold (409) is that member's verdict on
+    /// bytes it holds: the legacy Virtual walk stops there instead of serving
+    /// the same extension from a lower-priority member.
+    #[tokio::test]
+    async fn legacy_virtual_download_stops_at_a_quarantined_scanning_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "vscode").await else {
+            return;
+        };
+        let vsix = format!("legacy-held-vsix-{}", uuid::Uuid::new_v4()).into_bytes();
+        let route = "/extensions/acme/held/1.0.0/download";
+        let held = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vsix.clone()))
+            .mount(&held)
+            .await;
+        let fallback = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vsix))
+            .expect(0)
+            .mount(&fallback)
+            .await;
+        let (first, _, first_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "vscode", &held.uri(), 1).await;
+        let (second, _, second_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "vscode", &fallback.uri(), 2).await;
+        for member in [first, second] {
+            tdh::enable_proxy_scan(&fx.pool, member, "fail_open").await;
+        }
+        tdh::enable_proxy_quarantine(&fx.pool, first, 60).await;
+        let storage = fx.storage_dir.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+
+        let (status, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!("/{}{route}", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the hold is final, not a miss"
+        );
+
+        fallback.verify().await;
+        tdh::cleanup_member_repo(&fx.pool, first, &first_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, second, &second_dir).await;
+        fx.teardown().await;
+    }
+
     #[tokio::test]
     async fn legacy_remote_download_rejects_unsafe_decoded_path_segments() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -7571,6 +8225,230 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&gated_body).unwrap()["error"],
             "age_gate_unavailable"
         );
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// #4365 item 4: every known asset type is matched ignoring ASCII case and
+    /// mapped to one canonical spelling; only the package is `Package`, only
+    /// the allowlist is `Display`, everything else is `Other`.
+    #[test]
+    fn gallery_asset_types_classify_case_insensitively_to_one_spelling() {
+        let cases: &[(&str, &str, GalleryAssetKind)] = &[
+            (
+                GALLERY_VSIX_ASSET_TYPE,
+                GALLERY_VSIX_ASSET_TYPE,
+                GalleryAssetKind::Package,
+            ),
+            (
+                "microsoft.visualstudio.services.vsixpackage",
+                GALLERY_VSIX_ASSET_TYPE,
+                GalleryAssetKind::Package,
+            ),
+            (
+                "MICROSOFT.VISUALSTUDIO.SERVICES.VSIXPACKAGE",
+                GALLERY_VSIX_ASSET_TYPE,
+                GalleryAssetKind::Package,
+            ),
+            (
+                "microsoft.visualstudio.services.icons.default",
+                "Microsoft.VisualStudio.Services.Icons.Default",
+                GalleryAssetKind::Display,
+            ),
+            (
+                "Microsoft.VisualStudio.Services.Content.Changelog",
+                "Microsoft.VisualStudio.Services.Content.Changelog",
+                GalleryAssetKind::Display,
+            ),
+            (
+                "Microsoft.VisualStudio.Code.WebResources",
+                "Microsoft.VisualStudio.Code.WebResources",
+                GalleryAssetKind::Other,
+            ),
+            ("README.md", "README.md", GalleryAssetKind::Other),
+            // Language-pack translations are display metadata; the prefix is
+            // canonicalized, the language id kept.
+            (
+                "Microsoft.VisualStudio.Code.Translation.de",
+                "Microsoft.VisualStudio.Code.Translation.de",
+                GalleryAssetKind::Display,
+            ),
+            (
+                "microsoft.visualstudio.code.translation.zh-cn",
+                "Microsoft.VisualStudio.Code.Translation.zh-cn",
+                GalleryAssetKind::Display,
+            ),
+            // The bare prefix names no language.
+            (
+                "Microsoft.VisualStudio.Code.Translation.",
+                "Microsoft.VisualStudio.Code.Translation.",
+                GalleryAssetKind::Other,
+            ),
+            // Near misses are not the package and not display metadata.
+            (
+                "Microsoft.VisualStudio.Services.VSIXPackage2",
+                "Microsoft.VisualStudio.Services.VSIXPackage2",
+                GalleryAssetKind::Other,
+            ),
+        ];
+        for (requested, canonical, kind) in cases {
+            let (got, got_kind) = classify_gallery_asset_type(requested);
+            assert_eq!((got.as_ref(), got_kind), (*canonical, *kind), "{requested}");
+        }
+        // Every type the synthesized listing advertises is a known type.
+        for advertised in GALLERY_SYNTHESIZED_ASSET_TYPES {
+            assert_ne!(
+                classify_gallery_asset_type(advertised).1,
+                GalleryAssetKind::Other,
+                "{advertised}"
+            );
+        }
+    }
+
+    /// #4365 item 4: on a scanning repository a re-capitalised package asset
+    /// type goes through the gate (and is fetched under the canonical
+    /// spelling), and an asset type outside the allowlist is 404 without an
+    /// upstream request.
+    /// #4365 item 3: a `;`, a stray `%` or a raw space in a client-sent
+    /// coordinate is a 400 on every gallery route (asset, vspackage, legacy
+    /// download), before any upstream request. Before, each was
+    /// percent-encoded into the upstream URL. The display-asset fetch at the
+    /// end is the positive control that the upstream is reachable.
+    #[tokio::test]
+    async fn gallery_routes_refuse_ambiguous_coordinates_before_the_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"icon".to_vec()))
+            .mount(&server)
+            .await;
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
+        let key = &fx.repo_key;
+        let mut refused = Vec::new();
+        for bad in ["yaml%3Bjsessionid=1", "yaml%25zz", "yaml%20x"] {
+            for uri in [
+                format!(
+                    "/{key}/asset/RedHat/{bad}/1.0.0/universal/Microsoft.VisualStudio.Services.VSIXPackage"
+                ),
+                format!(
+                    "/{key}/asset/RedHat/yaml/1.0.0/universal/Microsoft.VisualStudio.Services.VSIXPackage{}",
+                    &bad[4..]
+                ),
+                format!("/{key}/gallery/publishers/RedHat/vsextensions/{bad}/1.0.0/vspackage"),
+                format!("/{key}/extensions/RedHat/{bad}/1.0.0/download"),
+            ] {
+                let (status, _) =
+                    tdh::send(tdh::router_anon(super::router(), state.clone()), tdh::get(uri.clone()))
+                        .await;
+                refused.push((uri, status));
+            }
+        }
+        let hits_after_refusals = server.received_requests().await.unwrap().len();
+        let (control, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{key}/asset/RedHat/yaml/1.0.0/universal/Microsoft.VisualStudio.Services.Icons.Default"
+            )),
+        )
+        .await;
+        let hits_after_control = server.received_requests().await.unwrap().len();
+        drop(server);
+        fx.teardown().await;
+
+        for (uri, status) in refused {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert_eq!(
+            hits_after_refusals, 0,
+            "refused before any upstream request"
+        );
+        assert_eq!(control, StatusCode::OK, "positive control");
+        assert!(hits_after_control > 0, "the control reaches the upstream");
+    }
+
+    #[tokio::test]
+    async fn gallery_asset_scans_recapitalised_package_and_refuses_unknown_types() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let vsix = b"item4-vulnerable-vsix-bytes";
+        Mock::given(method("GET"))
+            .and(path(
+                "/vscode/asset/RedHat/VSCode-YAML/1.0.0/Microsoft.VisualStudio.Services.VSIXPackage",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vsix.to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/vscode/asset/RedHat/VSCode-YAML/1.0.0/Microsoft.VisualStudio.Code.WebResources",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vsix.to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let digest = proxy_helpers::sha256_hex(&Bytes::from_static(vsix));
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let get = |asset: &str| {
+            tdh::get(format!(
+                "/{}/asset/RedHat/VSCode-YAML/1.0.0/universal/{asset}",
+                fx.repo_key
+            ))
+        };
+        let (status, _) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            get("microsoft.visualstudio.services.vsixpackage"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a re-capitalised package asset type must reach the scan gate"
+        );
+        let (status, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            get("Microsoft.VisualStudio.Code.WebResources"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
         drop(server);
         fx.teardown().await;
     }
@@ -9183,6 +10061,62 @@ mod catalog_registration_tests {
         assert_eq!(row.version, "3.1.4");
         assert_eq!(row.versions, vec!["3.1.4".to_string()]);
     }
+
+    /// #4725: an extension publish to a hosted repository must queue a push
+    /// sync task for a subscribed push peer, and a publish that arrives as
+    /// peer replication must not be fanned back out. Fails on `main`
+    /// (nothing queued).
+    #[tokio::test]
+    async fn vscode_publish_queues_push_sync_task_4725() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "vscode").await;
+
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .header("x-publisher", "acme")
+            .header("x-extension-name", "widget-tools")
+            .header("x-extension-version", "3.1.4")
+            .body(axum::body::Body::from("vsix-bytes"))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "extension publish must succeed: {status} {}",
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated publish (as the sync worker sends it) stores the
+        // extension but must not queue another task.
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .header("x-publisher", "acme")
+            .header("x-extension-name", "widget-tools")
+            .header("x-extension-version", "3.1.5")
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from("vsix-bytes-2"))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated extension publish must succeed: {status} {}",
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["acme/widget-tools/acme.widget-tools-3.1.4.vsix".to_string()],
+            "only the client publish queues a push task; the replicated one must not"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9196,6 +10130,17 @@ mod vsix_manifest_publish_tests {
 
     /// A `vsce package` archive, minus the compiled extension itself.
     fn vsix(publisher: &str, name: &str, version: &str, target_platform: &str) -> Vec<u8> {
+        vsix_with(publisher, name, version, target_platform, &[])
+    }
+
+    /// [`vsix`] plus `extra` entries.
+    fn vsix_with(
+        publisher: &str,
+        name: &str,
+        version: &str,
+        target_platform: &str,
+        extra: &[&str],
+    ) -> Vec<u8> {
         use std::io::Write;
         let package_json = serde_json::json!({
             "publisher": publisher,
@@ -9218,7 +10163,7 @@ mod vsix_manifest_publish_tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut cursor);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (entry, bytes) in [
                 ("extension/package.json", package_json.as_bytes()),
@@ -9227,9 +10172,84 @@ mod vsix_manifest_publish_tests {
                 writer.start_file(entry, options).unwrap();
                 writer.write_all(bytes).unwrap();
             }
+            for entry in extra {
+                writer.start_file(*entry, options).unwrap();
+                writer.write_all(b"payload").unwrap();
+            }
             writer.finish().unwrap();
         }
         cursor.into_inner()
+    }
+
+    /// #4673: an otherwise valid VSIX carrying a hostile entry name is refused
+    /// with 400 VALIDATION_ERROR and nothing is stored; a `..` inside a name
+    /// (not a whole segment) is not hostile and still publishes.
+    #[tokio::test]
+    async fn publish_rejects_traversal_entry_names() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let mut refused = Vec::new();
+        for hostile in [
+            "../../etc/passwd",
+            "extension/../../escape.js",
+            "/tmp/x",
+            "\\windows\\system32\\x.dll",
+            "extension\\..\\..\\x.js",
+            "C:/x.js",
+        ] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{}/api/extensions", fx.repo_key))
+                .body(axum::body::Body::from(vsix_with(
+                    "acme",
+                    "widget-tools",
+                    "3.1.4",
+                    "universal",
+                    &[hostile],
+                )))
+                .unwrap();
+            let (status, body) = tdh::send(fx.router_with_auth(super::router()), request).await;
+            refused.push((hostile, status, String::from_utf8_lossy(&body).into_owned()));
+        }
+        let stored = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await;
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .body(axum::body::Body::from(vsix_with(
+                "acme",
+                "widget-tools",
+                "3.1.5",
+                "universal",
+                &["extension/dist/a..b.js"],
+            )))
+            .unwrap();
+        let (ok_status, ok_body) = tdh::send(fx.router_with_auth(super::router()), request).await;
+        fx.teardown().await;
+
+        for (hostile, status, body) in refused {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{hostile}: {body}"
+            );
+            assert!(body.contains("VALIDATION_ERROR"), "{hostile}: {body}");
+            assert!(
+                body.contains("escapes the archive root"),
+                "{hostile}: {body}"
+            );
+        }
+        assert_eq!(stored.expect("count artifacts"), 0, "nothing may be stored");
+        assert!(
+            ok_status.is_success(),
+            "a benign name must still publish: {ok_status} {}",
+            String::from_utf8_lossy(&ok_body)
+        );
     }
 
     /// `vsce package` output publishes with no `x-*` header and its fields are
@@ -9367,7 +10387,7 @@ mod vsix_manifest_publish_tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut cursor);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             writer
                 .start_file("extension/package.json", options)
@@ -9415,5 +10435,51 @@ mod vsix_manifest_publish_tests {
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("vsce package"), "got: {body}");
         assert!(body.contains("x-publisher"), "got: {body}");
+    }
+}
+
+/// #4365 item 1: VS Code gallery `(cache_key, scannable)` decisions. The key
+/// is the one the gallery routes already used; scannable is exactly the
+/// package.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn gallery_serve_key_table() {
+        let coord = ("Red Hat", "vscode-yaml", "1.0.0", "linux-x64");
+        let package = gallery_asset_serve_key(coord, "vspackage", GalleryAssetKind::Package);
+        assert_eq!(
+            package.cache_key,
+            "gallery/Red%20Hat/vscode-yaml/1.0.0/linux-x64/vspackage"
+        );
+        assert!(package.scannable);
+        for (requested, scannable) in [
+            ("Microsoft.VisualStudio.Services.VSIXPackage", true),
+            ("microsoft.visualstudio.services.vsixpackage", true),
+            ("Microsoft.VisualStudio.Services.Icons.Default", false),
+            ("MICROSOFT.VISUALSTUDIO.CODE.MANIFEST", false),
+            ("Microsoft.VisualStudio.Code.WebResources", false),
+        ] {
+            let (canonical, kind) = classify_gallery_asset_type(requested);
+            let leaf = format!("asset-{:x}", Sha256::digest(canonical.as_bytes()));
+            let got = gallery_asset_serve_key(coord, &leaf, kind);
+            assert_eq!(
+                got.cache_key,
+                format!("gallery/Red%20Hat/vscode-yaml/1.0.0/linux-x64/{leaf}"),
+                "{requested}"
+            );
+            assert_eq!(got.scannable, scannable, "{requested}");
+        }
+        // Every capitalisation of the package shares one cache entry.
+        let leaf = |t: &str| {
+            let (canonical, _) = classify_gallery_asset_type(t);
+            format!("asset-{:x}", Sha256::digest(canonical.as_bytes()))
+        };
+        assert_eq!(
+            leaf("microsoft.visualstudio.services.vsixpackage"),
+            leaf(GALLERY_VSIX_ASSET_TYPE)
+        );
     }
 }

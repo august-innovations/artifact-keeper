@@ -6,17 +6,35 @@
       {
         "ordinal": 0,
         "name": "path",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "path"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "size_bytes",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "size_bytes"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "checksum_sha256",
-        "type_info": "Bpchar"
+        "type_info": "Bpchar",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "checksum_sha256"
+          }
+        }
       }
     ],
     "parameters": {

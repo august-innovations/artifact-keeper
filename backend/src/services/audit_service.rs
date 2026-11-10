@@ -39,6 +39,10 @@ pub enum AuditAction {
     ArtifactDownloaded,
     ArtifactDeleted,
     ArtifactMetadataUpdated,
+    /// A soft-deleted artifact was restored from the trash (#2072).
+    ArtifactRestored,
+    /// A trashed artifact was permanently deleted before storage GC reached it.
+    ArtifactPurged,
 
     // System operations
     BackupStarted,
@@ -94,6 +98,12 @@ pub enum AuditAction {
     AgeGateApproved,
     AgeGateRejected,
     AgeGateReopened,
+    /// An instance administrator's decision locked an age-gate policy or
+    /// review against relaxation by the repository's own admins (#4238).
+    AgeGateLockSet,
+    /// An instance administrator released such a lock: handed a policy back
+    /// to the repository's admins, or reopened a review (#4238).
+    AgeGateLockReleased,
 
     // Authorization decisions (#2366 functional audit log). Recorded when an
     // authenticated principal is refused a privileged operation (e.g. a
@@ -136,6 +146,191 @@ pub enum AuditAction {
     // Appended at the END of the enum to keep the additive change
     // conflict-free with in-flight taxonomy work.
     CiOidcGroupBindingReconciled,
+
+    // Storage integrity (#3910). Recorded when an admin runs the storage
+    // scrub, with the run's mode, scope, and counts. Appended at the END of
+    // the enum to keep the additive change conflict-free.
+    StorageScrubRun,
+    /// An admin reconciled a repository's stored objects with its artifact
+    /// rows (#1570), registering ghost objects.
+    StorageReindexRun,
+    /// A repository admin set, changed or removed the package allowlist of a
+    /// virtual conda channel (#4576). Appended at the END of the enum.
+    RepositoryAllowlistChanged,
+
+    // Core privileged actions (#4710). Each records the acting principal, the
+    // target, and the before/after that matters; never a secret, token, key
+    // material or webhook secret value. Appended at the END of the enum.
+    /// An admin released an artifact (or a held proxy-cache entry) from
+    /// quarantine.
+    QuarantineReleased,
+    /// An admin rejected a quarantined artifact.
+    QuarantineRejected,
+    /// An admin approved a promotion request; the promotion was executed.
+    PromotionApprovalGranted,
+    /// An admin rejected a promotion request.
+    PromotionApprovalDenied,
+    /// An artifact was promoted from a staging repository to a release one.
+    ArtifactPromoted,
+    /// A promotion was refused by the quality gate, the promotion policy or a
+    /// promotion rule.
+    PromotionRefused,
+    /// A principal rejected an artifact in a staging repository.
+    PromotionRejected,
+    /// A fine-grained permission rule was created, updated or deleted.
+    PermissionRuleCreated,
+    PermissionRuleUpdated,
+    PermissionRuleDeleted,
+    /// An SSO (OIDC, LDAP or SAML) provider configuration changed.
+    SsoProviderCreated,
+    SsoProviderUpdated,
+    SsoProviderDeleted,
+    SsoProviderEnabled,
+    SsoProviderDisabled,
+    /// A signing key was rotated (a successor generated) or revoked.
+    SigningKeyRotated,
+    SigningKeyRevoked,
+    /// An out-of-band issuer signature over a signing key was verified and
+    /// recorded (#4282). A cryptographic check, not a trust-anchor decision.
+    SigningKeyTrustAttested,
+    /// An outbound webhook was created, updated (enabled / disabled), deleted,
+    /// or had its signing secret rotated.
+    WebhookCreated,
+    WebhookUpdated,
+    WebhookDeleted,
+    WebhookSecretRotated,
+    /// A peer sync policy was created, updated (including enable / disable)
+    /// or deleted.
+    SyncPolicyCreated,
+    SyncPolicyUpdated,
+    SyncPolicyDeleted,
+
+    // Conda channel lifecycle (#4709). Appended at the END of the enum.
+    /// An administrator withdrew a hosted conda package
+    /// (`DELETE /conda/{key}/{subdir}/{file}`): permanent hold plus a CEP-6
+    /// channel notice.
+    CondaPackageWithdrawn,
+    /// A CEP-27 attestation uploaded for a package verified and was stored.
+    AttestationVerified,
+    /// A CEP-27 attestation uploaded for a package did not verify: refused,
+    /// or (under the explicit `CONDA_ATTESTATION_REQUIRE_VERIFIED=false`
+    /// opt-out) stored with its failed verification record.
+    AttestationRejected,
+    /// A lockfile was ingested as a stored environment (new or replaced).
+    EnvironmentRegistered,
+    /// A stored environment was deleted.
+    EnvironmentDeleted,
+
+    // Detection gaps (#4677). Appended at the END of the enum.
+    /// A login (`POST /api/v1/auth/login`) or OCI credential exchange
+    /// (`/v2/token`) was refused 429 by a login rate limiter. Recorded at most
+    /// once per source IP per limiter window so a flood cannot turn the
+    /// limiter into an audit-table DoS.
+    LoginRateLimited,
+    /// An external scanner's findings were ingested
+    /// (`POST /api/v1/security/findings/external`): a new completed scan row
+    /// that every gate and the repository score read, including any `MAL-*`
+    /// finding classed `malicious`.
+    ExternalFindingsIngested,
+    // Device Authorization Grant (RFC 8628, #3461). Token issuance itself is
+    // recorded as `Login` (auth_method `device_flow`), like every other path
+    // that starts a new session family; these cover the rest of the flow. No
+    // variant ever carries the device code or the user code. Appended at the
+    // END of the enum to keep the additive change conflict-free with in-flight
+    // taxonomy work.
+    /// An unauthenticated client started a device authorization.
+    DeviceCodeIssued,
+    /// A signed-in user approved a device authorization.
+    DeviceAuthorizationApproved,
+    /// A signed-in user denied a device authorization.
+    DeviceAuthorizationDenied,
+    /// A verify/approve/deny attempt was refused: wrong or expired user code,
+    /// a non-interactive credential, or the failed-attempt throttle.
+    DeviceAuthorizationFailed,
+    /// A token request presented a device code that was already redeemed
+    /// (replay) or whose approver can no longer be issued tokens.
+    DeviceTokenRejected,
+    /// An approved device authorization expired without being redeemed.
+    DeviceAuthorizationExpired,
+    /// An admin ran the source-free Debian package backfill (#4740),
+    /// re-registering imported `.deb` rows from their stored control members.
+    DebianBackfillRun,
+    /// The scan-on-proxy gate refused a proxied download with `403
+    /// scan_blocked` (#4777). Aggregated per (digest, principal, repository)
+    /// per minute so a CI loop retrying a blocked pull writes at most two
+    /// rows a minute per replica; see [`record_proxy_scan_blocked`].
+    ProxyScanBlocked,
+    /// A proxy-cache seed job of a Remote repository finished (#5284): one
+    /// summary row per job with its inventory counts.
+    CacheSeeded,
+    /// The proxy sent a request to an upstream (#5286): one row per request
+    /// actually sent, never for a cache hit. Off unless
+    /// `AUDIT_UPSTREAM_FETCHES` is `errors` or `all`; see
+    /// [`crate::services::upstream_fetch_audit`].
+    UpstreamFetched,
+    /// An administrator accepted a finding: a decision about an advisory in a
+    /// component of specific bytes (#5153).
+    FindingAcknowledged,
+    /// An acknowledgement was revoked. One row per decision the revoke reached.
+    FindingAcknowledgementRevoked,
+    /// A promotion copied an acknowledgement into the target repository. The
+    /// actor is the promoter; the decision stays that of its original author.
+    FindingAcknowledgementCarried,
+    /// A promotion left an acknowledgement behind, because the promoter could not
+    /// acknowledge in the target. The finding is open there.
+    FindingAcknowledgementNotCarried,
+    /// An acknowledgement reached its expiry and stopped applying.
+    FindingAcknowledgementExpired,
+    /// An MCP server publish pinned one `packages[]` entry to an artifact or
+    /// image digest in a backing repository (#5253). One row per entry.
+    McpPackagePinned,
+    /// An OCI tag an MCP server version pinned moved to another digest. The
+    /// version keeps serving the pinned digest (#5253).
+    McpPinDriftDetected,
+    /// The MCP registry API refused to hand a held server version to a
+    /// client (#5253). Sampled per (version, caller) per minute.
+    McpServerDownloadRefused,
+    /// A server version was published to a hosted MCP registry, or ingested from upstream into a Remote one. (#5253).
+    McpServerPublished,
+    /// A server version's registry status (active, deprecated, deleted) changed. (#5253).
+    McpServerStatusChanged,
+    /// A Remote MCP registry approved a server name (or a name@version pin) for serving. (#5253).
+    McpServerApproved,
+    /// A Remote MCP registry blocked a server name (or a name@version pin). (#5253).
+    McpServerRejected,
+    /// An MCP approval was revoked back to review (an admin reopened it, or content drift re-queued it). (#5253).
+    McpServerReopened,
+    /// An upstream entry changed content under an already ingested name@version. (#5253).
+    McpServerContentDrift,
+    /// An MCP serve gate could not be evaluated and the surface answered 503 (fail closed). (#5253).
+    McpGateUnavailable,
+    /// A capability snapshot (tools/resources/prompts) was recorded for a server version. (#5253).
+    McpCapabilitiesIngested,
+    /// A new capability snapshot differs from the previous one for the same server version. (#5253).
+    McpToolsDrift,
+    /// A namespace-conditioned MCP publish grant was created or widened. (#5253).
+    McpNamespaceGranted,
+    /// A namespace-conditioned MCP publish grant was removed or narrowed. (#5253).
+    McpNamespaceRevoked,
+    /// An admin-initiated DNS/HTTP namespace proof verified. (#5253).
+    McpNamespaceProofVerified,
+    /// An admin-initiated DNS/HTTP namespace proof did not verify. (#5253).
+    McpNamespaceProofFailed,
+    /// An administrator replaced a server version's document (PUT admin edit). (#5253).
+    McpServerEdited,
+    /// A server version was soft-deleted (DELETE), leaving a tombstone. (#5253).
+    McpServerDeleted,
+    /// An administrator purged a deleted server version: its server.json and
+    /// bundles went to the trash, releasing its pins; the tombstone stays. (#5368).
+    McpServerPurged,
+    /// A Remote MCP registry finished an upstream sync run. (#5253).
+    McpMirrorSynced,
+    /// An MCPB bundle's signature did not verify and the upload was refused. (#5253).
+    McpBundleSignatureRejected,
+    /// An administrator applied a config-as-code document (#5292). One
+    /// summary row per `mode=apply`; each write it made also records its own
+    /// per-repository row.
+    ConfigImported,
 }
 
 impl AuditAction {
@@ -161,6 +356,8 @@ impl AuditAction {
             AuditAction::ArtifactDownloaded => "ARTIFACT_DOWNLOADED",
             AuditAction::ArtifactDeleted => "ARTIFACT_DELETED",
             AuditAction::ArtifactMetadataUpdated => "ARTIFACT_METADATA_UPDATED",
+            AuditAction::ArtifactRestored => "ARTIFACT_RESTORED",
+            AuditAction::ArtifactPurged => "ARTIFACT_PURGED",
             AuditAction::BackupStarted => "BACKUP_STARTED",
             AuditAction::BackupCompleted => "BACKUP_COMPLETED",
             AuditAction::BackupFailed => "BACKUP_FAILED",
@@ -191,12 +388,86 @@ impl AuditAction {
             AuditAction::AgeGateApproved => "AGE_GATE_APPROVED",
             AuditAction::AgeGateRejected => "AGE_GATE_REJECTED",
             AuditAction::AgeGateReopened => "AGE_GATE_REOPENED",
+            AuditAction::AgeGateLockSet => "AGE_GATE_LOCK_SET",
+            AuditAction::AgeGateLockReleased => "AGE_GATE_LOCK_RELEASED",
             AuditAction::PermissionDenied => "PERMISSION_DENIED",
             AuditAction::CurationSyncTriggered => "CURATION_SYNC_TRIGGERED",
             AuditAction::CurationVersionCreated => "CURATION_VERSION_CREATED",
             AuditAction::CurationVersionPublished => "CURATION_VERSION_PUBLISHED",
             AuditAction::ProxyScanVerdictDeleted => "PROXY_SCAN_VERDICT_DELETED",
             AuditAction::CiOidcGroupBindingReconciled => "CI_OIDC_GROUP_BINDING_RECONCILED",
+            AuditAction::StorageScrubRun => "STORAGE_SCRUB_RUN",
+            AuditAction::StorageReindexRun => "STORAGE_REINDEX_RUN",
+            AuditAction::RepositoryAllowlistChanged => "REPOSITORY_ALLOWLIST_CHANGED",
+            AuditAction::FindingAcknowledged => "FINDING_ACKNOWLEDGED",
+            AuditAction::FindingAcknowledgementRevoked => "FINDING_ACKNOWLEDGEMENT_REVOKED",
+            AuditAction::FindingAcknowledgementCarried => "FINDING_ACKNOWLEDGEMENT_CARRIED",
+            AuditAction::FindingAcknowledgementNotCarried => "FINDING_ACKNOWLEDGEMENT_NOT_CARRIED",
+            AuditAction::FindingAcknowledgementExpired => "FINDING_ACKNOWLEDGEMENT_EXPIRED",
+            AuditAction::QuarantineReleased => "QUARANTINE_RELEASED",
+            AuditAction::QuarantineRejected => "QUARANTINE_REJECTED",
+            AuditAction::PromotionApprovalGranted => "PROMOTION_APPROVAL_GRANTED",
+            AuditAction::PromotionApprovalDenied => "PROMOTION_APPROVAL_DENIED",
+            AuditAction::ArtifactPromoted => "ARTIFACT_PROMOTED",
+            AuditAction::PromotionRefused => "PROMOTION_REFUSED",
+            AuditAction::PromotionRejected => "PROMOTION_REJECTED",
+            AuditAction::PermissionRuleCreated => "PERMISSION_RULE_CREATED",
+            AuditAction::PermissionRuleUpdated => "PERMISSION_RULE_UPDATED",
+            AuditAction::PermissionRuleDeleted => "PERMISSION_RULE_DELETED",
+            AuditAction::SsoProviderCreated => "SSO_PROVIDER_CREATED",
+            AuditAction::SsoProviderUpdated => "SSO_PROVIDER_UPDATED",
+            AuditAction::SsoProviderDeleted => "SSO_PROVIDER_DELETED",
+            AuditAction::SsoProviderEnabled => "SSO_PROVIDER_ENABLED",
+            AuditAction::SsoProviderDisabled => "SSO_PROVIDER_DISABLED",
+            AuditAction::SigningKeyRotated => "SIGNING_KEY_ROTATED",
+            AuditAction::SigningKeyRevoked => "SIGNING_KEY_REVOKED",
+            AuditAction::SigningKeyTrustAttested => "SIGNING_KEY_TRUST_ATTESTED",
+            AuditAction::WebhookCreated => "WEBHOOK_CREATED",
+            AuditAction::WebhookUpdated => "WEBHOOK_UPDATED",
+            AuditAction::WebhookDeleted => "WEBHOOK_DELETED",
+            AuditAction::WebhookSecretRotated => "WEBHOOK_SECRET_ROTATED",
+            AuditAction::SyncPolicyCreated => "SYNC_POLICY_CREATED",
+            AuditAction::SyncPolicyUpdated => "SYNC_POLICY_UPDATED",
+            AuditAction::SyncPolicyDeleted => "SYNC_POLICY_DELETED",
+            AuditAction::CondaPackageWithdrawn => "CONDA_PACKAGE_WITHDRAWN",
+            AuditAction::AttestationVerified => "ATTESTATION_VERIFIED",
+            AuditAction::AttestationRejected => "ATTESTATION_REJECTED",
+            AuditAction::EnvironmentRegistered => "ENVIRONMENT_REGISTERED",
+            AuditAction::EnvironmentDeleted => "ENVIRONMENT_DELETED",
+            AuditAction::LoginRateLimited => "LOGIN_RATE_LIMITED",
+            AuditAction::ExternalFindingsIngested => "EXTERNAL_FINDINGS_INGESTED",
+            AuditAction::DeviceCodeIssued => "DEVICE_CODE_ISSUED",
+            AuditAction::DeviceAuthorizationApproved => "DEVICE_AUTHORIZATION_APPROVED",
+            AuditAction::DeviceAuthorizationDenied => "DEVICE_AUTHORIZATION_DENIED",
+            AuditAction::DeviceAuthorizationFailed => "DEVICE_AUTHORIZATION_FAILED",
+            AuditAction::DeviceTokenRejected => "DEVICE_TOKEN_REJECTED",
+            AuditAction::DeviceAuthorizationExpired => "DEVICE_AUTHORIZATION_EXPIRED",
+            AuditAction::DebianBackfillRun => "DEBIAN_BACKFILL_RUN",
+            AuditAction::ProxyScanBlocked => "PROXY_SCAN_BLOCKED",
+            AuditAction::McpPackagePinned => "MCP_PACKAGE_PINNED",
+            AuditAction::McpPinDriftDetected => "MCP_PIN_DRIFT_DETECTED",
+            AuditAction::McpServerDownloadRefused => "MCP_SERVER_DOWNLOAD_REFUSED",
+            AuditAction::McpServerPublished => "MCP_SERVER_PUBLISHED",
+            AuditAction::McpServerStatusChanged => "MCP_SERVER_STATUS_CHANGED",
+            AuditAction::McpServerApproved => "MCP_SERVER_APPROVED",
+            AuditAction::McpServerRejected => "MCP_SERVER_REJECTED",
+            AuditAction::McpServerReopened => "MCP_SERVER_REOPENED",
+            AuditAction::McpServerContentDrift => "MCP_SERVER_CONTENT_DRIFT",
+            AuditAction::McpGateUnavailable => "MCP_GATE_UNAVAILABLE",
+            AuditAction::McpCapabilitiesIngested => "MCP_CAPABILITIES_INGESTED",
+            AuditAction::McpToolsDrift => "MCP_TOOLS_DRIFT",
+            AuditAction::McpNamespaceGranted => "MCP_NAMESPACE_GRANTED",
+            AuditAction::McpNamespaceRevoked => "MCP_NAMESPACE_REVOKED",
+            AuditAction::McpNamespaceProofVerified => "MCP_NAMESPACE_PROOF_VERIFIED",
+            AuditAction::McpNamespaceProofFailed => "MCP_NAMESPACE_PROOF_FAILED",
+            AuditAction::McpServerEdited => "MCP_SERVER_EDITED",
+            AuditAction::McpServerDeleted => "MCP_SERVER_DELETED",
+            AuditAction::McpServerPurged => "MCP_SERVER_PURGED",
+            AuditAction::McpMirrorSynced => "MCP_MIRROR_SYNCED",
+            AuditAction::McpBundleSignatureRejected => "MCP_BUNDLE_SIGNATURE_REJECTED",
+            AuditAction::CacheSeeded => "CACHE_SEEDED",
+            AuditAction::UpstreamFetched => "UPSTREAM_FETCHED",
+            AuditAction::ConfigImported => "CONFIG_IMPORTED",
         }
     }
 }
@@ -214,6 +485,15 @@ pub enum ResourceType {
     Setting,
     Plugin,
     ScanResult,
+    // #4710
+    PromotionApproval,
+    PermissionRule,
+    SsoProvider,
+    SigningKey,
+    Webhook,
+    SyncPolicy,
+    /// A stored environment (ingested lockfile graph, #4054 / #4709).
+    Environment,
 }
 
 impl ResourceType {
@@ -229,6 +509,13 @@ impl ResourceType {
             ResourceType::Setting => "setting",
             ResourceType::Plugin => "plugin",
             ResourceType::ScanResult => "scan_result",
+            ResourceType::PromotionApproval => "promotion_approval",
+            ResourceType::PermissionRule => "permission_rule",
+            ResourceType::SsoProvider => "sso_provider",
+            ResourceType::SigningKey => "signing_key",
+            ResourceType::Webhook => "webhook",
+            ResourceType::SyncPolicy => "sync_policy",
+            ResourceType::Environment => "environment",
         }
     }
 }
@@ -321,12 +608,28 @@ fn audit_detail_key_is_sensitive(key: &str) -> bool {
     )
 }
 
+/// Keys whose value is a repository upstream URL. Unlike a proxy URL the URL
+/// itself is useful audit context, so only its embedded userinfo is stripped
+/// (#4452), through the same helper the repository API renders it with.
+fn audit_detail_key_is_upstream_url(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().replace('-', "_").as_str(),
+        "upstream_url" | "index_upstream_url"
+    )
+}
+
 fn redact_audit_detail_secrets(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map {
                 if audit_detail_key_is_sensitive(key) {
                     *child = serde_json::Value::String(AUDIT_REDACTED_VALUE.to_owned());
+                } else if let (true, serde_json::Value::String(url)) =
+                    (audit_detail_key_is_upstream_url(key), &*child)
+                {
+                    *child = serde_json::Value::String(
+                        crate::services::proxy_service::strip_url_userinfo(url).0,
+                    );
                 } else {
                     redact_audit_detail_secrets(child);
                 }
@@ -376,6 +679,15 @@ impl AuditEntry {
     /// previous behavior; jobs that emit several related events should group
     /// them under one explicit [`AuditEntry::correlation`] value per logical
     /// operation.
+    ///
+    /// The client IP likewise defaults to the in-flight request's VERIFIED
+    /// client IP (#4762), the address [`AuditEntry::with_request_client_ip`]
+    /// resolves (#3888/#4681): the TCP peer, or a forwarded address only
+    /// under `XFF_TRUSTED_FOR_AUTHZ` behind a trusted proxy. Every writer
+    /// that builds its entry while handling a request records the same
+    /// address, whether or not it opts in. Outside a request scope, or when
+    /// the address is not verified, it stays `None` (`NULL` in the row);
+    /// [`AuditEntry::ip`] still overrides it.
     pub fn new(action: AuditAction, resource_type: ResourceType) -> Self {
         Self {
             event_id: Uuid::new_v4(),
@@ -385,7 +697,7 @@ impl AuditEntry {
             resource_id: None,
             resource_name: None,
             details: None,
-            ip_address: None,
+            ip_address: crate::api::middleware::client_ip::current_verified_client_ip(),
             correlation_id: crate::api::middleware::tracing::current_correlation_id()
                 .map(crate::api::middleware::tracing::CorrelationId::into_string)
                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
@@ -393,6 +705,21 @@ impl AuditEntry {
             outcome_override: None,
             actor_id_override: None,
         }
+    }
+
+    /// Start an entry attributed to the authenticated request principal
+    /// (#4710): `user_id`, the actor display name, and the verified client IP
+    /// when one is in scope. The shared shape for admin-initiated state
+    /// changes, so every such emitter records its actor the same way.
+    pub fn for_principal(
+        action: AuditAction,
+        resource_type: ResourceType,
+        auth: &crate::api::middleware::auth::AuthExtension,
+    ) -> Self {
+        Self::new(action, resource_type)
+            .user(auth.user_id)
+            .actor_name(auth.username.clone())
+            .with_request_client_ip()
     }
 
     pub fn user(mut self, user_id: Uuid) -> Self {
@@ -456,17 +783,19 @@ impl AuditEntry {
         self
     }
 
-    /// Attach the in-flight request's client IP, resolved by
-    /// `client_ip_context_middleware` (#3888): the TCP peer, with
-    /// `X-Forwarded-For` believed only under the configured trusted-proxy
-    /// policy (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`). Outside a request scope —
-    /// background jobs, startup, detached tasks — or when the address could
-    /// not be resolved, the entry keeps `ip_address: NULL`: the audit row
-    /// records "unknown", never a sentinel. Authentication emitters call this
-    /// so login/logout/refresh events carry the address the credential was
-    /// presented from.
+    /// Attach the in-flight request's VERIFIED client IP, resolved by
+    /// `client_ip_context_middleware` (#3888): the kernel-verified TCP
+    /// peer, or an `X-Forwarded-For`-derived address ONLY under the
+    /// operator's `XFF_TRUSTED_FOR_AUTHZ` assertion. Outside a
+    /// request scope — background jobs, startup, detached tasks — or when
+    /// the address could not be verified (unresolvable, or behind a
+    /// trusted proxy without the assertion), the entry keeps
+    /// `ip_address: NULL`: the audit row records an honest "unknown",
+    /// never a sentinel and never an unverifiable attacker-supplied
+    /// address. Authentication emitters call this so login/logout/refresh
+    /// events carry the address the credential was presented from.
     pub fn with_request_client_ip(mut self) -> Self {
-        if let Some(ip) = crate::api::middleware::client_ip::current_client_ip() {
+        if let Some(ip) = crate::api::middleware::client_ip::current_verified_client_ip() {
             self.ip_address = Some(ip);
         }
         self
@@ -909,6 +1238,28 @@ impl AuditService {
     }
 }
 
+/// Top-level keys whose values differ between two JSON snapshots of the same
+/// object (#4710), sorted, ignoring the bookkeeping timestamps. Lets an
+/// `*_UPDATED` row say WHAT changed without copying whole configurations into
+/// the trail. Both snapshots must already be secret-free (API response
+/// shapes, which expose `has_secret`-style flags, never the secret).
+pub fn changed_fields(before: &serde_json::Value, after: &serde_json::Value) -> Vec<String> {
+    const IGNORED: [&str; 2] = ["created_at", "updated_at"];
+    let (Some(before), Some(after)) = (before.as_object(), after.as_object()) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|k| !IGNORED.contains(&k.as_str()))
+        .filter(|k| before.get(*k) != after.get(*k))
+        .cloned()
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 /// Fire-and-forget audit write for auth-event and token-lifecycle emitters
 /// (#1617 Phase 1: auth-event audit completeness).
 ///
@@ -1156,6 +1507,544 @@ macro_rules! audit_log {
     };
 }
 
+// ---------------------------------------------------------------------------
+// PROXY_SCAN_BLOCKED (#4777): one audit trail entry per refused proxied pull,
+// aggregated so a client retrying a blocked pull cannot flood the table.
+// ---------------------------------------------------------------------------
+
+/// The aggregation window for `PROXY_SCAN_BLOCKED`.
+pub const PROXY_SCAN_BLOCK_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Upper bound on the (digest, principal, repository) keys the aggregator
+/// tracks. Past it, expired windows are dropped first; if none have expired
+/// the new key is still recorded (a row is never lost to the bound), it just
+/// is not aggregated.
+const PROXY_SCAN_BLOCK_MAX_KEYS: usize = 10_000;
+
+/// What one refused pull should write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockAdmission {
+    /// First block of this key in a window: write a row now (`attempts: 1`).
+    /// `closed_repeats` is the repeat count of the expired window this block
+    /// replaced when its summary row had not been written yet; the caller
+    /// writes that summary too, so no repeat is lost or counted twice.
+    Write { closed_repeats: u64 },
+    /// A repeat inside the window: count it. `flush_window` is the window's
+    /// start for the first repeat, whose caller schedules the window's
+    /// summary row for when the window closes; `None` for later repeats.
+    Suppress {
+        flush_window: Option<std::time::Instant>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockWindow {
+    started: std::time::Instant,
+    suppressed: u64,
+}
+
+/// Per-replica aggregation state for `PROXY_SCAN_BLOCKED`, keyed by
+/// (digest, principal, repository). Pure apart from the clock it is given.
+#[derive(Debug, Default)]
+pub(crate) struct BlockAggregator {
+    windows: std::collections::HashMap<(String, String, Uuid), BlockWindow>,
+}
+
+impl BlockAggregator {
+    pub(crate) fn admit(
+        &mut self,
+        key: (String, String, Uuid),
+        now: std::time::Instant,
+    ) -> BlockAdmission {
+        let mut closed_repeats = 0;
+        if let Some(w) = self.windows.get_mut(&key) {
+            if now.duration_since(w.started) < PROXY_SCAN_BLOCK_WINDOW {
+                w.suppressed += 1;
+                return BlockAdmission::Suppress {
+                    flush_window: (w.suppressed == 1).then_some(w.started),
+                };
+            }
+            // The window closed but its summary has not been taken yet: this
+            // block takes it over (the pending flush then finds a newer
+            // window and writes nothing).
+            closed_repeats = w.suppressed;
+        }
+        if self.windows.len() >= PROXY_SCAN_BLOCK_MAX_KEYS {
+            // Drop closed windows that owe no summary. One that does is
+            // removed by its own flush within a window, so the map stays
+            // bounded.
+            self.windows.retain(|_, w| {
+                now.duration_since(w.started) < PROXY_SCAN_BLOCK_WINDOW || w.suppressed > 0
+            });
+        }
+        if self.windows.len() < PROXY_SCAN_BLOCK_MAX_KEYS || self.windows.contains_key(&key) {
+            self.windows.insert(
+                key,
+                BlockWindow {
+                    started: now,
+                    suppressed: 0,
+                },
+            );
+        }
+        BlockAdmission::Write { closed_repeats }
+    }
+
+    /// Close the window that started at `started`: the repeats it absorbed,
+    /// for its summary row. The key is forgotten, so the next block starts a
+    /// new window with a fresh row. A newer window under the same key (a
+    /// block that arrived after `started`'s window closed and took its
+    /// count over) is left alone and yields 0.
+    pub(crate) fn take_suppressed(
+        &mut self,
+        key: &(String, String, Uuid),
+        started: std::time::Instant,
+    ) -> u64 {
+        match self.windows.get(key) {
+            Some(w) if w.started == started => {
+                self.windows.remove(key).map(|w| w.suppressed).unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+}
+
+fn block_aggregator() -> &'static std::sync::Mutex<BlockAggregator> {
+    static AGG: std::sync::OnceLock<std::sync::Mutex<BlockAggregator>> = std::sync::OnceLock::new();
+    AGG.get_or_init(Default::default)
+}
+
+/// One refused proxied pull, as the gate saw it.
+#[derive(Debug, Clone)]
+pub struct ProxyScanBlockEvent {
+    pub repository_id: Uuid,
+    /// The requested file as the gate named it in the 403 body.
+    pub path: String,
+    pub checksum_sha256: String,
+}
+
+/// The request principal of the in-flight request, for attribution: the
+/// username the auth middleware recorded (`None` for an anonymous pull) and
+/// the authorization-grade client IP. Captured before any detached task,
+/// which would not inherit the request's task-locals.
+///
+/// Shared with the `UPSTREAM_FETCHED` recorder (#5286), which attributes an
+/// upstream request to the client request that caused it the same way.
+#[derive(Debug, Clone)]
+pub(crate) struct BlockPrincipal {
+    pub(crate) username: Option<String>,
+    pub(crate) ip: Option<IpAddr>,
+    pub(crate) correlation_id: Option<String>,
+}
+
+impl BlockPrincipal {
+    pub(crate) fn current() -> Self {
+        Self {
+            username: crate::api::middleware::request_span::recorded_user(),
+            ip: crate::api::middleware::client_ip::current_verified_client_ip(),
+            correlation_id: crate::api::middleware::tracing::current_correlation_id()
+                .map(crate::api::middleware::tracing::CorrelationId::into_string),
+        }
+    }
+
+    /// The aggregation key's principal: the username, or for an anonymous
+    /// pull the client address (one CI runner's loop is one key).
+    fn key(&self) -> String {
+        match (&self.username, self.ip) {
+            (Some(u), _) => format!("user:{u}"),
+            (None, Some(ip)) => format!("anonymous:{ip}"),
+            (None, None) => "anonymous".to_string(),
+        }
+    }
+}
+
+/// Record a `PROXY_SCAN_BLOCKED` audit entry for a refused proxied pull
+/// (#4777), aggregated per (digest, principal, repository) per
+/// [`PROXY_SCAN_BLOCK_WINDOW`] on this replica.
+///
+/// The first block of a key in a window writes a row at once (`attempts: 1`).
+/// Repeats inside the window are counted, and one summary row with their
+/// count (`attempts: n`, `aggregated: true`) is written when the window
+/// closes. A client retrying a blocked pull in a loop therefore writes at most
+/// two rows a minute per replica, however fast it retries.
+///
+/// Fire and forget: the write runs detached so the 403 is never delayed, and
+/// a failed write is logged, never surfaced to the client. Must be called on
+/// the request's own task so the principal can be read.
+pub fn record_proxy_scan_blocked(db: &PgPool, event: ProxyScanBlockEvent) {
+    let principal = BlockPrincipal::current();
+    let key = (
+        event.checksum_sha256.clone(),
+        principal.key(),
+        event.repository_id,
+    );
+    let admission = match block_aggregator().lock() {
+        Ok(mut agg) => agg.admit(key.clone(), std::time::Instant::now()),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .admit(key.clone(), std::time::Instant::now()),
+    };
+    let db = db.clone();
+    match admission {
+        BlockAdmission::Write { closed_repeats } => {
+            tokio::spawn(async move {
+                if closed_repeats > 0 {
+                    write_proxy_scan_blocked(&db, &event, &principal, closed_repeats, true).await;
+                }
+                write_proxy_scan_blocked(&db, &event, &principal, 1, false).await;
+            });
+        }
+        BlockAdmission::Suppress {
+            flush_window: Some(started),
+        } => {
+            tokio::spawn(async move {
+                // Flush when the window closes, not a full window after its
+                // first repeat: a block arriving in between would otherwise
+                // start a new window under the same key.
+                tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    started + PROXY_SCAN_BLOCK_WINDOW,
+                ))
+                .await;
+                let repeats = match block_aggregator().lock() {
+                    Ok(mut agg) => agg.take_suppressed(&key, started),
+                    Err(poisoned) => poisoned.into_inner().take_suppressed(&key, started),
+                };
+                if repeats > 0 {
+                    write_proxy_scan_blocked(&db, &event, &principal, repeats, true).await;
+                }
+            });
+        }
+        BlockAdmission::Suppress { flush_window: None } => {}
+    }
+}
+
+async fn write_proxy_scan_blocked(
+    db: &PgPool,
+    event: &ProxyScanBlockEvent,
+    principal: &BlockPrincipal,
+    attempts: u64,
+    aggregated: bool,
+) {
+    #[derive(sqlx::FromRow)]
+    struct Context {
+        repository_key: Option<String>,
+        user_id: Option<Uuid>,
+        verdict: Option<String>,
+        max_severity: Option<String>,
+        findings_count: Option<i32>,
+        scanned_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    let ctx: Option<Context> = sqlx::query_as(
+        r#"
+        SELECT (SELECT key FROM repositories WHERE id = $1) AS repository_key,
+               (SELECT id FROM users WHERE username = $2 LIMIT 1) AS user_id,
+               psr.verdict, psr.max_severity, psr.findings_count, psr.scanned_at
+          FROM (SELECT 1) one
+          LEFT JOIN proxy_scan_results psr
+            ON psr.checksum_sha256 = $3 AND psr.scan_type = $4
+        "#,
+    )
+    .bind(event.repository_id)
+    .bind(principal.username.as_deref())
+    .bind(&event.checksum_sha256)
+    .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+    .fetch_optional(db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "PROXY_SCAN_BLOCKED context lookup failed; recording without it");
+        None
+    });
+    let ctx = ctx.unwrap_or(Context {
+        repository_key: None,
+        user_id: None,
+        verdict: None,
+        max_severity: None,
+        findings_count: None,
+        scanned_at: None,
+    });
+    let details = serde_json::json!({
+        "repository": ctx.repository_key,
+        "repository_id": event.repository_id,
+        "path": event.path,
+        "checksum_sha256": event.checksum_sha256,
+        "verdict": ctx.verdict.as_deref().unwrap_or("vulnerable"),
+        "max_severity": ctx.max_severity,
+        "findings_count": ctx.findings_count,
+        "scanned_at": ctx.scanned_at,
+        "principal": principal.username,
+        "anonymous": principal.username.is_none(),
+        "attempts": attempts,
+        "aggregated": aggregated,
+        "window_seconds": PROXY_SCAN_BLOCK_WINDOW.as_secs(),
+    });
+    let mut entry = AuditEntry::new(AuditAction::ProxyScanBlocked, ResourceType::Repository)
+        .resource(event.repository_id)
+        .details(details);
+    if let Some(name) = ctx.repository_key {
+        entry = entry.resource_name(name);
+    }
+    if let Some(user_id) = ctx.user_id {
+        entry = entry.user(user_id);
+    }
+    if let Some(username) = principal.username.clone() {
+        entry = entry.actor_name(username);
+    }
+    // The detached task does not inherit the request's task-locals, so the
+    // address and correlation id captured on the request are set explicitly.
+    if let Some(ip) = principal.ip {
+        entry = entry.ip(ip);
+    }
+    if let Some(cid) = principal.correlation_id.as_deref() {
+        entry = entry.correlation(cid);
+    }
+    if let Err(e) = AuditService::new(db.clone()).log(entry).await {
+        tracing::warn!(
+            repository_id = %event.repository_id, digest = %event.checksum_sha256, error = %e,
+            "failed to record the PROXY_SCAN_BLOCKED audit entry"
+        );
+    }
+}
+
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod proxy_scan_blocked_4777_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn key(digest: &str, who: &str) -> (String, String, Uuid) {
+        (digest.to_string(), who.to_string(), Uuid::nil())
+    }
+
+    /// A retry loop inside one window writes one row now and schedules one
+    /// summary; a new window writes again. Another digest or principal is
+    /// its own key.
+    #[test]
+    fn aggregation_writes_once_per_window_and_counts_repeats() {
+        let mut agg = BlockAggregator::default();
+        let t0 = Instant::now();
+        let write = BlockAdmission::Write { closed_repeats: 0 };
+        let k = key("d1", "user:ci");
+        assert_eq!(agg.admit(k.clone(), t0), write);
+        assert_eq!(
+            agg.admit(k.clone(), t0 + Duration::from_secs(1)),
+            BlockAdmission::Suppress {
+                flush_window: Some(t0)
+            }
+        );
+        for i in 2..50 {
+            assert_eq!(
+                agg.admit(k.clone(), t0 + Duration::from_millis(1000 + i)),
+                BlockAdmission::Suppress { flush_window: None }
+            );
+        }
+        assert_eq!(agg.admit(key("d2", "user:ci"), t0), write);
+        assert_eq!(agg.admit(key("d1", "user:other"), t0), write);
+        assert_eq!(agg.take_suppressed(&k, t0), 49);
+        assert_eq!(
+            agg.take_suppressed(&k, t0),
+            0,
+            "a closed window is forgotten"
+        );
+        assert_eq!(agg.admit(k.clone(), t0 + Duration::from_secs(61)), write);
+        // An expired window that owes no summary also restarts.
+        let k3 = key("d3", "anonymous:10.0.0.1");
+        assert_eq!(agg.admit(k3.clone(), t0), write);
+        assert_eq!(agg.admit(k3, t0 + PROXY_SCAN_BLOCK_WINDOW), write);
+    }
+
+    /// A block that arrives after a window closed but before its flush ran
+    /// takes the closed window's count over (the caller writes its summary),
+    /// and the late flush writes nothing: every repeat is reported exactly
+    /// once, under a continuous retry loop too.
+    #[test]
+    fn a_block_after_the_window_closes_carries_its_unflushed_count() {
+        let mut agg = BlockAggregator::default();
+        let t0 = Instant::now();
+        let k = key("d1", "user:ci");
+        assert_eq!(
+            agg.admit(k.clone(), t0),
+            BlockAdmission::Write { closed_repeats: 0 }
+        );
+        for i in 1..=10 {
+            agg.admit(k.clone(), t0 + Duration::from_secs(i));
+        }
+        let t1 = t0 + PROXY_SCAN_BLOCK_WINDOW + Duration::from_millis(5);
+        assert_eq!(
+            agg.admit(k.clone(), t1),
+            BlockAdmission::Write { closed_repeats: 10 },
+            "the closed window's 10 repeats are handed to this block"
+        );
+        assert_eq!(
+            agg.take_suppressed(&k, t0),
+            0,
+            "the late flush of the closed window writes nothing"
+        );
+        agg.admit(k.clone(), t1 + Duration::from_secs(1));
+        assert_eq!(
+            agg.take_suppressed(&k, t1),
+            1,
+            "the new window keeps its own count"
+        );
+    }
+
+    /// At the key bound, a closed window that still owes its summary is
+    /// kept for its flush; one that owes nothing is dropped.
+    #[test]
+    fn the_key_bound_keeps_windows_that_owe_a_summary() {
+        let mut agg = BlockAggregator::default();
+        let t0 = Instant::now();
+        for i in 0..PROXY_SCAN_BLOCK_MAX_KEYS {
+            agg.admit(key(&format!("d{i}"), "user:ci"), t0);
+        }
+        let owes = key("d0", "user:ci");
+        agg.admit(owes.clone(), t0 + Duration::from_secs(1));
+        let later = t0 + PROXY_SCAN_BLOCK_WINDOW + Duration::from_secs(1);
+        agg.admit(key("fresh", "user:ci"), later);
+        assert_eq!(
+            agg.windows.len(),
+            2,
+            "only the owing window and the new key"
+        );
+        assert_eq!(agg.take_suppressed(&owes, t0), 1);
+    }
+
+    #[test]
+    fn principal_key_prefers_the_username_then_the_address() {
+        let p = |u: Option<&str>, ip: Option<&str>| BlockPrincipal {
+            username: u.map(str::to_string),
+            ip: ip.map(|s| s.parse().unwrap()),
+            correlation_id: None,
+        };
+        assert_eq!(p(Some("ci"), Some("10.0.0.1")).key(), "user:ci");
+        assert_eq!(p(None, Some("10.0.0.1")).key(), "anonymous:10.0.0.1");
+        assert_eq!(p(None, None).key(), "anonymous");
+    }
+
+    #[test]
+    fn action_string_is_stable() {
+        assert_eq!(AuditAction::ProxyScanBlocked.as_str(), "PROXY_SCAN_BLOCKED");
+        assert!(AuditAction::ProxyScanBlocked.as_str().len() <= 100);
+        assert_eq!(AuditAction::UpstreamFetched.as_str(), "UPSTREAM_FETCHED");
+        assert_eq!(AuditAction::ConfigImported.as_str(), "CONFIG_IMPORTED");
+    }
+
+    /// #5253: the MCP registry vocabulary is a published contract
+    /// (`docs/audit-events.md`).
+    #[test]
+    fn mcp_action_names_and_outcomes() {
+        use crate::services::audit_export::Outcome;
+        for (action, name, outcome) in [
+            (
+                AuditAction::McpPackagePinned,
+                "MCP_PACKAGE_PINNED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpPinDriftDetected,
+                "MCP_PIN_DRIFT_DETECTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerDownloadRefused,
+                "MCP_SERVER_DOWNLOAD_REFUSED",
+                Outcome::Denied,
+            ),
+            (
+                AuditAction::McpServerPublished,
+                "MCP_SERVER_PUBLISHED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerStatusChanged,
+                "MCP_SERVER_STATUS_CHANGED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerApproved,
+                "MCP_SERVER_APPROVED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerRejected,
+                "MCP_SERVER_REJECTED",
+                Outcome::Denied,
+            ),
+            (
+                AuditAction::McpServerReopened,
+                "MCP_SERVER_REOPENED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerContentDrift,
+                "MCP_SERVER_CONTENT_DRIFT",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpGateUnavailable,
+                "MCP_GATE_UNAVAILABLE",
+                Outcome::Failure,
+            ),
+            (
+                AuditAction::McpCapabilitiesIngested,
+                "MCP_CAPABILITIES_INGESTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpToolsDrift,
+                "MCP_TOOLS_DRIFT",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpNamespaceGranted,
+                "MCP_NAMESPACE_GRANTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpNamespaceRevoked,
+                "MCP_NAMESPACE_REVOKED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpNamespaceProofVerified,
+                "MCP_NAMESPACE_PROOF_VERIFIED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpNamespaceProofFailed,
+                "MCP_NAMESPACE_PROOF_FAILED",
+                Outcome::Failure,
+            ),
+            (
+                AuditAction::McpServerEdited,
+                "MCP_SERVER_EDITED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerDeleted,
+                "MCP_SERVER_DELETED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerPurged,
+                "MCP_SERVER_PURGED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpMirrorSynced,
+                "MCP_MIRROR_SYNCED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpBundleSignatureRejected,
+                "MCP_BUNDLE_SIGNATURE_REJECTED",
+                Outcome::Denied,
+            ),
+        ] {
+            assert_eq!(action.as_str(), name);
+            assert_eq!(action.outcome(), outcome);
+        }
+    }
+}
+
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
@@ -1218,6 +2107,8 @@ mod tests {
             AuditAction::ArtifactMetadataUpdated.as_str(),
             "ARTIFACT_METADATA_UPDATED"
         );
+        assert_eq!(AuditAction::ArtifactRestored.as_str(), "ARTIFACT_RESTORED");
+        assert_eq!(AuditAction::ArtifactPurged.as_str(), "ARTIFACT_PURGED");
     }
 
     #[test]
@@ -1274,6 +2165,41 @@ mod tests {
         assert_eq!(AuditAction::PermissionDenied.as_str(), "PERMISSION_DENIED");
     }
 
+    #[test]
+    fn test_audit_action_as_str_conda_lifecycle() {
+        // #4709: conda withdraw, attestation outcomes, environment lifecycle.
+        assert_eq!(
+            AuditAction::CondaPackageWithdrawn.as_str(),
+            "CONDA_PACKAGE_WITHDRAWN"
+        );
+        assert_eq!(
+            AuditAction::AttestationVerified.as_str(),
+            "ATTESTATION_VERIFIED"
+        );
+        assert_eq!(
+            AuditAction::AttestationRejected.as_str(),
+            "ATTESTATION_REJECTED"
+        );
+        assert_eq!(
+            AuditAction::EnvironmentRegistered.as_str(),
+            "ENVIRONMENT_REGISTERED"
+        );
+        assert_eq!(
+            AuditAction::EnvironmentDeleted.as_str(),
+            "ENVIRONMENT_DELETED"
+        );
+    }
+
+    #[test]
+    fn test_audit_action_as_str_detection_gaps() {
+        // #4677: rate-limited logins and external findings ingest.
+        assert_eq!(AuditAction::LoginRateLimited.as_str(), "LOGIN_RATE_LIMITED");
+        assert_eq!(
+            AuditAction::ExternalFindingsIngested.as_str(),
+            "EXTERNAL_FINDINGS_INGESTED"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // ResourceType::as_str
     // -----------------------------------------------------------------------
@@ -1290,6 +2216,209 @@ mod tests {
         assert_eq!(ResourceType::Setting.as_str(), "setting");
         assert_eq!(ResourceType::Plugin.as_str(), "plugin");
         assert_eq!(ResourceType::ScanResult.as_str(), "scan_result");
+        assert_eq!(
+            ResourceType::PromotionApproval.as_str(),
+            "promotion_approval"
+        );
+        assert_eq!(ResourceType::PermissionRule.as_str(), "permission_rule");
+        assert_eq!(ResourceType::SsoProvider.as_str(), "sso_provider");
+        assert_eq!(ResourceType::SigningKey.as_str(), "signing_key");
+        assert_eq!(ResourceType::Webhook.as_str(), "webhook");
+        assert_eq!(ResourceType::SyncPolicy.as_str(), "sync_policy");
+        assert_eq!(ResourceType::Environment.as_str(), "environment");
+    }
+
+    /// #4710: the core privileged-action vocabulary. The names are a published
+    /// contract (`docs/audit-events.md`, SIEM rules key on them), so pin every
+    /// one together with its export outcome.
+    #[test]
+    fn test_core_privileged_action_names_and_outcomes() {
+        use crate::services::audit_export::Outcome;
+        let cases = [
+            (
+                AuditAction::FindingAcknowledged,
+                "FINDING_ACKNOWLEDGED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::FindingAcknowledgementRevoked,
+                "FINDING_ACKNOWLEDGEMENT_REVOKED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::FindingAcknowledgementCarried,
+                "FINDING_ACKNOWLEDGEMENT_CARRIED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::FindingAcknowledgementNotCarried,
+                "FINDING_ACKNOWLEDGEMENT_NOT_CARRIED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::FindingAcknowledgementExpired,
+                "FINDING_ACKNOWLEDGEMENT_EXPIRED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::QuarantineReleased,
+                "QUARANTINE_RELEASED",
+                Outcome::Success,
+            ),
+            (AuditAction::CacheSeeded, "CACHE_SEEDED", Outcome::Success),
+            (
+                AuditAction::QuarantineRejected,
+                "QUARANTINE_REJECTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::PromotionApprovalGranted,
+                "PROMOTION_APPROVAL_GRANTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::PromotionApprovalDenied,
+                "PROMOTION_APPROVAL_DENIED",
+                Outcome::Denied,
+            ),
+            (
+                AuditAction::ArtifactPromoted,
+                "ARTIFACT_PROMOTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::PromotionRefused,
+                "PROMOTION_REFUSED",
+                Outcome::Denied,
+            ),
+            (
+                AuditAction::PromotionRejected,
+                "PROMOTION_REJECTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::PermissionRuleCreated,
+                "PERMISSION_RULE_CREATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::PermissionRuleUpdated,
+                "PERMISSION_RULE_UPDATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::PermissionRuleDeleted,
+                "PERMISSION_RULE_DELETED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SsoProviderCreated,
+                "SSO_PROVIDER_CREATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SsoProviderUpdated,
+                "SSO_PROVIDER_UPDATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SsoProviderDeleted,
+                "SSO_PROVIDER_DELETED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SsoProviderEnabled,
+                "SSO_PROVIDER_ENABLED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SsoProviderDisabled,
+                "SSO_PROVIDER_DISABLED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SigningKeyRotated,
+                "SIGNING_KEY_ROTATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SigningKeyRevoked,
+                "SIGNING_KEY_REVOKED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SigningKeyTrustAttested,
+                "SIGNING_KEY_TRUST_ATTESTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::WebhookCreated,
+                "WEBHOOK_CREATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::WebhookUpdated,
+                "WEBHOOK_UPDATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::WebhookDeleted,
+                "WEBHOOK_DELETED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::WebhookSecretRotated,
+                "WEBHOOK_SECRET_ROTATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SyncPolicyCreated,
+                "SYNC_POLICY_CREATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SyncPolicyUpdated,
+                "SYNC_POLICY_UPDATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SyncPolicyDeleted,
+                "SYNC_POLICY_DELETED",
+                Outcome::Success,
+            ),
+        ];
+        for (action, name, outcome) in cases {
+            assert_eq!(action.as_str(), name);
+            assert_eq!(action.outcome(), outcome, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_for_principal_records_actor() {
+        let auth = crate::api::handlers::test_db_helpers::make_auth(Uuid::new_v4(), "alice");
+        let entry =
+            AuditEntry::for_principal(AuditAction::WebhookCreated, ResourceType::Webhook, &auth);
+        assert_eq!(entry.user_id(), Some(auth.user_id));
+        assert_eq!(entry.actor_name_ref(), Some("alice"));
+        assert_eq!(entry.resource_type().as_str(), "webhook");
+    }
+
+    #[test]
+    fn test_changed_fields_lists_differing_keys_only() {
+        let before = serde_json::json!({
+            "name": "a", "is_enabled": true, "has_secret": true,
+            "updated_at": "t1", "created_at": "t0", "gone": 1
+        });
+        let after = serde_json::json!({
+            "name": "b", "is_enabled": true, "has_secret": true,
+            "updated_at": "t2", "created_at": "t0", "added": 2
+        });
+        assert_eq!(
+            changed_fields(&before, &after),
+            vec!["added", "gone", "name"]
+        );
+        assert!(changed_fields(&before, &before).is_empty());
+        assert!(changed_fields(&serde_json::json!(1), &after).is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1399,6 +2528,29 @@ mod tests {
         assert_eq!(details["nested"]["Authorization"], AUDIT_REDACTED_VALUE);
         assert_eq!(details["nested"]["token_name"], "safe metadata");
         assert_eq!(details["items"][0]["client-secret"], AUDIT_REDACTED_VALUE);
+    }
+
+    #[test]
+    fn test_audit_entry_details_strips_upstream_url_userinfo() {
+        // #4452: an upstream URL keeps its host/path as audit context but
+        // never its embedded credentials, at any nesting depth.
+        let entry = AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
+            .details(serde_json::json!({
+                "upstream_url": "https://alice:s3cret@registry.example.com/simple",
+                "repo": {"Index-Upstream-Url": "https://tok@index.example.com/"},
+                "upstream_url_count": 3
+            }));
+        let details = entry.details.unwrap();
+        assert_eq!(
+            details["upstream_url"],
+            "https://registry.example.com/simple"
+        );
+        assert_eq!(
+            details["repo"]["Index-Upstream-Url"],
+            "https://index.example.com/"
+        );
+        // A non-string value under a non-URL key is left alone.
+        assert_eq!(details["upstream_url_count"], 3);
     }
 
     #[test]
@@ -1534,6 +2686,64 @@ mod tests {
         let entry =
             AuditEntry::new(AuditAction::Login, ResourceType::User).with_request_client_ip();
         assert!(entry.ip_address.is_none());
+    }
+
+    #[tokio::test]
+    async fn with_request_client_ip_records_null_when_verified_ip_is_unknown() {
+        // A best-effort (XFF-derived, unverifiable) address with NO
+        // verified grade — the topology behind a trusted proxy without
+        // XFF_TRUSTED_FOR_AUTHZ — must NOT be attributed in the audit row:
+        // NULL is the honest record.
+        let best = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 33));
+        let entry =
+            crate::api::middleware::client_ip::with_client_ip_context(Some(best), None, async {
+                AuditEntry::new(AuditAction::Login, ResourceType::User).with_request_client_ip()
+            })
+            .await;
+        assert_eq!(entry.ip_address, None);
+
+        // And the verified grade, when present, is the one attributed.
+        let verified = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99));
+        let entry = crate::api::middleware::client_ip::with_client_ip_context(
+            Some(best),
+            Some(verified),
+            async {
+                AuditEntry::new(AuditAction::Login, ResourceType::User).with_request_client_ip()
+            },
+        )
+        .await;
+        assert_eq!(entry.ip_address, Some(verified));
+    }
+
+    #[tokio::test]
+    async fn new_entry_defaults_to_the_verified_request_client_ip_4762() {
+        // #4762: a writer that never opts in still records the verified
+        // client IP of the request it runs in; only the verified grade is
+        // used, and an explicit `.ip(..)` still wins.
+        use crate::api::middleware::client_ip::with_client_ip_context;
+        let best = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 33));
+        let verified = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 62));
+        let entry = with_client_ip_context(Some(best), Some(verified), async {
+            AuditEntry::new(AuditAction::RepositoryCreated, ResourceType::Repository)
+        })
+        .await;
+        assert_eq!(entry.ip_address, Some(verified));
+
+        let entry = with_client_ip_context(Some(best), None, async {
+            AuditEntry::new(AuditAction::UserCreated, ResourceType::User)
+        })
+        .await;
+        assert_eq!(
+            entry.ip_address, None,
+            "an unverified address is never recorded"
+        );
+
+        let explicit = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let entry = with_client_ip_context(Some(best), Some(verified), async {
+            AuditEntry::new(AuditAction::UserCreated, ResourceType::User).ip(explicit)
+        })
+        .await;
+        assert_eq!(entry.ip_address, Some(explicit));
     }
 
     #[test]

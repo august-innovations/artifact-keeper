@@ -48,7 +48,10 @@ pub async fn try_pool() -> Option<PgPool> {
 /// tests that need a wiremock upstream. Production correctly blocks loopback,
 /// so the mock listens on the host's non-loopback address and only that /32 or
 /// /128 is allowlisted for the lifetime of the guard.
-static SSRF_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// It is the same lock the outbound-policy unit tests take
+/// (`validation::OUTBOUND_POLICY_ENV_LOCK`), so the two never interleave.
+static SSRF_TEST_ENV_LOCK: &tokio::sync::Mutex<()> =
+    &crate::api::validation::OUTBOUND_POLICY_ENV_LOCK;
 
 pub struct SsrfTestAllowlistGuard {
     _lock: tokio::sync::MutexGuard<'static, ()>,
@@ -289,6 +292,27 @@ pub async fn token_policy_serial_lock() -> TokenPolicySerialGuard {
     }
 }
 
+/// Advisory-lock key for [`hidden_nav_items_serial_lock`] (#4574).
+const HIDDEN_NAV_ITEMS_TEST_LOCK_KEY: i64 = 0x4e56_4574; // "NV" + issue #4574
+
+/// Cross-process serialization guard for the DB-backed tests that write the
+/// `ui.hidden_nav_items` row (#4574), or that compare it across reads (#5431). It is ONE row in `system_settings`
+/// shared by the whole database, so two tests writing it under `cargo
+/// nextest` process-per-test parallelism would read each other's values.
+/// Mirrors [`token_policy_serial_lock`].
+pub struct HiddenNavItemsSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the hidden-navigation-items test lock, blocking until it is free.
+/// Returns an inert guard when the database is unreachable, mirroring
+/// [`try_pool`].
+pub async fn hidden_nav_items_serial_lock() -> HiddenNavItemsSerialGuard {
+    HiddenNavItemsSerialGuard {
+        _conn: serial_lock_session(HIDDEN_NAV_ITEMS_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Advisory-lock key for [`usage_ledger_serial_lock`] (#2992).
 ///
 /// Distinct from the other test lock keys and from the application advisory
@@ -514,6 +538,29 @@ pub async fn oci_blob_digest_serial_lock() -> OciBlobDigestSerialGuard {
     }
 }
 
+/// Advisory-lock key for [`device_expiry_serial_lock`] (#3461).
+const DEVICE_EXPIRY_TEST_LOCK_KEY: i64 = 0x4456_3461; // "DV" + issue #3461
+
+/// Cross-process serialization guard for the device-grant tests that expire
+/// a session or run the expiry sweep (#3461).
+///
+/// The sweep deletes every expired `device_sessions` row, not just the
+/// caller's, so under process-per-test parallelism one test's sweep could
+/// delete a row another test had just expired and was about to poll
+/// (turning its `expired_token` into `invalid_grant`). Tests that expire a
+/// row or sweep take this lock for their whole body.
+pub struct DeviceExpirySerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the device-expiry test lock, blocking until it is free. Inert
+/// when no database is configured, like [`try_pool`].
+pub async fn device_expiry_serial_lock() -> DeviceExpirySerialGuard {
+    DeviceExpirySerialGuard {
+        _conn: serial_lock_session(DEVICE_EXPIRY_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Refresh the materialized storage stats for a test, absorbing transient
 /// cross-suite interference.
 ///
@@ -574,6 +621,8 @@ fn cfg(storage_path: &str) -> Config {
         s3_endpoint: None,
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
         signature_expiry_seconds: 604_800,
+        signing_key_rotation_overlap_secs: 1_209_600,
+        signing_auto_migrate_legacy_keys: false,
         jwt_expiration_secs: 86400,
         jwt_access_token_expiry_minutes: 30,
         jwt_refresh_token_expiry_days: 7,
@@ -595,13 +644,20 @@ fn cfg(storage_path: &str) -> Config {
         scan_workspace_path: "/tmp/scan".into(),
         demo_mode: false,
         guest_access_enabled: true,
+        guest_access_env_pinned: false,
         expose_detailed_health: false,
+        readyz_require_search: false,
         setup_password_hint: None,
         grpc_reflection_enabled: false,
         swagger_enabled: false,
+        plugins_enabled: true,
+        terraform_default_repo: None,
         plugins_require_signed: true,
         plugins_trusted_pubkey: None,
         conda_attestation_require_verified: true,
+        conda_attestation_issuers: Vec::new(),
+        conda_attestation_identities: Vec::new(),
+        conda_attestation_public_keys: Vec::new(),
         peer_instance_name: "test".into(),
         peer_public_endpoint: "http://localhost:8080".into(),
         peer_api_key: "test-key".into(),
@@ -609,11 +665,13 @@ fn cfg(storage_path: &str) -> Config {
         dependency_track_enabled: false,
         otel_exporter_otlp_endpoint: None,
         otel_service_name: "test".into(),
+        gc_trash_retention_days: 0,
         gc_schedule: "0 0 * * * *".into(),
         storage_stats_schedule: "0 0 */4 * * *".into(),
         blob_gc_enabled: false,
         maven_flat_gc_enabled: false,
         blob_gc_sweep_grace_secs: 3600,
+        blob_gc_min_age_secs: crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
         lifecycle_check_interval_secs: 60,
         stuck_scan_threshold_secs: 1800,
         stuck_scan_check_interval_secs: 600,
@@ -621,18 +679,29 @@ fn cfg(storage_path: &str) -> Config {
         allow_local_admin_login: false,
         sso_disable_admin_break_glass: false,
         oidc_silent_sso_enabled: true,
+        device_auth: Default::default(),
+        proxy_upstream: Default::default(),
         totp_policy: None,
         api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,
+        grpc_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
+        metrics_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
         database_max_connections: 20,
         database_min_connections: 5,
         database_acquire_timeout_secs: 30,
         database_idle_timeout_secs: 600,
         database_max_lifetime_secs: 1800,
+        database_tcp_keepalives: true,
         auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
         global_max_concurrency: 512,
         global_request_timeout_secs: 120,
+        proxy_scan_queue_wait_secs: 60,
+        http_header_read_timeout_secs: 10,
+        http_listen_backlog: 0,
+        upload_progress_window_secs: 60,
+        upload_min_progress_bytes: 16 * 1024,
+        upload_max_in_flight_per_principal: 64,
         rate_limit_enabled: true,
         rate_limit_auth_per_window: 120,
         rate_limit_api_per_window: 5000,
@@ -651,6 +720,7 @@ fn cfg(storage_path: &str) -> Config {
         rate_limit_exempt_service_accounts: false,
         rate_limit_trusted_cidrs: Vec::new(),
         rate_limit_trusted_proxy_cidrs: Vec::new(),
+        xff_trusted_for_authz: false,
         account_lockout_threshold: 5,
         account_lockout_duration_minutes: 30,
         quarantine_enabled: false,
@@ -668,9 +738,16 @@ fn cfg(storage_path: &str) -> Config {
         password_min_strength: 0,
         presigned_downloads_enabled: false,
         presigned_download_expiry_secs: 300,
+        download_verify_checksums: true,
+        storage_scrub_interval_secs: 0,
+        storage_scrub_max_objects: 500,
+        storage_scrub_max_bytes: 2 << 30,
         proxy_singleflight_advisory_locks_enabled: false,
         proxy_singleflight_lock_poll_interval_ms: 200,
         proxy_singleflight_lock_wait_timeout_secs: 65,
+        proxy_stale_if_error_grace_secs:
+            crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+        audit_upstream_fetches: Default::default(),
         oci_virtual_negative_cache_ttl_ms: crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
         npm_virtual_negative_cache_ttl_ms: crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
         oci_virtual_negative_cache_max_entries:
@@ -683,6 +760,9 @@ fn cfg(storage_path: &str) -> Config {
         smtp_password: None,
         smtp_from_address: "noreply@test.local".to_string(),
         smtp_tls_mode: "starttls".to_string(),
+        smtp_tls_ca_cert: None,
+        smtp_tls_ca_cert_source: None,
+        smtp_tls_skip_verify: false,
         npm_packument_cache_enabled: true,
         npm_packument_cache_fresh_ttl_secs: 300,
         npm_packument_cache_stale_max_secs: 86_400,
@@ -692,6 +772,7 @@ fn cfg(storage_path: &str) -> Config {
         pypi_simple_cache_ttl_secs: 60,
         pypi_simple_cache_max_bytes: 64 * 1024 * 1024,
         npm_upstream_feed_enabled: false,
+        upstream_jobs_paused: false,
         npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
             .into(),
         scan_token_ttl_seconds: 300,
@@ -796,6 +877,12 @@ impl crate::storage::StorageBackend for MemStorage {
         crate::storage::buffered_put_stream_fallback(self, key, stream).await
     }
 
+    /// Stands in for an S3/GCS/Azure backend, whose uploads stage on the
+    /// backend instead of local scratch (#3916).
+    fn supports_streamed_assembly(&self) -> bool {
+        true
+    }
+
     fn supports_redirect(&self) -> bool {
         self.presign
     }
@@ -888,6 +975,127 @@ impl crate::storage::StorageBackend for FallbackProbeStorage {
     }
 }
 
+/// A cloud backend whose every read and write fails with one storage error:
+/// the stand-in for an object store that is down or out of space (#5649,
+/// #5650). `exists` answers "absent", so upload paths go on to write, which
+/// is where a stopped or full store refuses them.
+pub struct FailingStorage {
+    message: String,
+}
+
+impl FailingStorage {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    fn fail<T>(&self) -> crate::error::Result<T> {
+        Err(crate::error::AppError::Storage(self.message.clone()))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for FailingStorage {
+    async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+        self.fail()
+    }
+    async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+        self.fail()
+    }
+    async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+        Ok(false)
+    }
+    async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+        Ok(())
+    }
+    async fn copy(&self, _source: &str, _dest: &str) -> crate::error::Result<()> {
+        self.fail()
+    }
+    async fn put_stream(
+        &self,
+        _key: &str,
+        _stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    ) -> crate::error::Result<crate::storage::PutStreamResult> {
+        self.fail()
+    }
+    fn supports_streamed_assembly(&self) -> bool {
+        true
+    }
+    async fn health_check(&self) -> crate::error::Result<()> {
+        self.fail()
+    }
+}
+
+/// `state` with its registry replaced by one whose `"s3"` backend is a
+/// [`FailingStorage`] failing with `message`, plus the repository moved onto
+/// it. Every request against `repo_id` then reaches the failing store.
+pub async fn route_repo_to_failing_storage(
+    pool: &PgPool,
+    state: &SharedState,
+    repo_id: Uuid,
+    message: &str,
+) -> SharedState {
+    sqlx::query("UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1")
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("move repository onto the failing backend");
+    let failing: Arc<dyn crate::storage::StorageBackend> = Arc::new(FailingStorage::new(message));
+    let mut backends: std::collections::HashMap<String, Arc<dyn crate::storage::StorageBackend>> =
+        std::collections::HashMap::new();
+    backends.insert("s3".to_string(), failing);
+    let mut next = (**state).clone();
+    next.storage_registry = Arc::new(crate::storage::StorageRegistry::new(
+        backends,
+        "s3".to_string(),
+    ));
+    Arc::new(next)
+}
+
+/// What MinIO answers a PUT into a bucket at its quota, as the S3 backend
+/// tags and renders it (#5650): the XML names the bucket and carries the
+/// request ids, none of which may reach a client.
+pub fn minio_quota_exceeded_error() -> String {
+    crate::storage::StorageFailure::Full.tag(
+        "S3 request failed. caused by: Client error with status 400 Bad Request: \
+         <?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>XMinioAdminBucketQuotaExceeded\
+         </Code><Message>Bucket quota exceeded</Message><BucketName>ak-quota-bucket-5650\
+         </BucketName><RequestId>187A0F1E2D3C4B5A</RequestId></Error>",
+    )
+}
+
+/// What the S3 backend reports once its retry budget runs out against a
+/// stopped MinIO (#5649).
+pub fn minio_unreachable_error() -> String {
+    crate::storage::StorageFailure::Unavailable.tag(
+        "S3 connection refused. caused by: Error performing PUT <url> in 10.4s, after 6 \
+         retries - HTTP error: error sending request: tcp connect error: connection refused",
+    )
+}
+
+/// Assert a response body carries none of the backend text in
+/// [`minio_quota_exceeded_error`] / [`minio_unreachable_error`].
+pub fn assert_no_storage_backend_text(label: &str, body: &[u8]) {
+    let body = String::from_utf8_lossy(body);
+    for needle in [
+        "XMinio",
+        "<Error>",
+        "<?xml",
+        "ak-quota-bucket-5650",
+        "187A0F1E2D3C4B5A",
+        "caused by",
+        "connection refused",
+        crate::storage::StorageFailure::Full.marker(),
+        crate::storage::StorageFailure::Unavailable.marker(),
+    ] {
+        assert!(
+            !body.contains(needle),
+            "{label}: response body must not carry backend text {needle:?}: {body}"
+        );
+    }
+}
+
 /// Like [`build_state`], but the registry carries an in-memory backend
 /// registered under `backend_name` (e.g. `"s3"`), simulating a shared cloud
 /// namespace. Returns the state plus the backing [`MemStorage`] so tests can
@@ -906,6 +1114,20 @@ pub fn build_state_with_presigning_cloud(
     backend_name: &str,
 ) -> (SharedState, Arc<MemStorage>) {
     build_cloud_state(pool, backend_name, /* presign = */ true)
+}
+
+/// Like [`build_state_with_cloud`], with `proxy` as the proxy service (an
+/// upstream sync, e.g. a Remote MCP registry's, on a shared cloud
+/// namespace; #5660).
+pub fn build_state_with_cloud_and_proxy(
+    pool: PgPool,
+    backend_name: &str,
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+) -> (SharedState, Arc<MemStorage>) {
+    let (state, mem) = build_cloud_state(pool, backend_name, false);
+    let mut state = Arc::try_unwrap(state).unwrap_or_else(|_| unreachable!("fresh state"));
+    state.set_proxy_service(proxy);
+    (Arc::new(state), mem)
 }
 
 fn build_cloud_state(
@@ -1135,6 +1357,63 @@ pub fn router_with_auth_ext(
         .with_state(state)
         .layer(Extension::<AuthExtension>(auth.clone()))
         .layer(Extension::<Option<AuthExtension>>(Some(auth)))
+}
+
+/// Put the production `client_ip_context_middleware` in front of `app` with
+/// no trusted proxies and `XFF_TRUSTED_FOR_AUTHZ` off (#4681 defaults), so
+/// the request's resolved client IP is the TCP peer set by
+/// [`request_from_peer`]. Used by the audit client-IP tests (#4762).
+pub fn with_client_ip_middleware(app: Router) -> Router {
+    app.layer(axum::middleware::from_fn_with_state(
+        Arc::new(crate::api::middleware::client_ip::ClientIpConfig {
+            trusted_proxies: Vec::new(),
+            xff_trusted_for_authz: false,
+        }),
+        crate::api::middleware::client_ip::client_ip_context_middleware,
+    ))
+}
+
+/// A JSON `POST` to `uri` arriving from TCP peer `peer`, carrying a spoofed
+/// `X-Forwarded-For` the untrusted-peer resolution must ignore.
+pub fn request_from_peer(uri: &str, body: serde_json::Value, peer: &str) -> Request<Body> {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("X-Forwarded-For", "192.0.2.1")
+        .body(Body::from(body.to_string()))
+        .expect("build request");
+    req.extensions_mut().insert(axum::extract::ConnectInfo(
+        peer.parse::<std::net::SocketAddr>()
+            .expect("peer socket address"),
+    ));
+    req
+}
+
+/// Poll for the (fire-and-forget) audit row of `action` on `resource_id` and
+/// return its `ip_address`. `None` when no row appeared; `Some(None)` when the
+/// row was written without a client IP.
+pub async fn audit_row_ip(
+    pool: &PgPool,
+    action: &str,
+    resource_id: Uuid,
+) -> Option<Option<String>> {
+    for _ in 0..40 {
+        let row: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT ip_address FROM audit_log WHERE action = $1 AND resource_id = $2 \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(action)
+        .bind(resource_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read audit row");
+        if row.is_some() {
+            return row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    None
 }
 
 /// Register a peer instance via the real `PeerInstanceService` and return its
@@ -1402,6 +1681,157 @@ pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
     );
 }
 
+/// Drop a wiremock [`MockServer`](wiremock::MockServer) from a task that may
+/// have just spent its whole Tokio coop budget.
+///
+/// `MockServer`'s `Drop` runs `futures::executor::block_on(self.verify())`,
+/// which takes a Tokio `RwLock`, on the test's own runtime thread. That lock
+/// charges the coop budget. A test whose last poll spent all 128 units gets
+/// `Pending` from it even though the lock is free, and the wake-up is deferred
+/// to the runtime, which cannot run because `block_on` has parked its thread.
+/// The test then hangs forever at 0% CPU: no timer can fire and no panic is
+/// raised.
+///
+/// Reading a body from the warm proxy cache spends one unit per 64 KiB when
+/// each `spawn_blocking` read has finished by the time it is polled, which a
+/// CPU-saturated machine makes possible, so a body of about 8 MiB or more can
+/// land the budget on exactly zero. Yielding first ends the poll, and the next
+/// one starts with a fresh budget. Use this instead of `drop(server)` after
+/// reading such a body.
+pub async fn drop_mock_server(server: wiremock::MockServer) {
+    tokio::task::yield_now().await;
+    drop(server);
+}
+
+/// #5322: mount a counting upstream for `path` on `server`. A `HEAD` is
+/// answered with `headers` and a `Content-Length` of `body` (no body), a `GET`
+/// with `headers` and `body`. Each mock expects exactly ONE request, verified
+/// when `server` is dropped, so a test that sends a HEAD and two GETs proves
+/// the body left the upstream once and the HEAD was answered by a HEAD.
+pub async fn mount_head_and_get_once(
+    server: &wiremock::MockServer,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) {
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let mut head =
+        ResponseTemplate::new(200).insert_header("content-length", body.len().to_string().as_str());
+    let mut get = ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    for (name, value) in headers {
+        head = head.insert_header(*name, *value);
+        get = get.insert_header(*name, *value);
+    }
+    Mock::given(method("HEAD"))
+        .and(wm_path(path))
+        .respond_with(head)
+        .expect(1)
+        .named("upstream HEAD")
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(wm_path(path))
+        .respond_with(get)
+        .expect(1)
+        .named("upstream GET of the body")
+        .mount(server)
+        .await;
+}
+
+/// #5322: the `hf_hub_download` request shape against a cold Remote: `HEAD
+/// uri`, then `GET uri`, then (once the proxy cache has committed the body)
+/// `GET uri` again. Returns the three `(status, body, headers)` answers.
+/// `app` builds a fresh router per request, as `oneshot` consumes it.
+pub async fn cold_head_then_two_gets(
+    app: impl Fn() -> Router,
+    uri: &str,
+    cache_dir: &std::path::Path,
+    body_len: u64,
+) -> [(StatusCode, Bytes, axum::http::HeaderMap); 3] {
+    let head_answer = send_with_headers(app(), head(uri.to_string())).await;
+    let cold_get = send_with_headers(app(), get(uri.to_string())).await;
+    wait_for_cache_commit(cache_dir, body_len).await;
+    let warm_get = send_with_headers(app(), get(uri.to_string())).await;
+    [head_answer, cold_get, warm_get]
+}
+
+/// #5343: the cold-`HEAD` contract for a format handler that streams a Remote
+/// download itself rather than through `try_remote_or_virtual_download`.
+///
+/// `server` must already carry the format's own upstream documents (an index,
+/// a packument, a checksum sidecar: whatever the handler resolves first),
+/// unconstrained. This mounts the counting pair for `upstream_path` (one
+/// `HEAD`, one body `GET`, see [`mount_head_and_get_once`]), points the
+/// fixture's Remote at `server`, and sends `HEAD uri`, `GET uri` and, once the
+/// cache has committed, `GET uri` again through `router` (with the fixture
+/// user's auth when `with_auth`).
+///
+/// Asserts the HEAD is a 200 with no body that advertises the GET's
+/// `Content-Length`, that both GETs serve `body`, and (the claim under test)
+/// that the upstream saw exactly one `HEAD` and one `GET` of the body.
+/// Returns the HEAD's headers for the format's own header assertions.
+#[allow(clippy::too_many_arguments)]
+pub async fn assert_cold_head_fetches_body_once(
+    fx: Fixture,
+    server: wiremock::MockServer,
+    router: fn() -> Router<SharedState>,
+    with_auth: bool,
+    upstream_path: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> axum::http::HeaderMap {
+    mount_head_and_get_once(&server, upstream_path, headers, body).await;
+    let (state, cache) = rewire_remote_proxy(&fx, &server.uri()).await;
+    let auth = make_auth(fx.user_id, &fx.username);
+    let app = || {
+        if with_auth {
+            router_with_auth(router(), state.clone(), auth.clone())
+        } else {
+            router_anon(router(), state.clone())
+        }
+    };
+    let [head_answer, cold, warm] =
+        cold_head_then_two_gets(app, uri, cache.path(), body.len() as u64).await;
+    fx.teardown().await;
+
+    assert_eq!(head_answer.0, StatusCode::OK, "HEAD {uri}");
+    assert!(head_answer.1.is_empty(), "HEAD {uri} must have no body");
+    let size = body.len().to_string();
+    assert_eq!(
+        head_answer
+            .2
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(size.as_str()),
+        "HEAD {uri} must advertise the GET's Content-Length"
+    );
+    for (which, answer) in [("cold", &cold), ("warm", &warm)] {
+        assert_eq!(answer.0, StatusCode::OK, "{which} GET {uri}");
+        assert!(answer.1[..] == body[..], "{which} GET {uri} body");
+    }
+    // The upstream request log, for a readable failure: before #5343 a cold
+    // HEAD opened a body GET whose dropped stream cached nothing, so the
+    // upstream saw no HEAD and two GETs of the body.
+    let seen: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == upstream_path)
+        .map(|r| r.method.to_string())
+        .collect();
+    assert_eq!(
+        seen,
+        ["HEAD", "GET"],
+        "cold HEAD then GET of {uri} must reach the upstream as one HEAD and one body GET"
+    );
+    drop_mock_server(server).await;
+    head_answer.2
+}
+
 /// Floor for "this proxy-cache entry was written as IMMUTABLE".
 ///
 /// `Mutability::write_ttl_secs` stamps an immutable entry with ~10 years and a
@@ -1615,6 +2045,42 @@ pub async fn audit_count_eventually(
     last
 }
 
+/// The newest `audit_log` row recorded for `(resource_id, action)` (#4710).
+#[derive(Debug)]
+pub struct AuditRow {
+    pub user_id: Option<Uuid>,
+    pub resource_type: String,
+    pub details: serde_json::Value,
+}
+
+/// Poll (~2s, like [`audit_count_eventually`]) for the newest `audit_log` row
+/// with this `resource_id` and `action`, panicking when none appears. The
+/// handler-level audit tests use it to assert the actor, target and `details`
+/// a fire-and-forget emitter recorded. Read it BEFORE deleting the acting
+/// user: `audit_log.user_id` is `ON DELETE SET NULL`.
+pub async fn audit_row_eventually(pool: &PgPool, resource_id: Uuid, action: &str) -> AuditRow {
+    for _ in 0..100 {
+        let row: Option<(Option<Uuid>, String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT user_id, resource_type, details FROM audit_log \
+             WHERE resource_id = $1 AND action = $2 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(resource_id)
+        .bind(action)
+        .fetch_optional(pool)
+        .await
+        .expect("audit_log row query");
+        if let Some((user_id, resource_type, details)) = row {
+            return AuditRow {
+                user_id,
+                resource_type,
+                details: details.unwrap_or(serde_json::Value::Null),
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("no {action} audit row for resource {resource_id}");
+}
+
 /// Count `download_statistics` rows for `artifact_id`.
 pub async fn download_count(pool: &PgPool, artifact_id: Uuid) -> i64 {
     sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
@@ -1772,6 +2238,8 @@ pub fn make_repo_info(
 /// an `artifacts` row at `path`. Returns the inserted artifact id.
 ///
 /// Centralizes the put+insert pattern shared by every handler smoke test.
+/// The row's checksum is the placeholder `test-seed`; use
+/// [`seed_artifact_with_checksum`] when the test matches on the digest.
 #[allow(clippy::too_many_arguments)]
 pub async fn seed_artifact(
     state: &SharedState,
@@ -1784,6 +2252,38 @@ pub async fn seed_artifact(
     content_type: &str,
     content: Bytes,
     uploaded_by: Uuid,
+) -> Uuid {
+    seed_artifact_with_checksum(
+        state,
+        pool,
+        repo,
+        storage_key,
+        path,
+        name,
+        version,
+        content_type,
+        content,
+        uploaded_by,
+        "test-seed",
+    )
+    .await
+}
+
+/// [`seed_artifact`] with an explicit `checksum_sha256` for the row, for
+/// tests whose behaviour depends on the stored digest (e.g. presence checks).
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_artifact_with_checksum(
+    state: &SharedState,
+    pool: &PgPool,
+    repo: &crate::api::handlers::proxy_helpers::RepoInfo,
+    storage_key: &str,
+    path: &str,
+    name: &str,
+    version: &str,
+    content_type: &str,
+    content: Bytes,
+    uploaded_by: Uuid,
+    checksum_sha256: &str,
 ) -> Uuid {
     crate::api::handlers::proxy_helpers::put_artifact_bytes(
         state,
@@ -1801,7 +2301,7 @@ pub async fn seed_artifact(
             name,
             version,
             size_bytes: content.len() as i64,
-            checksum_sha256: "test-seed",
+            checksum_sha256,
             content_type,
             storage_key,
             uploaded_by,
@@ -1907,6 +2407,158 @@ pub async fn catalog_row(pool: &PgPool, repo_id: Uuid, name: &str) -> Option<Cat
     })
 }
 
+/// #4725: subscribe a fresh push peer to `repo_id` and return its id.
+///
+/// The peer's row cascades to `peer_repo_subscriptions` and `sync_tasks` on
+/// delete, so tests must delete it — [`delete_push_peer`] — before
+/// `fx.teardown()` or the repository delete trips the subscription FK.
+pub async fn subscribe_push_peer(pool: &PgPool, repo_id: Uuid, label: &str) -> Uuid {
+    let peer_service =
+        crate::services::peer_instance_service::PeerInstanceService::new(pool.clone());
+    let peer = peer_service
+        .register(
+            crate::services::peer_instance_service::RegisterPeerInstanceRequest {
+                name: format!("{label}-push-peer-{}", uuid::Uuid::new_v4()),
+                endpoint_url: "https://push-peer.example.test".to_string(),
+                region: None,
+                cache_size_bytes: 1024 * 1024,
+                sync_filter: None,
+                api_key: "push-peer-key".to_string(),
+            },
+        )
+        .await
+        .expect("register push peer");
+    peer_service
+        .assign_repository(
+            peer.id,
+            repo_id,
+            true,
+            Some(crate::services::peer_instance_service::ReplicationMode::Push),
+            None,
+            None,
+        )
+        .await
+        .expect("assign repo to push peer");
+    peer.id
+}
+
+/// #4725: the artifact paths in `repo_id` that have a queued `push` sync task
+/// for `peer_id`, in byte order of the path (#5011: not the database's
+/// collation, under which `en_US.UTF-8` sorts `commits/...` before `_labels`).
+/// A native-format hosted upload that forgot to queue replication yields an
+/// empty vector.
+pub async fn queued_push_paths(pool: &PgPool, peer_id: Uuid, repo_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT a.path FROM sync_tasks st \
+         JOIN artifacts a ON a.id = st.artifact_id \
+         WHERE st.peer_instance_id = $1 AND st.task_type = 'push' \
+           AND a.repository_id = $2 AND a.is_deleted = false \
+         ORDER BY a.path COLLATE \"C\"",
+    )
+    .bind(peer_id)
+    .bind(repo_id)
+    .fetch_all(pool)
+    .await
+    .expect("list queued push sync tasks")
+}
+
+/// [`queued_push_paths`] for an upload that went through
+/// `ArtifactService::finalize_upload`, which queues push sync tasks from a
+/// spawned task, so the row can land after the HTTP response returns.
+/// Polls (up to 5s) until `expected` is queued, then waits a short grace
+/// period and reads again, so a task wrongly queued by a later upload in the
+/// same test still shows up in the result.
+pub async fn queued_push_paths_settled(
+    pool: &PgPool,
+    peer_id: Uuid,
+    repo_id: Uuid,
+    expected: &str,
+) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let queued = queued_push_paths(pool, peer_id, repo_id).await;
+        if queued.iter().any(|p| p == expected) || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    queued_push_paths(pool, peer_id, repo_id).await
+}
+
+/// #4725: delete the peer registered by [`subscribe_push_peer`] (and with it
+/// its subscriptions and queued tasks). No-op when the peer is already gone.
+pub async fn delete_push_peer(pool: &PgPool, peer_id: Uuid) {
+    let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+        .bind(peer_id)
+        .execute(pool)
+        .await;
+}
+
+/// Assert that the native publish just driven fired exactly ONE
+/// `artifact.uploaded` (#3411, #3939), scoped to `repo_id` and identifying the
+/// `artifacts` row it wrote for `(name, version)`.
+///
+/// Subscribe with `fx.state.event_bus.subscribe()` BEFORE sending the publish,
+/// and call this before tearing the fixture down (it reads the row). Shared by
+/// the per-format publish tests so a format that stops emitting, or starts
+/// emitting twice (a second producer on the same path), fails the same way.
+pub async fn assert_one_artifact_uploaded(
+    events: &mut tokio::sync::broadcast::Receiver<crate::services::event_bus::DomainEvent>,
+    pool: &PgPool,
+    repo_id: Uuid,
+    name: &str,
+    version: &str,
+) {
+    let artifact_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND name = $2 AND version = $3 \
+         AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(version)
+    .fetch_one(pool)
+    .await
+    .expect("the publish must have written an artifacts row");
+
+    assert_one_artifact_uploaded_event(events, repo_id, artifact_id);
+}
+
+/// [`assert_one_artifact_uploaded`] for a write path whose artifact id the test
+/// already holds (a promotion copy, a Git LFS object, a chunked upload).
+pub fn assert_one_artifact_uploaded_event(
+    events: &mut tokio::sync::broadcast::Receiver<crate::services::event_bus::DomainEvent>,
+    repo_id: Uuid,
+    artifact_id: Uuid,
+) {
+    let uploaded: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|e| e.event_type == "artifact.uploaded")
+        .collect();
+    assert_eq!(
+        uploaded.len(),
+        1,
+        "the write of artifact {artifact_id} must emit exactly one artifact.uploaded, got {uploaded:?}"
+    );
+    assert_eq!(uploaded[0].repository_id, Some(repo_id));
+    assert_eq!(
+        uploaded[0].entity_id,
+        artifact_id.to_string(),
+        "the event must identify the artifacts row that was written"
+    );
+}
+
+/// Id of the live `artifacts` row at `(repository, path)`.
+pub async fn artifact_id_at(pool: &PgPool, repo_id: Uuid, path: &str) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(path)
+    .fetch_one(pool)
+    .await
+    .expect("read artifact id at path")
+}
+
 /// Bundles all the per-test scaffolding so each handler test body is a
 /// single helper call followed by assertions. Returned `None` indicates
 /// the test should skip (no `DATABASE_URL`).
@@ -1982,6 +2634,103 @@ impl Fixture {
     pub fn router_with_auth(&self, router: Router<SharedState>) -> Router {
         let auth = make_auth(self.user_id, &self.username);
         router_with_auth(router, self.state.clone(), auth)
+    }
+
+    /// Drive the generic chunked upload flow (`/api/v1/uploads`: create a
+    /// session, PATCH `payload` as its one chunk, complete it) for `path` in
+    /// this fixture's repository, as the fixture user. `create_extra` fields
+    /// are merged into the create body (e.g. replication metadata) and
+    /// `replication` sets the replication header on create and complete.
+    /// Returns the completion's status and body; panics if create or the
+    /// chunk fails.
+    pub async fn chunked_upload(
+        &self,
+        path: &str,
+        payload: &[u8],
+        create_extra: serde_json::Value,
+        replication: bool,
+    ) -> (StatusCode, Bytes) {
+        let auth = make_auth(self.user_id, &self.username);
+        self.chunked_upload_as(auth, path, payload, create_extra, replication)
+            .await
+    }
+
+    /// [`Self::chunked_upload`] as `auth` (e.g. [`admin_auth`] for a trusted
+    /// replication session).
+    pub async fn chunked_upload_as(
+        &self,
+        auth: AuthExtension,
+        path: &str,
+        payload: &[u8],
+        create_extra: serde_json::Value,
+        replication: bool,
+    ) -> (StatusCode, Bytes) {
+        use sha2::{Digest, Sha256};
+        assert!(
+            !payload.is_empty(),
+            "chunked_upload needs a non-empty payload (one Content-Range chunk)"
+        );
+        let app = || {
+            crate::api::handlers::upload::router()
+                .with_state(self.state.clone())
+                .layer(Extension::<AuthExtension>(auth.clone()))
+        };
+        let mark = |mut req: Request<Body>| {
+            if replication {
+                req.headers_mut().insert(
+                    "x-artifact-keeper-replication",
+                    axum::http::HeaderValue::from_static("true"),
+                );
+            }
+            req
+        };
+        let mut create = serde_json::json!({
+            "repository_key": self.repo_key,
+            "artifact_path": path,
+            "total_size": payload.len() as i64,
+            "checksum_sha256": hex::encode(Sha256::digest(payload)),
+            "chunk_size": 1024 * 1024_i64,
+        });
+        if let (Some(body), Some(extra)) = (create.as_object_mut(), create_extra.as_object()) {
+            body.extend(extra.clone());
+        }
+        let create = post(
+            "/".to_string(),
+            "application/json",
+            Bytes::from(serde_json::to_vec(&create).unwrap()),
+        );
+        let (status, resp) = send(app(), mark(create)).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        let session: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        let session_id = session["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_string();
+
+        let chunk = Request::builder()
+            .method("PATCH")
+            .uri(format!("/{session_id}"))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
+            )
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(payload.to_vec()))
+            .unwrap();
+        let (status, resp) = send(app(), chunk).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+
+        let complete = Request::builder()
+            .method("PUT")
+            .uri(format!("/{session_id}/complete"))
+            .body(Body::empty())
+            .unwrap();
+        send(app(), mark(complete)).await
     }
 
     /// Drop all rows owned by this fixture and remove the storage dir.
@@ -2217,6 +2966,59 @@ pub fn build_state_with_proxy_and_scanner(
 /// Enable scan-on-proxy for a repository with the given
 /// `proxy_scan_action` (`"fail_open"` / `"fail_closed"`). Shared by the
 /// inline scan-and-block handler tests (#2954 PyPI, #3003 npm).
+/// A pool on which the `scan_configs` table cannot be read (#4365 item 5):
+/// every session's `search_path` puts a private schema first, holding a
+/// `scan_configs` view that raises `division_by_zero` on any row it reads.
+/// Every other table resolves to the real one, so a handler gets as far as
+/// its scan-policy read and fails there, exactly as on a database fault.
+/// Only rows that exist fault, so the repository under test needs a
+/// `scan_configs` row ([`enable_proxy_scan`]). Returns the pool and the
+/// schema to pass to [`drop_unreadable_scan_configs`]. `None` without a DB.
+pub async fn pool_with_unreadable_scan_configs() -> Option<(PgPool, String)> {
+    let base = try_pool().await?;
+    let url = crate::testing::require_db_url()?;
+    let schema = format!("ak_fault_{}", Uuid::new_v4().simple());
+    for sql in [
+        format!("CREATE SCHEMA {schema}"),
+        format!(
+            "CREATE VIEW {schema}.scan_configs AS \
+             SELECT s.* FROM public.scan_configs s \
+             WHERE 1 / (s.block_on_policy_violation::int * 0) = 1"
+        ),
+    ] {
+        // The schema name is generated here (a UUID), never caller input.
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&base)
+            .await
+            .expect("create the unreadable scan_configs view");
+    }
+    let search_path = format!("SET search_path TO {schema}, public");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _| {
+            let search_path = search_path.clone();
+            Box::pin(async move {
+                sqlx::query(sqlx::AssertSqlSafe(search_path))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("connect the unreadable-config pool");
+    Some((pool, schema))
+}
+
+/// Drop the schema [`pool_with_unreadable_scan_configs`] created.
+pub async fn drop_unreadable_scan_configs(pool: &PgPool, schema: &str) {
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(pool)
+    .await;
+}
+
 pub async fn enable_proxy_scan(pool: &PgPool, repo_id: Uuid, action: &str) {
     sqlx::query(
         "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
@@ -2229,6 +3031,136 @@ pub async fn enable_proxy_scan(pool: &PgPool, repo_id: Uuid, action: &str) {
     .execute(pool)
     .await
     .expect("enable scan-on-proxy");
+}
+
+/// A Maven-built jar declaring `<group>:<artifact>:<version>` in its own
+/// `META-INF/maven/<group>/<artifact>/pom.properties` (#4100 scan-on-proxy
+/// tests). A per-call nonce entry keeps every fixture's digest unique, since
+/// proxy scan verdicts are global and keyed on the content digest.
+pub fn maven_jar_fixture(group: &str, artifact: &str, version: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    zip.start_file(
+        format!("META-INF/maven/{group}/{artifact}/pom.properties"),
+        opts,
+    )
+    .expect("pom.properties entry");
+    write!(
+        zip,
+        "groupId={group}\nartifactId={artifact}\nversion={version}\n"
+    )
+    .expect("pom.properties body");
+    zip.start_file("nonce.txt", opts).expect("nonce entry");
+    zip.write_all(Uuid::new_v4().to_string().as_bytes())
+        .expect("nonce body");
+    zip.finish().expect("finish jar").into_inner()
+}
+
+/// Seed a `vulnerable` (one critical) or `clean` proxy scan verdict for
+/// `bytes`, returning its digest for [`drop_proxy_verdicts`].
+pub async fn seed_proxy_verdict(
+    pool: &PgPool,
+    bytes: &[u8],
+    repo_id: Uuid,
+    vulnerable: bool,
+) -> String {
+    let digest = crate::api::handlers::proxy_helpers::sha256_hex(&Bytes::copy_from_slice(bytes));
+    let (verdict, n, severity) = if vulnerable {
+        ("vulnerable", 1, Some("critical"))
+    } else {
+        ("clean", 0, None)
+    };
+    crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+        .record_verdict(
+            &digest,
+            "grype",
+            verdict,
+            n,
+            n,
+            0,
+            0,
+            0,
+            severity,
+            Some("grype-0.99.0-test"),
+            Some(repo_id),
+        )
+        .await
+        .expect("seed proxy scan verdict");
+    digest
+}
+
+/// Record on the stored verdict for `digest` the pin `pin` it was graded as,
+/// as the inline gate records it (#4952). A pinned pull reuses a `clean`
+/// verdict only when it carries a pin (#3396), so a test that seeds one for a
+/// pinned format and expects it reused records the pin with it.
+pub async fn pin_proxy_verdict(
+    pool: &PgPool,
+    digest: &str,
+    pin: &crate::services::scanner_service::ExpectedComponent,
+) {
+    sqlx::query("UPDATE proxy_scan_results SET pin_identity = $2 WHERE checksum_sha256 = $1")
+        .bind(digest)
+        .bind(pin.pin_identity())
+        .execute(pool)
+        .await
+        .expect("record the verdict's pin");
+}
+
+/// Remove the verdicts [`seed_proxy_verdict`] wrote.
+pub async fn drop_proxy_verdicts(pool: &PgPool, digests: &[String]) {
+    sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = ANY($1)")
+        .bind(digests)
+        .execute(pool)
+        .await
+        .expect("cleanup proxy_scan_results");
+}
+
+/// Proxy downloads recorded for `path` on `repo_id` (#3446 / #4100
+/// exactly-once assertions).
+pub async fn proxy_downloads_recorded(pool: &PgPool, repo_id: Uuid, path: &str) -> i64 {
+    crate::services::proxy_catalog::download_counts_by_paths(pool, repo_id, &[path.to_string()])
+        .await
+        .expect("download counts")
+        .get(path)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Attach a new public Remote repository of `format`, proxying `upstream`, to
+/// `virtual_id` at `priority`. Returns `(id, key, storage dir)`.
+pub async fn attach_remote_member(
+    pool: &PgPool,
+    virtual_id: Uuid,
+    format: &str,
+    upstream: &str,
+    priority: i32,
+) -> (Uuid, String, PathBuf) {
+    let (member_id, member_key, member_dir) = create_repo(pool, "remote", format).await;
+    sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+        .bind(upstream)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("configure remote member");
+    link_virtual_member(pool, virtual_id, member_id, priority).await;
+    (member_id, member_key, member_dir)
+}
+
+/// Turn on the Package Age Policy hold (#1770) for a Remote repository, so
+/// every freshly proxied object is held (`409`) for `minutes`.
+pub async fn enable_proxy_quarantine(pool: &PgPool, repo_id: Uuid, minutes: i64) {
+    sqlx::query(
+        "INSERT INTO repository_config (repository_id, key, value) \
+         VALUES ($1, 'quarantine_enabled', 'true'), \
+                ($1, 'quarantine_duration_minutes', $2)",
+    )
+    .bind(repo_id)
+    .bind(minutes.to_string())
+    .execute(pool)
+    .await
+    .expect("enable quarantine config");
+    crate::services::quarantine_service::invalidate_config_cache(repo_id);
 }
 
 /// Build a state whose scanner service holds exactly the given mock leaf
@@ -2253,6 +3185,82 @@ pub fn build_scan_state_with_leaf_scanners(
             .into_owned(),
     );
     build_state_with_proxy_and_scanner(fx.pool.clone(), storage_path, proxy, Arc::new(svc))
+}
+
+/// Leaf scanner for the #4166 scan-on-upload handler tests: applies to
+/// everything and completes clean. Its rows use scan_type `malware` -- allowed
+/// by the `scan_results_scan_type_check` constraint and used by no real
+/// scanner -- so the tests count only its rows.
+struct UploadProbeScanner;
+
+#[async_trait::async_trait]
+impl crate::services::scanner_service::Scanner for UploadProbeScanner {
+    fn name(&self) -> &str {
+        "upload-probe"
+    }
+
+    fn scan_type(&self) -> &str {
+        "malware"
+    }
+
+    async fn scan(
+        &self,
+        _artifact: &crate::models::artifact::Artifact,
+        _metadata: Option<&crate::models::artifact::ArtifactMetadata>,
+        _content: &Bytes,
+    ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+        Ok(crate::services::scanner_service::ScanOutput::default())
+    }
+}
+
+/// #4166: send one native upload `req` through `router` for `fx`'s repository
+/// with scanning enabled and `scan_on_upload = on_upload`, then return how many
+/// probe (`malware`) scan rows the repository has once `budget` elapses or the
+/// first row lands. Shared by the per-format scan-on-upload tests.
+pub async fn native_upload_probe_scans(
+    fx: &Fixture,
+    router: Router<SharedState>,
+    req: Request<Body>,
+    on_upload: bool,
+    budget: std::time::Duration,
+) -> i64 {
+    sqlx::query(
+        "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+             scan_on_proxy, block_on_policy_violation, severity_threshold) \
+         VALUES ($1, true, $2, false, false, 'high')",
+    )
+    .bind(fx.repo_id)
+    .bind(on_upload)
+    .execute(&fx.pool)
+    .await
+    .expect("seed scan_configs");
+
+    let storage_path = fx.storage_dir.to_string_lossy().into_owned();
+    let state =
+        build_scan_state_with_leaf_scanners(fx, &storage_path, vec![Arc::new(UploadProbeScanner)]);
+    let app = router_with_auth(router, state, make_auth(fx.user_id, &fx.username));
+    let (status, body) = send(app, req).await;
+    assert!(
+        status.is_success(),
+        "native upload failed: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scan_results \
+             WHERE repository_id = $1 AND scan_type = 'malware'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count scan_results");
+        if n > 0 || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Like [`build_state_with_proxy`] but also wires an [`AgeGateService`] onto the
@@ -2566,6 +3574,64 @@ pub async fn create_remote_and_virtual(
     (remote_id, remote_key, virtual_id, virtual_key)
 }
 
+/// #5504 rig: a public Virtual of `format` over two public Remote members on
+/// one mock server. The higher-priority member's upstream answers `404` for
+/// everything (a genuine miss); the lower-priority one answers
+/// `broken_status` for everything. Lets a test pin how a walk reads "member A
+/// missed, member B failed" through the format's real router.
+pub struct MissAndBrokenVirtual {
+    pub virtual_key: String,
+    pub repo_ids: Vec<Uuid>,
+    /// Kept alive for the rig's lifetime; dropping it stops the upstream.
+    pub upstream: wiremock::MockServer,
+}
+
+impl MissAndBrokenVirtual {
+    pub async fn new(pool: &PgPool, format: &str, broken_status: u16) -> Self {
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex("^/miss/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(path_regex("^/broken/"))
+            .respond_with(ResponseTemplate::new(broken_status))
+            .mount(&upstream)
+            .await;
+        let (virtual_id, virtual_key, _) = create_repo(pool, "virtual", format).await;
+        publish_repo(pool, virtual_id).await;
+        let mut repo_ids = vec![virtual_id];
+        for (priority, prefix) in [(0, "miss"), (1, "broken")] {
+            let (id, _, _) = create_repo(pool, "remote", format).await;
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(format!("{}/{prefix}", upstream.uri()))
+                .bind(id)
+                .execute(pool)
+                .await
+                .expect("point remote upstream at mock");
+            publish_repo(pool, id).await;
+            link_virtual_member(pool, virtual_id, id, priority).await;
+            repo_ids.push(id);
+        }
+        Self {
+            virtual_key,
+            repo_ids,
+            upstream,
+        }
+    }
+
+    pub async fn cleanup(self, pool: &PgPool) {
+        for id in &self.repo_ids {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+    }
+}
+
 /// Decode a body coded with `encoding` — the inverse of [`code_bytes`], so a
 /// test can assert the client receives BYTES it can actually decode rather
 /// than only that a header is present.
@@ -2788,4 +3854,359 @@ pub async fn collect_response(
 /// query.
 pub fn admin_auth_ext() -> Option<AuthExtension> {
     Some(admin_auth(Uuid::new_v4(), "tdh-resolver-admin"))
+}
+
+/// Keeps a capturing subscriber installed as the thread default; see
+/// [`set_capture_default`].
+pub struct CaptureGuard {
+    _default: tracing::subscriber::DefaultGuard,
+    _second_dispatcher: tracing::Dispatch,
+}
+
+/// Install `subscriber` as this thread's default so that no other thread can
+/// switch off the log lines it is there to see (#4803).
+///
+/// While only one dispatcher is registered, tracing-core computes a new
+/// callsite's interest from the default of whichever thread reaches the
+/// callsite first. A sibling test or a spawned worker with no subscriber then
+/// caches "never" for that line, and the capture silently misses it. A second
+/// live dispatcher makes every computation consult all live dispatchers, so
+/// one is held for as long as the guard lives. The rebuild picks up callsites
+/// whose registration was in flight while the dispatchers were being added.
+///
+/// Only events on this thread reach the subscriber, so run the code under test
+/// on it (the default current-thread `#[tokio::test]` runtime does).
+pub fn set_capture_default<S>(subscriber: S) -> CaptureGuard
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    let second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+    let default = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+    CaptureGuard {
+        _default: default,
+        _second_dispatcher: second_dispatcher,
+    }
+}
+
+/// Collects `tracing` output emitted on this thread while the guard returned
+/// by [`LogCapture::install`] lives; read it back with [`LogCapture::text`].
+///
+/// A test asserting that a line is ABSENT must also assert that a control line
+/// from the same capture is PRESENT. Without one, a capture that saw nothing
+/// at all passes the assertion.
+#[derive(Clone, Default)]
+pub struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogCapture {
+    /// Install a thread-default subscriber at `level` writing into this
+    /// capture; logs are captured until the returned guard drops.
+    pub fn install(&self, level: tracing::Level) -> CaptureGuard {
+        set_capture_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_max_level(level)
+                .with_ansi(false)
+                .finish(),
+        )
+    }
+
+    /// Everything captured so far, lossily decoded.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[test]
+fn log_capture_sees_a_line_another_thread_reached_first_4803() {
+    fn line_under_test() {
+        tracing::debug!("4803 line under test");
+    }
+    let capture = LogCapture::default();
+    let _guard = capture.install(tracing::Level::DEBUG);
+    // A thread with no subscriber registers the callsite first, as a sibling
+    // test or a spawned worker does.
+    std::thread::spawn(line_under_test)
+        .join()
+        .expect("sibling thread");
+    line_under_test();
+    assert!(
+        capture.text().contains("4803 line under test"),
+        "a thread with no subscriber must not switch the line off: {:?}",
+        capture.text()
+    );
+}
+
+/// A transient failure of the virtual-member AUTHORIZATION query alone, for
+/// the #4308 regressions: the member fetch (`virtual_repo_members` +
+/// `repositories`) still succeeds, but the grant predicate an authenticated
+/// non-admin caller's visibility filter evaluates (`role_assignments`) cannot
+/// be read.
+///
+/// Holds an `ACCESS EXCLUSIVE` lock on `role_assignments` from its own
+/// connection, and returns a separate small pool whose sessions run with a
+/// short `lock_timeout`, so a query through that pool that touches the table
+/// fails with a database error (the same `AppError::Database` shape as a pool
+/// timeout) instead of waiting. Other tests touching the table only wait for
+/// the guard to drop. Returns `None` without a database.
+pub struct AuthzQueryOutage {
+    pub pool: PgPool,
+    lock: Option<sqlx::Transaction<'static, sqlx::Postgres>>,
+}
+
+impl AuthzQueryOutage {
+    pub async fn start(lock_pool: &PgPool) -> Option<Self> {
+        use std::str::FromStr;
+        let url = crate::testing::require_db_url()?;
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .expect("parse DATABASE_URL")
+            .options([("lock_timeout", "300")]);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect_with(opts)
+            .await
+            .expect("connect lock-timeout pool");
+        let mut tx = lock_pool.begin().await.expect("begin lock transaction");
+        sqlx::query("LOCK TABLE role_assignments IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .expect("lock role_assignments");
+        Some(Self {
+            pool,
+            lock: Some(tx),
+        })
+    }
+
+    /// Release the lock (rolls the holding transaction back).
+    pub async fn end(mut self) {
+        if let Some(tx) = self.lock.take() {
+            let _ = tx.rollback().await;
+        }
+        self.pool.close().await;
+    }
+}
+
+pub use admin_gate::assert_admin_routes_refuse_repo_scoped_tokens;
+
+// ---------------------------------------------------------------------------
+// #4642: metric capture for async, DB-backed tests.
+// ---------------------------------------------------------------------------
+
+/// One captured metric: name, labels, value.
+pub type CapturedMetric = (
+    String,
+    Vec<(String, String)>,
+    metrics_util::debugging::DebugValue,
+);
+
+/// Run `body` to completion on a current-thread runtime under a local
+/// `DebuggingRecorder` and return its output with every metric it recorded.
+/// Current-thread so tasks the body spawns (and awaits) record on the same
+/// thread, which is the only thread a local recorder sees.
+pub fn capture_metrics<F, Fut, T>(body: F) -> (T, Vec<CapturedMetric>)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let out = metrics::with_local_recorder(&recorder, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(body())
+    });
+    let captured = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .map(|(ck, _, _, value)| {
+            let (_kind, key) = ck.into_parts();
+            let name = key.name().to_string();
+            let labels = key
+                .into_parts()
+                .1
+                .into_iter()
+                .map(|l| (l.key().to_string(), l.value().to_string()))
+                .collect();
+            (name, labels, value)
+        })
+        .collect();
+    (out, captured)
+}
+
+/// The captured metric named `name` whose labels are exactly `labels`.
+pub fn captured_metric<'a>(
+    captured: &'a [CapturedMetric],
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<&'a metrics_util::debugging::DebugValue> {
+    captured.iter().find_map(|(n, l, v)| {
+        let same = l.len() == labels.len()
+            && labels
+                .iter()
+                .all(|(k, val)| l.iter().any(|(lk, lv)| lk == k && lv == val));
+        (n == name && same).then_some(v)
+    })
+}
+
+/// A minimal npm tarball (`package/package.json` naming `name`@`version`), as
+/// `npm pack` lays it out. The generic upload finalizes a `.tgz` at an npm
+/// layout path from it (#5254), so a fixture standing in for a published
+/// tarball must be a real one.
+pub fn npm_tarball(name: &str, version: &str) -> Vec<u8> {
+    use std::io::Write;
+    let package_json = serde_json::json!({ "name": name, "version": version }).to_string();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(package_json.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, package_json.as_bytes()).unwrap();
+        builder.finish().unwrap();
+    }
+    gz.flush().unwrap();
+    gz.finish().unwrap()
+}
+
+// In a `#[cfg(test)]` module (this whole file is test-only anyway) so the
+// #1315 token-mint surface gate, which skips test modules, does not count the
+// API-token mint below as a production endpoint.
+#[cfg(test)]
+mod admin_gate {
+    use super::*;
+
+    /// Router-level check for instance-wide admin listings gated by
+    /// [`AuthExtension::require_unscoped_admin`] (#4273, #4550): every route in
+    /// `routes`, sent through the full router, answers 401 anonymous, 403 to a
+    /// non-admin JWT, 200 to an admin JWT and to an unrestricted admin API token,
+    /// and 403 to a repository-scoped admin API token and a repository-scoped
+    /// admin JWT. Creates and removes its own admin user and tokens.
+    pub async fn assert_admin_routes_refuse_repo_scoped_tokens(fx: &Fixture, routes: &[&str]) {
+        async fn statuses(
+            state: &SharedState,
+            routes: &[&str],
+            cred: Option<&str>,
+        ) -> Vec<StatusCode> {
+            let mut out = Vec::new();
+            for uri in routes {
+                let mut req = get(uri.to_string());
+                if let Some(c) = cred {
+                    req.headers_mut().insert(
+                        "authorization",
+                        c.parse::<axum::http::HeaderValue>().expect("auth header"),
+                    );
+                }
+                let (status, _) = send(crate::api::routes::create_router(state.clone()), req).await;
+                out.push(status);
+            }
+            out
+        }
+
+        let (admin_id, _) = create_user(&fx.pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(admin_id)
+            .execute(&fx.pool)
+            .await
+            .expect("promote admin");
+
+        let auth_service = crate::services::auth_service::AuthService::new(
+            fx.state.db.clone(),
+            Arc::new(fx.state.config.clone()),
+        );
+        // Admin-owned API tokens carrying the `admin` scope: one unrestricted,
+        // one pinned to the fixture repository through `api_token_repositories`.
+        let (open_token, _) = auth_service
+            .generate_api_token(admin_id, "gate-open", vec!["admin".into()], None)
+            .await
+            .expect("mint unrestricted admin token");
+        let (pinned_token, pinned_id) = auth_service
+            .generate_api_token(admin_id, "gate-pinned", vec!["admin".into()], None)
+            .await
+            .expect("mint repo-scoped admin token");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(pinned_id)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("pin token to the fixture repository");
+        // A repository-scoped JWT for the same admin.
+        let admin_user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("load admin");
+        let scoped_jwt = auth_service
+            .generate_tokens_with_repo_scope(&admin_user, Some(vec![fx.repo_id]))
+            .expect("mint repo-scoped JWT")
+            .access_token;
+
+        let user_bearer = bearer_for(&fx.state, fx.user_id).await;
+        let admin_bearer = bearer_for(&fx.state, admin_id).await;
+
+        let anonymous = statuses(&fx.state, routes, None).await;
+        let non_admin = statuses(&fx.state, routes, Some(&user_bearer)).await;
+        let admin = statuses(&fx.state, routes, Some(&admin_bearer)).await;
+        let open = statuses(&fx.state, routes, Some(&format!("Bearer {open_token}"))).await;
+        let pinned = statuses(&fx.state, routes, Some(&format!("Bearer {pinned_token}"))).await;
+        let scoped = statuses(&fx.state, routes, Some(&format!("Bearer {scoped_jwt}"))).await;
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(admin_id)
+            .execute(&fx.pool)
+            .await;
+        cleanup_user(&fx.pool, admin_id).await;
+
+        let all = |s: StatusCode| vec![s; routes.len()];
+        assert_eq!(
+            anonymous,
+            all(StatusCode::UNAUTHORIZED),
+            "anonymous {routes:?}"
+        );
+        assert_eq!(
+            non_admin,
+            all(StatusCode::FORBIDDEN),
+            "non-admin JWT {routes:?}"
+        );
+        assert_eq!(admin, all(StatusCode::OK), "admin JWT {routes:?}");
+        assert_eq!(
+            open,
+            all(StatusCode::OK),
+            "unrestricted admin API token {routes:?}"
+        );
+        assert_eq!(
+            pinned,
+            all(StatusCode::FORBIDDEN),
+            "repo-pinned admin API token {routes:?}"
+        );
+        assert_eq!(
+            scoped,
+            all(StatusCode::FORBIDDEN),
+            "repo-scoped admin JWT {routes:?}"
+        );
+    }
 }

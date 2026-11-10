@@ -27,6 +27,10 @@ struct ScanFindingCveRow {
     first_detected_at: DateTime<Utc>,
     last_detected_at: DateTime<Utc>,
     all_acknowledged: bool,
+    /// Whether the artifact's latest completed scans still report this CVE
+    /// (#4338). Only the per-artifact history selects it; `None` elsewhere.
+    #[sqlx(default)]
+    in_latest_scan: Option<bool>,
 }
 
 /// Build a deterministic synthetic UUID for a (artifact, cve) pair.
@@ -235,10 +239,16 @@ fn scan_finding_to_history_entry(row: ScanFindingCveRow) -> CveHistoryEntry {
         cve_published_at: None,
         first_detected_at: row.first_detected_at,
         last_detected_at: row.last_detected_at,
-        status: status_string_from_acknowledged(row.all_acknowledged).to_string(),
+        // #4338: no longer reported by the latest scans = fixed.
+        status: if row.in_latest_scan == Some(false) {
+            "fixed".to_string()
+        } else {
+            status_string_from_acknowledged(row.all_acknowledged).to_string()
+        },
         acknowledged_by: None,
         acknowledged_at: None,
         acknowledged_reason: None,
+        acknowledgements_left_effective: None,
         created_at: row.first_detected_at,
         updated_at: row.last_detected_at,
     }
@@ -364,25 +374,34 @@ fn project_scan_rows_to_entries(
 // the parameter binds; only the query text moved out.
 
 /// `scan_findings` aggregate keyed on (artifact_id, cve_id), filtered by a
-/// single artifact. Mirrors the inline query in
-/// `build_cve_entries_from_scan_findings` (#1375).
-pub(crate) const SCAN_FINDINGS_BY_ARTIFACT_SQL: &str = r#"
+/// single artifact (#1375), joined to the artifact's CURRENT state under the
+/// shared open-findings definition (#4338, [`crate::services::open_findings`]):
+/// a CVE the latest completed scans still report takes its severity and
+/// acknowledgement from those scans, and one they no longer report comes back
+/// with `in_latest_scan = false` and is shown as `fixed`. Counting the `open`
+/// entries therefore gives the artifact's open CVEs exactly as the dashboards
+/// count them.
+pub(crate) static SCAN_FINDINGS_BY_ARTIFACT_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"{cte}
 SELECT
-    artifact_id,
-    cve_id,
-    CASE severity_rank
+    h.artifact_id,
+    h.cve_id,
+    CASE COALESCE(v.severity_rank, h.severity_rank)
         WHEN 4 THEN 'critical'
         WHEN 3 THEN 'high'
         WHEN 2 THEN 'medium'
         WHEN 1 THEN 'low'
         ELSE NULL
     END AS severity,
-    affected_component,
-    affected_version,
-    fixed_version,
-    first_detected_at,
-    last_detected_at,
-    all_acknowledged
+    h.affected_component,
+    h.affected_version,
+    h.fixed_version,
+    h.first_detected_at,
+    h.last_detected_at,
+    COALESCE(v.acknowledged, h.all_acknowledged) AS all_acknowledged,
+    (v.advisory IS NOT NULL) AS in_latest_scan
 FROM (
     SELECT
         artifact_id,
@@ -402,83 +421,21 @@ FROM (
         MIN(created_at) AS first_detected_at,
         MAX(created_at) AS last_detected_at,
         BOOL_AND(is_acknowledged) AS all_acknowledged
-    FROM scan_findings
+    FROM scan_findings_effective
     WHERE artifact_id = $1
       AND cve_id IS NOT NULL
     GROUP BY artifact_id, cve_id
-    ORDER BY MIN(created_at) DESC
-) inner_ranked
-"#;
-
-/// CVE-history counts CTE, scoped to one repository. The outer projection
-/// must keep the column order in lockstep with the `(i64, i64, i64, i64,
-/// i64, i64, i64)` tuple destructured in `get_cve_trends`. (#1375)
-pub(crate) const CVE_TRENDS_COUNTS_REPO_SQL: &str = r#"
-WITH per_cve AS (
-    SELECT
-        sf.artifact_id,
-        sf.cve_id,
-        MAX(
-            CASE LOWER(sf.severity)
-                WHEN 'critical' THEN 4
-                WHEN 'high' THEN 3
-                WHEN 'medium' THEN 2
-                WHEN 'low' THEN 1
-                ELSE 0
-            END
-        ) AS severity_rank,
-        BOOL_AND(sf.is_acknowledged) AS all_ack
-    FROM scan_findings sf
-    JOIN artifacts a ON sf.artifact_id = a.id
-    WHERE sf.cve_id IS NOT NULL
-      AND a.repository_id = $1
-      AND NOT a.is_deleted
-    GROUP BY sf.artifact_id, sf.cve_id
-)
-SELECT
-    COUNT(*) AS total,
-    COUNT(*) FILTER (WHERE NOT all_ack) AS open,
-    COUNT(*) FILTER (WHERE all_ack) AS acknowledged,
-    COUNT(*) FILTER (WHERE severity_rank = 4) AS critical,
-    COUNT(*) FILTER (WHERE severity_rank = 3) AS high,
-    COUNT(*) FILTER (WHERE severity_rank = 2) AS medium,
-    COUNT(*) FILTER (WHERE severity_rank = 1) AS low
-FROM per_cve
-"#;
-
-/// CVE-history counts CTE, all-repos variant. Must stay byte-aligned with
-/// the repo-scoped variant above (same severity CASE, same projection).
-pub(crate) const CVE_TRENDS_COUNTS_ALL_SQL: &str = r#"
-WITH per_cve AS (
-    SELECT
-        sf.artifact_id,
-        sf.cve_id,
-        MAX(
-            CASE LOWER(sf.severity)
-                WHEN 'critical' THEN 4
-                WHEN 'high' THEN 3
-                WHEN 'medium' THEN 2
-                WHEN 'low' THEN 1
-                ELSE 0
-            END
-        ) AS severity_rank,
-        BOOL_AND(sf.is_acknowledged) AS all_ack
-    FROM scan_findings sf
-    JOIN artifacts a ON sf.artifact_id = a.id
-    WHERE sf.cve_id IS NOT NULL
-      AND NOT a.is_deleted
-    GROUP BY sf.artifact_id, sf.cve_id
-)
-SELECT
-    COUNT(*) AS total,
-    COUNT(*) FILTER (WHERE NOT all_ack) AS open,
-    COUNT(*) FILTER (WHERE all_ack) AS acknowledged,
-    COUNT(*) FILTER (WHERE severity_rank = 4) AS critical,
-    COUNT(*) FILTER (WHERE severity_rank = 3) AS high,
-    COUNT(*) FILTER (WHERE severity_rank = 2) AS medium,
-    COUNT(*) FILTER (WHERE severity_rank = 1) AS low
-FROM per_cve
-"#;
+) h
+LEFT JOIN vulnerabilities v
+    ON v.artifact_id = h.artifact_id
+   AND v.advisory = UPPER(BTRIM(h.cve_id))
+ORDER BY h.first_detected_at DESC
+"#,
+            cte = crate::services::open_findings::vulnerabilities_cte(
+                crate::services::open_findings::FindingScope::Artifact(Uuid::nil())
+            )
+        )
+    });
 
 /// CVE-history timeline projection (most recent 100 within 30 days), scoped
 /// to one repository. The severity CASE table must stay aligned with the
@@ -519,7 +476,7 @@ FROM (
         MIN(sf.created_at) AS first_detected_at,
         MAX(sf.created_at) AS last_detected_at,
         BOOL_AND(sf.is_acknowledged) AS all_acknowledged
-    FROM scan_findings sf
+    FROM scan_findings_effective sf
     JOIN artifacts a ON sf.artifact_id = a.id
     WHERE sf.cve_id IS NOT NULL
       AND a.repository_id = $1
@@ -568,7 +525,7 @@ FROM (
         MIN(sf.created_at) AS first_detected_at,
         MAX(sf.created_at) AS last_detected_at,
         BOOL_AND(sf.is_acknowledged) AS all_acknowledged
-    FROM scan_findings sf
+    FROM scan_findings_effective sf
     JOIN artifacts a ON sf.artifact_id = a.id
     WHERE sf.cve_id IS NOT NULL
       AND NOT a.is_deleted
@@ -689,7 +646,7 @@ FROM (
         MIN(created_at) AS first_detected_at,
         MAX(created_at) AS last_detected_at,
         BOOL_AND(is_acknowledged) AS all_acknowledged
-    FROM scan_findings
+    FROM scan_findings_effective
     WHERE LOWER(cve_id) = LOWER($1)
     GROUP BY artifact_id, cve_id
     ORDER BY MIN(created_at) DESC
@@ -1180,7 +1137,7 @@ impl SbomService {
         // shows up as `high` rather than the lexicographically-larger but
         // operationally-lower `medium`. Same fix as `get_cve_trends`. (#1375)
         let rows: Vec<ScanFindingCveRow> = if let Some(artifact_id) = artifact_filter {
-            sqlx::query_as::<_, ScanFindingCveRow>(SCAN_FINDINGS_BY_ARTIFACT_SQL)
+            sqlx::query_as::<_, ScanFindingCveRow>(SCAN_FINDINGS_BY_ARTIFACT_SQL.as_str())
                 .bind(artifact_id)
                 .fetch_all(&self.db)
                 .await?
@@ -1233,6 +1190,7 @@ impl SbomService {
         reason: Option<&str>,
         scope: AccessScope,
     ) -> Result<CveHistoryEntry> {
+        let scope_for_decision = scope.clone();
         let curated = sqlx::query_as::<_, CveHistoryEntry>(
             r#"
             UPDATE cve_history SET
@@ -1260,7 +1218,14 @@ impl SbomService {
         // from `scan_findings` and resolve it back to (artifact_id, cve_id).
         if let Some((artifact_id, cve_id)) = self.resolve_synth_cve_id(id, scope).await? {
             return self
-                .update_cve_status_by_artifact_cve(artifact_id, &cve_id, status, user_id, reason)
+                .update_cve_status_by_artifact_cve(
+                    artifact_id,
+                    &cve_id,
+                    status,
+                    user_id,
+                    reason,
+                    scope_for_decision,
+                )
                 .await;
         }
 
@@ -1320,8 +1285,8 @@ impl SbomService {
         Ok(match_synth_cve_id(id, &pairs))
     }
 
-    /// Update CVE status for an (artifact, cve) pair by mutating the
-    /// underlying `scan_findings` rows.
+    /// Update CVE status for an (artifact, cve) pair by recording or revoking
+    /// acknowledgement decisions (#5153).
     ///
     /// Why this exists (#1426): the Security tab read path projects
     /// `scan_findings` rows into synthetic `CveHistoryEntry` values whose
@@ -1330,19 +1295,17 @@ impl SbomService {
     /// `POST /sbom/cve/status/{id}` writes to `cve_history` only, so an
     /// "acknowledge" click on a scan-derived row returned 404 -- the second,
     /// unwired acknowledge path called out in the issue. This method gives
-    /// the Security tab a working acknowledge path by updating the source
-    /// table (`scan_findings`) directly, keyed on (artifact_id, cve_id)
-    /// because that is the only stable identity a synth row carries.
+    /// the Security tab a working acknowledge path, keyed on (artifact_id,
+    /// cve_id) because that is the only stable identity a synth row carries.
     ///
     /// `status` mapping (the four-state `cve_history.status` does not exist
     /// on `scan_findings`; the only acknowledge column there is the
     /// boolean `is_acknowledged`):
     ///
-    /// - `Acknowledged` / `FalsePositive` -- set `is_acknowledged = true`,
-    ///   record `acknowledged_by` / `acknowledged_at` / `acknowledged_reason`.
-    ///   `false_positive` collapses to `acknowledged` on `scan_findings` since
-    ///   the table has no separate column; the reason field carries the
-    ///   distinction for audit.
+    /// - `Acknowledged` / `FalsePositive` -- record a decision per component.
+    ///   `false_positive` collapses to `acknowledged`, since a decision has no
+    ///   separate state for it; the reason field carries the distinction for
+    ///   audit.
     /// - `Open` -- clear acknowledgement (mirror of the `revoke` endpoint).
     /// - `Fixed` -- not supported by `scan_findings`; returns `Validation`.
     ///   "Fixed" is only meaningful on curated `cve_history` rows.
@@ -1358,6 +1321,7 @@ impl SbomService {
         status: CveStatus,
         user_id: Option<Uuid>,
         reason: Option<&str>,
+        credential: AccessScope,
     ) -> Result<CveHistoryEntry> {
         // `scan_findings` only models a binary acknowledge state. `fixed`
         // has no representation; refuse rather than silently coerce.
@@ -1369,50 +1333,33 @@ impl SbomService {
             )
         })?;
 
-        // Compare CVE id case-insensitively. The schema does not constrain
-        // case on `scan_findings.cve_id`, and the synth ids the read path
-        // emits are upper-case, so we LOWER both sides.
-        let affected = if acknowledge {
-            sqlx::query(
-                r#"
-                UPDATE scan_findings
-                SET is_acknowledged = TRUE,
-                    acknowledged_by = $3,
-                    acknowledged_reason = $4,
-                    acknowledged_at = NOW()
-                WHERE artifact_id = $1
-                  AND cve_id IS NOT NULL
-                  AND LOWER(cve_id) = LOWER($2)
-                "#,
-            )
-            .bind(artifact_id)
-            .bind(cve_id)
-            .bind(user_id)
-            .bind(reason)
-            .execute(&self.db)
-            .await?
-            .rows_affected()
+        // #5153: a decision per component the artifact's current scans report
+        // this advisory for, or a revoke of the decisions on it. `None` / 0 when
+        // the artifact has no such finding, which the caller turns into 404.
+        let acknowledgements =
+            crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+                self.db.clone(),
+            );
+        let actor = crate::services::finding_acknowledgements::AckActor {
+            user_id,
+            credential,
+        };
+        let (found, left_effective) = if acknowledge {
+            let decided = acknowledgements
+                .acknowledge_advisory(artifact_id, cve_id, &actor, reason, Default::default())
+                .await?;
+            (decided > 0, None)
         } else {
-            sqlx::query(
-                r#"
-                UPDATE scan_findings
-                SET is_acknowledged = FALSE,
-                    acknowledged_by = NULL,
-                    acknowledged_reason = NULL,
-                    acknowledged_at = NULL
-                WHERE artifact_id = $1
-                  AND cve_id IS NOT NULL
-                  AND LOWER(cve_id) = LOWER($2)
-                "#,
-            )
-            .bind(artifact_id)
-            .bind(cve_id)
-            .execute(&self.db)
-            .await?
-            .rows_affected()
+            match acknowledgements
+                .revoke_advisory(artifact_id, cve_id, &actor)
+                .await?
+            {
+                Some(outcome) => (true, Some(outcome.left_effective)),
+                None => (false, None),
+            }
         };
 
-        if affected == 0 {
+        if !found {
             return Err(AppError::NotFound(format!(
                 "No scan_findings rows for artifact {} and CVE {}",
                 artifact_id, cve_id
@@ -1431,6 +1378,10 @@ impl SbomService {
         entries
             .into_iter()
             .find(|e| e.cve_id.to_ascii_uppercase() == cve_upper)
+            .map(|mut entry| {
+                entry.acknowledgements_left_effective = left_effective;
+                entry
+            })
             .ok_or_else(|| {
                 AppError::NotFound(format!(
                     "Updated scan_findings rows but could not re-read aggregate \
@@ -1463,24 +1414,26 @@ impl SbomService {
     /// We dedupe by (artifact_id, cve_id) so multi-scanner overlap doesn't
     /// double-count a single vulnerability.
     pub async fn get_cve_trends(&self, repository_id: Option<Uuid>) -> Result<CveTrends> {
-        let (total, open, acknowledged, critical, high, medium, low): (
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-        ) = if let Some(repo_id) = repository_id {
-            sqlx::query_as(CVE_TRENDS_COUNTS_REPO_SQL)
-                .bind(repo_id)
-                .fetch_one(&self.db)
-                .await?
-        } else {
-            sqlx::query_as(CVE_TRENDS_COUNTS_ALL_SQL)
-                .fetch_one(&self.db)
-                .await?
+        // #4338: the counts are the shared definition of open vulnerabilities
+        // (latest completed scan per artifact and scan type, one per
+        // (artifact, advisory), severity buckets count OPEN ones only), so
+        // the Overview card agrees with the security dashboard and the
+        // per-repository scores. They used to count every (artifact, CVE)
+        // ever recorded, acknowledged ones included in the severity buckets.
+        let scope = match repository_id {
+            Some(id) => crate::services::open_findings::FindingScope::Repository(id),
+            None => crate::services::open_findings::FindingScope::All,
         };
+        let counts = crate::services::open_findings::severity_counts(&self.db, scope).await?;
+        let (total, open, acknowledged, critical, high, medium, low) = (
+            counts.total(),
+            counts.open,
+            counts.acknowledged,
+            counts.critical,
+            counts.high,
+            counts.medium,
+            counts.low,
+        );
 
         // Timeline (most recent 100 newly-detected CVEs in the last 30 days)
         // derived from scan_findings.
@@ -1673,9 +1626,20 @@ impl SbomService {
     /// (free-form names, SPDX expressions, "UNKNOWN"), so emit `id` only for
     /// recognized identifiers and fall back to the free-form `name` field —
     /// which DT accepts unconditionally — for everything else.
+    ///
+    /// A compound SPDX expression (`MIT AND PSF-2.0`, `Apache-2.0 WITH
+    /// LLVM-exception`, `(MIT OR ISC) AND BSD-3-Clause`) is emitted as the
+    /// CycloneDX `expression` choice instead (#3866): written as a `name`,
+    /// Dependency-Track stores it as an unresolved free-text license and
+    /// every license policy fails on it, even when each operand is approved.
+    /// CycloneDX 1.5 requires an `expression` entry to be the only element
+    /// of its `licenses` array; every caller wraps this single entry in a
+    /// one-element array, so that holds.
     fn cyclonedx_license_entry(license: &str) -> serde_json::Value {
         if Self::SPDX_COMMON_IDS.contains(&license) {
             serde_json::json!({"license": {"id": license}})
+        } else if crate::services::spdx_licenses::is_compound_spdx_expression(license) {
+            serde_json::json!({"expression": license})
         } else {
             serde_json::json!({"license": {"name": license}})
         }
@@ -2107,13 +2071,80 @@ mod tests {
         assert!(entry["license"].get("id").is_none());
     }
 
+    /// #3866: a compound SPDX expression must reach Dependency-Track as the
+    /// CycloneDX `expression` choice, never as `license.name` (unresolved
+    /// free text that fails license policy) nor `license.id` (#1474: an
+    /// out-of-enum id rejects the whole BOM).
     #[test]
-    fn test_cyclonedx_license_entry_spdx_expression_uses_name() {
-        // SPDX expressions are not bare ids and fail `license.id` enum
-        // validation; they must fall back to `name`.
-        let entry = SbomService::cyclonedx_license_entry("MIT OR Apache-2.0");
-        assert_eq!(entry["license"]["name"], "MIT OR Apache-2.0");
-        assert!(entry["license"].get("id").is_none());
+    fn test_cyclonedx_license_entry_spdx_expression_uses_expression() {
+        for expr in [
+            "MIT AND PSF-2.0",
+            "MIT OR Apache-2.0",
+            "Apache-2.0 WITH LLVM-exception",
+            "(MIT OR Apache-2.0) AND BSD-3-Clause",
+        ] {
+            let entry = SbomService::cyclonedx_license_entry(expr);
+            assert_eq!(entry, serde_json::json!({"expression": expr}), "{expr}");
+        }
+    }
+
+    /// #3866 end to end for scanner-derived licenses: a package Trivy (or
+    /// Grype, through the same sanitizer) reports with two licenses must
+    /// export as their CONJUNCTION. Exported as `OR`, Dependency-Track would
+    /// pass the package on its approved arm alone, so GPL or a proprietary
+    /// `LicenseRef-` riding along with MIT would fail open.
+    #[test]
+    fn test_scanner_multi_license_package_exports_as_and_expression() {
+        use crate::services::scanner_service::sanitize_trivy_licenses;
+        for (raw, expected) in [
+            (vec!["MIT", "GPL-3.0-only"], "MIT AND GPL-3.0-only"),
+            (
+                vec!["mit", "Custom Commercial"],
+                "MIT AND LicenseRef-Custom-Commercial",
+            ),
+        ] {
+            let raw: Vec<String> = raw.into_iter().map(str::to_string).collect();
+            let license = sanitize_trivy_licenses(&raw).expect("non-empty list");
+            assert_eq!(license, expected);
+            let dep = DependencyInfo {
+                name: "pkg".to_string(),
+                version: Some("1.0.0".to_string()),
+                purl: None,
+                license: Some(license),
+                sha256: None,
+                cpe: None,
+            };
+            assert_eq!(
+                build_cyclonedx_component(&dep)["licenses"],
+                serde_json::json!([{"expression": expected}])
+            );
+        }
+    }
+
+    #[test]
+    fn test_cyclonedx_license_entry_prose_with_operator_words_uses_name() {
+        for text in ["GPL v2 or later", "MIT/Apache-2.0", "BSD License"] {
+            let entry = SbomService::cyclonedx_license_entry(text);
+            assert_eq!(entry["license"]["name"], text);
+            assert!(entry.get("expression").is_none());
+        }
+    }
+
+    #[test]
+    fn test_build_cyclonedx_component_compound_license_is_sole_expression() {
+        let dep = DependencyInfo {
+            name: "greenlet".to_string(),
+            version: Some("3.5.5".to_string()),
+            purl: None,
+            license: Some("MIT AND PSF-2.0".to_string()),
+            sha256: None,
+            cpe: None,
+        };
+        let comp = build_cyclonedx_component(&dep);
+        assert_eq!(
+            comp["licenses"],
+            serde_json::json!([{"expression": "MIT AND PSF-2.0"}])
+        );
     }
 
     #[test]
@@ -2686,23 +2717,11 @@ mod tests {
     /// Helper to create a mock SbomService for testing SBOM generation
     /// without a database connection.
     fn generate_test_cyclonedx(deps: &[DependencyInfo]) -> serde_json::Value {
-        let mut components = Vec::new();
-        for dep in deps {
-            let mut comp = serde_json::json!({
-                "type": "library",
-                "name": dep.name,
-            });
-            if let Some(v) = &dep.version {
-                comp["version"] = serde_json::json!(v);
-            }
-            if let Some(p) = &dep.purl {
-                comp["purl"] = serde_json::json!(p);
-            }
-            if let Some(l) = &dep.license {
-                comp["licenses"] = serde_json::json!([{"license": {"id": l}}]);
-            }
-            components.push(comp);
-        }
+        // Components go through the real builder, so these document-level
+        // tests cannot drift from what the exporter actually emits (the
+        // hand-built copy this replaced pinned `license.id` for an SPDX
+        // expression, the output #1474 and #3866 both forbid).
+        let components: Vec<_> = deps.iter().map(build_cyclonedx_component).collect();
 
         serde_json::json!({
             "bomFormat": "CycloneDX",
@@ -3156,7 +3175,10 @@ mod tests {
         assert_eq!(comp["name"], "serde");
         assert_eq!(comp["version"], "1.0.195");
         assert_eq!(comp["purl"], "pkg:cargo/serde@1.0.195");
-        assert_eq!(comp["licenses"][0]["license"]["id"], "MIT OR Apache-2.0");
+        assert_eq!(
+            comp["licenses"],
+            serde_json::json!([{"expression": "MIT OR Apache-2.0"}])
+        );
     }
 
     #[test]
@@ -3558,6 +3580,7 @@ mod tests {
             acknowledged_by: None,
             acknowledged_at: None,
             acknowledged_reason: None,
+            acknowledgements_left_effective: None,
             created_at: first_detected_at,
             updated_at: first_detected_at,
         }
@@ -3579,6 +3602,7 @@ mod tests {
             first_detected_at,
             last_detected_at: first_detected_at,
             all_acknowledged,
+            in_latest_scan: None,
         }
     }
 
@@ -3933,6 +3957,7 @@ mod tests {
             first_detected_at: now,
             last_detected_at: now,
             all_acknowledged: false,
+            in_latest_scan: None,
         };
         let t = scan_finding_to_timeline_entry(&row, now);
         // None fields default to empty strings in the DTO.
@@ -4396,86 +4421,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cve_trends_counts_repo_sql_uses_per_cve_cte() {
-        // Counts must come from a per-CVE CTE so multi-scanner overlap
-        // does not double-count.
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("WITH per_cve AS"));
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("GROUP BY sf.artifact_id, sf.cve_id"));
-    }
-
-    #[test]
-    fn test_cve_trends_counts_repo_sql_filters_deleted_artifacts() {
-        // A soft-deleted artifact must not contribute to the open count.
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("NOT a.is_deleted"));
-        assert!(CVE_TRENDS_COUNTS_ALL_SQL.contains("NOT a.is_deleted"));
-    }
-
-    #[test]
-    fn test_cve_trends_counts_repo_sql_emits_named_columns_in_tuple_order() {
-        // The outer SELECT in the counts CTE projects exactly seven
-        // columns in this order: total, open, acknowledged, critical,
-        // high, medium, low. The async caller destructures into a 7-i64
-        // tuple, so any column reorder here would silently swap the
-        // counts on the trends dashboard.
-        let columns = [
-            "AS total",
-            "AS open",
-            "AS acknowledged",
-            "AS critical",
-            "AS high",
-            "AS medium",
-            "AS low",
-        ];
-        for c in columns {
-            assert!(
-                CVE_TRENDS_COUNTS_REPO_SQL.contains(c),
-                "counts SQL missing column alias: {c}"
-            );
-            assert!(
-                CVE_TRENDS_COUNTS_ALL_SQL.contains(c),
-                "counts SQL missing column alias: {c}"
-            );
-        }
-        // Order: total appears before open before acknowledged.
-        let p_total = CVE_TRENDS_COUNTS_REPO_SQL.find("AS total").unwrap();
-        let p_open = CVE_TRENDS_COUNTS_REPO_SQL.find("AS open").unwrap();
-        let p_ack = CVE_TRENDS_COUNTS_REPO_SQL.find("AS acknowledged").unwrap();
-        let p_crit = CVE_TRENDS_COUNTS_REPO_SQL.find("AS critical").unwrap();
-        let p_low = CVE_TRENDS_COUNTS_REPO_SQL.find("AS low").unwrap();
-        assert!(p_total < p_open);
-        assert!(p_open < p_ack);
-        assert!(p_ack < p_crit);
-        assert!(p_crit < p_low);
-    }
-
-    #[test]
-    fn test_cve_trends_counts_repo_uses_filter_clauses() {
-        // Each severity count is gated by a FILTER (WHERE severity_rank
-        // = N) -- losing the FILTER would turn each count into the total.
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("FILTER (WHERE severity_rank = 4)"));
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("FILTER (WHERE severity_rank = 3)"));
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("FILTER (WHERE severity_rank = 2)"));
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("FILTER (WHERE severity_rank = 1)"));
-    }
-
-    #[test]
-    fn test_cve_trends_counts_repo_uses_bool_and_for_ack() {
-        // `acknowledged` only counts when EVERY scan_findings row for the
-        // (artifact, cve) pair is acknowledged -- otherwise a single
-        // unacknowledged scanner would silently mark it acked.
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("BOOL_AND(sf.is_acknowledged)"));
-    }
-
-    #[test]
-    fn test_cve_trends_counts_repo_scopes_by_repository_id() {
-        // The repo-scoped variant must bind $1 to a.repository_id; the
-        // all-repos variant must omit it. Pin both halves so a copy-paste
-        // could not collapse them.
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("a.repository_id = $1"));
-        assert!(!CVE_TRENDS_COUNTS_ALL_SQL.contains("a.repository_id ="));
-    }
-
-    #[test]
     fn test_cve_trends_timeline_repo_sql_30_day_window() {
         // The timeline is "newly-detected in the last 30 days"; the
         // INTERVAL must be present in both variants or the dashboard
@@ -4587,8 +4532,6 @@ mod tests {
         // an empty query against Postgres.
         assert!(!SCAN_FINDINGS_BY_ARTIFACT_SQL.trim().is_empty());
         assert!(!SCAN_FINDINGS_BY_CVE_SQL.trim().is_empty());
-        assert!(!CVE_TRENDS_COUNTS_REPO_SQL.trim().is_empty());
-        assert!(!CVE_TRENDS_COUNTS_ALL_SQL.trim().is_empty());
         assert!(!CVE_TRENDS_TIMELINE_REPO_SQL.trim().is_empty());
         assert!(!CVE_TRENDS_TIMELINE_ALL_SQL.trim().is_empty());
         assert!(!FIXED_CVES_COUNT_REPO_SQL.trim().is_empty());
@@ -4605,28 +4548,6 @@ mod tests {
         assert!(!SCAN_FINDINGS_BY_ARTIFACT_SQL.contains("LOWER(cve_id) = LOWER($1)"));
         assert!(SCAN_FINDINGS_BY_CVE_SQL.contains("LOWER(cve_id) = LOWER($1)"));
         assert!(!SCAN_FINDINGS_BY_CVE_SQL.contains("WHERE artifact_id = $1"));
-    }
-
-    #[test]
-    fn test_cve_trends_repo_and_all_sql_severity_ranks_align() {
-        // Both variants of the counts CTE must use the same ranked CASE;
-        // a drift would silently misreport severities on the all-repos
-        // dashboard vs the per-repo one.
-        for label_then in [
-            "WHEN 'critical' THEN 4",
-            "WHEN 'high' THEN 3",
-            "WHEN 'medium' THEN 2",
-            "WHEN 'low' THEN 1",
-        ] {
-            assert!(
-                CVE_TRENDS_COUNTS_REPO_SQL.contains(label_then),
-                "repo SQL missing rank clause: {label_then}"
-            );
-            assert!(
-                CVE_TRENDS_COUNTS_ALL_SQL.contains(label_then),
-                "all-repos SQL missing rank clause: {label_then}"
-            );
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -4792,7 +4713,7 @@ mod tests {
     ) -> Option<(bool, Option<Uuid>, Option<String>, Option<DateTime<Utc>>)> {
         sqlx::query_as::<_, (bool, Option<Uuid>, Option<String>, Option<DateTime<Utc>>)>(
             "SELECT is_acknowledged, acknowledged_by, acknowledged_reason, acknowledged_at \
-             FROM scan_findings \
+             FROM scan_findings_effective \
              WHERE artifact_id = $1 AND LOWER(cve_id) = LOWER($2) \
              LIMIT 1",
         )
@@ -4821,6 +4742,7 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("triaged: not exploitable"),
+                AccessScope::Admin,
             )
             .await
             .expect("acknowledge happy path");
@@ -4862,6 +4784,7 @@ mod tests {
                 CveStatus::FalsePositive,
                 None,
                 Some("false positive: code path not reachable"),
+                AccessScope::Admin,
             )
             .await
             .expect("false_positive happy path");
@@ -4894,14 +4817,15 @@ mod tests {
         let finding_id = seed_finding(&pool, scan_id, artifact_id, "CVE-2024-3333", "low").await;
 
         // Pre-acknowledge so we can verify Open clears the state.
-        sqlx::query(
-            "UPDATE scan_findings SET is_acknowledged = true, \
-             acknowledged_reason = 'pre-ack', acknowledged_at = NOW() WHERE id = $1",
-        )
-        .bind(finding_id)
-        .execute(&pool)
-        .await
-        .expect("pre-acknowledge");
+        crate::services::finding_acknowledgements::FindingAcknowledgementService::new(pool.clone())
+            .acknowledge_finding(
+                finding_id,
+                &crate::services::finding_acknowledgements::AckActor::system(),
+                Some("pre-ack"),
+                Default::default(),
+            )
+            .await
+            .expect("pre-acknowledge");
 
         let service = SbomService::new(pool.clone());
         let entry = service
@@ -4911,6 +4835,7 @@ mod tests {
                 CveStatus::Open,
                 None,
                 None,
+                AccessScope::Admin,
             )
             .await
             .expect("open happy path");
@@ -4951,6 +4876,7 @@ mod tests {
                 CveStatus::Fixed,
                 None,
                 None,
+                AccessScope::Admin,
             )
             .await
             .expect_err("fixed must be rejected");
@@ -4969,10 +4895,7 @@ mod tests {
         let (ack, _, _, _) = read_ack(&pool, artifact_id, "CVE-2024-4444")
             .await
             .expect("finding row still present");
-        assert!(
-            !ack,
-            "scan_findings.is_acknowledged must NOT change on Fixed rejection"
-        );
+        assert!(!ack, "the finding must stay open on Fixed rejection");
 
         teardown(&pool, repo_id).await;
     }
@@ -4997,6 +4920,7 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("won't match"),
+                AccessScope::Admin,
             )
             .await
             .expect_err("no matching rows must 404");
@@ -5032,6 +4956,7 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("case-insensitive match"),
+                AccessScope::Admin,
             )
             .await
             .expect("case-insensitive match must succeed");
@@ -5069,18 +4994,18 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("ack both rows"),
+                AccessScope::Admin,
             )
             .await
             .expect("multi-row acknowledge");
 
         // The aggregate must collapse to "acknowledged" only if BOTH rows
-        // are acknowledged (BOOL_AND semantics). The service uses an
-        // unbounded UPDATE, so this is the regression assertion.
+        // are acknowledged (BOOL_AND semantics): one decision per component.
         assert_eq!(entry.status, "acknowledged");
 
         // Direct count verification: both rows must be ack'd.
         let acked: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scan_findings \
+            "SELECT COUNT(*) FROM scan_findings_effective \
              WHERE artifact_id = $1 AND cve_id = $2 AND is_acknowledged = true",
         )
         .bind(artifact_id)
@@ -5139,11 +5064,11 @@ mod tests {
         // The synth aggregate the response carries must keep the same id.
         assert_eq!(entry.id, synth_id);
 
-        // And the ack must actually be persisted on the source table.
+        // And the ack must actually be persisted as a decision.
         let (ack, _, _, _) = read_ack(&pool, artifact_id, "CVE-2024-8888")
             .await
             .expect("finding row present");
-        assert!(ack, "scan_findings.is_acknowledged must be persisted");
+        assert!(ack, "the acknowledgement must be persisted");
 
         teardown(&pool, repo_id).await;
     }

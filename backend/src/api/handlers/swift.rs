@@ -90,10 +90,11 @@ fn extract_manifest_from_reader<R: std::io::Read + std::io::Seek>(reader: R) -> 
 
     // Defence-in-depth entry-count cap (#2556): the per-entry byte cap already
     // bounds memory, but reject entry-count bombs before walking the archive.
-    if archive.len() as u64 > crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES {
+    let max_entries = crate::util::bounded_archive::max_ingest_archive_entries();
+    if archive.len() as u64 > max_entries {
         tracing::debug!(
             entries = archive.len(),
-            cap = crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES,
+            cap = max_entries,
             "swift manifest extraction: too many zip entries"
         );
         return None;
@@ -118,7 +119,13 @@ fn extract_manifest_from_reader<R: std::io::Read + std::io::Seek>(reader: R) -> 
         if !entry.is_file() {
             continue;
         }
-        let name = entry.name().to_string();
+        let name = match entry.name() {
+            Ok(name) => name.into_owned(),
+            Err(e) => {
+                tracing::debug!(index = i, error = %e, "swift manifest extraction: skipped entry with undecodable name");
+                continue;
+            }
+        };
         let is_top_level = name == "Package.swift";
         let is_nested = name.ends_with("/Package.swift");
         if !is_top_level && !is_nested {
@@ -187,18 +194,24 @@ fn swift_json_response(status: StatusCode, body: serde_json::Value) -> Response 
 }
 
 /// Build an error response with the Content-Version: 1 header.
+///
+/// A 503 (the database sites pass `db_status`, which picks it for a saturated
+/// pool or an unreachable database) carries `Retry-After` like every other
+/// format's envelope (#4765).
 fn swift_error_response(status: StatusCode, detail: &str) -> Response {
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "application/problem+json")
-        .header("Content-Version", "1")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "detail": detail,
-            }))
+    super::with_retry_after_on_503(
+        Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, "application/problem+json")
+            .header("Content-Version", "1")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "detail": detail,
+                }))
+                .unwrap(),
+            ))
             .unwrap(),
-        ))
-        .unwrap()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +520,150 @@ async fn get_release_metadata(
 }
 
 // ---------------------------------------------------------------------------
+// Scan-on-proxy for source archives (#4110, on the #4098 generic gate)
+// ---------------------------------------------------------------------------
+
+/// The canonical `(cache_key, scannable)` decision for a proxied source
+/// archive (#4365 item 1): every `.zip` on the archive route is a package,
+/// cached under the `{scope}/{name}/{version}.zip` path the streaming arm
+/// commits to.
+fn swift_archive_serve_key(
+    scope: &str,
+    name: &str,
+    version: &str,
+) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(&format!(
+        "{scope}/{name}/{version}.zip"
+    ))
+}
+
+/// The Swift half of the generic gate (#4110). A source archive names its
+/// registry identity nowhere (`scope.name` lives in the URL; the manifest's
+/// own `name:` need not match it), so the rule is that the bytes are a
+/// readable zip carrying a `Package.swift` at the root or under the one
+/// top-level directory `swift package archive-source` wraps it in. The
+/// bundled scanner has no Swift advisory data, so an archive that agrees is
+/// graded on its contents (a vendored package of an ecosystem it does grade).
+struct SwiftSourceArchive;
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for SwiftSourceArchive {
+    const LABEL: &'static str = "swift source archive";
+    const CONTENT_TYPE: &'static str = "application/zip";
+
+    fn requested(&self) -> String {
+        "a swift source archive".to_string()
+    }
+
+    fn identity(
+        &self,
+        _filename: &str,
+        bytes: &bytes::Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        swift_archive_identity(bytes)
+    }
+}
+
+fn swift_archive_identity(
+    bytes: &bytes::Bytes,
+) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+    use crate::api::handlers::proxy_scan_archive::{zip_entry_names, ArchiveIdentity};
+    let Some(names) = zip_entry_names(bytes) else {
+        return ArchiveIdentity::Unreadable("not a readable zip".to_string());
+    };
+    let has_root_manifest = names.iter().any(|n| n == "Package.swift");
+    let wrapped_manifest = names
+        .first()
+        .and_then(|first| first.split('/').next())
+        .is_some_and(|top| {
+            names.iter().all(|n| n.split('/').next() == Some(top))
+                && names.iter().any(|n| *n == format!("{top}/Package.swift"))
+        });
+    if has_root_manifest || wrapped_manifest {
+        ArchiveIdentity::ContentGraded
+    } else {
+        ArchiveIdentity::Unreadable("no top-level Package.swift".to_string())
+    }
+}
+
+/// Inline scan-and-block for one source archive from one Remote repository
+/// (#4110).
+async fn serve_scanned_swift_archive(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    (scope, name, version): (&str, &str, &str),
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let serve_key = swift_archive_serve_key(scope, name, version);
+    let filename = format!("{name}-{version}.zip");
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: crate::models::repository::RepositoryFormat::Swift,
+        source_path: &serve_key.cache_key,
+        cache_path: &serve_key.cache_key,
+        filename: &filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+        proxy,
+        kind: SwiftSourceArchive,
+        disposition: None,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The scan-on-proxy arms of the source archive route (#4110): `Ok(None)`
+/// when nothing scans, so the caller keeps its untouched path.
+async fn serve_scanned_swift_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    (scope, name, version): (&str, &str, &str),
+    package_id: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Result<Response, Response>>, Response> {
+    use crate::api::handlers::proxy_scan_archive::{LocalLookup, ScannedRoute};
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    let serve_key = swift_archive_serve_key(scope, name, version);
+    let route = ScannedRoute {
+        upstream_path: &serve_key.cache_key,
+        lookup: LocalLookup::NameVersion {
+            name: package_id,
+            version,
+        },
+        default_content_type: "application/zip",
+        virtual_disposition: None,
+    };
+    crate::api::handlers::proxy_scan_archive::serve_scanned_package_download(
+        state,
+        auth,
+        repo,
+        route,
+        false,
+        ctx,
+        |(id, key, upstream_url), policy, _disposition| async move {
+            serve_scanned_swift_archive(
+                state,
+                proxy,
+                (id, &key, &upstream_url),
+                (scope, name, version),
+                policy,
+                ctx,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
 // GET /swift/:repo_key/:scope/:name/:version.zip -- Download source archive
 // ---------------------------------------------------------------------------
 
@@ -521,6 +678,12 @@ async fn download_archive(
 ) -> Result<Response, Response> {
     let repo = resolve_swift_repo(&state.db, repo_key).await?;
     let package_id = format!("{}.{}", scope, name);
+    // #4365 item 3 (#4110): on a proxying repository the scope, name and
+    // version are joined into the upstream path and key the proxy cache.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[scope, name, version],
+    )?;
 
     let artifact = sqlx::query!(
         r#"
@@ -548,6 +711,23 @@ async fn download_archive(
     let artifact = match artifact {
         Some(a) => a,
         None => {
+            // #4110: scan-on-proxy routes the source archive through the
+            // inline scan-and-block gate INSTEAD of the streaming paths
+            // below: the Remote arm when this repository scans, the Virtual
+            // walk when any Remote member scans. Repositories that have not
+            // opted in are unchanged.
+            if let Some(served) = serve_scanned_swift_download(
+                &state,
+                auth,
+                &repo,
+                (scope, name, version),
+                &package_id,
+                ctx,
+            )
+            .await?
+            {
+                return served;
+            }
             if repo.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
@@ -566,6 +746,7 @@ async fn download_archive(
                         upstream_url,
                         &upstream_path,
                         "application/octet-stream",
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -598,6 +779,7 @@ async fn download_archive(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    Some(ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -631,34 +813,43 @@ async fn download_archive(
         .await
         .map_err(|e| e.into_response())?;
 
-    let stream = storage
-        .get_stream(&artifact.storage_key)
-        .await
-        .map_err(|e| {
-            swift_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-        })?;
+    let filename = format!("{}-{}-{}.zip", scope, name, version);
+    // The name the proxied gate scans the archive under.
+    let gate_filename = format!("{name}-{version}.zip");
+    // #4514: a row a scanning Remote holds goes through the scan gate.
+    let proxy_helpers::StoredRowBody { body: stream, scan } = proxy_helpers::open_stored_row(
+        &state,
+        storage.as_ref(),
+        &proxy_helpers::StoredRow {
+            repo: &repo,
+            filename: &gate_filename,
+            storage_key: &artifact.storage_key,
+            size_bytes: artifact.size_bytes,
+        },
+        SwiftSourceArchive,
+    )
+    .await?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
 
     let checksum = artifact.checksum_sha256.clone();
-    let filename = format!("{}-{}-{}.zip", scope, name, version);
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/zip")
-        .header("Content-Version", "1")
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-        .header("Digest", format!("sha-256={}", checksum))
-        .body(Body::from_stream(stream))
-        .unwrap())
+    Ok(proxy_helpers::StoredRowBody::stamp(
+        scan,
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/zip")
+            .header("Content-Version", "1")
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"{}\"", filename),
+            )
+            .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+            .header("Digest", format!("sha-256={}", checksum))
+            .body(Body::from_stream(stream))
+            .unwrap(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -857,9 +1048,12 @@ const MAX_RELEASE_METADATA_BYTES: usize = 1024 * 1024;
 /// The parts of an SE-0292 `multipart/form-data` publish request that this
 /// handler acts on.
 struct PublishParts {
-    /// The required `source-archive` part, spooled to a bounded scratch file.
-    /// Never held whole in memory (Core Invariant (1), #1608).
-    staged: proxy_helpers::StagedUpload,
+    /// The required `source-archive` part, staged on the repository's backend
+    /// when it streams natively, else in local scratch. Never held whole in
+    /// memory (Core Invariant (1), #1608, #4990).
+    staged: super::repositories::GenericStagedBody,
+    /// The SHA-256/SHA-1/MD5 computed while the archive was staged.
+    digests: crate::services::artifact_service::ContentDigests,
     /// The optional `metadata` part, parsed as JSON.
     metadata: Option<serde_json::Value>,
     /// Names of the optional signature parts that were present. The bytes are
@@ -877,8 +1071,10 @@ struct PublishParts {
 ///
 /// Parsing is delegated to `multer` driven straight off the request-body
 /// stream -- the shape the nuget push handler already uses -- so the archive
-/// part goes to a scratch file through
-/// [`proxy_helpers::stage_stream_content_addressed`] instead of being buffered.
+/// part is staged on the repository's backend when it streams natively, else in
+/// bounded local scratch, through
+/// [`super::repositories::GenericStagedBody::stage_for_repo`] instead of being
+/// buffered.
 /// That stager is also what enforces `MAX_UPLOAD_SIZE` on the archive (413
 /// mid-stream); the `whole_stream` constraint here keeps the same ceiling on
 /// the envelope as a whole, which is what the route's `DefaultBodyLimit`
@@ -886,6 +1082,7 @@ struct PublishParts {
 /// ceiling is a 413, not a "malformed" 400 (#4023).
 async fn stage_publish_multipart(
     state: &SharedState,
+    repo: &proxy_helpers::RepoInfo,
     content_type: &str,
     body: Body,
 ) -> Result<PublishParts, Response> {
@@ -910,7 +1107,8 @@ async fn stage_publish_multipart(
         swift_error_response(status, &message)
     };
 
-    let mut staged: Option<proxy_helpers::StagedUpload> = None;
+    let mut staged: Option<super::repositories::GenericStagedBody> = None;
+    let mut staged_digests: Option<crate::services::artifact_service::ContentDigests> = None;
     let mut metadata: Option<serde_json::Value> = None;
     let mut signatures: Vec<String> = Vec::new();
     while let Some(mut field) = multipart.next_field().await.map_err(bad_request)? {
@@ -924,9 +1122,11 @@ async fn stage_publish_multipart(
                         "Publish request carries more than one source-archive part",
                     ));
                 }
-                let (archive, _digests) =
-                    proxy_helpers::stage_stream_content_addressed(state, field).await?;
+                let (archive, digests) =
+                    super::repositories::GenericStagedBody::stage_for_repo(state, repo, field)
+                        .await?;
                 staged = Some(archive);
+                staged_digests = Some(digests);
             }
             "metadata" => {
                 // Chunked rather than read whole so the cap is enforced as the
@@ -967,9 +1167,16 @@ async fn stage_publish_multipart(
             "Publish request is missing the required source-archive part",
         )
     })?;
+    let digests = staged_digests.ok_or_else(|| {
+        swift_error_response(
+            StatusCode::BAD_REQUEST,
+            "Publish request is missing the required source-archive part",
+        )
+    })?;
 
     Ok(PublishParts {
         staged,
+        digests,
         metadata,
         signatures,
     })
@@ -1025,12 +1232,17 @@ async fn publish_release(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let parts = if request_content_type.contains("multipart/form-data") {
-        stage_publish_multipart(&state, request_content_type, body).await?
+        stage_publish_multipart(&state, &repo, request_content_type, body).await?
     } else {
-        let (staged, _digests) =
-            proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+        let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
+            &state,
+            &repo,
+            body.into_data_stream(),
+        )
+        .await?;
         PublishParts {
             staged,
+            digests,
             metadata: None,
             signatures: Vec::new(),
         }
@@ -1075,8 +1287,8 @@ async fn publish_release(
     // the uploaded zip when the header is absent. Without the fallback, raw
     // `PUT ... application/zip` uploads fail SwiftPM dependency resolution
     // because the manifest endpoint returns 404 even though the archive is
-    // perfectly valid (issue #1100). Read from the staged file, before
-    // `put_artifact_stream` consumes it.
+    // perfectly valid (issue #1100). Read from the staged body, before
+    // `put_staged_body` consumes it.
     let manifest = match headers
         .get("X-Swift-Package-Manifest")
         .and_then(|v| v.to_str().ok())
@@ -1085,26 +1297,39 @@ async fn publish_release(
         Some(m) => Some(m),
         // #2561: permit-scoped decode, fast-fail 503 on saturation. Only taken
         // when the header fallback actually needs to decode the uploaded zip.
-        None => crate::util::bounded_archive::with_ingest_extraction_async(|| {
-            extract_manifest_from_staged(parts.staged.path())
-        })
-        .await
-        .map_err(|e| e.into_response())?
-        .map_err(|e| {
-            swift_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Manifest parse task failed: {}", e),
-            )
-        })?,
+        None => {
+            let local =
+                super::repositories::materialize_staged_for_repo(&state, &repo, &parts.staged)
+                    .await?;
+            crate::util::bounded_archive::with_ingest_extraction_async(|| {
+                extract_manifest_from_staged(local.path())
+            })
+            .await
+            .map_err(|e| e.into_response())?
+            .map_err(|e| {
+                swift_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Manifest parse task failed: {}", e),
+                )
+            })?
+        }
     };
 
-    // Stream the staged archive into storage, which computes SHA-256 as it
-    // copies. The checksum is over the ARCHIVE, not the multipart envelope --
-    // SwiftPM verifies the source archive's checksum, and this same value is
-    // what the release-metadata `checksum` and the download `Digest` header
-    // report (#3595).
+    // Stream the staged archive into storage, from local scratch or by copying
+    // the object the repository's backend already staged (#4990). The checksum
+    // is over the ARCHIVE, not the multipart envelope -- SwiftPM verifies the
+    // source archive's checksum, and this same value is what the release-metadata
+    // `checksum` and the download `Digest` header report (#3595).
     let storage_key = format!("swift/{}/{}/{}/{}.zip", scope, name, version, name);
-    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, parts.staged).await?;
+    let put = proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        parts.staged,
+        &parts.digests,
+    )
+    .await?;
     let computed_sha256 = put.checksum_sha256;
     let size_bytes = put.bytes_written as i64;
 
@@ -1139,6 +1364,13 @@ async fn publish_release(
         .map(str::to_string);
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -1158,9 +1390,15 @@ async fn publish_release(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
+        swift_error_response(
+            crate::api::handlers::db_status(&e),
+            crate::api::handlers::db_err_message(&e),
+        )
+    })?;
+    tx.commit().await.map_err(|e| {
         swift_error_response(
             crate::api::handlers::db_status(&e),
             crate::api::handlers::db_err_message(&e),
@@ -1169,6 +1407,13 @@ async fn publish_release(
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Store metadata
     let _ = sqlx::query!(
@@ -1205,6 +1450,18 @@ async fn publish_release(
         size_bytes,
         &computed_sha256,
         release_description.as_deref(),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers now that the row, its metadata
+    // and its catalog entry are committed.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -1922,7 +2179,7 @@ mod db_cov_tests {
             assert_eq!(body_bytes.len(), zip_bytes.len());
         }
 
-        drop(mock_server);
+        tdh::drop_mock_server(mock_server).await;
         tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
         let _ = std::fs::remove_dir_all(&fx.storage_dir);
     }
@@ -2124,6 +2381,27 @@ mod multipart_publish_tests {
         Bytes::from(body)
     }
 
+    /// The filesystem repository the multipart-staging cases upload into.
+    /// `stages_on_backend` keeps a filesystem repository on local scratch, so
+    /// these tests exercise the self-hosted path.
+    fn staging_repo(dir: &std::path::Path) -> super::RepoInfo {
+        super::RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            key: "swift-test".to_string(),
+            storage_path: dir.to_str().unwrap().to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "hosted".to_string(),
+            upstream_url: None,
+            format: "swift".to_string(),
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
+        }
+    }
+
     /// An envelope over `max_upload_size_bytes` is 413, not a "malformed" 400,
     /// whether the ceiling is crossed before the first part (the parser
     /// reports it) or mid-archive (it surfaces inside the stager) (#4023).
@@ -2134,6 +2412,7 @@ mod multipart_publish_tests {
         let state = tdh::build_state_with(tdh::lazy_pool(), dir.to_str().unwrap(), |cfg| {
             cfg.max_upload_size_bytes = 512
         });
+        let repo = staging_repo(&dir);
         let archive = vec![0xABu8; 4096];
         let envelope = publish_envelope(&[("source-archive", "application/zip", &archive)]);
         let content_type = format!("multipart/form-data; boundary={}", BOUNDARY);
@@ -2142,13 +2421,18 @@ mod multipart_publish_tests {
             .map(|c| Ok(Bytes::copy_from_slice(c)))
             .collect();
 
-        let whole =
-            super::stage_publish_multipart(&state, &content_type, Body::from(envelope.clone()))
-                .await
-                .err()
-                .map(|resp| resp.status());
+        let whole = super::stage_publish_multipart(
+            &state,
+            &repo,
+            &content_type,
+            Body::from(envelope.clone()),
+        )
+        .await
+        .err()
+        .map(|resp| resp.status());
         let chunked = super::stage_publish_multipart(
             &state,
+            &repo,
             &content_type,
             Body::from_stream(futures::stream::iter(pieces)),
         )
@@ -2350,7 +2634,7 @@ mod catalog_registration_tests {
         let mut buf = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
             writer.start_file("Package.swift", opts).unwrap();
             writer.write_all(b"// swift-tools-version:5.9\n").unwrap();
             writer.finish().unwrap();
@@ -2411,5 +2695,245 @@ mod catalog_registration_tests {
             row.description.as_deref(),
             Some("a catalogued swift package")
         );
+    }
+
+    /// #4725: a SE-0292 publish to a hosted repository must queue a push sync
+    /// task for a subscribed push peer, and a publish that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing
+    /// queued).
+    #[tokio::test]
+    async fn swift_publish_queues_push_sync_task_4725() {
+        let Some(fx) = tdh::Fixture::setup("local", "swift").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "swift").await;
+
+        let archive = source_zip();
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(format!("--{CATALOG_BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"source-archive\"\r\n");
+        body.extend_from_slice(b"Content-Type: application/zip\r\n");
+        body.extend_from_slice(b"Content-Transfer-Encoding: binary\r\n\r\n");
+        body.extend_from_slice(&archive);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{CATALOG_BOUNDARY}--\r\n").as_bytes());
+
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/example/ExamplePackage/1.0.0", fx.repo_key))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={CATALOG_BOUNDARY}"),
+            )
+            .body(axum::body::Body::from(body.clone()))
+            .expect("build publish request");
+        let (status, resp) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "swift publish must succeed: {status} {}",
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        // A replicated publish (as the sync worker sends it) stores the
+        // release but must not queue another task.
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/example/ExamplePackage/2.0.0", fx.repo_key))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={CATALOG_BOUNDARY}"),
+            )
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(body))
+            .expect("build replicated publish request");
+        let (status, resp) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated swift publish must succeed: {status} {}",
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["example/ExamplePackage/1.0.0/ExamplePackage.zip".to_string()],
+            "only the client publish queues a push task; the replicated one must not"
+        );
+    }
+}
+
+/// #4110: scan-on-proxy on Swift source archives, Remote and Virtual,
+/// through the shared archive scenarios, plus the archive rule.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod scan_on_proxy_4110 {
+    use super::*;
+    use crate::api::handlers::proxy_scan_archive::test_support::{archive_scan_suite, ArchiveCase};
+    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+    use bytes::Bytes;
+
+    fn zip_of(entries: &[(&str, String)]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            for (name, data) in entries {
+                zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zip, data.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    fn archive() -> Vec<u8> {
+        zip_of(&[
+            (
+                "dtf-scanned/Package.swift",
+                format!(
+                    "// swift-tools-version:5.5\n// {}\nimport PackageDescription\nlet package = Package(name: \"dtf-scanned\")\n",
+                    uuid::Uuid::new_v4()
+                ),
+            ),
+            ("dtf-scanned/Sources/Dtf/Dtf.swift", "struct Dtf {}\n".to_string()),
+        ])
+    }
+
+    fn case(_mock: &str) -> ArchiveCase {
+        ArchiveCase {
+            format: "swift",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/dtf/scanned/1.0.0.zip")),
+            package_path: "/dtf/scanned/1.0.0.zip".to_string(),
+            extra: Vec::new(),
+            body: archive(),
+            recorded_path: "dtf/scanned/1.0.0.zip".to_string(),
+            file: "scanned-1.0.0.zip".to_string(),
+            pin: None,
+        }
+    }
+
+    archive_scan_suite!(case);
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched or cached.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/dtf/scanned/1.0.0%3Fx.zip"),
+                format!("/{key}/dtf/scanned%3B/1.0.0.zip"),
+            ] {
+                let (status, _, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    #[test]
+    fn only_an_archive_with_a_top_level_manifest_is_graded() {
+        assert_eq!(
+            swift_archive_identity(&Bytes::from(archive())),
+            ArchiveIdentity::ContentGraded
+        );
+        let root = zip_of(&[("Package.swift", "// m\n".to_string())]);
+        assert_eq!(
+            swift_archive_identity(&Bytes::from(root)),
+            ArchiveIdentity::ContentGraded
+        );
+        let fixture_only = zip_of(&[
+            ("a/Tests/Fixture/Package.swift", "// m\n".to_string()),
+            ("a/x.swift", "\n".to_string()),
+        ]);
+        for bytes in [Bytes::from(fixture_only), Bytes::from_static(b"not a zip")] {
+            assert!(matches!(
+                swift_archive_identity(&bytes),
+                ArchiveIdentity::Unreadable(_)
+            ));
+        }
+    }
+}
+
+/// #4365 item 1: Swift decides by route (every source archive is a
+/// package); the cache key is `{scope}/{name}/{version}.zip`.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn swift_archive_serve_key_table() {
+        let got = swift_archive_serve_key("apple", "swift-nio", "2.29.0");
+        assert_eq!(got.cache_key, "apple/swift-nio/2.29.0.zip");
+        assert!(got.scannable);
+    }
+}
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+    use crate::api::handlers::proxy_scan_archive::test_support::archive_identities;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{tar_gz_with, tar_with, zip_with};
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_source_archive_with_two_manifests_is_not_established() {
+        let check = |bytes: &[u8]| {
+            archive_identities(
+                SwiftSourceArchive,
+                DupFormat::Swift,
+                "demo-1.0.0.zip",
+                bytes,
+            )
+        };
+        let good: &[u8] = b"// swift-tools-version:5.9\nimport PackageDescription\n";
+        let other: &[u8] = b"// swift-tools-version:5.9\nimport PackageDescription\n// other\n";
+        let dup = zip_with(&[
+            ("Package.swift", good),
+            ("Sources/A.swift", b""),
+            ("./Package.swift", other),
+        ]);
+        let (own, gate) = check(&dup);
+        assert!(
+            matches!(own, ProxyScanIdentity::NotApplicable),
+            "graded on contents"
+        );
+        assert!(unestablished(&gate));
+        let single = zip_with(&[("Package.swift", good), ("Sources/A.swift", b"")]);
+        assert!(matches!(check(&single).1, ProxyScanIdentity::NotApplicable));
     }
 }

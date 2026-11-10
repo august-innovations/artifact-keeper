@@ -258,6 +258,14 @@ mod tests {
                 .ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))),
             AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
                 .details_typed(details::AuthDetails::failed_login(Some("attacker"), None)),
+            AuditEntry::new(AuditAction::LoginRateLimited, ResourceType::User)
+                .ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)))
+                .details_typed(details::AuthDetails::rate_limited(
+                    Some("attacker"),
+                    "/api/v1/auth/login",
+                    "POST",
+                    "login_per_account",
+                )),
             AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
                 .system_actor("system:stuck_scan_janitor"),
             AuditEntry::new(AuditAction::PermissionDenied, ResourceType::User)
@@ -280,6 +288,15 @@ mod tests {
                     age_gate_enabled: None,
                     age_gate_min_age_days: None,
                     age_gate_mode: None,
+                    scan_config: None,
+                    previous_scan_config: None,
+                    scan_config_changed: None,
+                    upstream_change: None,
+                    project_change: None,
+                    allow_public_with_upstream_credentials: None,
+                    upstream_auth_change: None,
+                    age_gate_change: None,
+                    upstream_mode_change: None,
                 }),
         ];
         for entry in &entries {
@@ -336,6 +353,14 @@ mod tests {
 
     #[test]
     fn test_typed_details_validate_against_defs() {
+        let state = |action: &str| details::ScanConfigAuditState {
+            scan_enabled: true,
+            scan_on_upload: false,
+            scan_on_proxy: true,
+            block_on_policy_violation: false,
+            severity_threshold: "high".into(),
+            proxy_scan_action: action.into(),
+        };
         assert_valid_against(
             "RepositoryDetails",
             &serde_json::to_value(details::RepositoryDetails {
@@ -347,6 +372,27 @@ mod tests {
                 age_gate_enabled: Some(true),
                 age_gate_min_age_days: Some(14),
                 age_gate_mode: None,
+                scan_config: Some(state("record_only")),
+                previous_scan_config: Some(state("fail_open")),
+                scan_config_changed: Some(vec!["proxy_scan_action".into()]),
+                upstream_change: None,
+                project_change: Some(details::ProjectChangeAudit {
+                    previous_project_id: Some(Uuid::new_v4()),
+                    project_id: None,
+                }),
+                allow_public_with_upstream_credentials: None,
+                upstream_auth_change: None,
+                age_gate_change: Some(details::AgeGateChangeDetails {
+                    previous_enabled: true,
+                    previous_min_age_days: 30,
+                    previous_mode: "first_seen".into(),
+                    actor_tier: "repository_admin".into(),
+                    relaxed: true,
+                }),
+                upstream_mode_change: Some(details::UpstreamModeChangeAudit {
+                    previous_upstream_mode: "online".into(),
+                    upstream_mode: "cache_only".into(),
+                }),
             })
             .unwrap(),
         );

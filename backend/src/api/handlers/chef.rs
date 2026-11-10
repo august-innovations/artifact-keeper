@@ -12,7 +12,7 @@
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
@@ -290,6 +290,7 @@ async fn download_cookbook(
                         upstream_url,
                         &upstream_path,
                         "application/octet-stream",
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -323,6 +324,7 @@ async fn download_cookbook(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -388,6 +390,7 @@ async fn upload_cookbook(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "chef", "write:artifacts")?.user_id;
@@ -395,10 +398,14 @@ async fn upload_cookbook(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    // Spool the tarball straight to a bounded scratch file instead of buffering
-    // the whole body in memory; the small `cookbook` JSON field is still read
-    // in-hand. See proxy_helpers::stage_upload_field / put_artifact_stream.
-    let mut staged: Option<proxy_helpers::StagedUpload> = None;
+    // Stage the tarball on the repository's backend when it streams natively,
+    // else in bounded local scratch, instead of buffering the whole body in
+    // memory; the small `cookbook` JSON field is still read in-hand. See
+    // repositories::stage_upload_field_for_repo.
+    let mut staged: Option<(
+        super::repositories::GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    )> = None;
     let mut cookbook_json: Option<serde_json::Value> = None;
 
     while let Some(field) = multipart
@@ -409,7 +416,9 @@ async fn upload_cookbook(
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
             "tarball" => {
-                staged = Some(proxy_helpers::stage_upload_field(&state, field).await?);
+                staged = Some(
+                    super::repositories::stage_upload_field_for_repo(&state, &repo, field).await?,
+                );
             }
             "cookbook" => {
                 // Small JSON metadata field (not the artifact body): read as
@@ -433,7 +442,7 @@ async fn upload_cookbook(
         }
     }
 
-    let staged =
+    let (staged, digests) =
         staged.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing tarball field").into_response())?;
 
     if staged.is_empty() {
@@ -499,10 +508,18 @@ async fn upload_cookbook(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Stream the staged tarball into the repo's StorageBackend via `put_stream`,
-    // which computes the SHA-256 incrementally as it copies (no re-hash).
+    // Stream the staged tarball into the repo's StorageBackend, from local
+    // scratch or by copying the object the backend already staged (#4990).
     let storage_key = format!("chef/{}/{}/{}", cookbook_name, cookbook_version, filename);
-    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    let put = proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
     let computed_sha256 = put.checksum_sha256;
 
     // Captured before `cookbook_json` is moved into the metadata JSON below.
@@ -522,6 +539,13 @@ async fn upload_cookbook(
 
     let size_bytes = put.bytes_written as i64;
 
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -541,12 +565,20 @@ async fn upload_cookbook(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     let _ = sqlx::query!(
         r#"
@@ -572,6 +604,17 @@ async fn upload_cookbook(
         size_bytes,
         &computed_sha256,
         cookbook_description.as_deref(),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -1063,6 +1106,66 @@ mod upload_stream_tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         fx.teardown().await;
+    }
+
+    /// #4725: a cookbook upload to a hosted repository must queue a push sync
+    /// task for a subscribed push peer, and an upload that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn chef_upload_queues_push_sync_task_4725() {
+        let Some(fx) = tdh::Fixture::setup("local", "chef").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "chef").await;
+
+        let tarball = b"cookbook-payload-4725";
+        let body = cookbook_multipart("CHEFBND", "repl4725", "1.0.0", tarball);
+        let app = fx.router_with_auth(super::router());
+        let (status, resp) = tdh::send(
+            app,
+            tdh::post(
+                format!("/{}/api/v1/cookbooks", fx.repo_key),
+                "multipart/form-data; boundary=CHEFBND",
+                body,
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "cookbook upload must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the cookbook
+        // but must not queue another task.
+        let body = cookbook_multipart("CHEFBND", "repl4725", "2.0.0", tarball);
+        let mut req = tdh::post(
+            format!("/{}/api/v1/cookbooks", fx.repo_key),
+            "multipart/form-data; boundary=CHEFBND",
+            body,
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let app = fx.router_with_auth(super::router());
+        let (status, resp) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated cookbook upload must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["repl4725/1.0.0/repl4725-1.0.0.tar.gz".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
     }
 }
 

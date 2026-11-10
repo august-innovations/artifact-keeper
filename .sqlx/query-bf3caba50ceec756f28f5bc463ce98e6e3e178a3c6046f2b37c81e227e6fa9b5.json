@@ -6,17 +6,20 @@
       {
         "ordinal": 0,
         "name": "download_count!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": "Expression"
       },
       {
         "ordinal": 1,
         "name": "first_downloaded",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": "Expression"
       },
       {
         "ordinal": 2,
         "name": "last_downloaded",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": "Expression"
       }
     ],
     "parameters": {

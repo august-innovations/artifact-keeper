@@ -6,7 +6,13 @@
       {
         "ordinal": 0,
         "name": "is_enabled",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "format_handlers",
+            "name": "is_enabled"
+          }
+        }
       }
     ],
     "parameters": {

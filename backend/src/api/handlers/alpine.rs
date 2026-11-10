@@ -8,6 +8,7 @@
 //!   PUT  /alpine/{repo_key}/{branch}/{repository}/{arch}/{filename}.apk   - Upload package
 //!   POST /alpine/{repo_key}/upload                                        - Upload package (alternative)
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -20,6 +21,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use futures::StreamExt as _;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::io::Read;
@@ -241,6 +243,27 @@ const APK_PARSE_FAILED_FIELD: &str = "apk_parse_failed";
 /// way: `SELECT ... WHERE metadata ? 'apk_parse_truncated'`.
 const APK_PARSE_TRUNCATED_FIELD: &str = "apk_parse_truncated";
 
+/// Version of the set of `.PKGINFO`-derived index fields an artifact's metadata
+/// carries, recorded under [`APK_INDEX_FIELDS_FIELD`] whenever a package is
+/// parsed (at upload and by the backfill).
+///
+/// Metadata written before the marker existed is version 1: the checksum, sizes,
+/// the descriptive fields, `depends` and `provides`. Version 2 adds the package's
+/// own identity (`pkgname`/`pkgver`), `provider_priority` (`k:`) and `install_if`
+/// (`i:`) (#5254).
+///
+/// Bump this whenever [`apk_info_metadata_fields`] learns a new field the index
+/// needs: every artifact indexed with an older field set is then re-read once by
+/// the backfill, under the same per-request cap and failure markers as an
+/// unindexed one, so already-stored packages pick the field up without a
+/// re-upload.
+const APK_INDEX_FIELDS_VERSION: i64 = 2;
+
+/// Metadata field holding the [`APK_INDEX_FIELDS_VERSION`] an artifact's index
+/// fields were derived with. Queryable like the other markers:
+/// `SELECT ... WHERE (metadata->>'apk_index_fields')::int < 2`.
+const APK_INDEX_FIELDS_FIELD: &str = "apk_index_fields";
+
 /// Number of leading gzip segments searched for `.PKGINFO`. An apk v2 package is
 /// `[signature segment] control segment data segment`, so the control segment is
 /// always one of the first two — the same assumption apk-tools makes. Stopping
@@ -250,6 +273,10 @@ const APK_MAX_SEGMENTS_SCANNED: usize = 2;
 /// Fields read out of an `.apk` `.PKGINFO`.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct ApkPkgInfo {
+    /// The package's own name (`pkgname`), the APKINDEX `P:` field.
+    name: Option<String>,
+    /// The package's own version (`pkgver`), the APKINDEX `V:` field.
+    version: Option<String>,
     /// Uncompressed size of the installed files (`size`), the APKINDEX `I:` field.
     installed_size: Option<i64>,
     description: Option<String>,
@@ -261,6 +288,12 @@ struct ApkPkgInfo {
     commit: Option<String>,
     depends: Vec<String>,
     provides: Vec<String>,
+    /// `provider_priority`, the APKINDEX `k:` field: which of several packages
+    /// providing the same name apk picks when none is named explicitly.
+    provider_priority: Option<u16>,
+    /// `install_if`, the APKINDEX `i:` field: the packages whose joint presence
+    /// auto-installs this one (`-doc`, `-openrc`, `-bash-completion`, ...).
+    install_if: Vec<String>,
 }
 
 /// What the index generator needs from an uploaded `.apk`.
@@ -368,6 +401,8 @@ fn parse_pkginfo(text: &str) -> ApkPkgInfo {
         }
 
         match key {
+            "pkgname" => info.name = Some(value.to_string()),
+            "pkgver" => info.version = Some(value.to_string()),
             "size" => info.installed_size = value.parse().ok(),
             "pkgdesc" => info.description = Some(value.to_string()),
             "url" => info.url = Some(value.to_string()),
@@ -380,6 +415,18 @@ fn parse_pkginfo(text: &str) -> ApkPkgInfo {
             // them into a single space-separated field.
             "depend" => info.depends.push(value.to_string()),
             "provides" => info.provides.push(value.to_string()),
+            // apk-tools keeps this as an unsigned 16-bit value and leaves `k:`
+            // out when it is 0; anything it could not store is ignored here too.
+            "provider_priority" => info.provider_priority = value.parse().ok(),
+            // abuild writes `install_if` as ONE line of whitespace-separated
+            // dependencies (`install_if = docs 7zip=26.01-r0`), and apk-tools
+            // appends a repeated line rather than replacing it, so each entry is
+            // collected on its own and the index joins them with single spaces.
+            "install_if" => info
+                .install_if
+                .extend(value.split_whitespace().map(str::to_string)),
+            // `replaces` is deliberately not read: `apk index` does not emit it
+            // (no upstream APKINDEX carries an `r:` line).
             _ => {}
         }
     }
@@ -420,10 +467,16 @@ fn parse_apk_package(data: &[u8]) -> Option<ApkPackageInfo> {
 /// m:<maintainer>
 /// t:<build time>
 /// c:<commit>
+/// k:<provider priority>
 /// D:<dependencies>
 /// p:<provides>
+/// i:<install_if>
 ///
 /// ```
+///
+/// The order is the one `apk index` writes (`C P V A S I T U L o m t c k D p i`,
+/// checked against Alpine v3.24 `main`); the optional fields are left out when
+/// the package does not carry them, as apk-tools does.
 ///
 /// Entries without a stored apk checksum are skipped: apk-tools rejects an index
 /// it cannot parse a `C:` value from, so emitting such an entry would make the
@@ -434,29 +487,7 @@ fn generate_apkindex_text(artifacts: &[AlpineArtifact], arch: &str) -> String {
     let mut text = String::new();
 
     for artifact in artifacts {
-        let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-
-        // Extract metadata from artifact_metadata if available, else parse filename
-        let (name, version) = if let Some(ref meta) = artifact.metadata {
-            (
-                meta.get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&artifact.name)
-                    .to_string(),
-                meta.get("version")
-                    .and_then(|v| v.as_str())
-                    .or(artifact.version.as_deref())
-                    .unwrap_or("0")
-                    .to_string(),
-            )
-        } else if let Some((n, v)) = parse_apk_filename(filename) {
-            (n, v)
-        } else {
-            (
-                artifact.name.clone(),
-                artifact.version.clone().unwrap_or_else(|| "0".to_string()),
-            )
-        };
+        let (name, version) = apk_index_identity(artifact);
 
         let description = artifact
             .metadata
@@ -558,14 +589,74 @@ fn generate_apkindex_text(artifacts: &[AlpineArtifact], arch: &str) -> String {
             text.push_str(&format!("t:{}\n", build_time));
         }
         push_optional_field(&mut text, 'c', artifact.metadata.as_ref(), "commit");
+        // apk-tools omits `k:` for the default priority of 0.
+        if let Some(priority) = artifact
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("provider_priority"))
+            .and_then(|v| v.as_u64())
+            .filter(|p| *p > 0)
+        {
+            text.push_str(&format!("k:{}\n", priority));
+        }
         if !depends.is_empty() {
             text.push_str(&format!("D:{}\n", depends));
         }
         push_optional_field(&mut text, 'p', artifact.metadata.as_ref(), "provides");
+        push_optional_field(&mut text, 'i', artifact.metadata.as_ref(), "install_if");
         text.push('\n');
     }
 
     text
+}
+
+/// The `(P:, V:)` an artifact is indexed under.
+///
+/// The package's own `.PKGINFO` `pkgname`/`pkgver` win whenever they have been
+/// parsed (recorded as `pkgname`/`pkgver` by [`apk_info_metadata_fields`]):
+/// that is the identity `apk index` uses and the one apk resolves dependencies
+/// against. Without them, the upload-time `name`/`version` metadata, then the
+/// `{name}-{version}.apk` file name, and only last the `artifacts` columns —
+/// which an upload through the generic endpoint fills positionally from the
+/// path (`v3.24` / `main` for `v3.24/main/x86_64/nginx-1.30.6-r0.apk`, #5254),
+/// so they are the least trustworthy source.
+fn apk_index_identity(artifact: &AlpineArtifact) -> (String, String) {
+    let meta_str = |key: &str| {
+        artifact
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(key))
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+    };
+
+    if let (Some(name), Some(version)) = (meta_str("pkgname"), meta_str("pkgver")) {
+        return (name.to_string(), version.to_string());
+    }
+    if let Some(name) = meta_str("name") {
+        let version = meta_str("version")
+            .or(artifact.version.as_deref())
+            .unwrap_or("0");
+        return (name.to_string(), version.to_string());
+    }
+    let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+    if let Some(identity) = parse_apk_filename(filename) {
+        return identity;
+    }
+    (
+        artifact.name.clone(),
+        artifact.version.clone().unwrap_or_else(|| "0".to_string()),
+    )
+}
+
+/// The package identity a parsed `.PKGINFO` declares, when it declares one the
+/// index can carry: both `pkgname` and `pkgver` present and inside the APKINDEX
+/// charset ([`is_valid_apk_name_or_version`]).
+fn apk_package_identity(info: &ApkPkgInfo) -> Option<(&str, &str)> {
+    let name = info.name.as_deref()?;
+    let version = info.version.as_deref()?;
+    (is_valid_apk_name_or_version(name) && is_valid_apk_name_or_version(version))
+        .then_some((name, version))
 }
 
 /// Append `<key>:<value>` for a non-empty string field of the artifact metadata.
@@ -874,6 +965,22 @@ fn has_apk_checksum(artifact: &AlpineArtifact) -> bool {
         .is_some_and(|c| !c.is_empty())
 }
 
+/// Whether an artifact is indexed with the current field set: it has an apk
+/// checksum *and* its index fields were derived at [`APK_INDEX_FIELDS_VERSION`]
+/// or later.
+///
+/// `>=` for the same rollback reason as the failure markers: fields a newer
+/// backend derived are a superset of what this one would.
+fn has_current_apk_index_fields(artifact: &AlpineArtifact) -> bool {
+    has_apk_checksum(artifact)
+        && artifact
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(APK_INDEX_FIELDS_FIELD))
+            .and_then(|v| v.as_i64())
+            .is_some_and(|version| version >= APK_INDEX_FIELDS_VERSION)
+}
+
 /// Whether a parser at least as new as this one already failed on these bytes.
 ///
 /// `>=` rather than `==` so a marker left by a *newer* parser is still honoured
@@ -907,17 +1014,45 @@ fn apk_head_was_truncated(artifact: &AlpineArtifact) -> bool {
 
 /// Whether the index backfill should read this artifact's bytes.
 ///
-/// Every term matters. Without the checksum test a package would be re-read once
+/// Two populations are read: packages with no index metadata at all, and
+/// packages indexed with an older field set ([`APK_INDEX_FIELDS_VERSION`]) —
+/// still listed, but without the `P:`/`V:` identity, `k:` and `i:` an older
+/// backend never recorded (#5254).
+///
+/// Every term matters. Without the field-set test a package would be re-read once
 /// it is already indexed; without the marker tests an artifact this reader cannot
 /// index would be fetched and re-parsed on *every* index request forever, which
 /// is unmetered work for an endpoint that is anonymous on public repositories.
-/// The two markers are separate because they expire on different things: a parse
-/// failure is a verdict on the bytes that only a better parser can overturn, a
-/// truncated read is a limit of the window that a wider one lifts.
+/// The markers apply to the stale population too: a re-read that fails records
+/// its marker, which ends the re-reads while the entry keeps the fields it
+/// already had. The two markers are separate because they expire on different
+/// things: a parse failure is a verdict on the bytes that only a better parser
+/// can overturn, a truncated read is a limit of the window that a wider one
+/// lifts.
 fn needs_apk_backfill(artifact: &AlpineArtifact) -> bool {
-    !has_apk_checksum(artifact)
+    !has_current_apk_index_fields(artifact)
         && !apk_parse_already_failed(artifact)
         && !apk_head_was_truncated(artifact)
+}
+
+/// The artifacts one index request reads, as indices into `artifacts`: at most
+/// [`APK_BACKFILL_MAX_PER_REQUEST`] of those [`needs_apk_backfill`] accepts.
+///
+/// Packages missing from the index altogether go first; ones that are listed
+/// but carry an older field set only get what is left of the budget. Within
+/// each group the listing order is kept, so successive requests make steady
+/// progress through the same queue.
+fn select_apk_backfill(artifacts: &[AlpineArtifact]) -> Vec<usize> {
+    let mut selected: Vec<usize> = artifacts
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| needs_apk_backfill(a))
+        .map(|(i, _)| i)
+        .collect();
+    // Stable, so the listing order survives inside each group.
+    selected.sort_by_key(|&i| has_apk_checksum(&artifacts[i]));
+    selected.truncate(APK_BACKFILL_MAX_PER_REQUEST);
+    selected
 }
 
 /// What reading a stored package told us about it.
@@ -1023,7 +1158,8 @@ async fn backfill_apk_metadata(
     repo: &RepoInfo,
     artifacts: &mut [AlpineArtifact],
 ) {
-    if !artifacts.iter().any(needs_apk_backfill) {
+    let selected = select_apk_backfill(artifacts);
+    if selected.is_empty() {
         return;
     }
 
@@ -1035,13 +1171,15 @@ async fn backfill_apk_metadata(
         }
     };
 
-    for artifact in artifacts
-        .iter_mut()
-        .filter(|a| needs_apk_backfill(a))
-        .take(APK_BACKFILL_MAX_PER_REQUEST)
-    {
+    for index in selected {
+        let artifact = &mut artifacts[index];
+        let mut identity = None;
         let fields = match read_apk_backfill(storage.as_ref(), artifact).await {
-            ApkBackfillOutcome::Parsed(apk_info) => apk_info_metadata_fields(&apk_info),
+            ApkBackfillOutcome::Parsed(apk_info) => {
+                identity = apk_package_identity(&apk_info.pkginfo)
+                    .map(|(name, version)| (name.to_string(), version.to_string()));
+                apk_info_metadata_fields(&apk_info)
+            }
             ApkBackfillOutcome::Unreadable => {
                 // Record the failure so these bytes are not fetched and re-parsed
                 // on every subsequent index request. Keyed by parser version, so a
@@ -1062,22 +1200,7 @@ async fn backfill_apk_metadata(
         };
 
         let patch = serde_json::Value::Object(fields.clone());
-        // Merge server-side (`||`) rather than writing back a snapshot read before
-        // the package fetch: concurrent index requests and uploads touch the same
-        // row, and a plain `SET metadata = $2` would drop whatever they wrote in
-        // the meantime.
-        let stored = sqlx::query!(
-            r#"
-            INSERT INTO artifact_metadata (artifact_id, format, metadata)
-            VALUES ($1, 'alpine', $2)
-            ON CONFLICT (artifact_id)
-            DO UPDATE SET metadata = artifact_metadata.metadata || $2
-            "#,
-            artifact.id,
-            patch,
-        )
-        .execute(&state.db)
-        .await;
+        let stored = persist_apk_backfill(&state.db, artifact.id, &patch, identity.as_ref()).await;
 
         if let Err(e) = stored {
             tracing::warn!(
@@ -1099,7 +1222,63 @@ async fn backfill_apk_metadata(
             map.extend(fields);
             artifact.metadata = Some(metadata);
         }
+        if let Some((name, version)) = identity {
+            artifact.name = name;
+            artifact.version = Some(version);
+        }
     }
+}
+
+/// Persist one backfill result: merge `patch` into the artifact's metadata and,
+/// when the package's own `.PKGINFO` identity was read, correct the
+/// `artifacts.name`/`version` columns to it — in one transaction, so a row is
+/// never left marked current with its columns still wrong.
+///
+/// The columns are corrected because the index is not their only reader:
+/// listings, search (the `search_vector` trigger follows `name`) and the
+/// package catalog backfill all take the package identity from them. An upload through the generic endpoint fills them positionally
+/// from the path (`v3.24` / `main`, #5254), and nothing else ever revisits them.
+/// The `WHERE` leaves an already-correct row untouched.
+///
+/// The metadata is merged server-side (`||`) rather than written back from a
+/// snapshot read before the package fetch: concurrent index requests and uploads
+/// touch the same row, and a plain `SET metadata = $2` would drop whatever they
+/// wrote in the meantime.
+async fn persist_apk_backfill(
+    db: &PgPool,
+    artifact_id: uuid::Uuid,
+    patch: &serde_json::Value,
+    identity: Option<&(String, String)>,
+) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin().await?;
+    sqlx::query!(
+        r#"
+        INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'alpine', $2)
+        ON CONFLICT (artifact_id)
+        DO UPDATE SET metadata = artifact_metadata.metadata || $2
+        "#,
+        artifact_id,
+        patch,
+    )
+    .execute(&mut *tx)
+    .await?;
+    if let Some((name, version)) = identity {
+        sqlx::query!(
+            r#"
+            UPDATE artifacts
+            SET name = $2, version = $3, updated_at = NOW()
+            WHERE id = $1
+              AND (name IS DISTINCT FROM $2 OR version IS DISTINCT FROM $3)
+            "#,
+            artifact_id,
+            name,
+            version,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,13 +1336,25 @@ async fn download_package(
         String,
         String,
     )>,
+    headers: HeaderMap,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    // rules_apko fetches an .apk's three sections as separate ranged GETs and
+    // checksums each; ignoring Range answered 200 and failed all three. A
+    // stored package carries no ETag, so an `If-Range` gets the whole file.
+    let range_header = proxy_helpers::effective_range(&headers, None, ctx.is_head);
     if !filename.ends_with(".apk") {
         return Err((StatusCode::BAD_REQUEST, "File must have .apk extension").into_response());
     }
 
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
+    // #4365 item 3: on a proxying repository the branch, repository, arch and
+    // file name are the upstream path and the proxy-cache key, so an
+    // ambiguous one is a 400 before anything is fetched, scanned or not.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[&branch, &repository, &arch, &filename],
+    )?;
 
     let artifact_path = build_alpine_artifact_path(&branch, &repository, &arch, &filename);
 
@@ -1187,6 +1378,19 @@ async fn download_package(
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
+            // #4113: scan-on-proxy, Remote and Virtual. `None` when nothing
+            // scans: the paths below are untouched.
+            if let Some(served) = serve_scanned_apk_download(
+                &state,
+                auth.as_ref(),
+                &repo,
+                (&branch, &repository, &arch, &filename),
+                &ctx,
+            )
+            .await?
+            {
+                return served;
+            }
             if repo.repo_type == RepositoryType::Remote {
                 if let Some(response) = try_proxy_apk(
                     &state,
@@ -1197,6 +1401,7 @@ async fn download_package(
                     &arch,
                     &filename,
                     &ctx,
+                    &headers,
                 )
                 .await?
                 {
@@ -1215,6 +1420,7 @@ async fn download_package(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -1229,10 +1435,10 @@ async fn download_package(
                 )
                 .await?;
 
-                return proxy_helpers::stream_fetch_result(
-                    result,
-                    "application/vnd.alpine.package",
-                    None,
+                return proxy_helpers::apply_range_to_streamed_serve(
+                    proxy_helpers::stream_fetch_result(result, APK_CONTENT_TYPE, None)?,
+                    &headers,
+                    ctx.is_head,
                 );
             }
 
@@ -1253,17 +1459,13 @@ async fn download_package(
             // Record download
             crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/vnd.alpine.package")
-                .header(
-                    "Content-Disposition",
-                    format!("attachment; filename=\"{}\"", filename),
-                )
-                .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-                .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-                .body(Body::from_stream(stream))
-                .unwrap())
+            serve_ranged_apk(
+                range_header,
+                artifact.size_bytes.max(0) as u64,
+                stream,
+                &filename,
+                &artifact.checksum_sha256,
+            )
         }
         Err(crate::error::AppError::NotFound(_)) if repo.repo_type != RepositoryType::Remote => {
             // Hosted artifact: file absent from storage. Serialise concurrent
@@ -1279,17 +1481,14 @@ async fn download_package(
 
             crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/vnd.alpine.package")
-                .header(
-                    "Content-Disposition",
-                    format!("attachment; filename=\"{}\"", filename),
-                )
-                .header(CONTENT_LENGTH, content.len().to_string())
-                .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-                .body(Body::from(content))
-                .unwrap())
+            let total = content.len() as u64;
+            serve_ranged_apk(
+                range_header,
+                total,
+                futures::stream::once(async move { Ok(content) }).boxed(),
+                &filename,
+                &artifact.checksum_sha256,
+            )
         }
         Err(e) => {
             // Storage retrieval failed. For remote repos, the DB record may
@@ -1303,6 +1502,18 @@ async fn download_package(
                 e,
             );
             if repo.repo_type == RepositoryType::Remote {
+                // #4113: the re-fetch from upstream goes through the gate too.
+                if let Some(served) = serve_scanned_apk_download(
+                    &state,
+                    auth.as_ref(),
+                    &repo,
+                    (&branch, &repository, &arch, &filename),
+                    &ctx,
+                )
+                .await?
+                {
+                    return served;
+                }
                 if let Some(response) = try_proxy_apk(
                     &state,
                     &repo,
@@ -1312,6 +1523,7 @@ async fn download_package(
                     &arch,
                     &filename,
                     &ctx,
+                    &headers,
                 )
                 .await?
                 {
@@ -1327,6 +1539,199 @@ async fn download_package(
     }
 }
 
+/// Serve a stored `.apk` with a single `Range`, so all three local serve sites
+/// answer 206/416 identically.
+#[allow(clippy::result_large_err)]
+fn serve_ranged_apk(
+    range_header: Option<&str>,
+    total: u64,
+    body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    filename: &str,
+    checksum_sha256: &str,
+) -> Result<Response, Response> {
+    // X-Checksum-SHA256 covers the whole object, which is what a client
+    // assembling ranges verifies at the end, so keep it on a 206.
+    let base_headers = vec![
+        (CONTENT_TYPE, APK_CONTENT_TYPE.to_string()),
+        (
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        ),
+        (
+            axum::http::header::HeaderName::from_static("x-checksum-sha256"),
+            checksum_sha256.to_string(),
+        ),
+    ];
+    crate::api::handlers::repositories::ranged_stream_response(
+        range_header,
+        total,
+        body,
+        base_headers,
+    )
+    .map_err(|e| e.into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Scan-on-proxy (#4113)
+// ---------------------------------------------------------------------------
+
+const APK_CONTENT_TYPE: &str = "application/vnd.alpine.package";
+
+/// The `(cache_key, scannable)` decision for an Alpine package path (#4365
+/// item 1): every `.apk` on the package route is a package.
+fn apk_serve_key(upstream_path: &str) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(upstream_path)
+}
+
+/// The Alpine half of the generic gate (#4113): an `.apk` must be the
+/// `{pkgname}-{pkgver}.apk` its file name names, built for the requested
+/// architecture (or `noarch`), and is graded as that package of the release
+/// the requested branch names.
+struct ApkPackage<'a> {
+    arch: &'a str,
+    release: Option<crate::services::scanner_service::OsRelease>,
+}
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for ApkPackage<'_> {
+    const LABEL: &'static str = "alpine package";
+    const CONTENT_TYPE: &'static str = APK_CONTENT_TYPE;
+
+    fn requested(&self) -> String {
+        format!("the package file name's name and version for {}", self.arch)
+    }
+
+    fn identity(
+        &self,
+        filename: &str,
+        bytes: &Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        apk_identity(filename, self.arch, bytes, self.release.clone())
+    }
+}
+
+/// What a proxied `.apk` says about itself (#4113): its own `.PKGINFO` must
+/// name exactly the requested `{pkgname}-{pkgver}.apk`, for the requested
+/// architecture or `noarch`. It is then pinned as that package of `release`
+/// (from the branch), with its `origin` as the source package.
+fn apk_identity(
+    filename: &str,
+    arch: &str,
+    bytes: &Bytes,
+    release: Option<crate::services::scanner_service::OsRelease>,
+) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+    use crate::api::handlers::proxy_scan_archive::{
+        os_package_identity, read_apk_pkginfo, ArchiveIdentity,
+    };
+    let info = match read_apk_pkginfo(bytes) {
+        Ok(info) => info,
+        Err(e) => return ArchiveIdentity::Unreadable(e),
+    };
+    if format!("{}-{}.apk", info.pkgname, info.pkgver) != filename
+        || (info.arch != arch && info.arch != "noarch")
+    {
+        return ArchiveIdentity::Disagrees(format!(
+            ".PKGINFO declares {}-{} for {}",
+            info.pkgname, info.pkgver, info.arch
+        ));
+    }
+    os_package_identity(
+        crate::services::scanner_service::ComponentEcosystem::Alpine,
+        &info.pkgname,
+        &info.pkgver,
+        &info.arch,
+        info.origin,
+        release,
+    )
+}
+
+/// Inline scan-and-block for one Alpine package from one Remote repository
+/// (#4113).
+#[allow(clippy::too_many_arguments)]
+async fn serve_scanned_apk(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    cache_key: &str,
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    kind: ApkPackage<'_>,
+    disposition: Option<&str>,
+) -> Result<Response, Response> {
+    let filename = cache_key.rsplit('/').next().unwrap_or(cache_key);
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: crate::models::repository::RepositoryFormat::Alpine,
+        source_path: cache_key,
+        cache_path: cache_key,
+        filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+        proxy,
+        kind,
+        disposition,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The scan-on-proxy arms of an Alpine package download, Remote and Virtual
+/// (#4113): `Ok(None)` when nothing scans, so the caller keeps its untouched
+/// streaming path.
+async fn serve_scanned_apk_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    (branch, repository, arch, filename): (&str, &str, &str, &str),
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Result<Response, Response>>, Response> {
+    use crate::api::handlers::proxy_scan_archive::{LocalLookup, ScannedRoute};
+    let upstream_path = build_alpine_artifact_path(branch, repository, arch, filename);
+    let serve_key = apk_serve_key(&upstream_path);
+    if !serve_key.scannable {
+        return Ok(None);
+    }
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    let cache_key = serve_key.cache_key.as_str();
+    let route = ScannedRoute {
+        upstream_path: cache_key,
+        lookup: LocalLookup::ExactPath(&upstream_path),
+        default_content_type: APK_CONTENT_TYPE,
+        virtual_disposition: None,
+    };
+    let release = crate::api::handlers::proxy_scan_archive::alpine_release_from_branch(branch);
+    crate::api::handlers::proxy_scan_archive::serve_scanned_package_download(
+        state,
+        auth,
+        repo,
+        route,
+        false,
+        ctx,
+        |(id, key, upstream), policy, disposition| {
+            let release = release.clone();
+            async move {
+                serve_scanned_apk(
+                    state,
+                    proxy,
+                    (id, &key, &upstream),
+                    cache_key,
+                    policy,
+                    ctx,
+                    ApkPackage { arch, release },
+                    disposition.as_deref(),
+                )
+                .await
+            }
+        },
+    )
+    .await
+}
+
 /// Attempt to proxy-fetch an APK package from the upstream remote repository.
 /// Returns `Ok(Some(response))` on success, `Ok(None)` if the repo has no
 /// upstream or proxy configured, or `Err(response)` on proxy failure.
@@ -1340,6 +1745,7 @@ async fn try_proxy_apk(
     arch: &str,
     filename: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    headers: &HeaderMap,
 ) -> Result<Option<Response>, Response> {
     let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
         (Some(u), Some(p)) => (u, p),
@@ -1349,13 +1755,15 @@ async fn try_proxy_apk(
     // #895: stream large .apk bodies (a few MiB to ~100 MiB for LLVM-class
     // packages). Default Content-Type matches the buffered handler's
     // prior fallback.
-    let response = proxy_helpers::proxy_fetch_streaming(
+    // The proxy still caches the whole object; the range applies only to what we
+    // serve. Forwarding it upstream would cache a partial under the full key.
+    let result = proxy_helpers::proxy_fetch_streaming_result(
         proxy,
         repo.id,
         repo_key,
         upstream_url,
         &upstream_path,
-        "application/octet-stream",
+        ctx.is_head,
     )
     .await?;
     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -1366,7 +1774,11 @@ async fn try_proxy_apk(
     // lines up with the catalog row the artifact listing renders. `ctx` is
     // threaded in from `download_package` for exactly this call.
     proxy_helpers::record_proxy_download(state, repo.id, repo_key, &upstream_path, ctx).await;
-    Ok(Some(response))
+    // The proxied serve is a complete `200`; the shared helper cuts the
+    // client's window from it (#5554), and a cold fill the client stops
+    // reading at the window's end still completes (#5509).
+    let resp = proxy_helpers::stream_fetch_result(result, "application/octet-stream", None)?;
+    proxy_helpers::apply_range_to_streamed_serve(resp, headers, ctx.is_head).map(Some)
 }
 
 // ---------------------------------------------------------------------------
@@ -1383,6 +1795,7 @@ async fn upload_package_put(
         String,
         String,
     )>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -1402,6 +1815,7 @@ async fn upload_package_put(
         &repository,
         &arch,
         &filename,
+        &headers,
         body,
         user_id,
     )
@@ -1417,7 +1831,7 @@ async fn upload_package_post(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "alpine", "write:artifacts")?.user_id;
@@ -1475,6 +1889,7 @@ async fn upload_package_post(
         &repository,
         &arch,
         &filename,
+        &headers,
         body,
         user_id,
     )
@@ -1493,13 +1908,14 @@ async fn store_apk(
     repository: &str,
     arch: &str,
     filename: &str,
+    headers: &HeaderMap,
     content: Bytes,
     user_id: uuid::Uuid,
 ) -> Result<Response, Response> {
     let computed_sha256 = sha256_hex(&content);
 
     // Parse APK filename for metadata
-    let (pkg_name, pkg_version) = parse_apk_filename(filename).ok_or_else(|| {
+    let (filename_name, filename_version) = parse_apk_filename(filename).ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             format!(
@@ -1521,6 +1937,15 @@ async fn store_apk(
         );
     }
 
+    // The package is indexed, catalogued and stored under the identity its own
+    // `.PKGINFO` declares, the one `apk index` uses (#5254); the file name is
+    // only the fallback for a package whose control segment did not parse.
+    let (pkg_name, pkg_version) = resolve_upload_identity(
+        filename,
+        (filename_name, filename_version),
+        apk_info.as_ref(),
+    );
+
     let artifact_path = build_alpine_artifact_path(branch, repository, arch, filename);
 
     // Check for duplicate
@@ -1536,6 +1961,16 @@ async fn store_apk(
     if existing.is_some() {
         return Err((StatusCode::CONFLICT, "Package already exists").into_response());
     }
+
+    // Refuse an over-quota upload before a soft-deleted row at this path is
+    // purged (#4422).
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        content.len() as i64,
+    )
+    .await?;
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
@@ -1558,6 +1993,13 @@ async fn store_apk(
     let size_bytes = content.len() as i64;
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -1577,12 +2019,20 @@ async fn store_apk(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Store Alpine-specific metadata, including everything the APKINDEX needs
     // from the package itself (apk-native checksum + `.PKGINFO` fields).
@@ -1635,6 +2085,17 @@ async fn store_apk(
     .execute(&state.db)
     .await;
 
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await;
+
     info!(
         "Alpine upload: {}-{} arch={} to repo {} ({}/{}/{})",
         pkg_name, pkg_version, arch, repo.id, branch, repository, arch
@@ -1661,6 +2122,34 @@ async fn store_apk(
 // ---------------------------------------------------------------------------
 // Utility helpers
 // ---------------------------------------------------------------------------
+
+/// The `(name, version)` an uploaded package is stored under: what its
+/// `.PKGINFO` declares when that parsed into a representable identity, else the
+/// `{name}-{version}.apk` file name.
+///
+/// A file name that disagrees with the package is logged rather than refused:
+/// the upload is kept, as before, but apk derives the download file name from
+/// the index's `P:`/`V:`, so such a package only installs once it is stored
+/// under its real `{pkgname}-{pkgver}.apk`.
+fn resolve_upload_identity(
+    filename: &str,
+    from_filename: (String, String),
+    apk_info: Option<&ApkPackageInfo>,
+) -> (String, String) {
+    let Some((name, version)) = apk_info.and_then(|i| apk_package_identity(&i.pkginfo)) else {
+        return from_filename;
+    };
+    if (name, version) != (from_filename.0.as_str(), from_filename.1.as_str()) {
+        tracing::warn!(
+            filename,
+            pkgname = name,
+            pkgver = version,
+            "Alpine upload: file name disagrees with the package's .PKGINFO; \
+             indexing it under the .PKGINFO identity"
+        );
+    }
+    (name.to_string(), version.to_string())
+}
 
 /// Build the `artifact_metadata` JSON for an uploaded Alpine package.
 ///
@@ -1693,6 +2182,10 @@ fn build_alpine_artifact_metadata(
 }
 
 /// The `artifact_metadata` fields derived from the `.apk` file itself.
+///
+/// Always stamped with [`APK_INDEX_FIELDS_VERSION`], so the backfill can tell a
+/// row carrying this field set from one indexed before it and re-read only the
+/// latter.
 fn apk_info_metadata_fields(
     apk_info: &ApkPackageInfo,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -1700,13 +2193,25 @@ fn apk_info_metadata_fields(
     let info = &apk_info.pkginfo;
 
     fields.insert("apk_checksum".into(), apk_info.checksum.clone().into());
+    fields.insert(
+        APK_INDEX_FIELDS_FIELD.into(),
+        APK_INDEX_FIELDS_VERSION.into(),
+    );
     if let Some(installed_size) = info.installed_size {
         fields.insert("installed_size".into(), installed_size.into());
     }
     if let Some(build_time) = info.build_time {
         fields.insert("build_time".into(), build_time.into());
     }
+    if let Some(priority) = info.provider_priority {
+        fields.insert("provider_priority".into(), priority.into());
+    }
     for (field, value) in [
+        // The package's own identity, kept apart from the upload-time
+        // `name`/`version` so the index can tell what the package says about
+        // itself from what its path or file name said (#5254).
+        ("pkgname", &info.name),
+        ("pkgver", &info.version),
         ("description", &info.description),
         ("url", &info.url),
         ("license", &info.license),
@@ -1719,7 +2224,11 @@ fn apk_info_metadata_fields(
         }
     }
     // APKINDEX carries these as single space-separated fields.
-    for (field, values) in [("depends", &info.depends), ("provides", &info.provides)] {
+    for (field, values) in [
+        ("depends", &info.depends),
+        ("provides", &info.provides),
+        ("install_if", &info.install_if),
+    ] {
         if !values.is_empty() {
             fields.insert(field.into(), values.join(" ").into());
         }
@@ -1785,6 +2294,81 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Generic-upload finalize (#5254)
+// ---------------------------------------------------------------------------
+
+/// How much of an `.apk` the generic upload paths read to record its index
+/// metadata. The same window the index backfill reads: the control segment
+/// precedes the data segment, so the package's data is never read.
+pub(crate) const FINALIZE_HEAD_BYTES: usize = APK_BACKFILL_HEAD_BYTES;
+
+/// The `(name, version)` the native upload route writes for an `.apk` at
+/// `artifact_path`, the `{branch}/{repository}/{arch}/{name}-{version}.apk`
+/// layout `PUT /alpine/{repo}/...` stores a package under and `APKINDEX` is
+/// generated from. `None` for any other path (an index, a key, a file name the
+/// native route refuses).
+pub(crate) fn package_coordinates_from_path(artifact_path: &str) -> Option<(String, String)> {
+    let segments: Vec<&str> = artifact_path.split('/').collect();
+    let [branch, repository, arch, filename] = segments.as_slice() else {
+        return None;
+    };
+    if branch.is_empty() || repository.is_empty() || arch.is_empty() {
+        return None;
+    }
+    parse_apk_filename(filename)
+}
+
+/// What the native upload records for the package at `artifact_path`, built
+/// from the package's leading bytes (`head`, at most [`FINALIZE_HEAD_BYTES`]):
+/// the `(name, version)` the row and catalog are stored under, the
+/// `artifact_metadata` document (`format = 'alpine'`) and the `.PKGINFO`
+/// description for the catalog.
+///
+/// The identity is the package's own `.PKGINFO` `pkgname`/`pkgver`, as
+/// [`store_apk`] resolves it, with the file name's `name`/`version` as the
+/// fallback for a head without a readable control segment, which is stored
+/// unindexed as the native route stores it.
+pub(crate) fn finalize_document(
+    artifact_path: &str,
+    name: &str,
+    version: &str,
+    head: &[u8],
+) -> ((String, String), serde_json::Value, Option<String>) {
+    let mut segments = artifact_path.split('/');
+    let (branch, repository, arch) = (
+        segments.next().unwrap_or_default(),
+        segments.next().unwrap_or_default(),
+        segments.next().unwrap_or_default(),
+    );
+    let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+    let apk_info = parse_apk_package(head);
+    if apk_info.is_none() {
+        tracing::warn!(
+            "Alpine upload {}: no apk control segment found; package will not be indexed",
+            artifact_path
+        );
+    }
+    let identity = resolve_upload_identity(
+        filename,
+        (name.to_string(), version.to_string()),
+        apk_info.as_ref(),
+    );
+    let document = build_alpine_artifact_metadata(
+        &identity.0,
+        &identity.1,
+        arch,
+        branch,
+        repository,
+        filename,
+        apk_info.as_ref(),
+    );
+    let description = apk_info
+        .and_then(|info| info.pkginfo.description)
+        .filter(|d| !d.is_empty());
+    (identity, document, description)
+}
+
+// ---------------------------------------------------------------------------
 // Test fixtures
 // ---------------------------------------------------------------------------
 
@@ -1802,6 +2386,36 @@ const MARKER_APK_APK_TOOLS_CHECKSUM: &str = "Q11jnfYL890CWXj/b2WxBdoVucrs4=";
 #[cfg(test)]
 const MARKER_APK_INSTALLED_SIZE: i64 = 22;
 
+/// A real Alpine package carrying both `provider_priority` and `install_if`:
+/// `nginx-openrc-1.30.6-r0.apk`, byte for byte as served by dl-cdn for
+/// `v3.24/main/x86_64` (#5254).
+#[cfg(test)]
+const OPENRC_APK: &[u8] = include_bytes!("../../../tests/fixtures/nginx-openrc-1.30.6-r0.apk");
+
+/// The stanza Alpine's own `v3.24/main/x86_64` APKINDEX carries for
+/// [`OPENRC_APK`], copied verbatim from the upstream index. Generating the same
+/// text from the package bytes pins every field — `k:` and `i:` included — and
+/// their order to `apk index` itself.
+#[cfg(test)]
+const OPENRC_APK_UPSTREAM_STANZA: &str = "\
+C:Q1QrCyqojt0au6v6PHGtFNlfrw+pA=
+P:nginx-openrc
+V:1.30.6-r0
+A:x86_64
+S:2488
+I:1756
+T:HTTP and reverse proxy server (stable version) (OpenRC init scripts)
+U:https://www.nginx.org/
+L:BSD-2-Clause
+o:nginx
+m:Jakub Jirutka <jakub@jirutka.cz>
+t:1792666732
+c:afc9f8046186db82c3c1b41cc1b4f1125e150f39
+k:100
+i:openrc nginx=1.30.6-r0
+
+";
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1813,6 +2427,69 @@ mod tests {
 
     fn marker_apk_info() -> ApkPackageInfo {
         parse_apk_package(MARKER_APK).expect("marker .apk should parse")
+    }
+
+    /// The stored-bytes serve path must answer the same 206 the proxy path
+    /// does. An apk client that fetches an archive as three ranged spans hits
+    /// this arm for every span after the first, so a 200 here fails its
+    /// per-span checksum exactly as a cold 200 does.
+    #[test]
+    fn a_stored_apk_honours_range_and_keeps_the_whole_object_checksum() {
+        use futures::StreamExt as _;
+        let body =
+            || futures::stream::once(async { Ok(Bytes::from_static(b"0123456789")) }).boxed();
+
+        let partial = serve_ranged_apk(Some("bytes=2-5"), 10, body(), "pkg-1.0-r0.apk", "deadbeef")
+            .expect("ranged serve");
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            partial
+                .headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(
+            partial
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .unwrap(),
+            "4"
+        );
+        // The digest covers the whole object, which is what a client
+        // reassembling spans verifies at the end, so a 206 keeps it.
+        assert_eq!(
+            partial.headers().get("x-checksum-sha256").unwrap(),
+            "deadbeef"
+        );
+
+        let full =
+            serve_ranged_apk(None, 10, body(), "pkg-1.0-r0.apk", "deadbeef").expect("full serve");
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(
+            full.headers()
+                .get(axum::http::header::ACCEPT_RANGES)
+                .unwrap(),
+            "bytes",
+            "a client that probes before ranging must see the capability"
+        );
+
+        let unsatisfiable = serve_ranged_apk(
+            Some("bytes=50-60"),
+            10,
+            body(),
+            "pkg-1.0-r0.apk",
+            "deadbeef",
+        )
+        .expect("unsatisfiable serve");
+        assert_eq!(unsatisfiable.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            unsatisfiable
+                .headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .unwrap(),
+            "bytes */10"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2070,13 +2747,143 @@ mod tests {
     // Backfill gate
     // -----------------------------------------------------------------------
 
-    /// An artifact that is already indexed is not read again.
+    /// An artifact that is already indexed with the current field set is not
+    /// read again.
     #[test]
     fn test_needs_backfill_is_false_once_indexed() {
         let artifact = alpine_artifact(serde_json::json!({
             "apk_checksum": MARKER_APK_APK_TOOLS_CHECKSUM,
+            APK_INDEX_FIELDS_FIELD: APK_INDEX_FIELDS_VERSION,
         }));
         assert!(!needs_apk_backfill(&artifact));
+    }
+
+    /// Metadata written by an upload or backfill is stamped current, so a
+    /// freshly parsed package is never re-read.
+    #[test]
+    fn test_needs_backfill_is_false_for_metadata_this_parser_writes() {
+        let metadata = build_alpine_artifact_metadata(
+            "dtf-marker",
+            "1.0-r0",
+            "aarch64",
+            "v3.21",
+            "main",
+            "dtf-marker-1.0-r0.apk",
+            Some(&marker_apk_info()),
+        );
+        assert!(!needs_apk_backfill(&alpine_artifact(metadata)));
+    }
+
+    /// #5254 heal: a package indexed before the identity / `k:` / `i:` fields
+    /// were recorded carries a checksum but no field-set marker. It is re-read
+    /// once, or it would be listed without them forever.
+    #[test]
+    fn test_needs_backfill_is_true_for_a_row_indexed_with_an_older_field_set() {
+        let unmarked = alpine_artifact(serde_json::json!({
+            "apk_checksum": MARKER_APK_APK_TOOLS_CHECKSUM,
+            "installed_size": MARKER_APK_INSTALLED_SIZE,
+        }));
+        assert!(needs_apk_backfill(&unmarked));
+
+        let older = alpine_artifact(serde_json::json!({
+            "apk_checksum": MARKER_APK_APK_TOOLS_CHECKSUM,
+            APK_INDEX_FIELDS_FIELD: APK_INDEX_FIELDS_VERSION - 1,
+        }));
+        assert!(needs_apk_backfill(&older));
+    }
+
+    /// A field set recorded by a newer backend is honoured after a rollback.
+    #[test]
+    fn test_needs_backfill_is_false_when_fields_are_from_a_newer_backend() {
+        let artifact = alpine_artifact(serde_json::json!({
+            "apk_checksum": MARKER_APK_APK_TOOLS_CHECKSUM,
+            APK_INDEX_FIELDS_FIELD: APK_INDEX_FIELDS_VERSION + 1,
+        }));
+        assert!(!needs_apk_backfill(&artifact));
+    }
+
+    /// The field-set marker never stands in for the checksum itself.
+    #[test]
+    fn test_needs_backfill_is_true_when_marked_current_but_checksum_missing() {
+        let artifact = alpine_artifact(serde_json::json!({
+            APK_INDEX_FIELDS_FIELD: APK_INDEX_FIELDS_VERSION,
+        }));
+        assert!(needs_apk_backfill(&artifact));
+    }
+
+    /// The re-read of a stale row keeps the never-re-read-forever guarantee: once
+    /// it fails (unreadable, or out of the head window) its marker ends the
+    /// re-reads, and the entry keeps the fields it already had.
+    #[test]
+    fn test_stale_row_is_not_reread_after_a_recorded_failure() {
+        for marker in [
+            serde_json::json!({ APK_PARSE_FAILED_FIELD: APK_PARSER_VERSION }),
+            serde_json::json!({ APK_PARSE_TRUNCATED_FIELD: APK_BACKFILL_HEAD_BYTES as i64 }),
+        ] {
+            let mut metadata = serde_json::json!({
+                "apk_checksum": MARKER_APK_APK_TOOLS_CHECKSUM,
+            });
+            metadata
+                .as_object_mut()
+                .unwrap()
+                .extend(marker.as_object().unwrap().clone());
+            assert!(
+                !needs_apk_backfill(&alpine_artifact(metadata.clone())),
+                "a stale row whose re-read already failed would be re-read forever: {metadata}"
+            );
+        }
+    }
+
+    /// One index request reads at most the per-request cap, unindexed packages
+    /// before stale ones, and skips everything that is current or settled.
+    #[test]
+    fn test_select_apk_backfill_is_capped_and_prefers_unindexed() {
+        let stale = || {
+            alpine_artifact(serde_json::json!({
+                "apk_checksum": MARKER_APK_APK_TOOLS_CHECKSUM,
+            }))
+        };
+        let current = || {
+            alpine_artifact(serde_json::json!({
+                "apk_checksum": MARKER_APK_APK_TOOLS_CHECKSUM,
+                APK_INDEX_FIELDS_FIELD: APK_INDEX_FIELDS_VERSION,
+            }))
+        };
+        let unindexed = || alpine_artifact(serde_json::json!({}));
+        let failed = || {
+            alpine_artifact(serde_json::json!({
+                APK_PARSE_FAILED_FIELD: APK_PARSER_VERSION,
+            }))
+        };
+
+        // Stale rows first in listing order, then the unindexed ones.
+        let mut artifacts = Vec::new();
+        for _ in 0..APK_BACKFILL_MAX_PER_REQUEST {
+            artifacts.push(stale());
+        }
+        artifacts.push(current());
+        artifacts.push(failed());
+        for _ in 0..3 {
+            artifacts.push(unindexed());
+        }
+
+        let selected = select_apk_backfill(&artifacts);
+        assert_eq!(selected.len(), APK_BACKFILL_MAX_PER_REQUEST);
+        let first_unindexed = APK_BACKFILL_MAX_PER_REQUEST + 2;
+        assert_eq!(
+            &selected[..3],
+            &[first_unindexed, first_unindexed + 1, first_unindexed + 2],
+            "unindexed packages must take the budget before stale ones"
+        );
+        assert_eq!(
+            &selected[3..],
+            &(0..APK_BACKFILL_MAX_PER_REQUEST - 3).collect::<Vec<_>>()[..],
+            "stale rows fill the rest of the budget in listing order"
+        );
+        assert!(!selected.contains(&APK_BACKFILL_MAX_PER_REQUEST));
+        assert!(!selected.contains(&(APK_BACKFILL_MAX_PER_REQUEST + 1)));
+
+        assert!(select_apk_backfill(&[current(), failed()]).is_empty());
     }
 
     /// An artifact with no metadata at all is what the backfill is for.
@@ -2148,11 +2955,13 @@ mod tests {
         );
     }
 
-    /// A failure marker never overrides a checksum that is actually present.
+    /// A failure marker never overrides a current index entry that is actually
+    /// present.
     #[test]
     fn test_indexed_artifact_is_not_read_even_if_marked_failed() {
         let artifact = alpine_artifact(serde_json::json!({
             "apk_checksum": MARKER_APK_APK_TOOLS_CHECKSUM,
+            APK_INDEX_FIELDS_FIELD: APK_INDEX_FIELDS_VERSION,
             APK_PARSE_FAILED_FIELD: APK_PARSER_VERSION - 1,
         }));
         assert!(!needs_apk_backfill(&artifact));
@@ -2275,6 +3084,51 @@ mod tests {
             vec!["so:libc.musl-aarch64.so.1", "so:libz.so.1"]
         );
         assert_eq!(info.provides, vec!["cmd:busybox=1.37.0-r14"]);
+    }
+
+    /// The fields #5254 found missing, read the way abuild writes them: the
+    /// identity, `provider_priority`, and `install_if` as one line of
+    /// whitespace-separated entries (a repeated line appends, as in apk-tools).
+    #[test]
+    fn test_parse_pkginfo_reads_identity_provider_priority_and_install_if() {
+        let info = parse_pkginfo(
+            "pkgname = postgresql18\n\
+             pkgver = 18.6-r0\n\
+             provider_priority = 18\n\
+             replaces = postgresql\n\
+             install_if = docs   7zip=26.01-r0\n\
+             install_if = bash-completion\n",
+        );
+        assert_eq!(info.name.as_deref(), Some("postgresql18"));
+        assert_eq!(info.version.as_deref(), Some("18.6-r0"));
+        assert_eq!(info.provider_priority, Some(18));
+        assert_eq!(
+            info.install_if,
+            vec!["docs", "7zip=26.01-r0", "bash-completion"]
+        );
+    }
+
+    /// A `provider_priority` apk-tools could not store (not a u16) is dropped
+    /// rather than emitted as a `k:` apk would misread.
+    #[test]
+    fn test_parse_pkginfo_ignores_unrepresentable_provider_priority() {
+        for value in ["-1", "65536", "high"] {
+            let info = parse_pkginfo(&format!("provider_priority = {value}\n"));
+            assert_eq!(info.provider_priority, None, "{value}");
+        }
+    }
+
+    /// The real nginx-openrc package: `provider_priority = 100`,
+    /// `install_if = openrc nginx=1.30.6-r0`.
+    #[test]
+    fn test_parse_apk_package_reads_real_provider_priority_and_install_if() {
+        let info = parse_apk_package(OPENRC_APK)
+            .expect("nginx-openrc should parse")
+            .pkginfo;
+        assert_eq!(info.name.as_deref(), Some("nginx-openrc"));
+        assert_eq!(info.version.as_deref(), Some("1.30.6-r0"));
+        assert_eq!(info.provider_priority, Some(100));
+        assert_eq!(info.install_if, vec!["openrc", "nginx=1.30.6-r0"]);
     }
 
     #[test]
@@ -2415,9 +3269,228 @@ mod tests {
         assert_eq!(index_field(&text, "p").as_deref(), Some("cmd:dtf"));
     }
 
+    /// The stanza generated from the real nginx-openrc bytes is byte for byte
+    /// the one in Alpine's own index: `k:` after `c:`, `i:` last.
+    #[test]
+    fn test_generate_apkindex_text_matches_upstream_stanza_with_k_and_i() {
+        let info = parse_apk_package(OPENRC_APK).expect("nginx-openrc should parse");
+        let filename = "nginx-openrc-1.30.6-r0.apk";
+        let metadata = build_alpine_artifact_metadata(
+            "nginx-openrc",
+            "1.30.6-r0",
+            "x86_64",
+            "v3.24",
+            "main",
+            filename,
+            Some(&info),
+        );
+        let mut artifact = alpine_artifact(metadata);
+        artifact.path = format!("v3.24/main/x86_64/{filename}");
+        artifact.size_bytes = OPENRC_APK.len() as i64;
+
+        assert_eq!(
+            generate_apkindex_text(&[artifact], "x86_64"),
+            OPENRC_APK_UPSTREAM_STANZA
+        );
+    }
+
+    /// Field placement for a package with every optional field: the order
+    /// `apk index` writes, `C P V A S I T U L o m t c k D p i`.
+    #[test]
+    fn test_generate_apkindex_text_places_k_before_depends_and_i_last() {
+        let mut info = marker_apk_info();
+        info.pkginfo.commit = Some("284d827a".into());
+        info.pkginfo.provider_priority = Some(18);
+        info.pkginfo.depends = vec!["tzdata".into()];
+        info.pkginfo.provides = vec!["postgresql".into()];
+        info.pkginfo.install_if = vec!["docs".into(), "dtf-marker=1.0-r0".into()];
+        let metadata = build_alpine_artifact_metadata(
+            "dtf-marker",
+            "1.0-r0",
+            "aarch64",
+            "v3.21",
+            "main",
+            "dtf-marker-1.0-r0.apk",
+            Some(&info),
+        );
+        let text = generate_apkindex_text(&[alpine_artifact(metadata)], "aarch64");
+        let keys: String = text
+            .lines()
+            .filter_map(|l| l.split_once(':').map(|(k, _)| k))
+            .collect();
+        assert_eq!(keys, "CPVASITULomtckDpi", "{text}");
+        assert_eq!(index_field(&text, "k").as_deref(), Some("18"));
+        assert_eq!(
+            index_field(&text, "i").as_deref(),
+            Some("docs dtf-marker=1.0-r0")
+        );
+    }
+
+    /// apk-tools leaves `k:` and `i:` out for a package without them (and `k:`
+    /// for the default priority 0), so no empty line is emitted either.
+    #[test]
+    fn test_generate_apkindex_text_omits_absent_k_and_i() {
+        let mut info = marker_apk_info();
+        info.pkginfo.provider_priority = Some(0);
+        let metadata = build_alpine_artifact_metadata(
+            "dtf-marker",
+            "1.0-r0",
+            "aarch64",
+            "v3.21",
+            "main",
+            "dtf-marker-1.0-r0.apk",
+            Some(&info),
+        );
+        let text = generate_apkindex_text(&[alpine_artifact(metadata)], "aarch64");
+        assert_eq!(index_field(&text, "k"), None, "{text}");
+        assert_eq!(index_field(&text, "i"), None, "{text}");
+    }
+
+    /// #5254: an artifact uploaded through the generic endpoint has its columns
+    /// filled positionally from the path (`v3.24` / `main`). Once its `.PKGINFO`
+    /// has been parsed, the index lists it under the package's own identity.
+    #[test]
+    fn test_index_identity_prefers_pkginfo_over_artifact_columns() {
+        let mut fields = apk_info_metadata_fields(&marker_apk_info());
+        // As the generic-upload backfill recorded it: no `name`/`version` keys.
+        fields.remove("name");
+        fields.remove("version");
+        let mut artifact = alpine_artifact(serde_json::Value::Object(fields));
+        artifact.name = "v3.24".into();
+        artifact.version = Some("main".into());
+
+        assert_eq!(
+            apk_index_identity(&artifact),
+            ("dtf-marker".to_string(), "1.0-r0".to_string())
+        );
+        let text = generate_apkindex_text(&[artifact], "aarch64");
+        assert_eq!(index_field(&text, "P").as_deref(), Some("dtf-marker"));
+        assert_eq!(index_field(&text, "V").as_deref(), Some("1.0-r0"));
+    }
+
+    /// `pkgname`/`pkgver` also win over upload-time `name`/`version` metadata
+    /// that disagrees with the package.
+    #[test]
+    fn test_index_identity_prefers_pkginfo_over_upload_metadata() {
+        let metadata = build_alpine_artifact_metadata(
+            "v3.24",
+            "main",
+            "aarch64",
+            "v3.24",
+            "main",
+            "dtf-marker-1.0-r0.apk",
+            Some(&marker_apk_info()),
+        );
+        assert_eq!(
+            apk_index_identity(&alpine_artifact(metadata)),
+            ("dtf-marker".to_string(), "1.0-r0".to_string())
+        );
+    }
+
+    /// Before the heal reaches a pre-fix row (metadata without `pkgname` or
+    /// `name`), the file name is preferred to the positional columns; with no
+    /// usable file name the columns are the last resort.
+    #[test]
+    fn test_index_identity_falls_back_to_filename_then_columns() {
+        let mut artifact = alpine_artifact(serde_json::json!({
+            "apk_checksum": MARKER_APK_APK_TOOLS_CHECKSUM,
+        }));
+        artifact.path = "v3.24/main/x86_64/nginx-1.30.6-r0.apk".into();
+        artifact.name = "v3.24".into();
+        artifact.version = Some("main".into());
+        assert_eq!(
+            apk_index_identity(&artifact),
+            ("nginx".to_string(), "1.30.6-r0".to_string())
+        );
+
+        artifact.path = "v3.24/main/x86_64/not-a-package".into();
+        assert_eq!(
+            apk_index_identity(&artifact),
+            ("v3.24".to_string(), "main".to_string())
+        );
+
+        artifact.version = None;
+        artifact.metadata = None;
+        assert_eq!(
+            apk_index_identity(&artifact),
+            ("v3.24".to_string(), "0".to_string())
+        );
+
+        // Upload-time `name` without a `version` falls back to the column.
+        let mut artifact = alpine_artifact(serde_json::json!({ "name": "dtf-marker" }));
+        artifact.version = Some("1.0-r0".into());
+        assert_eq!(
+            apk_index_identity(&artifact),
+            ("dtf-marker".to_string(), "1.0-r0".to_string())
+        );
+    }
+
+    /// Only a complete, index-representable `.PKGINFO` identity is used.
+    #[test]
+    fn test_apk_package_identity_requires_both_halves_in_charset() {
+        let info = |name: Option<&str>, version: Option<&str>| ApkPkgInfo {
+            name: name.map(str::to_string),
+            version: version.map(str::to_string),
+            ..ApkPkgInfo::default()
+        };
+        assert_eq!(
+            apk_package_identity(&info(Some("nginx"), Some("1.30.6-r0"))),
+            Some(("nginx", "1.30.6-r0"))
+        );
+        assert_eq!(apk_package_identity(&info(Some("nginx"), None)), None);
+        assert_eq!(apk_package_identity(&info(None, Some("1.0"))), None);
+        assert_eq!(
+            apk_package_identity(&info(Some("bad name"), Some("1.0"))),
+            None
+        );
+    }
+
+    /// The native upload stores the package under its `.PKGINFO` identity and
+    /// falls back to the file name when the package did not parse.
+    #[test]
+    fn test_resolve_upload_identity() {
+        let from_filename = || ("renamed".to_string(), "9.9-r0".to_string());
+        let info = marker_apk_info();
+        assert_eq!(
+            resolve_upload_identity("renamed-9.9-r0.apk", from_filename(), Some(&info)),
+            ("dtf-marker".to_string(), "1.0-r0".to_string())
+        );
+        assert_eq!(
+            resolve_upload_identity(
+                "dtf-marker-1.0-r0.apk",
+                ("dtf-marker".into(), "1.0-r0".into()),
+                Some(&info)
+            ),
+            ("dtf-marker".to_string(), "1.0-r0".to_string())
+        );
+        assert_eq!(
+            resolve_upload_identity("renamed-9.9-r0.apk", from_filename(), None),
+            from_filename()
+        );
+    }
+
     // -----------------------------------------------------------------------
     // artifact metadata
     // -----------------------------------------------------------------------
+
+    /// Everything #5254 needs is recorded, with the field-set marker.
+    #[test]
+    fn test_apk_info_metadata_fields_record_identity_k_i_and_marker() {
+        let info = parse_apk_package(OPENRC_APK).expect("nginx-openrc should parse");
+        let fields = apk_info_metadata_fields(&info);
+        assert_eq!(fields["pkgname"], serde_json::json!("nginx-openrc"));
+        assert_eq!(fields["pkgver"], serde_json::json!("1.30.6-r0"));
+        assert_eq!(fields["provider_priority"], serde_json::json!(100));
+        assert_eq!(
+            fields["install_if"],
+            serde_json::json!("openrc nginx=1.30.6-r0")
+        );
+        assert_eq!(
+            fields[APK_INDEX_FIELDS_FIELD],
+            serde_json::json!(APK_INDEX_FIELDS_VERSION)
+        );
+        assert!(!fields.contains_key("replaces"));
+    }
 
     #[test]
     fn test_build_alpine_artifact_metadata_carries_apk_fields() {
@@ -3344,6 +4417,63 @@ mod tests {
         let key_v323 = build_alpine_storage_key(repo_id, &path_v323);
         assert_ne!(key_v322, key_v323);
     }
+
+    /// #4725: an `.apk` upload to a hosted repository must queue a push sync
+    /// task for a subscribed push peer, and an upload that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn alpine_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "alpine").await;
+
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::put(
+                format!("/{}/v3.21/main/aarch64/repl-apk-1.0-r0.apk", fx.repo_key),
+                bytes::Bytes::from_static(MARKER_APK),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "apk upload must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the package
+        // but must not queue another task.
+        let app = fx.router_with_auth(super::router());
+        let mut req = tdh::put(
+            format!("/{}/v3.21/main/aarch64/repl-apk-2.0-r0.apk", fx.repo_key),
+            bytes::Bytes::from_static(MARKER_APK),
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated apk upload must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["v3.21/main/aarch64/repl-apk-1.0-r0.apk".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
+    }
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -3389,13 +4519,14 @@ mod db_cov_tests {
 
     /// GET the APKINDEX and return the decompressed `APKINDEX` member.
     async fn fetch_index(fx: &tdh::Fixture) -> String {
+        fetch_index_at(fx, "v3.21/main/aarch64").await
+    }
+
+    /// [`fetch_index`] for the `{branch}/{repository}/{arch}` directory `dir`.
+    async fn fetch_index_at(fx: &tdh::Fixture, dir: &str) -> String {
         let k = fx.repo_key.clone();
         let app = fx.router_with_auth(super::router());
-        let (status, body) = tdh::send(
-            app,
-            tdh::get(format!("/{k}/v3.21/main/aarch64/APKINDEX.tar.gz")),
-        )
-        .await;
+        let (status, body) = tdh::send(app, tdh::get(format!("/{k}/{dir}/APKINDEX.tar.gz"))).await;
         assert_eq!(status, axum::http::StatusCode::OK);
 
         let gz = flate2::read::GzDecoder::new(&body[..]);
@@ -3493,6 +4624,39 @@ mod db_cov_tests {
             &body[..],
             super::MARKER_APK,
             "the advertised .apk must serve the published package bytes"
+        );
+    }
+
+    /// A ranged GET of a hosted package answers `206` with exactly the window
+    /// asked for (#5478): an apk client that fetches the sections as spans
+    /// checksums each one, so a whole-file `200` fails every span.
+    #[tokio::test]
+    async fn test_hosted_apk_download_honours_range() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let text = publish_marker_and_fetch_index(&fx).await;
+        let filename = format!(
+            "{}-{}.apk",
+            apkindex_field(&text, 'P'),
+            apkindex_field(&text, 'V')
+        );
+        let k = fx.repo_key.clone();
+        let mut req = tdh::get(format!("/{k}/v3.21/main/aarch64/{filename}"));
+        req.headers_mut().insert(
+            axum::http::header::RANGE,
+            axum::http::HeaderValue::from_static("bytes=0-9"),
+        );
+        let (status, body, headers) =
+            tdh::send_with_headers(fx.router_with_auth(super::router()), req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], &super::MARKER_APK[..10]);
+        assert_eq!(
+            headers[axum::http::header::CONTENT_RANGE],
+            format!("bytes 0-9/{}", super::MARKER_APK.len()).as_str()
         );
     }
 
@@ -3677,6 +4841,168 @@ mod db_cov_tests {
         fx.teardown().await;
     }
 
+    // -----------------------------------------------------------------------
+    // #5254: package identity, `k:` / `i:`, and the heal of pre-fix rows
+    // -----------------------------------------------------------------------
+
+    const OPENRC_DIR: &str = "v3.24/main/x86_64";
+
+    /// Publish the real nginx-openrc package through the native route.
+    async fn publish_openrc(fx: &tdh::Fixture) {
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/{OPENRC_DIR}/nginx-openrc-1.30.6-r0.apk", fx.repo_key),
+                bytes::Bytes::from_static(super::OPENRC_APK),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// The fixture repo's single artifact: its `(name, version)` columns and
+    /// its metadata.
+    async fn stored_row(fx: &tdh::Fixture) -> (String, Option<String>, serde_json::Value) {
+        sqlx::query_as(
+            "SELECT a.name, a.version, am.metadata FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read artifact row")
+    }
+
+    /// Rewind the artifact to what 1.11.x left behind for a package uploaded
+    /// through the generic endpoint and then backfilled by an index request:
+    /// positional `artifacts.name`/`version` (`v3.24` / `main`) and metadata with
+    /// the checksum and descriptive fields but no identity, `k:`, `i:` or
+    /// field-set marker.
+    async fn rewind_to_pre_fix_generic_row(fx: &tdh::Fixture) {
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = metadata \
+               - 'name' - 'version' - 'pkgname' - 'pkgver' \
+               - 'provider_priority' - 'install_if' - 'apk_index_fields' \
+             WHERE artifact_id IN (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("strip post-fix metadata");
+        sqlx::query(
+            "UPDATE artifacts SET name = 'v3.24', version = 'main' WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("set positional identity");
+    }
+
+    /// A native upload of a package carrying `provider_priority` and
+    /// `install_if` is indexed exactly as Alpine's own index lists it, and is
+    /// stored under its `.PKGINFO` identity with the current field-set marker.
+    #[tokio::test]
+    async fn test_native_upload_indexes_upstream_stanza_with_k_and_i() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        publish_openrc(&fx).await;
+        let text = fetch_index_at(&fx, OPENRC_DIR).await;
+        let (name, version, metadata) = stored_row(&fx).await;
+        fx.teardown().await;
+
+        assert_eq!(text, super::OPENRC_APK_UPSTREAM_STANZA);
+        assert_eq!(name, "nginx-openrc");
+        assert_eq!(version.as_deref(), Some("1.30.6-r0"));
+        assert_eq!(metadata["provider_priority"], serde_json::json!(100));
+        assert_eq!(
+            metadata[super::APK_INDEX_FIELDS_FIELD],
+            serde_json::json!(super::APK_INDEX_FIELDS_VERSION)
+        );
+    }
+
+    /// The heal: a row a pre-fix backend indexed (positional columns, no
+    /// identity / `k:` / `i:` in its metadata) is re-read on the next index
+    /// request, listed under its real identity with `k:` and `i:`, and its
+    /// columns are corrected — persisted, so it happens once.
+    ///
+    /// The "once" is observed rather than counted, as in
+    /// `test_unparsable_package_is_read_once_and_not_reread`: after the heal the
+    /// stored bytes are replaced with junk. A backfill that re-read the healed
+    /// row would now mark it unreadable; one that honours the marker leaves the
+    /// healed entry exactly as it was.
+    #[tokio::test]
+    async fn test_index_heals_pre_fix_generic_row_once() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        publish_openrc(&fx).await;
+        rewind_to_pre_fix_generic_row(&fx).await;
+
+        let (name, _, metadata) = stored_row(&fx).await;
+        assert_eq!(name, "v3.24", "rewind did not take");
+        assert!(metadata.get("apk_checksum").is_some());
+
+        let healed = fetch_index_at(&fx, OPENRC_DIR).await;
+        let (name, version, metadata) = stored_row(&fx).await;
+
+        tokio::fs::write(stored_package_path(&fx).await, [0u8; 4096])
+            .await
+            .expect("replace stored bytes");
+        let again = fetch_index_at(&fx, OPENRC_DIR).await;
+        let (_, _, metadata_after) = stored_row(&fx).await;
+        fx.teardown().await;
+
+        assert_eq!(healed, super::OPENRC_APK_UPSTREAM_STANZA);
+        assert_eq!(name, "nginx-openrc", "artifacts.name was not corrected");
+        assert_eq!(version.as_deref(), Some("1.30.6-r0"));
+        assert_eq!(
+            metadata[super::APK_INDEX_FIELDS_FIELD],
+            serde_json::json!(super::APK_INDEX_FIELDS_VERSION),
+            "the heal was not persisted, so it would re-read every request"
+        );
+        assert_eq!(again, healed, "a healed row must not be re-read");
+        assert_eq!(metadata_after.get(super::APK_PARSE_FAILED_FIELD), None);
+    }
+
+    /// A pre-fix row whose re-read finds bytes it cannot parse records the
+    /// failure (ending the re-reads) and keeps its existing index entry rather
+    /// than dropping out of the index.
+    #[tokio::test]
+    async fn test_failed_heal_keeps_the_existing_entry_and_stops_rereading() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        publish_openrc(&fx).await;
+        rewind_to_pre_fix_generic_row(&fx).await;
+        tokio::fs::write(stored_package_path(&fx).await, [0u8; 4096])
+            .await
+            .expect("replace stored bytes");
+
+        let text = fetch_index_at(&fx, OPENRC_DIR).await;
+        let (name, _, metadata) = stored_row(&fx).await;
+        fx.teardown().await;
+
+        assert!(
+            text.contains("C:Q1QrCyqojt0au6v6PHGtFNlfrw+pA=\nP:nginx-openrc\n"),
+            "the pre-fix entry must stay listed (identity from its file name): {text}"
+        );
+        assert_eq!(
+            metadata[super::APK_PARSE_FAILED_FIELD],
+            serde_json::json!(super::APK_PARSER_VERSION)
+        );
+        assert_eq!(
+            name, "v3.24",
+            "columns are only corrected from a parsed package"
+        );
+    }
+
     /// An upload whose percent-decoded filename carries a newline is rejected,
     /// so it can never reach the index generator. Without the charset gate the
     /// name lands in `P:` and forges an entry for another package.
@@ -3747,5 +5073,347 @@ mod catalog_registration_tests {
         let row = row.expect("an alpine publish must write a packages row (#3659)");
         assert_eq!(row.version, "1.0-r0");
         assert_eq!(row.versions, vec!["1.0-r0".to_string()]);
+    }
+}
+
+/// #4113: scan-on-proxy for Alpine packages, Remote and Virtual. The shared
+/// archive scenarios, the identity rule and the 400 on an ambiguous segment.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod scan_on_proxy_4113 {
+    use super::*;
+    use crate::api::handlers::proxy_scan_archive::test_support::{
+        apk_with_pkginfos, archive_scan_suite, ArchiveCase, Rig,
+    };
+    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// The pin the gate grades `apk()` as, on the `v3.19` branch.
+    fn pin() -> Option<crate::services::scanner_service::ExpectedComponent> {
+        crate::services::scanner_service::ExpectedComponent::os_package(
+            crate::services::scanner_service::ComponentEcosystem::Alpine,
+            "libdtf",
+            "1.0-r0",
+            crate::services::scanner_service::OsPackageContext {
+                release: crate::services::scanner_service::OsRelease::new("alpine", "3.19")?,
+                arch: "x86_64".to_string(),
+                source: Some("dtf".to_string()),
+            },
+        )
+    }
+
+    const FILE: &str = "libdtf-1.0-r0.apk";
+    const DIR: &str = "v3.19/main/x86_64";
+
+    /// A real `.apk` for `FILE`; the random description keeps every
+    /// fixture's digest unique.
+    fn apk() -> Vec<u8> {
+        apk_with_pkginfos(&[&format!(
+            "pkgname = libdtf\npkgver = 1.0-r0\npkgdesc = {}\narch = x86_64\norigin = dtf\n",
+            uuid::Uuid::new_v4()
+        )])
+    }
+
+    fn case(_mock: &str) -> ArchiveCase {
+        let path = format!("{DIR}/{FILE}");
+        ArchiveCase {
+            format: "alpine",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/{DIR}/{FILE}")),
+            package_path: format!("/{path}"),
+            extra: Vec::new(),
+            body: apk(),
+            recorded_path: path,
+            file: FILE.to_string(),
+            pin: pin(),
+        }
+    }
+
+    archive_scan_suite!(case);
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = Rig::new(case, Some("fail_closed")).await else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/{DIR}/libdtf-1.0-r0%3F.apk"),
+                format!("/{key}/v3.19%23/main/x86_64/{FILE}"),
+                format!("/{key}/v3.19/main%3B/x86_64/{FILE}"),
+            ] {
+                let (status, _, _) = tdh::send_with_headers(
+                    tdh::router_anon(super::router(), rig.state.clone()),
+                    tdh::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    /// A Remote's own `artifacts` row whose blob is unreadable falls through
+    /// to a re-fetch from upstream; that re-fetch goes through the gate, so
+    /// under `fail_closed` with no verdict it is 423, never the bytes.
+    #[tokio::test]
+    async fn a_refetch_for_an_unreadable_cached_row_is_gated() {
+        let Some(rig) = Rig::new(case, Some("fail_closed")).await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, 'libdtf', '1.0-r0', 4, $3, $4, $5, $6)",
+        )
+        .bind(rig.fx.repo_id)
+        .bind(format!("{DIR}/{FILE}"))
+        .bind("0".repeat(64))
+        .bind(APK_CONTENT_TYPE)
+        .bind(format!("missing/{}", uuid::Uuid::new_v4()))
+        .bind(rig.fx.user_id)
+        .execute(&rig.fx.pool)
+        .await
+        .expect("seed a row whose blob is missing");
+        let (status, body, _) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::LOCKED, "the re-fetch is gated");
+        assert_ne!(&body[..], &rig.case.body[..]);
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(rig.fx.repo_id)
+            .execute(&rig.fx.pool)
+            .await;
+        rig.teardown().await;
+    }
+
+    #[test]
+    fn an_apk_that_is_the_requested_package_is_pinned_as_it() {
+        let release = crate::services::scanner_service::OsRelease::new("alpine", "3.19");
+        let ArchiveIdentity::Pinned(pin) =
+            apk_identity(FILE, "x86_64", &Bytes::from(apk()), release.clone())
+        else {
+            panic!("an .apk whose .PKGINFO agrees is pinned");
+        };
+        assert_eq!(
+            (pin.name.as_str(), pin.version.as_str()),
+            ("libdtf", "1.0-r0")
+        );
+        let os = pin.os.expect("an OS pin");
+        assert_eq!(os.release.label(), "alpine:3.19");
+        assert_eq!(os.source.as_deref(), Some("dtf"));
+        // A noarch package is served under every architecture directory.
+        let noarch = Bytes::from(apk_with_pkginfos(&[
+            "pkgname = libdtf\npkgver = 1.0-r0\narch = noarch\n",
+        ]));
+        assert!(matches!(
+            apk_identity(FILE, "aarch64", &noarch, release),
+            ArchiveIdentity::Pinned(_)
+        ));
+    }
+
+    #[test]
+    fn an_apk_that_is_not_the_requested_package_is_unestablished() {
+        let release = crate::services::scanner_service::OsRelease::new("alpine", "3.19");
+        let bytes = Bytes::from(apk());
+        for (file, arch) in [
+            ("other-1.0-r0.apk", "x86_64"),
+            ("libdtf-1.0-r1.apk", "x86_64"),
+            (FILE, "aarch64"),
+        ] {
+            assert!(
+                matches!(
+                    apk_identity(file, arch, &bytes, release.clone()),
+                    ArchiveIdentity::Disagrees(_)
+                ),
+                "{file} {arch}"
+            );
+        }
+        // A branch that names no release: not graded as anything.
+        assert!(matches!(
+            apk_identity(FILE, "x86_64", &bytes, None),
+            ArchiveIdentity::Unreadable(_)
+        ));
+        assert!(matches!(
+            apk_identity(FILE, "x86_64", &Bytes::from_static(b"not an apk"), release),
+            ArchiveIdentity::Unreadable(_)
+        ));
+    }
+}
+
+/// #4365 item 1: Alpine decides by route (every file on the package route
+/// is a `.apk`); the cache key is the streaming arm's upstream path.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn the_serve_key_is_the_streaming_cache_path() {
+        for path in [
+            "v3.19/main/x86_64/busybox-1.36.1-r15.apk",
+            "edge/community/aarch64/py3-dtf-1.0-r0.apk",
+        ] {
+            let key = apk_serve_key(path);
+            assert!(key.scannable, "{path}");
+            assert_eq!(key.cache_key, path);
+        }
+    }
+}
+
+/// A ranged `.apk` GET on a cold Remote cache fills the cache (#5509).
+///
+/// Served over a real socket, because the bug lives in hyper: it stops
+/// polling a body once `Content-Length` bytes are out, so a client window
+/// ending before EOF used to drop the tee into the proxy cache mid-object.
+/// An in-process `oneshot` reads the body to its end and cannot see that.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+// Test reads of small, bounded bodies (#1608 exempts test scaffolding).
+#[allow(clippy::disallowed_methods)]
+mod ranged_cold_fill_5509 {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::{header, StatusCode};
+
+    const PATH: &str = "v3.21/main/x86_64/pkg-1.0-r0.apk";
+    const ETAG: &str = "\"apk-v1\"";
+
+    /// Several tee chunks long, so the first window ends well before EOF.
+    fn payload() -> Vec<u8> {
+        (0..300 * 1024u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    async fn serve(app: axum::Router) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+        });
+        (base, stop)
+    }
+
+    #[tokio::test]
+    async fn a_cold_ranged_get_fills_the_cache_5509() {
+        let Some(fx) = tdh::Fixture::setup("remote", "alpine").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let data = payload();
+        let total = data.len();
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{PATH}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("etag", ETAG)
+                    .set_body_bytes(data.clone()),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let (state, cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let (base, stop) = serve(tdh::router_anon(super::router(), state)).await;
+        let url = format!("{base}/{}/{PATH}", fx.repo_key);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let get = |headers: &[(header::HeaderName, &str)]| {
+            let mut req = client.get(&url);
+            for (name, value) in headers {
+                req = req.header(name.clone(), *value);
+            }
+            req
+        };
+
+        // Cold: the first span only, as rules_apko asks for the signature.
+        let cold = get(&[(header::RANGE, "bytes=0-99")]).send().await.unwrap();
+        assert_eq!(cold.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            cold.headers()[header::CONTENT_RANGE],
+            format!("bytes 0-99/{total}").as_str()
+        );
+        assert_eq!(&cold.bytes().await.unwrap()[..], &data[..100]);
+
+        // The fill outlives the client's window and commits the whole object.
+        tdh::wait_for_cache_commit(cache.path(), total as u64).await;
+
+        let warm = get(&[(header::RANGE, "bytes=100-199")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(warm.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            warm.headers()[header::CONTENT_RANGE],
+            format!("bytes 100-199/{total}").as_str()
+        );
+        assert_eq!(&warm.bytes().await.unwrap()[..], &data[100..200]);
+
+        let whole = get(&[]).send().await.unwrap();
+        assert_eq!(whole.status(), StatusCode::OK);
+        assert_eq!(whole.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(&whole.bytes().await.unwrap()[..], &data[..]);
+
+        // `If-Range`: the current ETag keeps the range, a stale one gets all.
+        let current = get(&[(header::RANGE, "bytes=0-9"), (header::IF_RANGE, ETAG)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&current.bytes().await.unwrap()[..], &data[..10]);
+        let stale = get(&[(header::RANGE, "bytes=0-9"), (header::IF_RANGE, "\"old\"")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::OK);
+        assert_eq!(&stale.bytes().await.unwrap()[..], &data[..]);
+
+        // HEAD ignores `Range`: a 200 describing the whole file, no body.
+        let head = client
+            .head(&url)
+            .header(header::RANGE, "bytes=0-99")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(
+            head.headers()[header::CONTENT_LENGTH],
+            total.to_string().as_str()
+        );
+        assert!(head.headers().get(header::CONTENT_RANGE).is_none());
+        assert!(head.bytes().await.unwrap().is_empty());
+
+        // Past the end is a 416 naming the length.
+        let past_end = format!("bytes={total}-");
+        let past = get(&[(header::RANGE, past_end.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(past.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            past.headers()[header::CONTENT_RANGE],
+            format!("bytes */{total}").as_str()
+        );
+
+        let requests = upstream.received_requests().await.unwrap_or_default();
+        let _ = stop.send(());
+        fx.teardown().await;
+        assert_eq!(requests.len(), 1, "every serve after the cold one is a hit");
+        assert!(
+            requests.iter().all(|r| !r.headers.contains_key("range")),
+            "Range must not reach the upstream, so the cache fills whole"
+        );
     }
 }

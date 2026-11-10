@@ -64,8 +64,23 @@ curl -sS -X POST "$AK/api/v1/admin/ci-oidc" \
 ```
 
 `issuer_url` must use HTTPS and match the token's `iss` exactly. A trailing
-slash does not matter. `provider_type` (`gitlab`, `github` or `generic`)
-only affects how the account's display name is built.
+slash does not matter. `provider_type` (`gitlab`, `github`, `kubernetes` or `generic`)
+only affects how the account's display name is built, except for
+`kubernetes`, which also changes what the exchange mints (see
+[Kubernetes](#kubernetes-pulling-images-with-a-serviceaccount-token)).
+
+By default a provider finds its signing keys through OIDC discovery at
+`{issuer_url}/.well-known/openid-configuration` (`"key_source": "discovery"`).
+When Artifact Keeper cannot reach the issuer, store the issuer's JWKS on the
+provider instead (`"key_source": "static"`, see
+[Static keys](#static-keys-when-the-issuer-is-not-reachable)).
+
+`token_ttl_secs` sets how long the access token an exchange through this
+provider mints lives: 60 to 3600 seconds, default 900 (15 minutes). A value
+outside that range is refused with `400`. Change it later with
+`PUT /api/v1/admin/ci-oidc/{id}` (omit the field to keep it). See
+[Token lifetime](#token-lifetime) for how it relates to the CI platform's own
+ID token, and why it does not apply to `kubernetes` providers.
 
 ### 2. Create a mapping
 
@@ -84,6 +99,13 @@ curl -sS -X POST "$AK/api/v1/admin/ci-oidc/$PROVIDER_ID/mappings" \
   match exactly. An array matches any of its values. All keys must match. An
   empty object `{}` matches every token from the issuer, so do not use it
   outside a single-tenant issuer.
+- A key that starts with `/` is a JSON Pointer (RFC 6901) into nested claims:
+  `{"/kubernetes.io/namespace": "payments"}` matches the `namespace` member
+  of the `kubernetes.io` object. Matching is still exact, with no prefix or
+  glob matching. Escape a `/` inside a member name as `~1` and a `~` as `~0`.
+  A key without a leading `/` is always a top-level claim name, dots
+  included: `"kubernetes.io"` compares the whole object. A pointer with any
+  other `~` sequence is refused with `400` when the mapping is saved.
 - Prefer immutable claims. In GitLab, `project_id` survives a project rename or
   transfer and `project_path` does not. If a path is freed and reused by another
   project, a `project_path` filter admits that new project.
@@ -152,10 +174,11 @@ permission cache on the replica that served it; other replicas are told to
 clear theirs through the database's cache-invalidation notifications, and a
 replica that has lost that connection falls back to the cache's 30-second
 expiry. A credential a pipeline had already been handed keeps working as a
-bearer token until it expires (default 15 minutes); what it can *do* with
-that token is re-evaluated on every request against the current binding, same
-as any other credential. There is no separate revocation list — shorten the
-access-token TTL if you need a tighter bound.
+bearer token until it expires (the provider's `token_ttl_secs`, default 15
+minutes, at most one hour); what it can *do* with that token is re-evaluated
+on every request against the current binding, same as any other credential.
+There is no separate revocation list — lower the provider's `token_ttl_secs`
+if you need a tighter bound.
 
 **A binding is enforced or nothing happens.** If a mapping write cannot
 reconcile its binding, the write fails and nothing changes: the mapping keeps
@@ -204,14 +227,277 @@ publish:
 - No body is needed: the provider is chosen from the token's own `iss`. A body
   `{"provider_id": "<uuid>"}` is accepted only to disambiguate two enabled
   providers on the same issuer.
-- The access token lives for the configured access-token TTL (15 minutes by
-  default), and never longer than the ID token that bought it. Docker does not
-  refresh credentials, so a job that runs longer must exchange again before
-  its next push. `expires_in` gives the real lifetime.
+- The access token lives for the provider's `token_ttl_secs` (see
+  [Token lifetime](#token-lifetime)). `expires_in` gives the real lifetime.
 
 GitHub Actions uses the same exchange. Request `permissions: id-token: write`,
 fetch the token from `$ACTIONS_ID_TOKEN_REQUEST_URL` with the provider's
 audience, and send it as above.
+
+### Token lifetime
+
+The ID token only has to be valid when it is exchanged. The access token the
+exchange returns lives for the provider's `token_ttl_secs` (default 900 s, at
+most 3600 s), however long the ID token had left. GitHub Actions ID tokens,
+for example, expire about five minutes after they are issued; the access
+token exchanged from one still lasts the full 15 minutes by default. This is
+how other relying parties of CI OIDC tokens behave too: AWS STS, GCP Workload
+Identity Federation, Azure, PyPI trusted publishing and Vault all issue their
+own credential with their own lifetime (#5054).
+
+Until 1.11.8 the access token was capped at the ID token's own `exp`, so a
+token exchanged in GitHub Actions stopped working after about five minutes
+whatever TTL was configured.
+
+What still holds:
+
+- An ID token that has already expired is refused with `401`, even inside the
+  60 s clock-skew leeway its signature check allows (#4663).
+- The exchange returns no refresh token, and a CI service account's session
+  cannot be refreshed. When the access token expires, the pipeline exchanges
+  again.
+- Using the access token elsewhere does not extend it: the Docker `/v2/token`
+  and Conan exchanges mint tokens that expire no later than the token
+  presented to them.
+- A `kubernetes` provider ignores `token_ttl_secs`: its pull-only credential
+  still expires no later than the ServiceAccount token it was exchanged for,
+  because the kubelet caches it on the node.
+
+**Jobs longer than the TTL.** Docker caches credentials and never refreshes
+them, so a job that runs longer than `token_ttl_secs` exchanges again before
+the steps that talk to Artifact Keeper. The CI platform hands out a fresh ID
+token whenever asked. In GitHub Actions:
+
+```yaml
+permissions:
+  id-token: write
+steps:
+  - name: Log in to Artifact Keeper
+    run: |
+      ID_TOKEN=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+        "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://artifacts.example.com" | jq -r .value)
+      RESPONSE=$(curl -sSf -X POST https://artifacts.example.com/api/v1/auth/ci/token \
+        -H "Authorization: Bearer $ID_TOKEN")
+      echo "$RESPONSE" | jq -r .access_token \
+        | docker login artifacts.example.com -u "$(echo "$RESPONSE" | jq -r .username)" --password-stdin
+  # ... steps that take less than token_ttl_secs ...
+  # Repeat the login step before the next block of pushes once the TTL may have passed.
+```
+
+`core.getIDToken()` in a JavaScript action returns a fresh ID token the same
+way. In GitLab, run the exchange again with the job's `id_tokens` value before
+the step that needs it; once that ID token has itself expired it can no longer
+be exchanged.
+
+## Kubernetes: pulling images with a ServiceAccount token
+
+Since Kubernetes 1.34 the kubelet can hand an image credential provider a
+ServiceAccount token bound to the pod that is being started (KEP-4412). That
+token is an ordinary OIDC JWT, so the same exchange turns it into a registry
+credential, with no `imagePullSecret` in any namespace and no static
+credentials on any node (#1246).
+
+Create one provider per cluster with `"provider_type": "kubernetes"`. The type
+changes three things about an exchange:
+
+- **The credential can pull and nothing else.** The access token carries only
+  the `read:artifacts` and `read:repositories` scopes, whatever the service
+  account's groups would otherwise allow. A push with it, as the Docker
+  password or through a bearer from `/v2/token`, is refused with `403`. The
+  mapping's `allowed_repo_ids` ceiling still applies, and the credential
+  expires no later than the ServiceAccount token it was exchanged for (the
+  provider's `token_ttl_secs` does not apply).
+- **It cannot be renewed.** No refresh token is minted or stored, and the
+  credential cannot mint an API token either: the token endpoints refuse every
+  CI OIDC service account with `403`, whatever the provider type. The response
+  keeps its shape (`access_token`, `token_type`, `expires_in`, `username`).
+- **The workload is logged.** The exchange's `security` line adds
+  `k8s_namespace`, `k8s_serviceaccount`, `k8s_pod` and `k8s_node` from the
+  token's `kubernetes.io` claims. A claim the token does not carry is logged as
+  `(absent)`. The account's display name names only the provider and the
+  mapping, because one mapping serves many workloads.
+
+The kubelet caches the credential on the node, where anything with root on the
+host can read it. A leaked token that could push would let an attacker replace
+images for every consumer of the registry, which is why this ceiling is fixed
+by type and cannot be widened. `provider_type` is matched case-insensitively
+and stored lowercase; a value that is not `gitlab`, `github`, `kubernetes` or
+`generic`, a typo such as `k8s` included, is refused with 400. A provider
+created before the type was checked may hold another value; an update that
+sends that stored value back unchanged is accepted, so editing such a provider
+in the web UI keeps working, and it still acts as `generic`. Changing a
+provider's type, for example `kubernetes` to `generic`, is written to the
+`security` log with the acting admin, because it widens every credential the
+provider mints from then on.
+
+### Issuer and key source per platform
+
+The provider's `issuer_url` is the cluster's ServiceAccount issuer. On any
+platform the cluster reports it itself:
+
+```bash
+kubectl get --raw /.well-known/openid-configuration | jq -r .issuer
+```
+
+| Platform | Issuer | Key source |
+|---|---|---|
+| EKS | `https://oidc.eks.<region>.amazonaws.com/id/<id>` (`aws eks describe-cluster --query cluster.identity.oidc.issuer`) | `discovery` |
+| GKE | `https://container.googleapis.com/v1/projects/<project>/locations/<location>/clusters/<cluster>` | `discovery` |
+| AKS with `--enable-oidc-issuer` | `az aks show --query oidcIssuerProfile.issuerUrl` | `discovery` |
+| AKS without `--enable-oidc-issuer` | whatever the command above prints; its discovery document is not published outside the cluster | `static` |
+| On-prem (kubeadm and others) | the API server's `--service-account-issuer`; kubeadm's default is `https://kubernetes.default.svc.cluster.local` | `static` |
+
+Use `discovery` whenever Artifact Keeper can fetch the issuer's discovery
+document over HTTPS. It follows key rotation by itself. Use `static` when it
+cannot.
+
+### Static keys when the issuer is not reachable
+
+A `static` provider verifies tokens only against the JWKS stored on it and
+never contacts the issuer. The API server serves that JWKS:
+
+```bash
+kubectl get --raw /openid/v1/jwks > jwks.json
+
+curl -sS -X POST "$AK/api/v1/admin/ci-oidc" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{
+        "name": "onprem-prod",
+        "provider_type": "kubernetes",
+        "issuer_url": "https://prod.k8s.example.internal",
+        "audience": "https://artifacts.example.com",
+        "key_source": "static",
+        "static_jwks": '"$(cat jwks.json)"'
+      }'
+```
+
+- The JWKS must hold at least one public RSA or EC key. Keys must have unique
+  `kid`s. A key with private members (`d`, `p`, `q`, `dp`, `dq`, `qi`, `k`)
+  is refused with `400`: a trust anchor needs only the public key, and a pasted
+  private key is already leaked. A set of more than 16 keys, or larger than
+  64 KiB, is refused with `400`.
+- A token's `kid` must name a key in the set. A token whose `kid` is not there
+  is refused with `401`, and the `security` log names the provider and the
+  missing `kid`. That warning is written at most once a minute per provider;
+  further refusals in the same minute are logged at `DEBUG`, so forged tokens
+  cannot flood the log. There is no fall-back to another key. A token without a `kid`
+  is accepted only when the set holds exactly one key.
+- `iss`, `aud` and expiry are checked exactly as for `discovery`.
+- `PUT /api/v1/admin/ci-oidc/{id}` with `static_jwks` replaces the whole set.
+  Setting `"key_source": "discovery"` discards the stored set. Every change to
+  the key source or the set is written to the `security` log with the admin
+  and the resulting `kid`s.
+
+**Key rotation.** When the cluster switches to a new signing key, every token
+it issues names the new `kid`, and pulls fail until the provider holds that
+key. Rotate with overlap:
+
+1. Add the new public key to the API server's `--service-account-key-file`
+   list. It now appears in `/openid/v1/jwks` next to the old one.
+2. Push that JWKS, both keys, to the provider.
+3. Switch `--service-account-signing-key-file` to the new key.
+4. Once no token signed with the old key can still be valid, remove it from
+   the API server and push the JWKS again.
+
+A CronJob in the cluster can keep the provider current. Any ServiceAccount may
+read `/openid/v1/jwks` through the default
+`system:service-account-issuer-discovery` binding. The admin token it uses is
+a full admin credential, so keep it in its own namespace and restrict who can
+read that Secret.
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: artifact-keeper-jwks-sync
+  namespace: artifact-keeper-sync
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: sync
+              image: alpine:3.20
+              env:
+                - name: AK
+                  value: https://artifacts.example.com
+                - name: PROVIDER_ID
+                  value: "<provider uuid>"
+                - name: ADMIN_TOKEN
+                  valueFrom:
+                    secretKeyRef: {name: artifact-keeper-admin, key: token}
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  apk add --no-cache curl jq >/dev/null
+                  SA=/var/run/secrets/kubernetes.io/serviceaccount
+                  JWKS=$(curl -sSf --cacert "$SA/ca.crt" \
+                    -H "Authorization: Bearer $(cat "$SA/token")" \
+                    https://kubernetes.default.svc/openid/v1/jwks)
+                  jq -n --argjson jwks "$JWKS" '{static_jwks: $jwks}' |
+                    curl -sSf -X PUT "$AK/api/v1/admin/ci-oidc/$PROVIDER_ID" \
+                      -H "Authorization: Bearer $ADMIN_TOKEN" \
+                      -H 'Content-Type: application/json' --data-binary @- >/dev/null
+```
+
+Managed clusters on `discovery` need none of this.
+
+### Audience: dedicated, never the API server's
+
+Set the provider's `audience` to a value used only for Artifact Keeper, such
+as `https://artifacts.example.com`, and configure the kubelet credential
+provider to request tokens for it. Never use the API server's own audience
+(`https://kubernetes.default.svc`, or any value in `--api-audiences`):
+
+- every pod's default projected token carries that audience, so the provider
+  would accept any pod's token, not only tokens the kubelet requested for
+  image pulls;
+- a token presented to Artifact Keeper would also be valid against the API
+  server.
+
+Creating or updating a provider with `https://kubernetes.default.svc` or
+`https://kubernetes.default.svc.cluster.local` as its audience is refused with
+400 (#4133). A provider stored with one before that check is kept, and named
+in a `security` warning at every startup until its audience is changed. Values
+your cluster adds with `--api-audiences` are not known to Artifact Keeper, so
+check those yourself.
+
+### Mappings for namespaces and ServiceAccounts
+
+Use pointer keys to match the token's `kubernetes.io` claims:
+
+```json
+{ "/kubernetes.io/namespace": "payments" }
+```
+
+admits every ServiceAccount in `payments`, and
+
+```json
+{ "/kubernetes.io/namespace": "payments",
+  "/kubernetes.io/serviceaccount/name": "api" }
+```
+
+admits only `payments/api`. Matching is exact: `"prod"` does not admit
+`prod-sandbox`. `sub` (`system:serviceaccount:<namespace>:<name>`) also works
+with an any-of array for a fixed list of ServiceAccounts.
+
+Bind the mapping to a group that has **read** on the repositories the
+workloads pull from (`group_binding_ids`). Granting write gains nothing, since
+the credential cannot push.
+
+### Several clusters
+
+Give every on-prem cluster its own `--service-account-issuer`, such as
+`https://prod.k8s.example.internal`. Issuer resolution picks the provider from
+the token's `iss`. If two clusters keep kubeadm's default issuer, their tokens
+cannot be told apart by issuer: two enabled providers on one issuer and
+audience make the exchange fail with `400` unless the request names
+`provider_id`, and a provider holding both clusters' keys would accept either
+cluster's tokens under the other's mappings.
 
 ## The mapping is the security boundary
 

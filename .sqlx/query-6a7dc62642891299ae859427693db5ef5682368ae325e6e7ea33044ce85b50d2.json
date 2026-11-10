@@ -6,37 +6,79 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "plugins",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "name",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "plugins",
+            "name": "name"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "version",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "plugins",
+            "name": "version"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "display_name",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "plugins",
+            "name": "display_name"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "description",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "plugins",
+            "name": "description"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "author",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "plugins",
+            "name": "author"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "homepage",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "plugins",
+            "name": "homepage"
+          }
+        }
       },
       {
         "ordinal": 7,
@@ -51,6 +93,12 @@
                 "error"
               ]
             }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "plugins",
+            "name": "status"
           }
         }
       },
@@ -71,22 +119,46 @@
               ]
             }
           }
+        },
+        "origin": {
+          "Table": {
+            "table": "plugins",
+            "name": "plugin_type"
+          }
         }
       },
       {
         "ordinal": 9,
         "name": "config_schema",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "plugins",
+            "name": "config_schema"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "installed_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "plugins",
+            "name": "installed_at"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "enabled_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "plugins",
+            "name": "enabled_at"
+          }
+        }
       }
     ],
     "parameters": {

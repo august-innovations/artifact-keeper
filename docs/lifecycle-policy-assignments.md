@@ -9,9 +9,101 @@ Lifecycle policies use explicit repository scope:
 | `true` | `[]` | All current and future repositories |
 
 Global scope with a nonempty assignment list is rejected with HTTP 422.
-All six policy types support these scopes. Version retention groups and storage
+All seven policy types support these scopes. Version retention groups and storage
 quotas are evaluated independently in each repository. Existing `config.exclude`
 protection remains per policy; it does not protect artifacts from other policies.
+
+## Policy configuration
+
+Every policy type accepts these optional `config` keys:
+
+- `exclude`: `{"versions": [...], "version_patterns": [...]}` names versions
+  the policy never deletes. `versions` are exact matches; `version_patterns`
+  are regexes (see below).
+- `match.path_prefix` limits the policy to artifacts whose repository-relative
+  path starts with that literal string.
+- `match.version_pattern` limits the policy to artifacts whose version (the tag,
+  for container images) matches a regex. It is a **PostgreSQL** regular
+  expression, checked by PostgreSQL when the policy is created or updated. It is
+  unanchored unless you use `^` / `$`, so `sha-` also matches `release-sha-1`.
+  Use `\y`, not `\b`, for a word boundary. A version-less artifact is in scope
+  only if the pattern matches the empty string.
+- `match.format` limits the policy to repositories of one format
+  (`"format": "docker"`) or of several (`"format": ["npm", "yarn"]`). Use the
+  format name the repository API reports (`docker`, `helm_oci`,
+  `conda_native`, ...); an unknown name is rejected with 400. The policy does
+  not run at all in a repository of another format, even when it is assigned
+  to it or is global, so neither its artifact sweep nor its proxy-cache
+  eviction touches that repository. Formats are matched exactly: `docker`
+  does not include `podman` or `oras` repositories.
+  `match.format` is new in 1.12.0. A 1.11.x server rejects the unknown key
+  instead of ignoring it, so in a fleet that mixes 1.11.x and 1.12.0
+  replicas a policy that carries it never runs unscoped on the older ones:
+  there a run or preview answers 400 `unknown key 'match.format'` before
+  anything is deleted, a scheduled run logs
+  `Failed to execute lifecycle policy '<name>'` and leaves `last_run_at`
+  unchanged so a later tick runs it again, and creating or updating such a
+  policy through a 1.11.x replica is refused with the same 400. Finish the
+  upgrade before relying on the policy's schedule.
+
+Every lifecycle regex -- `match.version_pattern`, each
+`exclude.version_patterns` entry, and the `pattern` of `tag_pattern_keep` /
+`tag_pattern_delete` -- is a **PostgreSQL** (ARE) regular expression, because
+PostgreSQL runs it. Patterns are unanchored unless they use `^` / `$`. When a
+policy is created or updated, each pattern is compiled by PostgreSQL (with a
+2-second limit, on its own connection) and the request returns 400 if:
+
+- PostgreSQL rejects it, for example `\z`, `\pL`, `(?P<name>...)` or a
+  mid-pattern `(?i)`, or it takes too long to compile;
+- it uses `\b` or `\B`. In PostgreSQL these mean backspace and backslash, so
+  `\bstable\b` would protect nothing. Write `\ystable\y` instead;
+- it uses a back-reference (`\1` to `\9`);
+- it is longer than 512 bytes, or `exclude.version_patterns` has more than 64
+  entries.
+
+Policies stored before these checks are not changed. On every start the backend
+logs one WARN per stored policy with a pattern PostgreSQL cannot compile or
+that uses `\b` / `\B`. A preview (`POST /api/v1/admin/lifecycle/{id}/preview`)
+lists the problems in `errors`, and stops with zero matches when a pattern
+cannot compile or a selecting pattern -- `match.version_pattern`, or the
+`pattern` of `tag_pattern_delete` -- uses `\b` / `\B`. A live run refuses (400)
+a policy whose protective pattern -- an `exclude.version_patterns` entry, or
+the `pattern` of `tag_pattern_keep` -- has such a problem, because it would
+delete what it was written to keep. It also refuses (400) a policy whose
+selecting pattern uses `\b` / `\B`: "matches nothing" does not make a
+selector safe, since inside a negative lookahead such as `^(?!.*\bstable)` it
+selects every version or tag. A live run of a policy with any pattern
+PostgreSQL cannot compile is refused (400, naming the field) before it starts,
+rather than failing part-way. Fix the policy with
+`PATCH /api/v1/admin/lifecycle/{id}`.
+
+Scope and exclusions filter before `min_keep` / `max_versions` count their kept
+versions, so out-of-scope and excluded versions never take a kept slot.
+
+`composite` deletes artifacts that meet **every** condition in `conditions`:
+
+```json
+{
+  "conditions": [
+    {"type": "max_age_days", "value": 14},
+    {"type": "no_downloads_days", "value": 7}
+  ],
+  "min_keep": 5,
+  "match": {"version_pattern": "^sha-[0-9a-f]+$"},
+  "exclude": {"versions": ["latest", "stable"]}
+}
+```
+
+- The condition types are `max_age_days` and `no_downloads_days`. Each one
+  matches exactly what the single-condition policy of that name matches.
+- Each type may appear only once.
+- `min_keep` is a top-level key, as on `max_age_days`. It keeps the newest N
+  versions of each package or image whether or not they meet the conditions.
+- Day windows are between 1 and 36500.
+
+A composite policy, like a policy with `exclude`, `min_keep` or
+`match.version_pattern`, never evicts a Remote repository's proxy cache. Assigning
+one to a non-OCI Remote repository returns 422.
 
 ## Safe rollout and compatibility
 
@@ -122,3 +214,40 @@ policies can still be previewed but cannot be executed live. Scheduled execution
 and execute-all skip unassigned policies. OCI cleanup uses only the same concrete
 repositories selected for execution, including recovery of previously stale
 soft-deleted references in those repositories.
+
+MCP registry repositories are always skipped (#5368), whether assigned
+explicitly or reached through a global policy: a server version leaves an MCP
+repository only through the MCP routes (the soft delete, then the
+administrator purge), which recompute `isLatest`, keep the version's OCI pins
+until the purge and audit each step. A preview whose scope includes MCP
+repositories says so in `errors` (`N MCP registry repositories skipped: ...`);
+a live run logs it.
+
+### Preview before assigning is not enough for a new policy
+
+A policy with no `cron_schedule` and no `last_run_at` is due on the very next
+scheduler tick: the default six-hour cadence treats "never run" as due
+immediately. Assigning an already-enabled policy to a Remote repository
+therefore makes it eligible to evict proxy-cache entries at once, so a preview
+read afterwards can arrive after the eviction it was meant to show. "Run a
+preview first" is correct for the artifact policies it was written for, but a
+Remote proxy-cache eviction can win the race.
+
+Create disabled, preview, then enable:
+
+1. Create the policy with `"enabled": false`, optionally together with its
+   `repository_ids` in the same `POST /api/v1/admin/lifecycle`. It is not
+   eligible for a scheduled run yet.
+2. `POST /api/v1/admin/lifecycle/{id}/preview` and read
+   `proxy_cache.entries_matched` / `entries_removed`. A disabled policy can
+   still be previewed.
+3. `PATCH /api/v1/admin/lifecycle/{id}` with `{"enabled": true}` once the
+   preview matches what you intend to reclaim.
+
+A `cron_schedule` does not avoid this. A never-run policy is due immediately
+even when it has one — the scheduler treats a null `last_run_at` as due,
+whichever path computes it — and a cron schedule is recurring, not a one-shot
+delay, so it cannot be used to schedule a single future run. Creating the
+policy disabled is the only reliable order. This is what the changelog's
+"preview before assigning" (#3734) should have said for a Remote proxy cache,
+and what the repository UI should follow.

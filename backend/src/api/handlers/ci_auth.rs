@@ -36,10 +36,17 @@
 //! The `username` field can be used directly as the Docker login username,
 //! removing the need for a separate `GET /api/v1/auth/me` call.
 //!
-//! **Token lifetime:** `expires_in` is the TTL in seconds (default 900 s /
-//! 15 min).  Docker caches credentials and does not auto-refresh — if your
-//! pipeline runs longer than this window, re-exchange the CI JWT before each
-//! `docker push` step.
+//! **Token lifetime:** `expires_in` is the minted token's lifetime in seconds.
+//! For every provider type except `kubernetes` it is the provider's
+//! `token_ttl_secs` (default 900 s, at most 3600 s), whatever the presented
+//! CI JWT's own `exp` (#5054): the CI JWT only has to be valid when it is
+//! exchanged, as for AWS STS, GCP Workload Identity Federation, Azure, PyPI
+//! trusted publishing and Vault. A `kubernetes` provider's pull-only
+//! credential still expires no later than the ServiceAccount token it was
+//! exchanged for (#3820). No refresh token is returned and a CI session cannot
+//! be refreshed. Docker caches credentials and does not auto-refresh, so a job
+//! that runs longer than the TTL requests a fresh CI JWT, exchanges it again
+//! and re-runs `docker login` before the steps that talk to Artifact Keeper.
 
 use std::sync::Arc;
 
@@ -51,8 +58,9 @@ use uuid::Uuid;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::User;
-use crate::services::auth_service::{AuthService, FederatedCredentials, TokenPair};
-use crate::services::ci_oidc_service::{CiOidcProvider, CiOidcService};
+use crate::services::auth_service::{AccessToken, AuthService, FederatedCredentials};
+use crate::services::ci_oidc_service::{claim_value, CiOidcProvider, CiOidcService};
+use crate::services::metrics_service::AuthFailureReason;
 
 /// Create public CI auth routes (no auth middleware needed — the CI JWT is the
 /// credential).
@@ -143,19 +151,7 @@ pub async fn exchange_ci_token(
 
     let req = parse_optional_body(&body)?;
 
-    let svc = CiOidcService::new(state.db.clone());
-
-    // 1. Pick the provider from the assertion's own `iss` claim, or from the
-    //    explicit `provider_id` override when one was sent (#3548).
-    let provider = svc
-        .resolve_provider_for_assertion(jwt, req.provider_id)
-        .await?;
-
-    // 2. Validate the CI JWT (signature, audience, issuer — no claim check yet)
-    let claims = svc.validate_ci_jwt(&provider, jwt).await?;
-
-    // 3-5. Resolve the mapping, its service account, and mint.
-    let (user, tokens) = exchange_validated_claims(&state, &svc, &provider, &claims).await?;
+    let (user, tokens, _claims) = exchange_assertion(&state, jwt, req.provider_id).await?;
 
     Ok(Json(CiTokenResponse {
         access_token: tokens.access_token,
@@ -163,6 +159,59 @@ pub async fn exchange_ci_token(
         expires_in: tokens.expires_in,
         username: user.username,
     }))
+}
+
+/// The whole exchange of one CI assertion: provider by `iss` (or the
+/// explicit `provider_id`), signature/audience/issuer validation, mapping,
+/// service account, mint. Returns the verified claims too, for callers that
+/// record them (the MCP registry's `/auth/github-oidc` bridge, #5253).
+pub(crate) async fn exchange_assertion(
+    state: &SharedState,
+    jwt: &str,
+    provider_id: Option<Uuid>,
+) -> Result<(User, AccessToken, serde_json::Value)> {
+    let svc = CiOidcService::new(state.db.clone());
+
+    // 1. Pick the provider from the assertion's own `iss` claim, or from the
+    //    explicit `provider_id` override when one was sent (#3548).
+    let provider = svc
+        .resolve_provider_for_assertion(jwt, provider_id)
+        .await
+        .inspect_err(|e| record_ci_auth_failure(e, AuthFailureReason::InvalidToken))?;
+
+    // 2. Validate the CI JWT (signature, audience, issuer — no claim check yet)
+    let claims = svc
+        .validate_ci_jwt(&provider, jwt)
+        .await
+        .inspect_err(|e| record_ci_auth_failure(e, AuthFailureReason::InvalidToken))?;
+
+    // 3-5. Resolve the mapping, its service account, and mint. A verified
+    // assertion refused here is refused by policy (no mapping matches).
+    let (user, tokens) = exchange_validated_claims(state, &svc, &provider, &claims)
+        .await
+        .inspect_err(|e| record_ci_auth_failure(e, AuthFailureReason::Scope))?;
+    // #5253: the claims of this session, for namespace grants that
+    // interpolate them (`io.github.{repository_owner}/*`). Best-effort: a
+    // session without a record matches no interpolated grant (fail closed).
+    crate::services::mcp_namespaces::record_ci_session(
+        &state.db,
+        &tokens.access_token,
+        user.id,
+        &claims,
+        tokens.expires_in,
+    )
+    .await;
+    Ok((user, tokens, claims))
+}
+
+/// Count a rejected CI assertion in `ak_auth_failures_total` (#4676): only
+/// credential rejections, `expired` when the validator said so.
+fn record_ci_auth_failure(err: &AppError, fallback: AuthFailureReason) {
+    crate::services::metrics_service::record_auth_failure_for_error(
+        crate::services::metrics_service::AuthFailureSurface::CiOidc,
+        err,
+        fallback,
+    );
 }
 
 /// Everything the exchange does once the assertion is verified: pick the
@@ -175,7 +224,15 @@ async fn exchange_validated_claims(
     svc: &CiOidcService,
     provider: &CiOidcProvider,
     claims: &serde_json::Value,
-) -> Result<(User, TokenPair)> {
+) -> Result<(User, AccessToken)> {
+    // The verifier accepts an assertion up to its leeway past `exp` (clock
+    // skew between the CI issuer and this server). That leeway must not chain
+    // into a session: refuse here, before any account is touched, when the
+    // assertion has no validity left (#4663). The assertion must be valid at
+    // exchange time for every provider type; only a Kubernetes exchange also
+    // caps the minted token at its `exp` (#5054).
+    let assertion_exp = mintable_assertion_expiry(claims, chrono::Utc::now())?;
+
     // 3. Find the first matching enabled identity mapping (enforces claim filters)
     let mapping = svc.resolve_mapping(provider.id, claims).await?;
 
@@ -187,23 +244,19 @@ async fn exchange_validated_claims(
 
     // 5. Provision / sync the CI service account and generate scoped tokens.
     //
-    //    The minted access token's `exp` is capped at the presented
-    //    assertion's own `exp` (#3820), the rule every other arm that
-    //    exchanges a presented credential follows after #3625/#3460: an
-    //    exchange narrows a lifetime, never extends it, so access dies with
-    //    the credential that anchored it. An assertion with no usable `exp`
-    //    yields `None` and the configured base TTL stands — the verifier in
-    //    step 2 has already rejected anything actually expired.
+    //    The minted lifetime is decided by the provider (see
+    //    `CredentialShape`): its `token_ttl_secs` for every type but
+    //    `kubernetes`, which keeps the #3820 cap at the assertion's `exp`.
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let mint = |credentials| {
         mint_ci_session(
-            &state.db,
             svc,
             &auth_service,
             credentials,
+            CredentialShape::for_provider(provider),
             mapping.allowed_repo_ids.clone(),
             mapping.group_binding_ids.is_some().then_some(mapping.id),
-            assertion_expiry(claims),
+            assertion_exp,
         )
     };
     let (user, tokens) = match mint(credentials.clone()).await {
@@ -219,43 +272,116 @@ async fn exchange_validated_claims(
 
     // The subject names the presenting project and ref: it is recorded here,
     // for audit, and confers no identity.
-    tracing::info!(
-        target: "security",
-        user_id = %user.id,
-        username = %user.username,
-        mapping_id = %mapping.id,
-        subject = claims["sub"].as_str().unwrap_or(""),
-        "CI OIDC token exchange"
-    );
+    let subject = claims["sub"].as_str().unwrap_or("");
+    if provider.provider_type == KUBERNETES_PROVIDER_TYPE {
+        // One mapping serves many workloads and its account is named after
+        // the mapping (design D5), so this line is where the pulling workload
+        // is recorded. A claim the token lacks is logged as absent.
+        let k8s = |pointer| {
+            claim_value(claims, pointer)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(ABSENT_CLAIM)
+        };
+        tracing::info!(
+            target: "security",
+            user_id = %user.id,
+            username = %user.username,
+            mapping_id = %mapping.id,
+            subject,
+            k8s_namespace = k8s("/kubernetes.io/namespace"),
+            k8s_serviceaccount = k8s("/kubernetes.io/serviceaccount/name"),
+            k8s_pod = k8s("/kubernetes.io/pod/name"),
+            k8s_node = k8s("/kubernetes.io/node/name"),
+            "CI OIDC token exchange"
+        );
+    } else {
+        tracing::info!(
+            target: "security",
+            user_id = %user.id,
+            username = %user.username,
+            mapping_id = %mapping.id,
+            subject,
+            "CI OIDC token exchange"
+        );
+    }
     Ok((user, tokens))
+}
+
+/// `provider_type` whose exchange mints a pull-only, non-renewable credential.
+const KUBERNETES_PROVIDER_TYPE: &str = "kubernetes";
+
+/// Action scopes of a Kubernetes-exchanged access token: pull, nothing else.
+const KUBERNETES_SCOPES: [&str; 2] = ["read:artifacts", "read:repositories"];
+
+/// Logged for a `kubernetes.io` claim a token does not carry, such as the pod
+/// of a token not bound to one.
+const ABSENT_CLAIM: &str = "(absent)";
+
+/// What an exchange mints, decided by the provider alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialShape {
+    /// Action-unrestricted access token plus a persisted (never returned)
+    /// refresh JTI, as every CI exchange has minted since #2430. The access
+    /// token lives exactly `ttl`, the provider's `token_ttl_secs` (at most
+    /// one hour, `ci_oidc_service::MAX_TOKEN_TTL_SECS`), and is NOT capped at
+    /// the assertion's `exp` (#5054). CI assertions are short-lived by design (GitHub Actions ID
+    /// tokens live about five minutes) and only have to be valid when they
+    /// are exchanged; tying the session to them cut every GitHub Actions
+    /// session to five minutes whatever the operator configured. The
+    /// lifetime stays bounded: the hard maximum, no refresh (the refresh JWT
+    /// is never returned and `AuthService` refuses to refresh a CI account),
+    /// and every re-mint downstream (`/v2/token`, Conan) capped at this
+    /// token's own `exp` (#3460/#3625). This token is not accepted as a CI
+    /// assertion, so it cannot be exchanged into a later one either.
+    Unrestricted { ttl: chrono::Duration },
+    /// [`KUBERNETES_SCOPES`] only, no refresh token at all, and the access
+    /// token's `exp` capped at the assertion's (#3820).
+    ReadOnlyNoRefresh,
+}
+
+impl CredentialShape {
+    fn for_provider(provider: &CiOidcProvider) -> Self {
+        if provider.provider_type == KUBERNETES_PROVIDER_TYPE {
+            Self::ReadOnlyNoRefresh
+        } else {
+            Self::Unrestricted {
+                ttl: provider.minted_token_ttl(),
+            }
+        }
+    }
+
+    /// The default-provider shape (900 s), for tests.
+    #[cfg(test)]
+    fn unrestricted_default() -> Self {
+        Self::Unrestricted {
+            ttl: chrono::Duration::seconds(i64::from(
+                crate::services::ci_oidc_service::DEFAULT_TOKEN_TTL_SECS,
+            )),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Provision / sync the CI service account and mint its tokens, capping the
-/// ACCESS token's `exp` at `assertion_exp` (#3820).
+/// Provision / sync the CI service account and mint its tokens, with the
+/// lifetime `shape` decides: the provider's TTL, or for a Kubernetes exchange
+/// the configured TTL capped at `assertion_exp` (#3820, #5054).
 ///
-/// This is `AuthService::authenticate_federated_with_scope` with one thing
-/// changed, composed here from that method's own public parts rather than
-/// added to `AuthService` as a fourth near-identical `..._with_scope_capped`
-/// wrapper. The capped minter `generate_tokens_with_scope_capped` already
-/// exists and is already public — it is what the Conan `users/authenticate`
-/// and OCI `/v2/token` arms mint through after #3625/#3460 — so the only
-/// difference between the SSO path and this one is which expiry is passed to
-/// it. The three SSO callers keep the uncapped method untouched: they
-/// authenticate afresh rather than exchanging a credential that already
-/// carries an expiry, so capping them would be wrong.
+/// This is `AuthService::authenticate_federated_with_scope` composed from
+/// that method's own public parts, so the SSO callers keep their minter
+/// untouched while this one picks the lifetime. Either way `assertion_exp`
+/// must still have validity left when the token is minted (#4663).
 async fn mint_ci_session(
-    db: &sqlx::PgPool,
     svc: &CiOidcService,
     auth_service: &AuthService,
     credentials: FederatedCredentials,
+    shape: CredentialShape,
     allowed_repo_ids: Option<Vec<Uuid>>,
     bound_mapping_id: Option<Uuid>,
     assertion_exp: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<(User, TokenPair)> {
+) -> Result<(User, AccessToken)> {
     let user = auth_service
         .sync_federated_user(CiOidcService::auth_provider(), &credentials)
         .await?;
@@ -328,23 +454,95 @@ async fn mint_ci_session(
            AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes')",
     )
     .bind(user.id)
-    .execute(db)
+    .execute(auth_service.db())
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // `scopes: None` — a CI exchange mints an action-unrestricted token, as
-    // the federated path always has (#2430); the repository allow-list comes
-    // from the resolved identity mapping.
-    let tokens = auth_service.generate_tokens_with_scope_capped(
-        &user,
-        None,
-        allowed_repo_ids,
-        assertion_exp,
-    )?;
-    auth_service
-        .persist_refresh_jti_from_pair(&tokens, user.id)
-        .await?;
+    // The account sync and binding reconcile above take time; re-check that
+    // the assertion still has validity left right before the mint (#4663).
+    mintable_expiry(assertion_exp, chrono::Utc::now())?;
+
+    let tokens = match shape {
+        // `scopes: None` — a CI exchange mints an action-unrestricted token,
+        // as the federated path always has (#2430); the repository allow-list
+        // comes from the resolved identity mapping. The lifetime is the
+        // provider's, not the assertion's (#5054); see `CredentialShape`.
+        CredentialShape::Unrestricted { ttl } => {
+            let tokens =
+                auth_service.generate_tokens_with_scope_ttl(&user, None, allowed_repo_ids, ttl)?;
+            refuse_zero_lifetime(tokens.expires_in)?;
+            auth_service
+                .persist_refresh_jti_from_pair(&tokens, user.id)
+                .await?;
+            tokens.into()
+        }
+        // A deliberate ceiling, fixed by provider type and not configurable,
+        // so no misconfiguration can widen it. The kubelet caches this
+        // credential on a long-lived node, where anything with root on the
+        // host can read it, and a leaked token that could push would let an
+        // attacker replace images for every consumer of the registry. So it
+        // can pull and nothing else (whatever the account's groups would
+        // allow), and it cannot be renewed: no refresh JWT is even signed.
+        // The mapping's repository ceiling and the expiry cap still apply.
+        //
+        // Other provider types still mint action-unrestricted tokens. The
+        // general fix, action scopes on a mapping or finer-grained grants
+        // alongside the mapping's group binding, is tracked in #4132.
+        CredentialShape::ReadOnlyNoRefresh => {
+            let token = auth_service.generate_access_token_capped(
+                &user,
+                Some(KUBERNETES_SCOPES.map(str::to_owned).to_vec()),
+                allowed_repo_ids,
+                assertion_exp,
+            )?;
+            refuse_zero_lifetime(token.expires_in)?;
+            token
+        }
+    };
     Ok((user, tokens))
+}
+
+/// The assertion has no validity left to mint a session from (#4663).
+fn expired_assertion() -> AppError {
+    AppError::Authentication(
+        "CI token has expired; request a fresh one from the CI platform".into(),
+    )
+}
+
+/// The presented assertion's `exp`, refusing when less than one whole second
+/// of it remains at `now` (#4663). It caps the minted token only for a
+/// Kubernetes exchange (#3820, #5054).
+///
+/// The verifier keeps its clock-skew leeway, so an assertion up to 60 s past
+/// `exp` verifies. Minting from one would cap the session at an `exp` that
+/// has already passed (`expires_in: 0`), so the exchange is refused instead.
+/// One second, not zero, because `expires_in` counts whole seconds.
+fn mintable_assertion_expiry(
+    claims: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    mintable_expiry(assertion_expiry(claims), now)
+}
+
+/// See [`mintable_assertion_expiry`]. `None` (no usable `exp`) passes: the
+/// verifier has already rejected anything actually expired.
+fn mintable_expiry(
+    exp: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    match exp {
+        Some(exp) if (exp - now).num_seconds() < 1 => Err(expired_assertion()),
+        other => Ok(other),
+    }
+}
+
+/// Never hand out a session with `expires_in: 0` (#4663): the clamp can still
+/// land there when the mint runs in the last second of the assertion.
+fn refuse_zero_lifetime(expires_in: u64) -> Result<()> {
+    if expires_in == 0 {
+        return Err(expired_assertion());
+    }
+    Ok(())
 }
 
 /// Parse the optional JSON request body.
@@ -363,8 +561,8 @@ fn parse_optional_body(body: &Bytes) -> Result<CiTokenRequest> {
         .map_err(|e| AppError::Validation(format!("Invalid request body: {e}")))
 }
 
-/// The `exp` of the presented assertion, as the cap for the minted access
-/// token (#3820).
+/// The `exp` of the presented assertion: checked for remaining validity on
+/// every exchange, and the cap on a Kubernetes exchange's token (#3820).
 ///
 /// `None` when the assertion carries no numeric `exp`: the cap may only ever
 /// narrow the lifetime, so an unreadable expiry leaves the configured base TTL
@@ -414,7 +612,10 @@ pub struct CiAuthApiDoc;
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
-    use super::{assertion_expiry, exchange_ci_token, extract_bearer_jwt, parse_optional_body};
+    use super::{
+        assertion_expiry, exchange_ci_token, expired_assertion, extract_bearer_jwt,
+        mintable_assertion_expiry, mintable_expiry, parse_optional_body, refuse_zero_lifetime,
+    };
     use crate::api::handlers::test_db_helpers as tdh;
     use axum::body::Bytes;
     use axum::extract::State;
@@ -499,6 +700,35 @@ mod tests {
         .expect_err("missing Authorization header must fail");
 
         assert!(err.to_string().contains("Missing Authorization header"));
+    }
+
+    /// #4676: a rejected CI assertion is counted in
+    /// `ak_auth_failures_total{surface="ci_oidc"}`; a request that presents no
+    /// assertion at all is not. Both are rejected before any DB lookup.
+    #[test]
+    fn exchange_ci_token_counts_rejected_assertions_4676() {
+        use crate::services::metrics_service::capture_counters_async;
+        let ((), counted) = capture_counters_async(|| async {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer not-a-jwt"),
+            );
+            exchange_ci_token(State(lazy_test_state()), headers, Bytes::new())
+                .await
+                .expect_err("an unreadable assertion must be rejected");
+            exchange_ci_token(State(lazy_test_state()), HeaderMap::new(), Bytes::new())
+                .await
+                .expect_err("a missing assertion must be rejected");
+        });
+        assert_eq!(
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", "ci_oidc"), ("reason", "invalid_token")]
+            ),
+            1
+        );
+        assert_eq!(counted.get("ak_auth_failures_total", &[]), 1);
     }
 
     #[tokio::test]
@@ -610,7 +840,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Minted-token expiry cap (#3820)
+    // Assertion expiry (#3820, #4663, #5054)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -626,15 +856,51 @@ mod tests {
         assert_eq!(assertion_expiry(&json!({ "exp": "soon" })), None);
     }
 
-    /// `POST /api/v1/auth/ci/token` exchanges a presented credential, so the
-    /// token it mints must not outlive that credential (#3820) — the rule the
-    /// Conan and OCI `/v2/token` arms adopted in #3625/#3460. Drives the mint
-    /// site directly: the handler's steps 1-4 need a live OIDC issuer, step 5
-    /// is what the cap changes.
+    /// #4663: the verifier accepts an assertion up to 60 s past `exp`; the
+    /// exchange must not mint from one with no validity left, so the session
+    /// never inherits a second leeway window and never reports
+    /// `expires_in: 0`.
+    #[test]
+    fn mintable_expiry_refuses_an_assertion_with_no_validity_left() {
+        let now = chrono::Utc::now();
+        let at = |secs: i64| assertion_expiry(&json!({ "exp": now.timestamp() + secs }));
+        for (offset, why) in [
+            (-59, "inside the verifier leeway, past exp"),
+            (-1, "one second past exp"),
+            (0, "exp is this second"),
+        ] {
+            let err = mintable_expiry(at(offset), now).expect_err(why);
+            assert_eq!(
+                axum::response::IntoResponse::into_response(err).status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{why}"
+            );
+        }
+        assert_eq!(mintable_expiry(at(120), now).unwrap(), at(120));
+        // No usable `exp`: the base TTL stands, as before.
+        assert_eq!(mintable_expiry(None, now).unwrap(), None);
+        assert_eq!(
+            mintable_assertion_expiry(&json!({ "exp": now.timestamp() - 30 }), now)
+                .expect_err("expired assertion")
+                .to_string(),
+            expired_assertion().to_string()
+        );
+
+        assert!(refuse_zero_lifetime(0).is_err());
+        assert!(refuse_zero_lifetime(1).is_ok());
+    }
+
+    /// #5054: a non-Kubernetes exchange mints a token that lives the
+    /// provider's TTL, not the assertion's remaining lifetime; a Kubernetes
+    /// exchange keeps the #3820 cap; an expired assertion mints nothing
+    /// (#4663); and the resulting CI session cannot be refreshed. Drives the
+    /// mint site directly: the handler's steps 1-4 need a live OIDC issuer,
+    /// step 5 is what decides the lifetime.
     ///
     /// DB-backed; no-ops when no database is configured.
     #[tokio::test]
-    async fn test_3820_ci_token_exchange_caps_the_mint_at_the_assertion_expiry() {
+    async fn test_5054_ci_token_lifetime_comes_from_the_provider() {
+        use crate::models::user::AuthProvider;
         use crate::services::auth_service::{AuthService, FederatedCredentials};
         use crate::services::ci_oidc_service::CiOidcService;
         use std::sync::Arc;
@@ -643,7 +909,7 @@ mod tests {
             return;
         };
         let storage_path = std::env::temp_dir()
-            .join(format!("ci-auth-cap-{}", Uuid::new_v4()))
+            .join(format!("ci-auth-ttl-{}", Uuid::new_v4()))
             .to_string_lossy()
             .to_string();
         let state = tdh::build_state(pool.clone(), &storage_path);
@@ -652,77 +918,149 @@ mod tests {
         let svc = CiOidcService::new(pool.clone());
 
         let creds = |tag: &str| FederatedCredentials {
-            external_id: format!("ci-3820-{tag}"),
-            username: format!("ci_3820_{tag}"),
-            email: format!("ci_3820_{tag}@ci.artifact-keeper.internal"),
-            display_name: Some("CI cap probe".to_string()),
+            external_id: format!("ci-5054-{tag}"),
+            username: format!("ci_5054_{tag}"),
+            email: format!("ci_5054_{tag}@ci.artifact-keeper.internal"),
+            display_name: Some("CI TTL probe".to_string()),
             groups: vec!["ci".to_string()],
             required_admin_group: None,
             auto_create_users: true,
         };
+        let remaining = |token: &str| {
+            let claims = auth_service
+                .validate_access_token(token)
+                .expect("minted token validates");
+            claims.exp - chrono::Utc::now().timestamp()
+        };
+        let mut users = Vec::new();
 
-        // An assertion expiring well after the base TTL must not extend it:
-        // the cap only ever narrows.
+        // A GitHub-shaped assertion: about five minutes left. The minted token
+        // lives the provider's configured TTL (default 900 s), not five minutes.
         let tag = &Uuid::new_v4().to_string()[..8];
-        let far = chrono::Utc::now().timestamp() + (base_ttl_minutes * 60) + 3600;
-        let (far_user, far_tokens) = super::mint_ci_session(
-            &pool,
+        let github_exp = chrono::Utc::now().timestamp() + 300;
+        let (user, tokens) = super::mint_ci_session(
             &svc,
             &auth_service,
-            creds(&format!("far{tag}")),
+            creds(&format!("gh{tag}")),
+            super::CredentialShape::unrestricted_default(),
             None,
             None,
-            assertion_expiry(&json!({ "exp": far })),
+            assertion_expiry(&json!({ "exp": github_exp })),
         )
         .await
-        .expect("federated CI exchange should succeed");
-        let claims = auth_service
-            .validate_access_token(&far_tokens.access_token)
-            .expect("minted token validates");
-        let remaining = claims.exp - chrono::Utc::now().timestamp();
+        .expect("a GitHub-shaped exchange should succeed");
+        users.push(user.id);
+        let left = remaining(&tokens.access_token);
         assert!(
-            remaining > (base_ttl_minutes * 60) - 120,
-            "a long-lived assertion must still get the uncapped base TTL: {remaining}s"
+            (900 - 5..=900).contains(&left),
+            "the token must live the provider TTL, not the assertion's 300 s: {left}s"
         );
-        // `expires_in` was computed at mint time and `remaining` a few
-        // statements later, so a second boundary between the two is normal;
-        // what must hold is that they describe the same lifetime.
-        let drift = far_tokens.expires_in as i64 - remaining;
+        let drift = tokens.expires_in as i64 - left;
         assert!(
             (0..=2).contains(&drift),
-            "expires_in must report the real lifetime so the pipeline schedules renewal right \
-             (expires_in={} remaining={remaining})",
-            far_tokens.expires_in
+            "expires_in must report the real lifetime (expires_in={} remaining={left})",
+            tokens.expires_in
         );
 
-        // An assertion expiring BEFORE the base TTL caps the minted token at
-        // its own `exp` to the second.
+        // A provider TTL longer than the global access-token TTL wins too:
+        // the provider owns the CI lifetime.
         let tag = &Uuid::new_v4().to_string()[..8];
-        let soon = chrono::Utc::now().timestamp() + 300;
+        let hour = chrono::Duration::seconds(3600);
         assert!(
-            soon < chrono::Utc::now().timestamp() + base_ttl_minutes * 60,
-            "the test only means anything while the base TTL exceeds 5 minutes"
+            base_ttl_minutes * 60 < 3600,
+            "test needs a base TTL under 1 h"
         );
-        let (soon_user, soon_tokens) = super::mint_ci_session(
-            &pool,
+        let (user, tokens) = super::mint_ci_session(
             &svc,
             &auth_service,
-            creds(&format!("soon{tag}")),
+            creds(&format!("hr{tag}")),
+            super::CredentialShape::Unrestricted { ttl: hour },
+            None,
+            None,
+            assertion_expiry(&json!({ "exp": github_exp })),
+        )
+        .await
+        .expect("exchange should succeed");
+        users.push(user.id);
+        let left = remaining(&tokens.access_token);
+        assert!((3600 - 5..=3600).contains(&left), "{left}s");
+
+        // The session cannot be refreshed: a refresh JWT for a CI account,
+        // were one ever exposed, is refused on both refresh paths.
+        let pair = auth_service
+            .generate_tokens_with_scope_ttl(&user, None, None, hour)
+            .expect("mint pair");
+        auth_service
+            .persist_refresh_jti_from_pair(&pair, user.id)
+            .await
+            .expect("persist jti");
+        assert_eq!(user.auth_provider, AuthProvider::Ci);
+        let err = auth_service
+            .refresh_tokens(&pair.refresh_token)
+            .await
+            .expect_err("a CI session must not be refreshable");
+        assert!(
+            matches!(err, crate::error::AppError::Authentication(_)),
+            "{err}"
+        );
+
+        // Kubernetes keeps the #3820 cap: the token expires with the
+        // ServiceAccount token that bought it, to the second.
+        let tag = &Uuid::new_v4().to_string()[..8];
+        let soon = chrono::Utc::now().timestamp() + 300;
+        let (user, token) = super::mint_ci_session(
+            &svc,
+            &auth_service,
+            creds(&format!("k8s{tag}")),
+            super::CredentialShape::ReadOnlyNoRefresh,
             None,
             None,
             assertion_expiry(&json!({ "exp": soon })),
         )
         .await
-        .expect("federated CI exchange should succeed");
+        .expect("kubernetes exchange should succeed");
+        users.push(user.id);
         let claims = auth_service
-            .validate_access_token(&soon_tokens.access_token)
+            .validate_access_token(&token.access_token)
             .expect("minted token validates");
         assert_eq!(
             claims.exp, soon,
-            "the minted token must expire exactly with the assertion that bought it"
+            "a Kubernetes token must expire exactly with its ServiceAccount token"
         );
 
-        for user_id in [far_user.id, soon_user.id] {
+        // #4663: an assertion past its `exp` (the verifier accepted it inside
+        // its leeway) mints nothing on either shape.
+        let past = chrono::Utc::now().timestamp() - 30;
+        for shape in [
+            super::CredentialShape::unrestricted_default(),
+            super::CredentialShape::ReadOnlyNoRefresh,
+        ] {
+            let tag = &Uuid::new_v4().to_string()[..8];
+            let err = super::mint_ci_session(
+                &svc,
+                &auth_service,
+                creds(&format!("past{tag}")),
+                shape,
+                None,
+                None,
+                assertion_expiry(&json!({ "exp": past })),
+            )
+            .await
+            .expect_err("an expired assertion must not mint a session");
+            assert!(
+                matches!(err, crate::error::AppError::Authentication(_)),
+                "{err}"
+            );
+            let past_user: Option<Uuid> =
+                sqlx::query_scalar("SELECT id FROM users WHERE username = $1")
+                    .bind(format!("ci_5054_past{tag}"))
+                    .fetch_optional(&pool)
+                    .await
+                    .expect("lookup past user");
+            users.extend(past_user);
+        }
+
+        for user_id in users {
             let _ = sqlx::query("DELETE FROM refresh_token_jti WHERE user_id = $1")
                 .bind(user_id)
                 .execute(&pool)
@@ -738,6 +1076,47 @@ mod tests {
         }
     }
 
+    /// #5054: the provider TTL is clamped to 60..=3600 s at mint time, and
+    /// only a Kubernetes provider keeps the assertion cap.
+    #[test]
+    fn credential_shape_takes_the_clamped_provider_ttl() {
+        use crate::services::ci_oidc_service::{
+            CiOidcProvider, KEY_SOURCE_DISCOVERY, MAX_TOKEN_TTL_SECS, MIN_TOKEN_TTL_SECS,
+        };
+        let provider = |provider_type: &str, token_ttl_secs: i32| CiOidcProvider {
+            id: Uuid::new_v4(),
+            name: "p".into(),
+            provider_type: provider_type.into(),
+            issuer_url: "https://token.actions.githubusercontent.com".into(),
+            audience: "artifact-keeper".into(),
+            is_enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            key_source: KEY_SOURCE_DISCOVERY.into(),
+            static_jwks: None,
+            token_ttl_secs,
+        };
+        let ttl = |secs: i64| super::CredentialShape::Unrestricted {
+            ttl: chrono::Duration::seconds(secs),
+        };
+        use super::CredentialShape as S;
+        assert_eq!(S::for_provider(&provider("github", 900)), ttl(900));
+        assert_eq!(S::for_provider(&provider("gitlab", 1800)), ttl(1800));
+        assert_eq!(
+            S::for_provider(&provider("github", 86_400)),
+            ttl(MAX_TOKEN_TTL_SECS.into()),
+            "a TTL above the hard maximum is clamped to it"
+        );
+        assert_eq!(
+            S::for_provider(&provider("generic", 1)),
+            ttl(MIN_TOKEN_TTL_SECS.into())
+        );
+        assert_eq!(
+            S::for_provider(&provider("kubernetes", 3600)),
+            S::ReadOnlyNoRefresh
+        );
+    }
+
     // -----------------------------------------------------------------------
     // One mapping, one principal (fix-ci-oidc-identity-key)
     //
@@ -749,7 +1128,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod one_principal {
-        use super::super::{exchange_validated_claims, mint_ci_session};
+        use super::super::{exchange_validated_claims, mint_ci_session, CredentialShape};
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::api::SharedState;
         use crate::error::AppError;
@@ -784,11 +1163,14 @@ mod tests {
                 let svc = CiOidcService::new(pool.clone());
                 let provider = svc
                     .create(CreateCiOidcProviderRequest {
+                        token_ttl_secs: None,
                         name: format!("gitlab-{}", Uuid::new_v4()),
                         provider_type: Some("gitlab".into()),
                         issuer_url: "https://gitlab.example.com".into(),
                         audience: None,
                         is_enabled: Some(true),
+                        key_source: None,
+                        static_jwks: None,
                     })
                     .await
                     .expect("create provider");
@@ -1335,10 +1717,10 @@ mod tests {
             let auth_service =
                 AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
             let err = mint_ci_session(
-                &fx.pool,
                 &fx.svc,
                 &auth_service,
                 credentials,
+                CredentialShape::unrestricted_default(),
                 None,
                 None,
                 None,
@@ -1464,11 +1846,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod group_bindings {
-        use super::super::{exchange_validated_claims, mint_ci_session};
+        use super::super::{exchange_validated_claims, mint_ci_session, CredentialShape};
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::api::SharedState;
         use crate::models::access_scope::AccessScope;
-        use crate::services::auth_service::{AuthService, TokenPair};
+        use crate::services::auth_service::{AccessToken, AuthService};
         use crate::services::ci_oidc_service::{
             CiOidcService, CreateCiOidcMappingRequest, CreateCiOidcProviderRequest,
             UpdateCiOidcMappingRequest,
@@ -1490,6 +1872,10 @@ mod tests {
 
         impl Fixture {
             async fn new() -> Option<Self> {
+                Self::with_provider_type("gitlab").await
+            }
+
+            async fn with_provider_type(provider_type: &str) -> Option<Self> {
                 let pool = tdh::try_pool().await?;
                 let storage_path = std::env::temp_dir()
                     .join(format!("ci-auth-grants-{}", Uuid::new_v4()))
@@ -1499,11 +1885,14 @@ mod tests {
                 let svc = CiOidcService::new(pool.clone());
                 let provider = svc
                     .create(CreateCiOidcProviderRequest {
-                        name: format!("gitlab-{}", Uuid::new_v4()),
-                        provider_type: Some("gitlab".into()),
+                        token_ttl_secs: None,
+                        name: format!("{provider_type}-{}", Uuid::new_v4()),
+                        provider_type: Some(provider_type.into()),
                         issuer_url: "https://gitlab.example.com".into(),
                         audience: None,
                         is_enabled: Some(true),
+                        key_source: None,
+                        static_jwks: None,
                     })
                     .await
                     .expect("create provider");
@@ -1591,7 +1980,7 @@ mod tests {
             async fn exchange(
                 &self,
                 claims: serde_json::Value,
-            ) -> crate::error::Result<(crate::models::user::User, TokenPair)> {
+            ) -> crate::error::Result<(crate::models::user::User, AccessToken)> {
                 let provider = self.svc.get(self.provider_id).await?;
                 exchange_validated_claims(&self.state, &self.svc, &provider, &claims).await
             }
@@ -1609,7 +1998,7 @@ mod tests {
             /// repository the binding reaches, which is exactly the
             /// "narrows and never widens" property tasks 5.1-5.3 exist to
             /// pin.
-            async fn can(&self, tokens: &TokenPair, repo_id: Uuid, access: RepoAccess) -> bool {
+            async fn can(&self, tokens: &AccessToken, repo_id: Uuid, access: RepoAccess) -> bool {
                 let auth_service =
                     AuthService::new(self.pool.clone(), Arc::new(self.state.config.clone()));
                 let claims = auth_service
@@ -2100,6 +2489,28 @@ mod tests {
             CiOidcService::new(unreachable)
         }
 
+        // -------------------------------------------------------------------
+        // Kubernetes provider type (add-ci-oidc-kubernetes-provider D4, D5)
+        // -------------------------------------------------------------------
+
+        /// A kubelet-issued ServiceAccount token's verified claims; `pod`
+        /// `None` models a token not bound to a pod.
+        fn k8s(namespace: &str, sa: &str, pod: Option<&str>) -> serde_json::Value {
+            let mut claims = json!({
+                "sub": format!("system:serviceaccount:{namespace}:{sa}"),
+                "exp": chrono::Utc::now().timestamp() + 600,
+                "kubernetes.io": {
+                    "namespace": namespace,
+                    "serviceaccount": {"name": sa},
+                    "node": {"name": "node-3"},
+                },
+            });
+            if let Some(pod) = pod {
+                claims["kubernetes.io"]["pod"] = json!({ "name": pod });
+            }
+            claims
+        }
+
         async fn refresh_jtis(pool: &PgPool, user_id: Uuid) -> i64 {
             sqlx::query_scalar("SELECT COUNT(*) FROM refresh_token_jti WHERE user_id = $1")
                 .bind(user_id)
@@ -2130,10 +2541,10 @@ mod tests {
             let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
 
             let err = mint_ci_session(
-                &fx.pool,
                 &broken_svc(),
                 &auth_service,
                 credentials,
+                CredentialShape::unrestricted_default(),
                 None,
                 Some(mapping_id),
                 None,
@@ -2165,10 +2576,10 @@ mod tests {
             let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
 
             let (user, _tokens) = mint_ci_session(
-                &fx.pool,
                 &broken_svc(),
                 &auth_service,
                 credentials,
+                CredentialShape::unrestricted_default(),
                 None,
                 mapping.group_binding_ids.is_some().then_some(mapping.id),
                 None,
@@ -2207,10 +2618,10 @@ mod tests {
 
             let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
             let (_user, tokens) = mint_ci_session(
-                &fx.pool,
                 &fx.svc,
                 &auth_service,
                 credentials,
+                CredentialShape::unrestricted_default(),
                 stale.allowed_repo_ids.clone(),
                 stale.group_binding_ids.is_some().then_some(stale.id),
                 None,
@@ -2254,10 +2665,10 @@ mod tests {
 
             let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
             let err = mint_ci_session(
-                &fx.pool,
                 &fx.svc,
                 &auth_service,
                 credentials,
+                CredentialShape::unrestricted_default(),
                 None,
                 Some(mapping_id),
                 None,
@@ -2270,6 +2681,212 @@ mod tests {
                 "got: {err}"
             );
             assert_eq!(refresh_jtis(&fx.pool, account_id).await, 0);
+            fx.cleanup().await;
+        }
+
+        fn access_claims(
+            fx: &Fixture,
+            tokens: &AccessToken,
+        ) -> crate::services::auth_service::Claims {
+            AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()))
+                .validate_access_token(&tokens.access_token)
+                .expect("valid access token")
+        }
+
+        /// 4.2 — a Kubernetes exchange mints exactly the two read scopes,
+        /// whatever the bound group grants, persists no refresh token, and
+        /// still honours the expiry cap. The namespace-pointer mapping is
+        /// what matched it.
+        #[tokio::test]
+        async fn kubernetes_exchange_is_read_only_and_not_renewable() {
+            let Some(mut fx) = Fixture::with_provider_type("kubernetes").await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let group_id = fx.group_granting(repo_id, &["read", "write"]).await;
+            fx.mapping(
+                json!({"/kubernetes.io/namespace": "payments"}),
+                None,
+                Some(vec![group_id]),
+            )
+            .await;
+
+            let assertion = k8s("payments", "api", Some("api-7d9f"));
+            let (user, tokens) = fx.exchange(assertion.clone()).await.unwrap();
+            let claims = access_claims(&fx, &tokens);
+            assert_eq!(
+                claims.scopes,
+                Some(vec![
+                    "read:artifacts".to_string(),
+                    "read:repositories".to_string()
+                ]),
+                "exactly the two read scopes, although the group grants write"
+            );
+            assert!(claims.exp <= assertion["exp"].as_i64().unwrap());
+            assert_eq!(refresh_jtis(&fx.pool, user.id).await, 0, "no refresh row");
+
+            // A second exchange of the same workload still writes none.
+            fx.exchange(assertion).await.unwrap();
+            assert_eq!(refresh_jtis(&fx.pool, user.id).await, 0);
+
+            let err = fx
+                .exchange(k8s("payments-sandbox", "api", Some("api-1")))
+                .await
+                .expect_err("the namespace filter is exact");
+            assert!(matches!(err, crate::error::AppError::Authentication(_)));
+            fx.cleanup().await;
+        }
+
+        /// Other provider types are unchanged: unrestricted, with a refresh
+        /// token persisted as before.
+        #[tokio::test]
+        async fn non_kubernetes_exchange_keeps_its_credential_shape() {
+            let Some(fx) = Fixture::new().await else {
+                return;
+            };
+            fx.mapping(json!({"project_path": "group/app"}), None, None)
+                .await;
+            let (user, tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert_eq!(access_claims(&fx, &tokens).scopes, None);
+            assert_eq!(refresh_jtis(&fx.pool, user.id).await, 1);
+            fx.cleanup().await;
+        }
+
+        /// No exchanged credential can mint an API token for its account: a
+        /// pull-only, non-renewable Kubernetes credential would otherwise
+        /// turn into a permanent one, and a GitHub/GitLab credential would
+        /// outlive the pipeline. Both self-service mint endpoints, through
+        /// the full router, refuse with 403 and write no token row.
+        #[tokio::test]
+        async fn an_exchanged_credential_cannot_mint_an_api_token() {
+            for provider_type in ["kubernetes", "gitlab"] {
+                let Some(fx) = Fixture::with_provider_type(provider_type).await else {
+                    return;
+                };
+                let (assertion, filters) = if provider_type == "kubernetes" {
+                    (
+                        k8s("payments", "api", Some("api-7d9f")),
+                        json!({"/kubernetes.io/namespace": "payments"}),
+                    )
+                } else {
+                    (
+                        gitlab("group/app", "main"),
+                        json!({"project_path": "group/app"}),
+                    )
+                };
+                fx.mapping(filters, None, None).await;
+                let (user, tokens) = fx.exchange(assertion).await.unwrap();
+
+                for uri in ["/api/v1/profile/access-tokens", "/api/v1/auth/tokens"] {
+                    let req = axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("Authorization", format!("Bearer {}", tokens.access_token))
+                        .header("Content-Type", "application/json")
+                        .body(axum::body::Body::from(
+                            json!({"name": "keep", "scopes": ["read:artifacts"]}).to_string(),
+                        ))
+                        .unwrap();
+                    let (status, body) =
+                        tdh::send(crate::api::routes::create_router(fx.state.clone()), req).await;
+                    assert_eq!(
+                        status,
+                        axum::http::StatusCode::FORBIDDEN,
+                        "{provider_type} {uri}: {}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+                let minted: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE user_id = $1")
+                        .bind(user.id)
+                        .fetch_one(&fx.pool)
+                        .await
+                        .unwrap();
+                assert_eq!(minted, 0, "{provider_type}: no token row");
+                fx.cleanup().await;
+            }
+        }
+
+        /// 4.3 — two workloads through one mapping leave the same display
+        /// name, which carries neither of them.
+        #[tokio::test]
+        async fn kubernetes_display_name_is_stable_across_workloads() {
+            let Some(fx) = Fixture::with_provider_type("kubernetes").await else {
+                return;
+            };
+            fx.mapping(json!({"/kubernetes.io/namespace": "payments"}), None, None)
+                .await;
+            let display_name = |user_id: Uuid| {
+                let pool = fx.pool.clone();
+                async move {
+                    sqlx::query_scalar::<_, Option<String>>(
+                        "SELECT display_name FROM users WHERE id = $1",
+                    )
+                    .bind(user_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                }
+            };
+
+            let (api, _) = fx
+                .exchange(k8s("payments", "api", Some("api-7d9f")))
+                .await
+                .unwrap();
+            let after_api = display_name(api.id).await;
+            let (worker, _) = fx
+                .exchange(k8s("payments", "worker", Some("worker-5c2a")))
+                .await
+                .unwrap();
+            assert_eq!(api.id, worker.id, "one account per mapping");
+            let after_worker = display_name(worker.id).await;
+            assert_eq!(after_api, after_worker);
+            assert!(after_api.starts_with("CI [Kubernetes] "), "{after_api}");
+            assert!(!after_api.contains("api-7d9f") && !after_api.contains("worker"));
+            fx.cleanup().await;
+        }
+
+        /// 4.4 — the exchange's `security` line names the workload; a claim
+        /// the token lacks is logged as absent and does not fail it.
+        #[tokio::test]
+        async fn kubernetes_exchange_is_attributed_to_its_workload() {
+            let Some(fx) = Fixture::with_provider_type("kubernetes").await else {
+                return;
+            };
+            fx.mapping(json!({"/kubernetes.io/namespace": "payments"}), None, None)
+                .await;
+            let exchange_line = |claims: serde_json::Value| {
+                let fx = &fx;
+                async move {
+                    let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
+                    let _guard = capture.install(tracing::Level::INFO);
+                    fx.exchange(claims).await.expect("exchange succeeds");
+                    capture
+                        .text()
+                        .lines()
+                        .find(|l| l.contains("CI OIDC token exchange"))
+                        .expect("an exchange security line")
+                        .to_owned()
+                }
+            };
+
+            let bound = exchange_line(k8s("payments", "api", Some("api-7d9f"))).await;
+            for field in [
+                "k8s_namespace=\"payments\"",
+                "k8s_serviceaccount=\"api\"",
+                "k8s_pod=\"api-7d9f\"",
+                "k8s_node=\"node-3\"",
+                "subject=\"system:serviceaccount:payments:api\"",
+            ] {
+                assert!(bound.contains(field), "missing {field} in: {bound}");
+            }
+
+            let podless = exchange_line(k8s("payments", "api", None)).await;
+            assert!(
+                podless.contains("k8s_pod=\"(absent)\""),
+                "a pod-less token logs the pod as absent: {podless}"
+            );
             fx.cleanup().await;
         }
     }

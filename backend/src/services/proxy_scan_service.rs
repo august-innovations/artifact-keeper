@@ -74,6 +74,12 @@ pub enum ProxySeverityGate {
     /// Opted-in posture: findings at or above this severity block; a verdict
     /// whose highest severity is known and strictly below it serves.
     Threshold(Severity),
+    /// Record-only posture (#3645, `proxy_scan_action = 'record_only'`): the
+    /// verdict is scanned and recorded exactly as under enforcement, but no
+    /// verdict ever blocks a pull. Only a repository that explicitly selects
+    /// the record-only action resolves to this gate; it is the WEAKEST gate,
+    /// so any enforcing side of a stricter-of-two combination wins.
+    RecordOnly,
 }
 
 impl ProxySeverityGate {
@@ -96,6 +102,7 @@ impl ProxySeverityGate {
     /// gate: an ungraded vulnerable verdict is fail-closed, never fail-open.
     pub fn blocks(self, max_severity: Option<Severity>) -> bool {
         match self {
+            Self::RecordOnly => false,
             Self::BlockOnAny => true,
             Self::Threshold(t) => match max_severity {
                 None => true,
@@ -110,11 +117,19 @@ impl ProxySeverityGate {
     /// severities wins (`Severity` is ordered Critical=0 .. Info=4, and a
     /// threshold blocks everything at-or-above it, so the numerically larger
     /// variant is the stricter gate).
+    /// `RecordOnly` is the weakest gate: it yields to anything that enforces.
     pub fn stricter(a: Self, b: Self) -> Self {
         match (a, b) {
             (Self::BlockOnAny, _) | (_, Self::BlockOnAny) => Self::BlockOnAny,
+            (Self::RecordOnly, other) | (other, Self::RecordOnly) => other,
             (Self::Threshold(x), Self::Threshold(y)) => Self::Threshold(x.max(y)),
         }
+    }
+
+    /// True for the record-only gate (#3645): verdicts are recorded, never
+    /// enforced.
+    pub fn is_record_only(self) -> bool {
+        matches!(self, Self::RecordOnly)
     }
 }
 
@@ -154,6 +169,12 @@ pub enum ProxyScanAction {
     /// verdict is a 403, and an over-cap / budget-exceeded / scan-error object
     /// returns 423 rather than a 200 of unscanned bytes.
     FailClosed,
+    /// Record-only (#3645): scan and record exactly as fail-open does (serve
+    /// the first pull with `X-AK-Scan: pending`, scan asynchronously), but
+    /// never withhold a pull: a vulnerable verdict is served with
+    /// `X-AK-Scan: recorded`, and an over-cap / inconclusive scan serves
+    /// pending. Visibility without enforcement.
+    RecordOnly,
 }
 
 impl ProxyScanAction {
@@ -163,12 +184,26 @@ impl ProxyScanAction {
     pub fn from_db(value: &str) -> Self {
         match value {
             "fail_closed" => ProxyScanAction::FailClosed,
+            "record_only" => ProxyScanAction::RecordOnly,
             _ => ProxyScanAction::FailOpen,
+        }
+    }
+
+    /// The `scan_configs.proxy_scan_action` token for this action.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            ProxyScanAction::FailOpen => "fail_open",
+            ProxyScanAction::FailClosed => "fail_closed",
+            ProxyScanAction::RecordOnly => "record_only",
         }
     }
 
     pub fn is_fail_closed(self) -> bool {
         matches!(self, ProxyScanAction::FailClosed)
+    }
+
+    pub fn is_record_only(self) -> bool {
+        matches!(self, ProxyScanAction::RecordOnly)
     }
 }
 
@@ -237,10 +272,13 @@ pub enum InconclusiveOutcome {
 }
 
 /// Pure decision for the inconclusive branch (over-cap / budget / scan error):
-/// fail-open serves-with-pending, fail-closed locks.
+/// fail-open serves-with-pending, fail-closed locks. Record-only (#3645)
+/// never withholds, so it serves pending like fail-open.
 pub fn decide_inconclusive(action: ProxyScanAction) -> InconclusiveOutcome {
     match action {
-        ProxyScanAction::FailOpen => InconclusiveOutcome::ServePending,
+        ProxyScanAction::FailOpen | ProxyScanAction::RecordOnly => {
+            InconclusiveOutcome::ServePending
+        }
         ProxyScanAction::FailClosed => InconclusiveOutcome::Locked,
     }
 }
@@ -314,6 +352,165 @@ pub fn decide_serve(
     } else {
         ServeDecision::ServePendingScanAsync
     }
+}
+
+/// A stored verdict as the proxy-cache fast paths read it (#4514): the row,
+/// the coordinate it was graded as (`pin_identity`, #4952) and how many
+/// components it was graded on (`components_cataloged`).
+#[derive(Debug, Clone)]
+pub struct StoredProxyVerdict {
+    pub row: ProxyScanRow,
+    pub pin_identity: Option<String>,
+    pub components_cataloged: Option<i32>,
+}
+
+/// Whether a stored verdict graded nothing: `clean` with no findings,
+/// recorded with no pin and with no component cataloged. Under `fail_closed`
+/// such a verdict is not reused (part of #3396).
+pub fn clean_verdict_graded_nothing(
+    row: &ProxyScanRow,
+    stored_pin: Option<&str>,
+    components_cataloged: Option<i32>,
+) -> bool {
+    row.verdict == VERDICT_CLEAN
+        && row.findings_count == 0
+        && components_cataloged.unwrap_or(0) <= 0
+        && stored_pin.is_none()
+}
+
+/// What a presigned redirect to a cached package may do with a cached body of
+/// a Remote that scans on proxy (#4514), given the stored verdict for the
+/// body's SHA-256.
+///
+/// A redirect cannot scan: it hands out a cached object without buffering
+/// it. So they only consult the stored verdict, by the same rules the
+/// buffered gate ([`decide_serve`]) applies before it would scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheScanGate {
+    /// Nothing stored refuses these bytes: serve them.
+    Serve,
+    /// A reusable `vulnerable` verdict that the repository's severity gate
+    /// blocks: refuse with the scan block (`403`).
+    Block,
+    /// `fail_closed` and no reusable verdict that lets the bytes through: not
+    /// for a fast path. The redirect declines, and the request is served by
+    /// a path that reads the body itself.
+    NotForFastPath,
+}
+
+/// The pure decision behind [`CacheScanGate`] (#4514).
+///
+/// * Record-only never refuses.
+/// * A reusable `vulnerable` verdict refuses when the severity gate blocks
+///   it, and is served when it is below an opted-in threshold, exactly as in
+///   [`decide_serve`]'s `BlockCached` arm.
+/// * Under `fail_closed`, only a reusable `clean` verdict that graded
+///   something (see [`clean_verdict_graded_nothing`]) AND was graded as a
+///   coordinate the bytes carry themselves is good enough. The buffered gate
+///   reuses a verdict only when it pertains to the coordinate the request
+///   names (#4952); a fast path has no request coordinate, so a verdict
+///   graded as a request-pinned coordinate (Go, Composer, Conan, Debian, RPM,
+///   Alpine) or graded without a pin is not reused there. Anything else, no
+///   verdict included, is [`CacheScanGate::NotForFastPath`].
+/// * Under `fail_open`, everything else is served, as the buffered gate
+///   serves it `pending`.
+///
+/// `current_version` is the live CVE-scanner version, `None` when unknown:
+/// as in [`verdict_is_reusable`], a clean verdict is then not reusable under
+/// `fail_closed`.
+pub fn decide_cache_scan_gate(
+    stored: Option<&StoredProxyVerdict>,
+    current_version: Option<&str>,
+    action: ProxyScanAction,
+    severity_gate: ProxySeverityGate,
+    ttl_days: i64,
+    now: DateTime<Utc>,
+) -> CacheScanGate {
+    if action.is_record_only() || severity_gate.is_record_only() {
+        return CacheScanGate::Serve;
+    }
+    let reusable = stored.filter(|s| {
+        verdict_is_reusable(
+            &s.row.verdict,
+            s.row.scanned_at,
+            s.row.scanner_version.as_deref(),
+            current_version,
+            action,
+            ttl_days,
+            now,
+        )
+    });
+    if let Some(s) = reusable {
+        if verdict_blocks(&s.row.verdict) {
+            let max_severity = s
+                .row
+                .max_severity
+                .as_deref()
+                .and_then(Severity::from_str_loose);
+            return if severity_gate.blocks(max_severity) {
+                CacheScanGate::Block
+            } else {
+                CacheScanGate::Serve
+            };
+        }
+    }
+    if !action.is_fail_closed() {
+        return CacheScanGate::Serve;
+    }
+    let pinned_by_the_bytes = |pin: Option<&str>| {
+        pin.is_some_and(|pin| {
+            !crate::services::scanner_service::ExpectedComponent::pin_identity_is_request_pinned(
+                pin,
+            )
+        })
+    };
+    match reusable {
+        Some(s)
+            if s.row.verdict == VERDICT_CLEAN
+                && pinned_by_the_bytes(s.pin_identity.as_deref())
+                && !clean_verdict_graded_nothing(
+                    &s.row,
+                    s.pin_identity.as_deref(),
+                    s.components_cataloged,
+                ) =>
+        {
+            CacheScanGate::Serve
+        }
+        _ => CacheScanGate::NotForFastPath,
+    }
+}
+
+/// How long the fast paths reuse a verdict read (#4514). A write on this
+/// replica drops the entry, but a read already in flight can store the
+/// previous value again, so a new verdict is only guaranteed to be seen,
+/// on every replica, within this window.
+const VERDICT_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Entries in the fast-path verdict memo (#4514), keyed by digest and scan
+/// type. About 300 B each.
+const VERDICT_MEMO_CAPACITY: u64 = 10_000;
+
+type VerdictMemo = moka::future::Cache<(String, String), Option<StoredProxyVerdict>>;
+
+/// The in-process memo of verdict reads for the proxy-cache fast paths
+/// (#4514). Only the fast paths read through it; the buffered gate reads the
+/// table directly, so the decision that scans always sees the current row.
+fn verdict_memo() -> &'static VerdictMemo {
+    static MEMO: std::sync::OnceLock<VerdictMemo> = std::sync::OnceLock::new();
+    MEMO.get_or_init(|| {
+        moka::future::Cache::builder()
+            .max_capacity(VERDICT_MEMO_CAPACITY)
+            .time_to_live(VERDICT_MEMO_TTL)
+            .build()
+    })
+}
+
+/// Drop the memoised verdict read for `(checksum_sha256, scan_type)` after a
+/// write on this replica.
+async fn forget_memoised_verdict(checksum_sha256: &str, scan_type: &str) {
+    verdict_memo()
+        .invalidate(&(checksum_sha256.to_string(), scan_type.to_string()))
+        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -437,8 +634,94 @@ impl ProxyScanService {
         Ok(row)
     }
 
+    /// [`lookup_verdict`](Self::lookup_verdict) plus the coordinate the
+    /// verdict was graded as (`pin_identity`, #4952) and the number of
+    /// components it was graded on (`components_cataloged`, `None` when not
+    /// recorded), in one read, for the inline gate's reuse decision (#3396).
+    /// Runtime query (no macro) so this adds no offline sqlx data.
+    pub async fn lookup_verdict_with_pin(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+    ) -> Result<Option<(ProxyScanRow, Option<String>, Option<i32>)>> {
+        #[derive(sqlx::FromRow)]
+        struct PinnedRow {
+            #[sqlx(flatten)]
+            row: ProxyScanRow,
+            pin_identity: Option<String>,
+            components_cataloged: Option<i32>,
+        }
+        let row = sqlx::query_as::<_, PinnedRow>(
+            r#"
+            SELECT checksum_sha256, scan_type, verdict,
+                   findings_count, critical_count, high_count, medium_count, low_count,
+                   max_severity, scanner_version, scanned_at, pin_identity,
+                   components_cataloged
+            FROM proxy_scan_results
+            WHERE checksum_sha256 = $1 AND scan_type = $2
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(row.map(|r| (r.row, r.pin_identity, r.components_cataloged)))
+    }
+
+    /// [`lookup_verdict_with_pin`](Self::lookup_verdict_with_pin) through the
+    /// fast-path memo (#4514), for the proxy-cache readers that consult a
+    /// stored verdict on every hit. A miss (`None`) is memoised too, so a hot
+    /// unscanned object costs no query per hit.
+    pub async fn lookup_verdict_memoized(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+    ) -> Result<Option<StoredProxyVerdict>> {
+        let key = (checksum_sha256.to_string(), scan_type.to_string());
+        verdict_memo()
+            .try_get_with(key, async {
+                self.lookup_verdict_with_pin(checksum_sha256, scan_type)
+                    .await
+                    .map(|found| {
+                        found.map(
+                            |(row, pin_identity, components_cataloged)| StoredProxyVerdict {
+                                row,
+                                pin_identity,
+                                components_cataloged,
+                            },
+                        )
+                    })
+            })
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// The stored verdict for `(checksum_sha256, scan_type)` and the number of
+    /// components it was graded on (`components_cataloged`, `None` when not
+    /// recorded), for the rescan's replacement rule (#3396). Runtime query
+    /// (no macro) so this adds no offline sqlx data.
+    pub async fn lookup_verdict_catalog(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+    ) -> Result<Option<(String, Option<i32>)>> {
+        sqlx::query_as::<_, (String, Option<i32>)>(
+            "SELECT verdict, components_cataloged FROM proxy_scan_results \
+             WHERE checksum_sha256 = $1 AND scan_type = $2",
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
     /// Upsert a verdict keyed on `(checksum_sha256, scan_type)`. A newer scan of
     /// the same bytes (e.g. against a bumped CVE-DB) replaces the prior row.
+    /// Leaves `components_cataloged` as it was; the inline gate records through
+    /// [`record_verdict_with_catalog`](Self::record_verdict_with_catalog),
+    /// which writes it with the verdict (#4594).
     #[allow(clippy::too_many_arguments)]
     pub async fn record_verdict(
         &self,
@@ -489,6 +772,7 @@ impl ProxyScanService {
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        forget_memoised_verdict(checksum_sha256, scan_type).await;
 
         Ok(())
     }
@@ -528,7 +812,7 @@ impl ProxyScanService {
         &self,
         checksum_sha256: &str,
     ) -> Result<Vec<ProxyScanRow>> {
-        sqlx::query_as::<_, ProxyScanRow>(
+        let deleted = sqlx::query_as::<_, ProxyScanRow>(
             r#"
             DELETE FROM proxy_scan_results
             WHERE checksum_sha256 = $1
@@ -540,7 +824,11 @@ impl ProxyScanService {
         .bind(checksum_sha256)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        for row in &deleted {
+            forget_memoised_verdict(checksum_sha256, &row.scan_type).await;
+        }
+        Ok(deleted)
     }
 
     /// Persist the package inventory the inline proxy scan cataloged, so an
@@ -600,6 +888,232 @@ impl ProxyScanService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Record how complete the inventory just written by
+    /// [`record_packages`](Self::record_packages) is (#4096), on the verdict row
+    /// for `(checksum_sha256, scan_type)`.
+    ///
+    /// `None` means the CVE-authoritative scanner read every target it found;
+    /// `Some("partial")` means it saw at least one it could not parse (#1153).
+    /// Written unconditionally (a later complete scan clears an earlier
+    /// `partial`), but only by the caller that also wrote the inventory, so the
+    /// marker always describes the scan whose packages the SBOM is built from:
+    /// a rescan that reports no packages leaves both the inventory and its
+    /// completeness alone.
+    ///
+    /// A no-op when no verdict row exists (its upsert failed); the SBOM then
+    /// renders without a marker until the digest is scanned again, exactly as
+    /// for a verdict recorded before migration 252. Runtime query (no macro)
+    /// so this adds no offline sqlx data.
+    pub async fn record_inventory_completeness(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        scan_completeness: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE proxy_scan_results
+            SET scan_completeness = $3
+            WHERE checksum_sha256 = $1 AND scan_type = $2
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .bind(scan_completeness)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// [`record_verdict`](Self::record_verdict) plus the number of components
+    /// the CVE engine cataloged (#4594), in ONE upsert, so a reader never
+    /// sees the new verdict with the previous scan's count. `Some(0)` on a
+    /// clean verdict means it was graded on file contents only; `None` means
+    /// the engine reported no catalog. The inline gate and the rescan
+    /// endpoint record through this. Runtime query (no macro) so this adds
+    /// no offline sqlx data.
+    ///
+    /// `pin_identity` is the coordinate the verdict was graded as
+    /// ([`ExpectedComponent::pin_identity`](crate::services::scanner_service::ExpectedComponent::pin_identity)),
+    /// `None` for a scan without one (#4952); it is replaced with the verdict.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_verdict_with_catalog(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        verdict: &str,
+        findings_count: i32,
+        critical_count: i32,
+        high_count: i32,
+        medium_count: i32,
+        low_count: i32,
+        max_severity: Option<&str>,
+        scanner_version: Option<&str>,
+        repository_id: Option<Uuid>,
+        components_cataloged: Option<i32>,
+        pin_identity: Option<&str>,
+    ) -> Result<()> {
+        self.upsert_verdict(
+            checksum_sha256,
+            scan_type,
+            verdict,
+            findings_count,
+            critical_count,
+            high_count,
+            medium_count,
+            low_count,
+            max_severity,
+            scanner_version,
+            repository_id,
+            components_cataloged,
+            pin_identity,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// [`record_verdict_with_catalog`](Self::record_verdict_with_catalog) for a
+    /// scan that took a while (#5231): with `observed` set, the row is written only
+    /// if its `scanned_at` is still that value (`None` inside: there was no row),
+    /// so a verdict recorded since the scan started is not overwritten. Returns
+    /// whether the row was written. `observed: None` always writes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_verdict_if_unchanged(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        verdict: &str,
+        findings_count: i32,
+        critical_count: i32,
+        high_count: i32,
+        medium_count: i32,
+        low_count: i32,
+        max_severity: Option<&str>,
+        scanner_version: Option<&str>,
+        repository_id: Option<Uuid>,
+        components_cataloged: Option<i32>,
+        pin_identity: Option<&str>,
+        observed: Option<Option<DateTime<Utc>>>,
+    ) -> Result<bool> {
+        self.upsert_verdict(
+            checksum_sha256,
+            scan_type,
+            verdict,
+            findings_count,
+            critical_count,
+            high_count,
+            medium_count,
+            low_count,
+            max_severity,
+            scanner_version,
+            repository_id,
+            components_cataloged,
+            pin_identity,
+            observed,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_verdict(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        verdict: &str,
+        findings_count: i32,
+        critical_count: i32,
+        high_count: i32,
+        medium_count: i32,
+        low_count: i32,
+        max_severity: Option<&str>,
+        scanner_version: Option<&str>,
+        repository_id: Option<Uuid>,
+        components_cataloged: Option<i32>,
+        pin_identity: Option<&str>,
+        observed: Option<Option<DateTime<Utc>>>,
+    ) -> Result<bool> {
+        let written = sqlx::query(
+            r#"
+            INSERT INTO proxy_scan_results (
+                checksum_sha256, scan_type, verdict,
+                findings_count, critical_count, high_count, medium_count, low_count,
+                max_severity, scanner_version, repository_id, components_cataloged,
+                pin_identity, scanned_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
+            ON CONFLICT (checksum_sha256, scan_type) DO UPDATE SET
+                verdict = EXCLUDED.verdict,
+                findings_count = EXCLUDED.findings_count,
+                critical_count = EXCLUDED.critical_count,
+                high_count = EXCLUDED.high_count,
+                medium_count = EXCLUDED.medium_count,
+                low_count = EXCLUDED.low_count,
+                max_severity = EXCLUDED.max_severity,
+                scanner_version = EXCLUDED.scanner_version,
+                repository_id = EXCLUDED.repository_id,
+                components_cataloged = EXCLUDED.components_cataloged,
+                pin_identity = EXCLUDED.pin_identity,
+                scanned_at = now()
+            WHERE NOT $14 OR proxy_scan_results.scanned_at IS NOT DISTINCT FROM $15
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .bind(verdict)
+        .bind(findings_count)
+        .bind(critical_count)
+        .bind(high_count)
+        .bind(medium_count)
+        .bind(low_count)
+        .bind(max_severity)
+        .bind(scanner_version)
+        .bind(repository_id)
+        .bind(components_cataloged)
+        .bind(pin_identity)
+        .bind(observed.is_some())
+        .bind(observed.flatten())
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .rows_affected()
+            > 0;
+        forget_memoised_verdict(checksum_sha256, scan_type).await;
+
+        Ok(written)
+    }
+
+    /// The completeness recorded by
+    /// [`record_inventory_completeness`](Self::record_inventory_completeness)
+    /// for a digest's inventory, for the proxy SBOM's completeness marker.
+    ///
+    /// `None` when complete, when no verdict row exists, and for verdicts
+    /// recorded before migration 252. `complete` is also folded to `None` so
+    /// a complete inventory renders byte-identically to the hosted path's
+    /// complete SBOMs (no marker).
+    pub async fn fetch_inventory_completeness(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+    ) -> Result<Option<String>> {
+        let value: Option<Option<String>> = sqlx::query_scalar(
+            r#"
+            SELECT scan_completeness
+            FROM proxy_scan_results
+            WHERE checksum_sha256 = $1 AND scan_type = $2
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(value.flatten().filter(|c| c != "complete"))
     }
 
     /// Read back the inventory for a digest, for SBOM generation.
@@ -818,6 +1332,52 @@ mod tests {
             ProxySeverityGate::from_config(true, "garbage"),
             ProxySeverityGate::BlockOnAny,
             "an unparseable configured threshold must fail closed"
+        );
+    }
+
+    /// #3645: the record-only gate never blocks -- not even an ungraded
+    /// verdict -- and is the weakest gate in a stricter-of-two combination.
+    #[test]
+    fn record_only_gate_never_blocks_and_yields_to_any_enforcing_gate() {
+        let ro = ProxySeverityGate::RecordOnly;
+        for sev in [
+            Some(Severity::Critical),
+            Some(Severity::High),
+            Some(Severity::Info),
+            None,
+        ] {
+            assert!(!ro.blocks(sev), "record-only must not block {sev:?}");
+        }
+        let high = ProxySeverityGate::Threshold(Severity::High);
+        assert_eq!(ProxySeverityGate::stricter(ro, high), high);
+        assert_eq!(ProxySeverityGate::stricter(high, ro), high);
+        assert_eq!(
+            ProxySeverityGate::stricter(ro, ProxySeverityGate::BlockOnAny),
+            ProxySeverityGate::BlockOnAny
+        );
+        assert_eq!(ProxySeverityGate::stricter(ro, ro), ro);
+        assert!(ro.is_record_only());
+        assert!(!high.is_record_only());
+    }
+
+    /// #3645: the record-only action round-trips through the column, never
+    /// scans inline (so it can never 423 on a first pull), and serves an
+    /// inconclusive / over-cap outcome pending rather than locking.
+    #[test]
+    fn record_only_action_scans_async_and_never_locks() {
+        for a in [
+            ProxyScanAction::FailOpen,
+            ProxyScanAction::FailClosed,
+            ProxyScanAction::RecordOnly,
+        ] {
+            assert_eq!(ProxyScanAction::from_db(a.as_db_str()), a);
+        }
+        let ro = ProxyScanAction::RecordOnly;
+        assert!(ro.is_record_only() && !ro.is_fail_closed());
+        assert_eq!(decide_inconclusive(ro), InconclusiveOutcome::ServePending);
+        assert_eq!(
+            decide_serve(None, Some("grype-1"), ro, 30, Utc::now()),
+            ServeDecision::ServePendingScanAsync
         );
     }
 
@@ -1144,6 +1704,124 @@ mod tests {
             .await
             .expect("lookup other type")
             .is_none());
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+
+    /// #4096: the inventory completeness round-trips through the verdict row,
+    /// a later complete scan clears an earlier `partial`, `complete` reads back
+    /// as `None` (no marker), and a digest with no verdict row reads `None`
+    /// instead of erroring.
+    #[tokio::test]
+    async fn inventory_completeness_roundtrip_and_clear() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = ProxyScanService::new(pool.clone());
+        let digest = format!("{:0>64}", uuid::Uuid::new_v4().simple());
+
+        // No verdict row: the write is a no-op and the read is None.
+        svc.record_inventory_completeness(&digest, "grype", Some("partial"))
+            .await
+            .expect("no-op write");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch missing"),
+            None
+        );
+
+        svc.record_verdict(
+            &digest,
+            "grype",
+            VERDICT_CLEAN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some("grype-0.99.0-test"),
+            None,
+        )
+        .await
+        .expect("record verdict");
+        // A verdict recorded without a completeness (pre-252 shape) is None.
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch unset"),
+            None
+        );
+
+        svc.record_inventory_completeness(&digest, "grype", Some("partial"))
+            .await
+            .expect("record partial");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch partial")
+                .as_deref(),
+            Some("partial")
+        );
+        // Scoped by scan type like the inventory itself.
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "trivy")
+                .await
+                .expect("fetch other type"),
+            None
+        );
+
+        // A re-upserted verdict does not erase it: only the inventory writer
+        // owns this column.
+        svc.record_verdict(
+            &digest,
+            "grype",
+            VERDICT_CLEAN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some("grype-0.99.1-test"),
+            None,
+        )
+        .await
+        .expect("re-record verdict");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch after upsert")
+                .as_deref(),
+            Some("partial")
+        );
+
+        // A later complete inventory clears it; an explicit "complete" also
+        // reads back as None so the SBOM carries no marker.
+        svc.record_inventory_completeness(&digest, "grype", None)
+            .await
+            .expect("record complete");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch cleared"),
+            None
+        );
+        svc.record_inventory_completeness(&digest, "grype", Some("complete"))
+            .await
+            .expect("record explicit complete");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch explicit complete"),
+            None
+        );
 
         sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
             .bind(&digest)
@@ -1522,5 +2200,115 @@ mod tests {
             decide_inconclusive(ProxyScanAction::FailClosed),
             InconclusiveOutcome::Locked
         );
+    }
+
+    fn stored(
+        verdict: &str,
+        scanned_at: DateTime<Utc>,
+        scanner_version: Option<&str>,
+        pin_identity: Option<&str>,
+        components_cataloged: Option<i32>,
+    ) -> StoredProxyVerdict {
+        StoredProxyVerdict {
+            row: row(verdict, scanned_at, scanner_version),
+            pin_identity: pin_identity.map(str::to_string),
+            components_cataloged,
+        }
+    }
+
+    /// #4514: what a proxy-cache fast path may do with a scanning Remote's
+    /// cached body, from the verdict stored for its digest.
+    #[test]
+    fn cache_scan_gate_truth_table_4514() {
+        use CacheScanGate::*;
+        let now = Utc::now();
+        let fresh = now - Duration::days(1);
+        let expired = now - Duration::days(31);
+        let live = Some("grype-0.84.0");
+        let gate = |s: Option<&StoredProxyVerdict>, v, action, sg| {
+            decide_cache_scan_gate(s, v, action, sg, 30, now)
+        };
+        let closed = ProxyScanAction::FailClosed;
+        let open = ProxyScanAction::FailOpen;
+        let any = ProxySeverityGate::BlockOnAny;
+
+        let clean = stored(VERDICT_CLEAN, fresh, live, Some("python|foo|1.0"), Some(3));
+        let vulnerable = stored(
+            VERDICT_VULNERABLE,
+            fresh,
+            live,
+            Some("python|foo|1.0"),
+            Some(3),
+        );
+
+        // A fresh vulnerable verdict blocks under both enforcing actions.
+        assert_eq!(gate(Some(&vulnerable), live, closed, any), Block);
+        assert_eq!(gate(Some(&vulnerable), live, open, any), Block);
+        // ... with the live version unknown too: it only gates `clean` reuse.
+        assert_eq!(gate(Some(&vulnerable), None, closed, any), Block);
+
+        // A fresh clean verdict serves under both actions.
+        assert_eq!(gate(Some(&clean), live, closed, any), Serve);
+        assert_eq!(gate(Some(&clean), live, open, any), Serve);
+
+        // Fail-closed: no verdict, a stale one, an unprovable clean one
+        // (#2976) or a clean one that graded nothing (#3396) is not for a
+        // fast path.
+        assert_eq!(gate(None, live, closed, any), NotForFastPath);
+        let stale_clean = stored(VERDICT_CLEAN, expired, live, None, Some(3));
+        assert_eq!(gate(Some(&stale_clean), live, closed, any), NotForFastPath);
+        assert_eq!(gate(Some(&clean), None, closed, any), NotForFastPath);
+        let graded_nothing = stored(VERDICT_CLEAN, fresh, live, None, Some(0));
+        assert_eq!(
+            gate(Some(&graded_nothing), live, closed, any),
+            NotForFastPath
+        );
+        // #4952: a clean verdict graded as a coordinate the request names
+        // (here a Go module) or graded with no pin at all (an on-demand
+        // rescan) pertains to one request only; a fast path has none.
+        let go_pin = Some("go|example.com/m|v1.0.0");
+        let request_pinned = stored(VERDICT_CLEAN, fresh, live, go_pin, Some(3));
+        assert_eq!(
+            gate(Some(&request_pinned), live, closed, any),
+            NotForFastPath
+        );
+        let unpinned = stored(VERDICT_CLEAN, fresh, live, None, Some(3));
+        assert_eq!(gate(Some(&unpinned), live, closed, any), NotForFastPath);
+        assert_eq!(gate(Some(&request_pinned), live, open, any), Serve);
+        // A blocking verdict refuses whatever coordinate it was graded as.
+        let vulnerable_go = stored(VERDICT_VULNERABLE, fresh, live, go_pin, Some(3));
+        assert_eq!(gate(Some(&vulnerable_go), live, closed, any), Block);
+        let errored = stored(VERDICT_ERROR, fresh, live, None, None);
+        assert_eq!(gate(Some(&errored), live, closed, any), NotForFastPath);
+        let stale_vulnerable = stored(VERDICT_VULNERABLE, expired, live, None, Some(3));
+        assert_eq!(
+            gate(Some(&stale_vulnerable), live, closed, any),
+            NotForFastPath
+        );
+
+        // Fail-open: the buffered gate would serve all of those `pending`.
+        assert_eq!(gate(None, live, open, any), Serve);
+        assert_eq!(gate(Some(&stale_vulnerable), live, open, any), Serve);
+        assert_eq!(gate(Some(&graded_nothing), live, open, any), Serve);
+
+        // A vulnerable verdict below an opted-in threshold serves (#3243);
+        // an ungraded one (no max_severity) blocks under every gate.
+        let mut low = vulnerable.clone();
+        low.row.max_severity = Some("low".to_string());
+        let high_threshold = ProxySeverityGate::Threshold(Severity::High);
+        assert_eq!(gate(Some(&low), live, closed, high_threshold), Serve);
+        assert_eq!(gate(Some(&vulnerable), live, closed, high_threshold), Block);
+
+        // Record-only never refuses, whatever is stored.
+        for record_only in [
+            (ProxyScanAction::RecordOnly, ProxySeverityGate::RecordOnly),
+            (closed, ProxySeverityGate::RecordOnly),
+        ] {
+            assert_eq!(
+                gate(Some(&vulnerable), live, record_only.0, record_only.1),
+                Serve
+            );
+            assert_eq!(gate(None, live, record_only.0, record_only.1), Serve);
+        }
     }
 }

@@ -1,16 +1,15 @@
 //! Route definitions for the API.
 
 use axum::{
-    error_handling::HandleErrorLayer,
     extract::{DefaultBodyLimit, Request, State},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
-    BoxError, Router,
+    Router,
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tower::{limit::GlobalConcurrencyLimitLayer, load_shed::LoadShedLayer, ServiceBuilder};
+use tokio::sync::Semaphore;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::error::AppError;
@@ -18,18 +17,21 @@ use crate::error::AppError;
 use super::handlers;
 use super::middleware::auth::{
     admin_middleware, auth_middleware, csrf_middleware, optional_auth_middleware,
-    repo_visibility_middleware, RepoVisibilityState,
+    repo_visibility_middleware, repository_download_auth_middleware, RepoVisibilityState,
 };
-use super::middleware::client_ip::client_ip_context_middleware;
+use super::middleware::client_ip::{self, client_ip_context_middleware};
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
 use super::middleware::nul_path::nul_path_guard;
 use super::middleware::rate_limit::{
     login_rate_limit_middleware, rate_limit_by_ip_middleware, rate_limit_middleware, CidrRange,
-    LoginRateLimitState, RateLimitExemptions, RateLimitState, RateLimiter,
+    LoginRateLimitAudit, LoginRateLimitState, RateLimitExemptions, RateLimitState, RateLimiter,
 };
 use super::middleware::setup::setup_guard;
-use super::middleware::tracing::correlation_id_middleware;
+use super::middleware::tracing::correlation_id_with_proxies_middleware;
+use super::middleware::upload_guard::{
+    per_principal_upload_admission, upload_progress_deadline, ProgressPolicy, UploadAdmission,
+};
 use super::SharedState;
 use crate::services::auth_service::AuthService;
 
@@ -65,6 +67,15 @@ pub fn create_router(state: SharedState) -> Router {
     // default 10 GB). A value of 0 disables the limit entirely.
     let upload_limit = state.config.max_upload_size_bytes;
 
+    let wasm_proxy_routes = if state.config.plugins_enabled {
+        Router::new().nest("/ext", handlers::wasm_proxy::router())
+    } else {
+        Router::new()
+    };
+    // One in-flight upload budget per principal, shared by every upload
+    // surface below (GHSA-9f9r-c4w8-rjv9).
+    let upload_admission = UploadAdmission::new(state.config.upload_max_in_flight_per_principal);
+
     let format_routes = Router::new()
         .nest("/general", handlers::general::router())
         .nest("/npm", handlers::npm::router())
@@ -96,8 +107,12 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/composer", handlers::composer::router())
         .nest("/conan", handlers::conan::router())
         .nest("/alpine", handlers::alpine::router())
+        .nest("/pacman", handlers::pacman::router())
         .nest("/conda", handlers::conda::router())
         .nest("/conda/t", handlers::conda::token_router())
+        // rattler (pixi `auth login --conda-token`) puts the token in FRONT of
+        // the whole path: `/t/<TOKEN>/conda/<repo_key>/...`.
+        .nest("/t", handlers::conda::rattler_token_router())
         .nest("/swift", handlers::swift::router())
         .nest(
             handlers::terraform::MOUNT_PREFIX,
@@ -106,11 +121,14 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/cocoapods", handlers::cocoapods::router())
         .nest("/hex", handlers::hex::router())
         .nest("/huggingface", handlers::huggingface::router())
+        .nest(handlers::mcp::MOUNT_PREFIX, handlers::mcp::router())
         .nest("/jetbrains", handlers::jetbrains::router())
+        .nest("/agentplugins", handlers::agent_plugins::router())
         .nest("/chef", handlers::chef::router())
         .nest("/puppet", handlers::puppet::router())
         .nest("/ansible", handlers::ansible::router())
         .nest("/cran", handlers::cran::router())
+        .nest("/bazel", handlers::bazel::router())
         .nest("/ivy", handlers::sbt::router())
         .nest("/vscode", handlers::vscode::router())
         .nest("/proto", handlers::protobuf::router())
@@ -123,7 +141,13 @@ pub fn create_router(state: SharedState) -> Router {
         // served via this prefix currently references `/incus/...` download
         // URLs; making those URLs prefix-aware is tracked as a follow-up.
         .nest("/lxc", handlers::incus::router())
-        .nest("/ext", handlers::wasm_proxy::router())
+        .merge(wasm_proxy_routes)
+        // Per-principal in-flight upload cap (GHSA-9f9r-c4w8-rjv9). Layered
+        // inside the visibility middleware so it sees the caller's identity.
+        .layer(middleware::from_fn_with_state(
+            upload_admission.clone(),
+            per_principal_upload_admission,
+        ))
         .layer(middleware::from_fn_with_state(
             vis_state,
             repo_visibility_middleware,
@@ -152,7 +176,14 @@ pub fn create_router(state: SharedState) -> Router {
         .route("/healthz", get(handlers::health::health_check))
         .route("/ready", get(handlers::health::readiness_check))
         .route("/readyz", get(handlers::health::readiness_check))
-        .route("/livez", get(handlers::health::liveness_check));
+        .route("/livez", get(handlers::health::liveness_check))
+        // Host-level Terraform/OpenTofu service discovery. Clients look this
+        // up per host, so it cannot live under `/terraform/{repo}`; it 404s
+        // unless `TERRAFORM_DEFAULT_REPO` is configured.
+        .route(
+            "/.well-known/terraform.json",
+            get(handlers::terraform::host_service_discovery),
+        );
 
     // Only mount Swagger UI and the OpenAPI spec when explicitly enabled
     if swagger_enabled {
@@ -170,11 +201,27 @@ pub fn create_router(state: SharedState) -> Router {
         state.config.rate_limit_trusted_cidrs.clone(),
     ));
     let rate_limit_trusted_proxies = Arc::new(state.config.rate_limit_trusted_proxy_cidrs.clone());
-    let login_rate_limit_state = build_login_rate_limit_state(
+    let client_ip_config = Arc::new(client_ip::ClientIpConfig {
+        trusted_proxies: state.config.rate_limit_trusted_proxy_cidrs.clone(),
+        xff_trusted_for_authz: state.config.xff_trusted_for_authz,
+    });
+    let mut login_rate_limit_state = build_login_rate_limit_state(
         &state.config,
         &rate_limit_exemptions,
         &rate_limit_trusted_proxies,
     );
+    // #4677: a refused login leaves a `LOGIN_RATE_LIMITED` audit row (once
+    // per source IP per window) instead of no trace at all.
+    login_rate_limit_state.audit = Some(Arc::new(LoginRateLimitAudit::new(state.db.clone())));
+
+    // The `/v2/token` state has the larger per-(username, IP) bucket package
+    // clients need, and shares the login limiter's global backstop. LDAP
+    // Basic-auth passthrough (#3830) draws from THIS state: a directory bind
+    // must spend the same budget as the OCI credential exchange, and the
+    // format routes had no login budget before the passthrough.
+    let token_exchange_rate_limit_state =
+        build_token_exchange_rate_limit_state(&login_rate_limit_state, &state.config);
+    crate::services::ldap_basic_auth::install_rate_limit(token_exchange_rate_limit_state.clone());
 
     let mut router = router
         // API v1 routes
@@ -185,16 +232,32 @@ pub fn create_router(state: SharedState) -> Router {
                 rate_limit_exemptions,
                 rate_limit_trusted_proxies.clone(),
                 login_rate_limit_state.clone(),
+                upload_admission,
             ),
+        )
+        // Device Authorization Grant (#3461): the browser approval page. 404
+        // unless DEVICE_AUTH_ENABLED=true.
+        .merge(
+            handlers::device::device_page_router().route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                handlers::device::require_device_auth_enabled,
+            )),
         )
         // Docker Registry V2 API (OCI Distribution Spec)
         .route("/v2/", handlers::oci_v2::version_check_handler())
-        // `/v2/token` shares the login limiter (#4020): the same per-(username,
-        // IP) password-guessing budget and global backstop as /api/v1/auth/login.
+        // `/v2/token` shares the login limiter's global backstop and failed-
+        // verify pad budget (#4020) but has its own, larger per-(username, IP)
+        // bucket: an OCI client re-exchanges credentials for every scope it
+        // touches, so a single push + sign + verify spends more than the ten
+        // interactive logins the login bucket allows.
         .nest(
             "/v2",
-            handlers::oci_v2::router(Some(login_rate_limit_state)),
+            handlers::oci_v2::router(Some(token_exchange_rate_limit_state)),
         )
+        // #5253: the MCP registry's credential exchange (`/mcp/{repo}/v0/auth/*`);
+        // the OIDC assertion in the body is the credential, so it sits outside
+        // the repository visibility middleware.
+        .merge(handlers::mcp_edges::public_router())
         // All native-protocol format handler routes (repo visibility enforced)
         .merge(format_routes);
 
@@ -225,7 +288,9 @@ pub fn create_router(state: SharedState) -> Router {
     ));
     guest_auth_service.register_for_global_flush();
     let guest_access_state = GuestAccessState {
-        guest_access_enabled: state.config.guest_access_enabled,
+        // The same handle the admin settings endpoint writes through (#867),
+        // so a flip is enforced on the next request, without a restart.
+        policy: state.guest_access_policy.clone(),
         auth_service: guest_auth_service,
     };
     router = router.layer(middleware::from_fn_with_state(
@@ -254,17 +319,26 @@ pub fn create_router(state: SharedState) -> Router {
 
     // Correlation ID middleware (runs first on every request after the global
     // backstop below). Extracts or generates a correlation ID and sets the
-    // X-Correlation-ID response header.
-    router = router.layer(middleware::from_fn(correlation_id_middleware));
-
-    // Client-IP context (#3888/#1849). Resolves the request's client address
-    // once — TCP peer authoritative, `X-Forwarded-For` believed only for
-    // trusted-proxy peers (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`, the same policy
-    // the rate limiter keys on) — and scopes it as a request task-local so
-    // audit emission and IP-conditioned permission gates observe the same
-    // address without signature threading. Runs on every route.
+    // X-Correlation-ID response header. A gateway's `x-request-id` becomes the
+    // correlation ID only from a trusted-proxy peer (#4677).
     router = router.layer(middleware::from_fn_with_state(
-        rate_limit_trusted_proxies,
+        rate_limit_trusted_proxies.clone(),
+        correlation_id_with_proxies_middleware,
+    ));
+
+    // Client-IP context (#3888/#1849). Resolves the request's client
+    // address once, in two trust grades, and scopes them as a request
+    // task-local so consumers observe the same address without signature
+    // threading: the best-effort grade (rate-limit keying, upload guard,
+    // telemetry — TCP peer authoritative, `X-Forwarded-For` believed only
+    // for trusted-proxy peers per `RATE_LIMIT_TRUSTED_PROXY_CIDRS`, the
+    // same policy the rate limiter keys on) and the authorization grade
+    // (IP-conditioned permission gates, auth-audit attribution — XFF-derived
+    // ONLY under the operator's `XFF_TRUSTED_FOR_AUTHZ` assertion, failing
+    // closed to "unknown" behind trusted proxies without it). Runs on every
+    // route.
+    router = router.layer(middleware::from_fn_with_state(
+        client_ip_config,
         client_ip_context_middleware,
     ));
 
@@ -280,23 +354,73 @@ pub fn create_router(state: SharedState) -> Router {
     // any real work.
     let max_concurrency = state.config.global_max_concurrency;
     let request_timeout_secs = state.config.global_request_timeout_secs;
+    let progress = ProgressPolicy::from_config(&state.config);
     apply_global_backstop(
-        router.with_state(state),
+        apply_upload_progress_deadline(router.with_state(state), progress),
         max_concurrency,
         request_timeout_secs,
     )
 }
 
-/// Map a backstop layer error (load-shed `Overloaded` or timeout `Elapsed`)
-/// onto a 503 so clients back off and retry, mirroring the auth-semaphore
-/// shed policy. `Retry-After` is attached by `AppError`'s `IntoResponse`.
-async fn handle_backstop_error(err: BoxError) -> AppError {
-    AppError::ServiceUnavailable(format!("Server overloaded, please retry: {err}"))
+/// Give every byte-transfer upload body a progress deadline
+/// (GHSA-9f9r-c4w8-rjv9). These routes are exempt from the wall-clock
+/// request timeout (#3263), so without it a client that stops sending holds
+/// its global permit for as long as it keeps the socket open. `None` (window
+/// 0) leaves the router unchanged.
+fn apply_upload_progress_deadline(router: Router, policy: Option<ProgressPolicy>) -> Router {
+    match policy {
+        Some(policy) => router.layer(middleware::from_fn_with_state(
+            policy,
+            upload_progress_deadline,
+        )),
+        None => router,
+    }
+}
+
+/// The 503 the global concurrency backstop sheds with: byte-for-byte what the
+/// `tower` `LoadShedLayer` + `HandleErrorLayer` pair it replaced produced, so
+/// clients and dashboards keying off the message do not break.
+/// `Retry-After` is attached by `AppError`'s `IntoResponse`.
+fn overloaded_response() -> Response {
+    AppError::ServiceUnavailable("Server overloaded, please retry: service overloaded".to_string())
+        .into_response()
+}
+
+/// Liveness and readiness probes. They do no work beyond what their handlers
+/// bound themselves, and an orchestrator that cannot reach them restarts or
+/// drains a replica that is merely busy, so they are never shed by the
+/// global concurrency backstop (GHSA-9f9r-c4w8-rjv9).
+const PROBE_PATHS: &[&str] = &["/health", "/healthz", "/ready", "/readyz", "/livez"];
+
+fn is_probe_path(path: &str) -> bool {
+    PROBE_PATHS.contains(&path)
+}
+
+/// Router-wide load-shed concurrency limit: hold one permit from `permits`
+/// for the life of the request, and answer 503 at once when none is free
+/// (no queueing). Health and readiness probes bypass it.
+///
+/// Replaces `tower`'s `LoadShedLayer` + `GlobalConcurrencyLimitLayer`, which
+/// cannot exempt a route: with every permit held (for instance by slow
+/// uploads, GHSA-9f9r-c4w8-rjv9) they refused the probes as well.
+async fn global_concurrency_backstop(
+    State(permits): State<Arc<Semaphore>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if is_probe_path(req.uri().path()) {
+        return next.run(req).await;
+    }
+    match permits.try_acquire_owned() {
+        Ok(_permit) => next.run(req).await,
+        Err(_) => overloaded_response(),
+    }
 }
 
 /// Native-protocol path prefixes whose own routers already declare that they
 /// carry artifact-sized bodies (`DefaultBodyLimit::disable()` for incus/lxc,
-/// a 2 GB limit for Git LFS). See [`is_byte_transfer_path`].
+/// streamed object uploads bounded by `MAX_UPLOAD_SIZE` for Git LFS). See
+/// [`is_byte_transfer_path`].
 const BYTE_TRANSFER_PREFIXES: &[&str] = &["/incus/", "/lxc/", "/lfs/"];
 
 /// Whether `path` is an artifact **byte transfer** — a request whose duration is
@@ -320,6 +444,10 @@ const BYTE_TRANSFER_PREFIXES: &[&str] = &["/incus/", "/lxc/", "/lfs/"];
 /// the load-shed + `GLOBAL_MAX_CONCURRENCY` limiter still bounds how many may run
 /// at once — so the "no path can pin every worker" backstop is preserved for the
 /// paths it was written for (bcrypt, decompression, and other server-side work).
+/// What the timeout used to bound for them, a client that stops sending, is
+/// bounded instead by the upload progress deadline and the per-principal
+/// in-flight cap in [`crate::api::middleware::upload_guard`]
+/// (GHSA-9f9r-c4w8-rjv9).
 ///
 /// Pure (`&str` in, `bool` out) so the whole route table is unit-testable
 /// without a router, a server, or a clock.
@@ -337,6 +465,13 @@ pub(crate) fn is_byte_transfer_path(path: &str) -> bool {
 
     // Native protocols that already opt out of (or far above) the body limit.
     if BYTE_TRANSFER_PREFIXES.iter().any(|p| path.starts_with(p)) {
+        return true;
+    }
+
+    // Conan recipe and package files (`.../files/<name>`), uploaded and
+    // downloaded whole: a multi-GB `conan_package.tgz` was cut off at the
+    // timeout mid-body (#4329). The `.../files` listings stay bounded.
+    if path.starts_with("/conan/") && path.contains("/files/") {
         return true;
     }
 
@@ -381,7 +516,13 @@ async fn conditional_request_timeout(
     if is_byte_transfer_path(req.uri().path()) {
         return next.run(req).await;
     }
-    match tokio::time::timeout(timeout, next.run(req)).await {
+    // A scan gate has to answer inside what is left of this clock (#5231).
+    let answer_by = tokio::time::Instant::now()
+        + crate::api::handlers::proxy_scan_inflight::answer_within(timeout.as_secs())
+            .unwrap_or(timeout);
+    let request = crate::api::handlers::proxy_scan_inflight::REQUEST_ANSWER_BY
+        .scope(answer_by, next.run(req));
+    match tokio::time::timeout(timeout, request).await {
         Ok(response) => response,
         Err(_) => request_timed_out_response(),
     }
@@ -391,10 +532,11 @@ async fn conditional_request_timeout(
 /// applied only when its config value is non-zero (`0` disables it), so the
 /// behaviour is identical to the unpatched router when both are disabled.
 ///
-/// The load-shed + concurrency limiter stays the outermost `tower` stack (a shed
-/// must happen before any work). The request timeout is applied just inside it
-/// as an axum middleware rather than a `TimeoutLayer` so it can skip artifact
-/// byte transfers — see [`is_byte_transfer_path`] and #3263.
+/// The load-shed + concurrency limiter stays the outermost layer (a shed must
+/// happen before any work), and health and readiness probes bypass it
+/// (GHSA-9f9r-c4w8-rjv9). The request timeout is applied just inside it as an
+/// axum middleware rather than a `TimeoutLayer` so it can skip artifact byte
+/// transfers — see [`is_byte_transfer_path`] and #3263.
 fn apply_global_backstop(
     router: Router,
     max_concurrency: usize,
@@ -413,12 +555,10 @@ fn apply_global_backstop(
         return router;
     }
 
-    router.layer(
-        ServiceBuilder::new()
-            .layer(HandleErrorLayer::new(handle_backstop_error))
-            .layer(LoadShedLayer::new())
-            .layer(GlobalConcurrencyLimitLayer::new(max_concurrency)),
-    )
+    router.layer(middleware::from_fn_with_state(
+        Arc::new(Semaphore::new(max_concurrency)),
+        global_concurrency_backstop,
+    ))
 }
 
 /// Construct the login rate-limit state shared by `/api/v1/auth/login` and
@@ -441,20 +581,26 @@ fn build_login_rate_limit_state(
     // username-cycling attacker cannot exhaust memory via unbounded distinct
     // keys. Sized far above any legitimate concurrent-login volume so real
     // users never reach it; it sheds rather than starves.
-    let backstop = Arc::new(RateLimiter::new(
-        config.rate_limit_login_global_per_window,
-        config.rate_limit_window_secs,
-    ));
+    let backstop = Arc::new(
+        RateLimiter::new(
+            config.rate_limit_login_global_per_window,
+            config.rate_limit_window_secs,
+        )
+        .named("login_global"),
+    );
     // Dedicated tight per-(username, IP) bucket for the login endpoint. The
     // login handler bcrypt-verifies the submitted password (and does so even
     // for locked accounts), so borrowing the loose general-auth budget lets a
     // single client drive a burst of verifies that saturates CPU. This budget
     // sheds excess login attempts as 429 in the middleware layer, before the
     // verifier runs. Default: 10 attempts / 15 minutes per (username, IP).
-    let limiter = Arc::new(RateLimiter::new(
-        config.rate_limit_login_per_window,
-        config.rate_limit_login_window_secs,
-    ));
+    let limiter = Arc::new(
+        RateLimiter::new(
+            config.rate_limit_login_per_window,
+            config.rate_limit_login_window_secs,
+        )
+        .named("login"),
+    );
     // Per-source-IP budget for the login bcrypt timing pad (#3504). The bucket
     // above is keyed per-(username, IP), so cycling usernames gets a fresh one
     // every request; this one accrues against the source IP. It gates the pad,
@@ -475,7 +621,64 @@ fn build_login_rate_limit_state(
         },
         backstop,
         failed_by_ip,
+        // Wired by `create_router`, which owns the database pool (#4677).
+        audit: None,
     }
+}
+
+/// Environment variable for the `/v2/token` per-(username, IP) budget.
+pub(crate) const TOKEN_EXCHANGE_PER_WINDOW_ENV: &str = "RATE_LIMIT_TOKEN_EXCHANGE_PER_WINDOW";
+
+/// Default `/v2/token` per-(username, IP) budget per login window.
+pub(crate) const DEFAULT_TOKEN_EXCHANGE_PER_WINDOW: u32 = 300;
+
+/// Parse the `/v2/token` budget; unset, unparseable or zero means the default.
+pub(crate) fn token_exchange_per_window(raw: Option<&str>) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_TOKEN_EXCHANGE_PER_WINDOW)
+}
+
+/// The `/v2/token` limiter: the login state with its per-(username, IP)
+/// bucket swapped for a larger one ([`TOKEN_EXCHANGE_PER_WINDOW_ENV`], default
+/// [`DEFAULT_TOKEN_EXCHANGE_PER_WINDOW`] per `rate_limit_login_window_secs`).
+///
+/// The global backstop and the per-IP failed-verify pad budget stay SHARED
+/// with `/api/v1/auth/login` (#4020), so the two surfaces together still bound
+/// total verification volume and padded failures per source IP; only the
+/// per-key bucket is separate. A container client exchanges credentials once
+/// per repository scope and per tool (podman push, cosign sign, cosign verify,
+/// skopeo), so ten per fifteen minutes made one ordinary build 429.
+fn build_token_exchange_rate_limit_state(
+    login: &LoginRateLimitState,
+    config: &crate::config::Config,
+) -> LoginRateLimitState {
+    let limiter = Arc::new(
+        RateLimiter::new(
+            token_exchange_per_window(std::env::var(TOKEN_EXCHANGE_PER_WINDOW_ENV).ok().as_deref()),
+            config.rate_limit_login_window_secs,
+        )
+        .named("token"),
+    );
+    {
+        let cleanup = Arc::clone(&limiter);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                cleanup.cleanup_expired().await;
+            }
+        });
+    }
+    let mut state = login.clone();
+    state.inner.limiter = limiter;
+    // Its own once-per-window audit memory (#4677), so a `/v2/token` refusal
+    // is not swallowed by a login refusal from the same address.
+    state.audit = login
+        .audit
+        .as_ref()
+        .map(|audit| Arc::new(audit.for_another_surface()));
+    state
 }
 
 /// API v1 routes.
@@ -490,6 +693,7 @@ fn api_v1_routes(
     exemptions: Arc<RateLimitExemptions>,
     trusted_proxies: Arc<Vec<CidrRange>>,
     login_rate_limit_state: LoginRateLimitState,
+    upload_admission: Arc<UploadAdmission>,
 ) -> Router<SharedState> {
     // Create an AuthService for middleware use
     let auth_service = Arc::new(AuthService::new(
@@ -502,38 +706,122 @@ fn api_v1_routes(
 
     let upload_limit = state.config.max_upload_size_bytes;
 
+    let plugin_routes = if state.config.plugins_enabled {
+        Router::new()
+            .nest(
+                "/plugins",
+                handlers::plugins::router().layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
+            )
+            .nest(
+                "/plugins",
+                handlers::plugins::admin_router().layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    admin_middleware,
+                )),
+            )
+            .nest(
+                "/formats",
+                handlers::plugins::format_router().layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
+                )),
+            )
+            .nest(
+                "/formats",
+                handlers::plugins::format_admin_router().layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    admin_middleware,
+                )),
+            )
+    } else {
+        Router::new()
+    };
+
     // Rate limiters, driven by Config fields. The exemption set and trusted
     // reverse-proxy policy arrive from `create_router` (see the doc comment
     // above) so they stay identical to the policy `/v2/token` sees; only the
     // endpoint limiters are built here.
 
-    let auth_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_auth_per_window,
-        state.config.rate_limit_window_secs,
-    ));
-    let api_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_api_per_window,
-        state.config.rate_limit_window_secs,
-    ));
-    let search_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_search_per_window,
-        state.config.rate_limit_window_secs,
-    ));
+    let auth_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_auth_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("auth"),
+    );
+    let api_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_api_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("api"),
+    );
+    let search_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_search_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("search"),
+    );
     // Stricter per-IP bucket for endpoints that mint presigned download
     // URLs. See #1053.
-    let presign_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_presign_per_window,
-        state.config.rate_limit_window_secs,
-    ));
+    let presign_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_presign_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("presign"),
+    );
     // Stricter per-user bucket for self-password-change attempts. The
     // handler bcrypt-verifies the current password, so an attacker who
     // already holds the victim's JWT can otherwise drive ~`api/min`
     // password guesses through this endpoint and CPU-grind the bcrypt
     // verifier. Default: 5 attempts / 15 minutes per user. See #1026.
-    let password_change_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_password_change_per_window,
-        state.config.rate_limit_password_change_window_secs,
-    ));
+    let password_change_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_password_change_per_window,
+            state.config.rate_limit_password_change_window_secs,
+        )
+        .named("password_change"),
+    );
+    // Device Authorization Grant (#3461). Starting a flow is unauthenticated
+    // and writes a row, so it gets its own tight per-IP bucket
+    // (DEVICE_AUTH_CODE_REQUESTS_PER_WINDOW, default 10). Token polling gets
+    // a bucket sized like the other public auth endpoints but separate from
+    // theirs, so a polling CLI never spends a user's refresh/logout budget;
+    // per-code pacing is enforced by `slow_down` itself. The signed-in
+    // verify/approve/deny calls get a per-user bucket of the same size, also
+    // separate from refresh/logout.
+    let device_code_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.device_auth.code_requests_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("device_code"),
+    );
+    let device_token_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_auth_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("device_token"),
+    );
+    let device_approval_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_auth_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("device_approval"),
+    );
+    // Failed user-code budgets (per user and per IP) for verify/approve/deny.
+    // Always on: see `DeviceApprovalThrottle`.
+    let device_approval_throttle = handlers::device::DeviceApprovalThrottle::new(
+        &state.config.device_auth,
+        Arc::clone(&trusted_proxies),
+    );
 
     // Master on/off switch (#1602). When disabled, every rate-limit layer
     // short-circuits before touching its limiter so no request is limited.
@@ -583,6 +871,24 @@ fn api_v1_routes(
         enabled: rate_limit_enabled,
         trusted_proxies: Arc::clone(&trusted_proxies),
     };
+    let device_code_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&device_code_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+        enabled: rate_limit_enabled,
+        trusted_proxies: Arc::clone(&trusted_proxies),
+    };
+    let device_token_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&device_token_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+        enabled: rate_limit_enabled,
+        trusted_proxies: Arc::clone(&trusted_proxies),
+    };
+    let device_approval_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&device_approval_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+        enabled: rate_limit_enabled,
+        trusted_proxies: Arc::clone(&trusted_proxies),
+    };
 
     // Spawn periodic cleanup of expired rate-limiter entries to prevent
     // unbounded HashMap growth from unique client IPs over time.
@@ -595,6 +901,11 @@ fn api_v1_routes(
         let login_cleanup = Arc::clone(&login_rate_limit_state.inner.limiter);
         let login_failed_ip_cleanup = Arc::clone(&login_rate_limit_state.failed_by_ip);
         let password_change_cleanup = Arc::clone(&password_change_rate_limiter);
+        let device_code_cleanup = Arc::clone(&device_code_rate_limiter);
+        let device_token_cleanup = Arc::clone(&device_token_rate_limiter);
+        let device_approval_cleanup = Arc::clone(&device_approval_rate_limiter);
+        let device_throttle_cleanup = device_approval_throttle.clone();
+        let device_db = state.db.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
@@ -607,6 +918,14 @@ fn api_v1_routes(
                 login_cleanup.cleanup_expired().await;
                 login_failed_ip_cleanup.cleanup_expired().await;
                 password_change_cleanup.cleanup_expired().await;
+                device_code_cleanup.cleanup_expired().await;
+                device_token_cleanup.cleanup_expired().await;
+                device_approval_cleanup.cleanup_expired().await;
+                device_throttle_cleanup.cleanup_expired().await;
+                // Delete expired device authorizations (and audit approvals
+                // nobody redeemed). Runs whether or not the grant is enabled,
+                // so disabling it also drains the table.
+                handlers::device::sweep_expired_sessions(device_db.clone()).await;
             }
         });
     }
@@ -627,6 +946,9 @@ fn api_v1_routes(
                 optional_auth_middleware,
             )),
         )
+        // Active maintenance banners (#2155): public, no auth, and on the
+        // guest-access allowlist so the login page can show them.
+        .nest("/banners", handlers::banners::public_router())
         // Setup status (public, no auth)
         .nest("/setup", handlers::auth::setup_router())
         // Auth routes - split into login / logout / public / protected (rate
@@ -672,6 +994,64 @@ fn api_v1_routes(
         .nest("/auth/sso", handlers::sso::router())
         // CI OIDC token exchange (public, no auth — JWT is the credential)
         .nest("/auth/ci", handlers::ci_auth::router())
+        // Device Authorization Grant (RFC 8628, #3461). Every route answers
+        // 404 unless DEVICE_AUTH_ENABLED=true. Bodies are tiny, so cap them
+        // well below the global upload limit these routes would otherwise
+        // inherit: /code and /token buffer an unauthenticated body.
+        .nest(
+            "/auth/device",
+            Router::new()
+                // Public client endpoints: per-IP limiters, 429s re-shaped
+                // into the RFC 6749 §5.2 error body.
+                .merge(
+                    Router::new()
+                        .route(
+                            "/code",
+                            axum::routing::post(handlers::device::create_device_code),
+                        )
+                        .layer(middleware::from_fn_with_state(
+                            device_code_rate_limit_state,
+                            rate_limit_middleware,
+                        ))
+                        .layer(middleware::from_fn(
+                            handlers::device::oauth_rate_limit_response,
+                        )),
+                )
+                .merge(
+                    Router::new()
+                        .route(
+                            "/token",
+                            axum::routing::post(handlers::device::poll_device_token),
+                        )
+                        .layer(middleware::from_fn_with_state(
+                            device_token_rate_limit_state,
+                            rate_limit_middleware,
+                        ))
+                        .layer(middleware::from_fn(
+                            handlers::device::oauth_rate_limit_response,
+                        )),
+                )
+                // Signed-in user endpoints: session auth (with its CSRF
+                // contract), a per-user request budget, and the failed-code
+                // throttle the handlers consult.
+                .merge(
+                    handlers::device::approval_router()
+                        .layer(axum::Extension(device_approval_throttle))
+                        .layer(middleware::from_fn_with_state(
+                            device_approval_rate_limit_state,
+                            rate_limit_middleware,
+                        ))
+                        .layer(middleware::from_fn_with_state(
+                            auth_service.clone(),
+                            auth_middleware,
+                        )),
+                )
+                .layer(DefaultBodyLimit::max(16 * 1024))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    handlers::device::require_device_auth_enabled,
+                )),
+        )
         .nest(
             "/auth",
             handlers::auth::protected_router().layer(middleware::from_fn_with_state(
@@ -706,6 +1086,13 @@ fn api_v1_routes(
             "/repositories",
             handlers::repositories::router()
                 .merge(handlers::age_gate::repo_config_routes())
+                // Repository-scoped age-gate review queue (#4238):
+                // GET/POST /repositories/{key}/age-gate/reviews[/{id}[/...]].
+                // Gated inside the handlers on the repository `admin` action,
+                // so a repository's own admins operate its gate without being
+                // instance admins. The instance-wide queue stays at
+                // /admin/age-gate behind `admin_middleware`.
+                .merge(handlers::age_gate::repo_review_routes())
                 // Per-repo storage GC (web #708): the UI's per-repo storage
                 // panel calls POST /repositories/{key}/storage-gc. Admin-gated
                 // inside the handler.
@@ -721,11 +1108,30 @@ fn api_v1_routes(
                 // POST/GET /repositories/{key}/environments,
                 // GET/DELETE /repositories/{key}/environments/{id}.
                 .merge(handlers::environments::repo_router())
-                .merge(handlers::repositories::download_router().layer(
-                    middleware::from_fn_with_state(
-                        presign_rate_limit_state,
-                        rate_limit_by_ip_middleware,
-                    ),
+                // Bulk artifact presence check for air-gap imports (#3427):
+                // POST /repositories/{key}/artifacts-missing.
+                .merge(handlers::artifact_presence::repo_router())
+                // Per-Remote proxy-cache cap and usage (#4660):
+                // GET/PUT/DELETE /repositories/{key}/proxy-cache-cap.
+                .merge(handlers::proxy_cache_cap::repo_router())
+                // Precomputed RPM repodata (#4544):
+                // POST /repositories/{key}/rpm/repodata/rebuild.
+                .merge(handlers::rpm::repo_router())
+                // Remote MCP registries (#5253): upstream catalog, approval
+                // queue, pins, bulk approval, sync:
+                // /repositories/{key}/mcp/{catalog,sync}[/...].
+                .merge(handlers::mcp_remote::repo_router())
+                // MCP server health roll-up (#5253):
+                // GET /repositories/{key}/mcp/servers/{name}/versions/{v}/health.
+                .merge(handlers::mcp_health::repo_router())
+                // `GET /repositories/{key}/download/{path}` is NOT merged
+                // here: it is nested separately below with its own
+                // authentication layer (#4654).
+                // Inside the auth layer below, so it sees the caller
+                // (GHSA-9f9r-c4w8-rjv9).
+                .layer(middleware::from_fn_with_state(
+                    upload_admission.clone(),
+                    per_principal_upload_admission,
                 ))
                 .layer(if upload_limit == 0 {
                     DefaultBodyLimit::disable()
@@ -735,6 +1141,42 @@ fn api_v1_routes(
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
                     optional_auth_middleware,
+                )),
+        )
+        // Repository delete jobs (#4311): GET /repository-deletions/{id}.
+        .nest(
+            "/repository-deletions",
+            handlers::repositories::deletion_router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                optional_auth_middleware,
+            )),
+        )
+        // The generic download route, `GET /repositories/{key}/download/{path}`,
+        // takes the format routes' authentication contract rather than the
+        // management API's (#4654): an API token is accepted as the Basic
+        // password, and an anonymous request on a non-public repository is
+        // challenged with 401 so wget / curl / Maven send the credential on
+        // their retry. It is nested at the same prefix as a SEPARATE router so
+        // it does not sit under the `optional_auth_middleware` layer above,
+        // which would refuse the token-as-Basic-password (#2809) before this
+        // layer ran. The stricter per-IP presign-mint limiter (#1053) stays
+        // with it.
+        .nest(
+            "/repositories",
+            handlers::repositories::download_router()
+                .layer(middleware::from_fn_with_state(
+                    presign_rate_limit_state,
+                    rate_limit_by_ip_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    RepoVisibilityState {
+                        auth_service: auth_service.clone(),
+                        db: state.db.clone(),
+                        repo_cache: state.repo_cache.clone(),
+                        repo_miss_cache: state.repo_miss_cache.clone(),
+                        permission_service: state.permission_service.clone(),
+                    },
+                    repository_download_auth_middleware,
                 )),
         )
         // Artifact routes (standalone by ID) with optional auth.
@@ -926,7 +1368,11 @@ fn api_v1_routes(
                 .nest("/:id/transfer", handlers::transfer::router())
                 .nest("/:id/connections", handlers::peer::peer_router())
                 .nest("/:id/chunks", handlers::peer::chunk_router())
-                .merge(handlers::peer::network_profile_router())
+                // The handler extracts the peer id from this path segment.
+                // Merging the router at `/peers` instead matched
+                // `/peers/network-profile` and produced a 500 PathRejection
+                // (#4884).
+                .nest("/:id", handlers::peer::network_profile_router())
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
                     auth_middleware,
@@ -957,6 +1403,11 @@ fn api_v1_routes(
             .nest("/analytics", handlers::analytics::router())
             .nest("/lifecycle", handlers::lifecycle::router())
             .nest("/storage-gc", handlers::storage_gc::router())
+            // Artifact trash (#2072): list + restore soft-deleted artifacts.
+            .nest("/trash", handlers::trash::router())
+            // Storage scrub (#3910) and repository storage reindex (#1570):
+            // admin-only, gated by this block's admin_middleware.
+            .merge(handlers::storage_integrity::router())
             .nest("/search", handlers::search::admin_router())
             // Blast-radius reports expose download attribution (who pulled a
             // vulnerable artifact) — this nest MUST stay inside the /admin
@@ -966,51 +1417,34 @@ fn api_v1_routes(
             .nest("/monitoring", handlers::monitoring::router())
             .nest("/sso", handlers::sso_admin::router())
             .nest("/ci-oidc", handlers::ci_auth_admin::router())
+            // #5253: MCP namespace proofs (admin-initiated DNS/HTTP checks).
+            .nest(
+                "/mcp/namespace-proofs",
+                handlers::mcp_namespace_proofs::router(),
+            )
             .nest("/smtp", handlers::smtp::router())
+            // Maintenance banner CRUD (#2155); the public read is `/banners`.
+            .nest("/banners", handlers::banners::admin_router())
             .nest("/age-gate", handlers::age_gate::admin_router())
+            .nest("/holds", handlers::download_holds::admin_router())
             // Admin quality-checks list-all (#2419). Kept inside the `/admin`
             // block so `admin_middleware` gates it; the artifact-scoped
             // `/quality/checks` (auth-only, 400s without artifact_id) is the
             // separate #2334 contract and is unchanged.
             .nest("/quality-checks", handlers::quality_gates::admin_router())
+            // Config-as-code export / plan / apply (#5292).
+            .nest("/config", handlers::admin_config::router())
             .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
             .layer(middleware::from_fn_with_state(
                 auth_service.clone(),
                 admin_middleware,
             )),
         )
-        // Plugin read-only routes with auth middleware
-        .nest(
-            "/plugins",
-            handlers::plugins::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                auth_middleware,
-            )),
-        )
-        // Plugin install + lifecycle routes require admin (loads arbitrary WASM)
-        .nest(
-            "/plugins",
-            handlers::plugins::admin_router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                admin_middleware,
-            )),
-        )
-        // Format handler read-only routes (list, get) with optional auth
-        .nest(
-            "/formats",
-            handlers::plugins::format_router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                optional_auth_middleware,
-            )),
-        )
-        // Format handler mutating routes (enable, disable, test) require admin
-        .nest(
-            "/formats",
-            handlers::plugins::format_admin_router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                admin_middleware,
-            )),
-        )
+        .merge(plugin_routes)
+        // Public webhook JWKS (#921): receivers verify `v2=` signatures
+        // against it without credentials. No auth layer; also exempt from the
+        // guest-access guard (`guest_access::is_allowlisted`).
+        .nest("/webhooks", handlers::webhooks::public_router())
         // Webhook routes with auth middleware
         .nest(
             "/webhooks",
@@ -1073,6 +1507,14 @@ fn api_v1_routes(
             "/sbom/",
             get(|| async { axum::response::Redirect::permanent("/api/v1/sbom") }),
         )
+        // CEP-27 attestation trust policy (#4033): any authenticated caller.
+        .nest(
+            "/attestations",
+            handlers::attestations::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Promotion routes with auth middleware (staging -> release workflow)
         .nest(
             "/promotion",
@@ -1109,6 +1551,24 @@ fn api_v1_routes(
         .nest(
             "/quality",
             handlers::quality_gates::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
+        // MCP approval-queue count across the Remote MCP repositories the
+        // caller can read (#5253): GET /mcp/pending-summary.
+        .nest(
+            "/mcp",
+            handlers::mcp_remote::summary_router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
+        // MCP introspection worker API (#5253): claim/complete jobs with an
+        // `mcp:introspect` token. The worker is a separate process.
+        .nest(
+            "/mcp/introspection",
+            handlers::mcp_capabilities::worker_router().layer(middleware::from_fn_with_state(
                 auth_service.clone(),
                 auth_middleware,
             )),
@@ -1190,13 +1650,30 @@ fn api_v1_routes(
                 admin_middleware,
             )),
         )
+        // Content bundles (#2464): an export reads whole repositories and an
+        // import provisions content into them, so the whole nest is global
+        // admin only, the same tier and reasoning as `/migrations` above.
+        .nest(
+            "/bundles",
+            handlers::bundles::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                admin_middleware,
+            )),
+        )
         // Chunked/resumable upload routes with auth middleware
         .nest(
             "/uploads",
-            handlers::upload::router().layer(middleware::from_fn_with_state(
-                auth_service,
-                auth_middleware,
-            )),
+            handlers::upload::router()
+                // Inside the auth layer, so it sees the caller
+                // (GHSA-9f9r-c4w8-rjv9).
+                .layer(middleware::from_fn_with_state(
+                    upload_admission,
+                    per_principal_upload_admission,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    auth_service,
+                    auth_middleware,
+                )),
         )
         // Web-UI CSRF contract (#3065): a state-changing request authenticated
         // by the session cookie must carry the `X-Requested-With` header the
@@ -1226,9 +1703,120 @@ mod tests {
     //! prefixes wired to the same handler until the `lxc` format is either
     //! folded into `incus` or given its own handler with prefix-aware URL
     //! construction (tracked as a follow-up to #1272).
+    use super::{
+        api_v1_routes, build_login_rate_limit_state, build_token_exchange_rate_limit_state,
+        token_exchange_per_window, DEFAULT_TOKEN_EXCHANGE_PER_WINDOW,
+    };
     use super::{is_byte_transfer_path, request_timed_out_response};
+    use crate::api::middleware::rate_limit::RateLimitExemptions;
+    use crate::api::middleware::upload_guard::UploadAdmission;
+    use crate::api::{AppState, SharedState};
+    use crate::storage::filesystem::FilesystemStorage;
+    use crate::storage::{StorageBackend, StorageRegistry};
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Router;
+    use sqlx::PgPool;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    #[test]
+    fn token_exchange_budget_defaults_and_parses() {
+        assert_eq!(
+            token_exchange_per_window(None),
+            DEFAULT_TOKEN_EXCHANGE_PER_WINDOW
+        );
+        assert_eq!(
+            token_exchange_per_window(Some("0")),
+            DEFAULT_TOKEN_EXCHANGE_PER_WINDOW
+        );
+        assert_eq!(
+            token_exchange_per_window(Some("x")),
+            DEFAULT_TOKEN_EXCHANGE_PER_WINDOW
+        );
+        assert_eq!(token_exchange_per_window(Some(" 50 ")), 50);
+    }
+
+    /// `/v2/token` gets its own per-(username, IP) bucket, sized above the
+    /// login bucket, while the global backstop and failed-verify pad budget
+    /// stay shared with `/api/v1/auth/login` (#4020).
+    #[tokio::test]
+    async fn token_exchange_limiter_shares_the_backstop_but_not_the_bucket() {
+        let config = crate::config::Config::test_config();
+        let exemptions = Arc::new(RateLimitExemptions::with_cidrs(
+            Vec::new(),
+            false,
+            Vec::new(),
+        ));
+        let proxies = Arc::new(Vec::new());
+        let login = build_login_rate_limit_state(&config, &exemptions, &proxies);
+        let token = build_token_exchange_rate_limit_state(&login, &config);
+        assert!(Arc::ptr_eq(&login.backstop, &token.backstop));
+        assert!(Arc::ptr_eq(&login.failed_by_ip, &token.failed_by_ip));
+        assert!(!Arc::ptr_eq(&login.inner.limiter, &token.inner.limiter));
+    }
+
+    /// #4676: the production limiters carry the names their refusals are
+    /// counted under in `ak_rate_limit_rejections_total{limiter}`.
+    #[tokio::test]
+    async fn production_login_limiters_are_named_for_the_rejection_counter() {
+        let config = crate::config::Config::test_config();
+        let exemptions = Arc::new(RateLimitExemptions::with_cidrs(
+            Vec::new(),
+            false,
+            Vec::new(),
+        ));
+        let proxies = Arc::new(Vec::new());
+        let login = build_login_rate_limit_state(&config, &exemptions, &proxies);
+        let token = build_token_exchange_rate_limit_state(&login, &config);
+        assert_eq!(login.inner.limiter.name(), "login");
+        assert_eq!(login.backstop.name(), "login_global");
+        assert_eq!(token.inner.limiter.name(), "token");
+        for name in [
+            "auth",
+            "api",
+            "search",
+            "presign",
+            "password_change",
+            "device_code",
+            "device_token",
+            "device_approval",
+        ] {
+            assert!(
+                ROUTES_RS_SRC.contains(&format!(".named(\"{name}\")")),
+                "the {name} limiter must be named for ak_rate_limit_rejections_total"
+            );
+        }
+    }
 
     const ROUTES_RS_SRC: &str = include_str!("routes.rs");
+
+    fn plugin_test_state(plugins_enabled: bool) -> SharedState {
+        let pool = PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake")
+            .expect("connect_lazy should not fail");
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(FilesystemStorage::new("/tmp/test-plugin-routes"));
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let mut config = crate::config::Config::test_config();
+        config.plugins_enabled = plugins_enabled;
+        Arc::new(AppState::new(config, pool, storage, registry))
+    }
+
+    fn plugin_test_router(plugins_enabled: bool) -> Router {
+        let state = plugin_test_state(plugins_enabled);
+        let exemptions = Arc::new(RateLimitExemptions::with_cidrs(
+            Vec::new(),
+            false,
+            Vec::new(),
+        ));
+        let trusted_proxies = Arc::new(Vec::new());
+        let login = build_login_rate_limit_state(&state.config, &exemptions, &trusted_proxies);
+        let uploads = UploadAdmission::new(state.config.upload_max_in_flight_per_principal);
+        api_v1_routes(state.clone(), exemptions, trusted_proxies, login, uploads).with_state(state)
+    }
 
     #[test]
     fn lxc_route_is_registered_alongside_incus() {
@@ -1259,6 +1847,116 @@ mod tests {
         );
     }
 
+    /// #4884: `network_profile_router()` was merged at `/peers` instead of
+    /// nested under `/:id`, so axum routed `PUT /api/v1/peers/network-profile`
+    /// to a handler whose `Path<Uuid>` then rejected the zero-argument path
+    /// with a raw 500 extractor error. Exercise the production router so the
+    /// mount shape, the sanitized 400, and the unknown-peer 404 are pinned
+    /// together; a hand-built `/:id` nest (as the handler unit tests use)
+    /// would mask the regression.
+    #[tokio::test]
+    async fn peer_network_profile_route_is_mounted_under_peer_id_4884() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/peers-network-profile-4884");
+        let (admin_id, _) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = TRUE WHERE id = $1")
+            .bind(admin_id)
+            .execute(&pool)
+            .await
+            .expect("promote test user to admin");
+        let peer_id = tdh::register_test_peer(&pool, "network-profile-4884", "route").await;
+        let bearer = tdh::bearer_for(&state, admin_id).await;
+        let app = super::create_router(state);
+        let put_profile = |uri: String, body: &'static str| {
+            Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .header("authorization", bearer.as_str())
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let (status, body) = tdh::send(
+            app.clone(),
+            put_profile(
+                format!("/api/v1/peers/{peer_id}/network-profile"),
+                r#"{"max_bandwidth_bps":123456}"#,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "PUT /peers/:id/network-profile must reach the handler: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let stored: Option<i64> =
+            sqlx::query_scalar("SELECT max_bandwidth_bps FROM peer_instances WHERE id = $1")
+                .bind(peer_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read stored network profile");
+        assert_eq!(stored, Some(123456));
+
+        // The old, miswired path must never reach the handler again. It is a
+        // method mismatch on `GET/DELETE /peers/:id` (or no route at all), but
+        // crucially not the old 500 with axum's PathRejection text.
+        let (status, body) = tdh::send(
+            app.clone(),
+            put_profile(
+                "/api/v1/peers/network-profile".to_string(),
+                r#"{"max_bandwidth_bps":1}"#,
+            ),
+        )
+        .await;
+        assert!(
+            status == StatusCode::METHOD_NOT_ALLOWED || status == StatusCode::NOT_FOUND,
+            "the pre-#4884 miswired path must not route to the handler; got {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains("Wrong number of path arguments"),
+            "an extractor error must not leak through the production router"
+        );
+
+        // A syntactically invalid id is a normal 400, not a raw PathRejection.
+        let (status, body) = tdh::send(
+            app.clone(),
+            put_profile(
+                "/api/v1/peers/not-a-uuid/network-profile".to_string(),
+                r#"{"max_bandwidth_bps":1}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("error body is JSON");
+        assert_eq!(error["code"], "VALIDATION_ERROR");
+        assert_eq!(error["message"], "Invalid peer id");
+
+        // The documented endpoint still reports an unknown peer as 404
+        // instead of accepting a no-op UPDATE.
+        let (status, _) = tdh::send(
+            app,
+            put_profile(
+                format!("/api/v1/peers/{}/network-profile", uuid::Uuid::new_v4()),
+                r#"{"max_bandwidth_bps":1}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, admin_id).await;
+    }
+
     #[test]
     fn logout_route_runs_through_optional_auth_middleware() {
         // GHSA-965p-gcgh-67vf: mounted on the public router with only the
@@ -1285,6 +1983,57 @@ mod tests {
         assert!(
             nest_body.contains("rate_limit_middleware"),
             "/auth/logout must keep the plain IP-keyed rate limiter"
+        );
+    }
+
+    #[test]
+    fn download_router_carries_its_own_auth_layer_not_optional_auth() {
+        // #4654: `GET /repositories/{key}/download/{path}` must be mounted
+        // under `repository_download_auth_middleware` (token-as-Basic-password
+        // accepted, anonymous callers challenged with 401) and must NOT sit
+        // under the `/repositories` nest's `optional_auth_middleware`, which
+        // would refuse the Basic token (#2809) before the download layer ran.
+        // The per-IP presign-mint limiter (#1053) has to move with it. A
+        // runtime test needs full app state; pin the routing decision in
+        // source like `logout_route_runs_through_optional_auth_middleware`.
+        // Only the production half of the file: this test's own text names
+        // the function too.
+        let production_src = ROUTES_RS_SRC
+            .split("#[cfg(test)]")
+            .next()
+            .expect("routes.rs has a test module");
+        assert_eq!(
+            production_src
+                .matches("handlers::repositories::download_router()")
+                .count(),
+            1,
+            "download_router() must be mounted exactly once"
+        );
+        let after = production_src
+            .split("handlers::repositories::download_router()")
+            .nth(1)
+            .expect("download_router() must be mounted");
+        // Code only: the comments around the mount (and on the nest that
+        // follows it) name both middlewares when explaining the split.
+        let mount: String = after
+            .split(".nest(")
+            .next()
+            .expect("download mount must be followed by other route registrations")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            mount.contains("repository_download_auth_middleware"),
+            "the download route must be layered with repository_download_auth_middleware (#4654)"
+        );
+        assert!(
+            !mount.contains("optional_auth_middleware"),
+            "the download route must not be layered with optional_auth_middleware (#4654)"
+        );
+        assert!(
+            mount.contains("rate_limit_by_ip_middleware"),
+            "the download route must keep its per-IP presign-mint limiter (#1053)"
         );
     }
 
@@ -1335,6 +2084,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn disabled_plugins_have_no_runtime_state_or_routes() {
+        let state = plugin_test_state(false);
+        assert!(state.plugin_registry.is_none());
+        assert!(state.wasm_plugin_service.is_none());
+
+        let app = plugin_test_router(false);
+        for (method, uri) in [
+            (Method::GET, "/plugins"),
+            (Method::POST, "/plugins/install/zip"),
+            (Method::GET, "/formats"),
+            (Method::POST, "/formats/example/enable"),
+            (Method::GET, "/ext/example/repository/index"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_plugins_retain_management_routes() {
+        let response = plugin_test_router(true)
+            .oneshot(
+                Request::builder()
+                    .uri("/plugins")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn plugin_routes_are_conditionally_mounted() {
+        assert!(
+            ROUTES_RS_SRC
+                .contains("let plugin_routes = if state.config.plugins_enabled"),
+            "plugin management and format-handler routes must be controlled by the process-level gate"
+        );
+        assert!(ROUTES_RS_SRC.contains(".merge(plugin_routes)"));
+        assert!(
+            ROUTES_RS_SRC.contains("let wasm_proxy_routes = if state.config.plugins_enabled"),
+            "the WASM protocol proxy must be controlled by the same process-level gate"
+        );
+        assert!(ROUTES_RS_SRC.contains(".merge(wasm_proxy_routes)"));
+    }
+
     #[test]
     fn dependency_track_nest_requires_admin() {
         // #2321 G1: every `dependency_track` handler binds `_auth` and performs
@@ -1362,6 +2169,28 @@ mod tests {
         assert!(
             ROUTES_RS_SRC.contains("\"/dependency-track\","),
             "/dependency-track nest registration missing"
+        );
+    }
+
+    #[test]
+    fn bundles_nest_requires_admin() {
+        // #2464: bundle export reads whole repositories and import writes
+        // into them; both are operator workflows gated like `/migrations`.
+        let nest = ROUTES_RS_SRC
+            .split("handlers::bundles::router()")
+            .nth(1)
+            .expect("bundles::router() must be nested under /bundles");
+        let next_middleware = nest
+            .split("from_fn_with_state")
+            .nth(1)
+            .expect("bundles nest must attach a middleware layer");
+        assert!(
+            next_middleware.contains("admin_middleware"),
+            "bundle routes must be gated by admin_middleware, not auth_middleware"
+        );
+        assert!(
+            ROUTES_RS_SRC.contains("\"/bundles\","),
+            "/bundles nest registration missing"
         );
     }
 
@@ -1478,6 +2307,242 @@ mod tests {
         }
     }
 
+    /// GHSA-9f9r-c4w8-rjv9: health and readiness must answer while every
+    /// global request permit is held. Slow uploads used to be able to hold all
+    /// of them, after which the load-shed layer refused `/health` and
+    /// `/ready` with 503 too and an orchestrator restarted a healthy replica.
+    /// Other routes are still shed while the pool is full.
+    #[tokio::test]
+    async fn health_and_readiness_answer_while_the_global_pool_is_full() {
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (hold, held) = (release.clone(), entered.clone());
+        let router = axum::Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route("/healthz", get(|| async { "ok" }))
+            .route("/ready", get(|| async { "ok" }))
+            .route("/readyz", get(|| async { "ok" }))
+            .route("/livez", get(|| async { "ok" }))
+            .route("/other", get(|| async { "other" }))
+            .route(
+                "/slow",
+                get(move || {
+                    let (hold, held) = (hold.clone(), held.clone());
+                    async move {
+                        held.notify_one();
+                        hold.notified().await;
+                        "slow"
+                    }
+                }),
+            );
+        let app = super::apply_global_backstop(router, 1, 120);
+        let get_req = |p: &str| {
+            axum::http::Request::builder()
+                .uri(p)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        // Hold the only permit.
+        let holder = tokio::spawn(app.clone().oneshot(get_req("/slow")));
+        entered.notified().await;
+
+        for probe in ["/health", "/healthz", "/ready", "/readyz", "/livez"] {
+            let resp = app.clone().oneshot(get_req(probe)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{probe} while the pool is full"
+            );
+        }
+        let shed = app.clone().oneshot(get_req("/other")).await.unwrap();
+        assert_eq!(
+            shed.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "other routes are still shed while the pool is full"
+        );
+        // #4647: the shed is a status a retrying client can act on, not a
+        // dropped connection.
+        assert!(
+            shed.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "a shed request carries Retry-After"
+        );
+
+        release.notify_one();
+        let held = holder.await.unwrap().unwrap();
+        assert_eq!(held.status(), StatusCode::OK);
+        let after = app.oneshot(get_req("/other")).await.unwrap();
+        assert_eq!(after.status(), StatusCode::OK, "the permit is released");
+    }
+
+    /// GHSA-9f9r-c4w8-rjv9 end to end, through the production router and a
+    /// real database: a repository writer opens Git LFS uploads that send one
+    /// byte and then nothing, the advisory's attack.
+    ///
+    /// * the writer's uploads beyond its per-principal cap get 429 at once;
+    /// * `/health` and `/ready` keep answering 200 while they are held;
+    /// * each stalled upload ends with 408 once its progress window passes,
+    ///   instead of holding its global permit for as long as the socket stays
+    ///   open;
+    /// * a normal upload by the same writer then succeeds, streamed through
+    ///   the scratch disk, and the object is stored with the right digest.
+    #[tokio::test]
+    async fn stalled_lfs_uploads_are_bounded_and_health_stays_up() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::StatusCode;
+        use futures::StreamExt;
+        use sha2::{Digest, Sha256};
+        use tower::ServiceExt;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "gitlfs").await;
+        let (user_id, _name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        // The progress window starts when the handler first reads the body
+        // (`ProgressDeadlineBody`), so it only has to outlast the third
+        // request below, not the time the held uploads take to authenticate.
+        const WINDOW_SECS: u64 = 4;
+        let state = tdh::build_state_with(pool.clone(), dir.to_string_lossy().as_ref(), |c| {
+            c.upload_progress_window_secs = WINDOW_SECS;
+            c.upload_min_progress_bytes = 1024;
+            c.upload_max_in_flight_per_principal = 2;
+            c.global_max_concurrency = 8;
+        });
+        let bearer = tdh::bearer_for(&state, user_id).await;
+        let app = super::create_router(state);
+        let put = |oid: String, body: Body| {
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/lfs/{repo_key}/objects/{oid}"))
+                .header("authorization", bearer.as_str())
+                .header("content-type", "application/octet-stream")
+                .body(body)
+                .unwrap()
+        };
+        // A body that sends one byte and then nothing. Its first poll means
+        // the handler is reading it, i.e. the upload has passed the
+        // per-principal admission and holds a slot; it reports that on
+        // `entered`.
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let stalled_body = || {
+            let entered = entered_tx.clone();
+            Body::from_stream(
+                futures::stream::once(async move {
+                    let _ = entered.send(());
+                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x"))
+                })
+                .chain(futures::stream::pending()),
+            )
+        };
+        let oid = |n: u8| format!("{n:064x}");
+        let started = tokio::time::Instant::now();
+
+        // Two stalled uploads take the writer's two slots.
+        let held: Vec<_> = (1..=2)
+            .map(|n| tokio::spawn(app.clone().oneshot(put(oid(n), stalled_body()))))
+            .collect();
+
+        // Wait until both hold their slots (they authenticate first, which
+        // takes as long as the database does), then a third is refused at
+        // once. Waiting on the uploads themselves rather than on the clock
+        // keeps a slow runner from sending the third before the first two
+        // are admitted (it used to poll for a fixed 1.5 s and then got 422
+        // from the LFS handler instead of 429).
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+                .await
+                .expect("both stalled uploads must reach the handler")
+                .expect("the entered channel stays open");
+        }
+        let third = app
+            .clone()
+            .oneshot(put(oid(3), Body::from("y")))
+            .await
+            .unwrap()
+            .status();
+        let health = app
+            .clone()
+            .oneshot(tdh::get("/health".into()))
+            .await
+            .unwrap();
+        let ready = app
+            .clone()
+            .oneshot(tdh::get("/ready".into()))
+            .await
+            .unwrap();
+
+        // The stalled uploads end on their own.
+        let mut stalled = Vec::new();
+        for h in held {
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(10), h)
+                .await
+                .expect("a stalled upload must not be held indefinitely")
+                .unwrap()
+                .unwrap();
+            stalled.push(resp.status());
+        }
+
+        // A real upload by the same writer now succeeds.
+        let content = vec![42u8; 300 * 1024];
+        let real_oid = format!("{:x}", Sha256::digest(&content));
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = content
+            .chunks(64 * 1024)
+            .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+            .collect();
+        let real = app
+            .clone()
+            .oneshot(put(
+                real_oid.clone(),
+                Body::from_stream(futures::stream::iter(chunks)),
+            ))
+            .await
+            .unwrap();
+        let real_status = real.status();
+        let stored: Option<(i64, String)> = sqlx::query_as(
+            "SELECT size_bytes, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(format!("lfs/objects/{}/{}", &real_oid[..2], real_oid))
+        .fetch_optional(&pool)
+        .await
+        .expect("read the stored object");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            third,
+            StatusCode::TOO_MANY_REQUESTS,
+            "upload beyond the cap"
+        );
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "/health while uploads are held"
+        );
+        assert_eq!(
+            ready.status(),
+            StatusCode::OK,
+            "/ready while uploads are held"
+        );
+        assert_eq!(
+            stalled,
+            vec![StatusCode::REQUEST_TIMEOUT, StatusCode::REQUEST_TIMEOUT],
+            "stalled uploads end with 408"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(WINDOW_SECS));
+        assert_eq!(real_status, StatusCode::OK, "a real upload still works");
+        assert_eq!(stored, Some((300 * 1024, real_oid)));
+    }
+
     /// Regression guard on the mechanism, not just the predicate: a
     /// `tower::timeout::TimeoutLayer` cannot be made conditional on the
     /// request, so re-introducing one over the whole router would silently
@@ -1537,6 +2602,137 @@ mod tests {
         (ui, spec)
     }
 
+    /// #2155 / #867 through the production router: with guest access off,
+    /// the public banner list still answers anonymous callers (the login page
+    /// shows it) while the admin banner and runtime-settings surfaces stay
+    /// gated; and a runtime flip of the policy handle the router was built
+    /// with is enforced on the next request, without rebuilding anything.
+    #[tokio::test]
+    async fn banners_public_and_guest_toggle_live_through_the_router() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::guest_access_policy::GuestAccessPolicy;
+        use axum::http::StatusCode;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let state = tdh::build_state_with(pool.clone(), "/tmp/banners-router-2155", |c| {
+            c.guest_access_enabled = false;
+            c.guest_access_env_pinned = true;
+        });
+        let app = super::create_router(state);
+        let get = |p: &str| tdh::get(p.to_string());
+        let (code, body) = tdh::send(app.clone(), get("/api/v1/banners")).await;
+        assert_eq!(code, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(parsed["banners"].is_array());
+        for gated in [
+            "/api/v1/admin/banners",
+            "/api/v1/admin/settings/system",
+            "/api/v1/repositories",
+        ] {
+            let (code, _) = tdh::send(app.clone(), get(gated)).await;
+            assert_eq!(code, StatusCode::UNAUTHORIZED, "{gated}");
+        }
+
+        // Runtime flip, no router rebuild. A private setting key keeps this
+        // off the real row.
+        let (admin, _) = tdh::create_user(&pool).await;
+        let key = format!("test.guest_access.{}", uuid::Uuid::new_v4());
+        let mut inner = (*tdh::build_state(pool.clone(), "/tmp/guest-toggle-867")).clone();
+        let policy = std::sync::Arc::new(GuestAccessPolicy::new(
+            Some(pool.clone()),
+            key.clone(),
+            None,
+            true,
+        ));
+        inner.guest_access_policy = policy.clone();
+        let app = super::create_router(std::sync::Arc::new(inner));
+        let (open, _) = tdh::send(app.clone(), get("/api/v1/repositories")).await;
+        let (_, cfg) = tdh::send(app.clone(), get("/api/v1/system/config")).await;
+        let cfg: serde_json::Value = serde_json::from_slice(&cfg).unwrap();
+        policy.store(false, admin).await.expect("flip off");
+        let (closed, _) = tdh::send(app.clone(), get("/api/v1/repositories")).await;
+        let (_, cfg_after) = tdh::send(app.clone(), get("/api/v1/system/config")).await;
+        let cfg_after: serde_json::Value = serde_json::from_slice(&cfg_after).unwrap();
+
+        sqlx::query("DELETE FROM system_settings WHERE key = $1")
+            .bind(&key)
+            .execute(&pool)
+            .await
+            .expect("cleanup setting");
+        tdh::cleanup_user(&pool, admin).await;
+
+        assert_eq!(open, StatusCode::OK);
+        assert_eq!(cfg["guest_access_enabled"], true);
+        assert_eq!(closed, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            cfg_after["guest_access_enabled"], false,
+            "/system/config must report the runtime value"
+        );
+    }
+
+    /// The two new admin surfaces (#2155 banner CRUD, #867 runtime settings)
+    /// must be gated by the admin block, not merely by the guest guard: an
+    /// authenticated NON-admin gets 403, and an anonymous caller with guests
+    /// ON gets 401. Pins that `/admin/banners` did not land in the public
+    /// `/banners` nest by mistake.
+    #[tokio::test]
+    async fn admin_banners_and_runtime_settings_refuse_non_admins() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state_with(pool.clone(), "/tmp/admin-gate-867-2155", |c| {
+            c.guest_access_enabled = true;
+            c.guest_access_env_pinned = true;
+        });
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let bearer = tdh::bearer_for(&state, user_id).await;
+        let app = super::create_router(state);
+        let req = |method: &str, uri: &str, body: serde_json::Value, auth: Option<&str>| {
+            let mut b = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json");
+            if let Some(a) = auth {
+                b = b.header("authorization", a);
+            }
+            b.body(Body::from(body.to_string())).unwrap()
+        };
+        let calls = [
+            (
+                "POST",
+                "/api/v1/admin/banners",
+                serde_json::json!({"title": "t", "message": "m"}),
+            ),
+            (
+                "PATCH",
+                "/api/v1/admin/settings/system",
+                serde_json::json!({"guest_access_enabled": false}),
+            ),
+            (
+                "GET",
+                "/api/v1/admin/settings/system",
+                serde_json::json!({}),
+            ),
+        ];
+        let mut results = Vec::new();
+        for (method, uri, body) in calls.iter() {
+            let (as_user, _) =
+                tdh::send(app.clone(), req(method, uri, body.clone(), Some(&bearer))).await;
+            let (anon, _) = tdh::send(app.clone(), req(method, uri, body.clone(), None)).await;
+            results.push((*method, *uri, as_user, anon));
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+        for (method, uri, as_user, anon) in results {
+            assert_eq!(as_user, StatusCode::FORBIDDEN, "non-admin {method} {uri}");
+            assert_eq!(anon, StatusCode::UNAUTHORIZED, "anonymous {method} {uri}");
+        }
+    }
+
     /// #3489: Swagger UI and the OpenAPI document must not be mounted unless
     /// the operator opted in. On `main` the gate was `ENVIRONMENT ==
     /// "development"` with a code default of `development`, so both surfaces
@@ -1587,5 +2783,40 @@ mod tests {
             String::from_utf8_lossy(&spec_body).contains("\"paths\""),
             "ENABLE_SWAGGER=true must serve the real OpenAPI document"
         );
+    }
+
+    /// #921: the webhook JWKS answers an anonymous caller even with guest
+    /// access disabled (receivers hold no credentials), while the rest of
+    /// `/api/v1/webhooks` stays gated.
+    #[tokio::test]
+    async fn webhook_jwks_is_public_with_guest_access_disabled_921() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        use crate::api::handlers::test_db_helpers as tdh;
+        // Env-pinned so the runtime `system_settings` row (#867) cannot turn
+        // the guard back on underneath this test.
+        let state = tdh::build_state_with(pool, "/tmp/jwks-921", |c| {
+            c.guest_access_enabled = false;
+            c.guest_access_env_pinned = true;
+        });
+        let app = super::create_router(state);
+        let (status, body, headers) =
+            tdh::send_with_headers(app.clone(), tdh::get("/api/v1/webhooks/jwks".to_string()))
+                .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=300")
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&body).expect("JWKS is JSON");
+        assert!(
+            doc["keys"].is_array(),
+            "JWKS must carry a keys array: {doc}"
+        );
+        let (list_status, _) = tdh::send(app, tdh::get("/api/v1/webhooks".to_string())).await;
+        assert_eq!(list_status, axum::http::StatusCode::UNAUTHORIZED);
     }
 }

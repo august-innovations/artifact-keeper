@@ -121,6 +121,11 @@ jobs:
   # and smoke jobs on a PR that changes nothing under docker/. Labels are
   # read live from the API, so "add the label, then re-run all jobs" works;
   # if that read fails they fall back to the labels in the event payload.
+  #
+  # `scanner_adapter` gates the Go job for docker/scanner-adapter (#4437): it
+  # is "true" when the change touches the adapter's sources (not its
+  # Markdown), its Dockerfile, or this workflow, and on every push, dispatch
+  # and failed listing. Independent of the arms below, like `tests`.
   changes:
     name: 🔍 Docs-Only Gate
     runs-on: ubuntu-24.04
@@ -139,6 +144,7 @@ jobs:
       tests: ${{ steps.filter.outputs.tests }}
       ci_full: ${{ steps.filter.outputs.ci_full }}
       ci_image: ${{ steps.filter.outputs.ci_image }}
+      scanner_adapter: ${{ steps.filter.outputs.scanner_adapter }}
     steps:
       # Push only, and only the tree-check script: on a push the checkout is
       # the protected branch's own commit. Pull requests are classified from
@@ -182,6 +188,7 @@ jobs:
             echo "backend=true" >> "$GITHUB_OUTPUT"
             echo "manifest=true" >> "$GITHUB_OUTPUT"
             echo "tests=true" >> "$GITHUB_OUTPUT"
+            echo "scanner_adapter=true" >> "$GITHUB_OUTPUT"
             rust=true
             if [ "$EVENT_NAME" = "push" ] && [ -f scripts/ci/resolve-verified-tree.sh ]; then
               # Fails open: a non-zero exit or anything but an explicit
@@ -204,6 +211,7 @@ jobs:
             echo "manifest=true" >> "$GITHUB_OUTPUT"
             echo "rust=true" >> "$GITHUB_OUTPUT"
             echo "tests=true" >> "$GITHUB_OUTPUT"
+            echo "scanner_adapter=true" >> "$GITHUB_OUTPUT"
             exit 0
           }
           if [ "$EVENT_NAME" = "merge_group" ]; then
@@ -228,6 +236,7 @@ jobs:
           manifest=false
           rust=false
           tests=false
+          scanner_adapter=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             # What the integration job reads that the unit shards do not:
@@ -238,6 +247,14 @@ jobs:
               *.md) ;;
               backend/tests/*|backend/migrations/*|.github/workflows/ci.yml)
                 tests=true
+                ;;
+            esac
+            # The Go job's inputs (#4437): the adapter module, the image
+            # that builds it, and this workflow. Docs are never Go inputs.
+            case "$f" in
+              *.md) ;;
+              docker/scanner-adapter/*|docker/Dockerfile.scanner-adapter|.github/workflows/ci.yml)
+                scanner_adapter=true
                 ;;
             esac
             # First arm: keep in sync with the `push` trigger's paths-ignore
@@ -308,11 +325,13 @@ jobs:
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
           echo "tests=$tests" >> "$GITHUB_OUTPUT"
+          echo "scanner_adapter=$scanner_adapter" >> "$GITHUB_OUTPUT"
           echo "non-docs changes: $code"
           echo "backend changes: $backend"
           echo "manifest/lockfile changes: $manifest"
           echo "rust-job inputs changed: $rust"
           echo "integration-job inputs changed: $tests"
+          echo "scanner-adapter Go inputs changed: $scanner_adapter"
 
   # ════════════════════════════════════════════════════════════════════════════
   # RELEASE-BUMP GATE
@@ -545,7 +564,7 @@ jobs:
       # group restores from the `refs/heads/main` entry (exact key or prefix
       # fallback). The repository sits at the 10 GiB cache limit, and
       # per-ref entries nobody restores are what push main's own entries out.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: v2-rust
           shared-key: clippy
@@ -732,16 +751,18 @@ jobs:
           tool: cargo-llvm-cov,cargo-nextest,sqlx-cli
 
       # The self-hosted runner image ships protoc; ubuntu-24.04 does not,
-      # and build scripts in the dependency tree need it.
+      # and build scripts in the dependency tree need it. services-1 also
+      # gets squashfs-tools so the incus scanner's real mksquashfs/unsquashfs
+      # tests run as the non-root runner user instead of skipping (#4470).
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler ${{ matrix.shard == 'services-1' && 'squashfs-tools' || '' }}
 
       # The instrumented dependency graph (~750 crates, 3.3 GB) is identical
       # in every leg, so all legs share one cache entry. Saved from `main`
       # only (see the note on check-rust's rust-cache step; a merge group's
       # ref is as unrestorable as a PR's) and from one leg only, so five legs
       # do not race to write the same key.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: v1-rust
           shared-key: unit-shard-instrumented
@@ -822,6 +843,9 @@ jobs:
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           AK_TESTS_REQUIRE_DB: "1"
+          # The squashfs tests fail instead of skipping where the tools are
+          # installed (see the protoc step).
+          AK_TESTS_REQUIRE_SQUASHFS: ${{ matrix.shard == 'services-1' && '1' || '' }}
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
           source <(cargo llvm-cov show-env --sh)
@@ -959,7 +983,7 @@ jobs:
       # were never considered fresh (jobs 35213124311 and 35213128071,
       # 2026-09-17). Here CARGO_HOME is the runner's ~/.cargo, the path
       # rust-cache is built for.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: v2-rust
           shared-key: integration
@@ -1048,6 +1072,7 @@ jobs:
               --test pypi_name_normalization \
               --test pypi_path_parse \
               --test pypi_version_conformance \
+              --test mcp_server_json_conformance \
               --test scan_dedup_short_circuit_tests; then
             echo "::error title=Integration test BUILD failed — no test ran::cargo could not build the integration test crates. A genuine compile error also fails Check Rust on this commit; if this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job. 'signal: 9 (SIGKILL)' means out of memory, already retried once (#3856)."
             exit 1
@@ -1104,6 +1129,7 @@ jobs:
             --test pypi_name_normalization \
             --test pypi_path_parse \
             --test pypi_version_conformance \
+            --test mcp_server_json_conformance \
             --test scan_dedup_short_circuit_tests
 
       # ── TIER 2: DB INTEGRATION SUITES ────────────────────────────────────
@@ -1183,6 +1209,7 @@ jobs:
             --test grpc_sbom_tests \
             --test search_reindex_tests \
             --test scan_convert_to_reused_tests \
+            --test finding_acknowledgement_tests \
             --test stuck_scan_janitor_tests \
             --test virtual_docker_grouped_listing_test \
             --test virtual_members_atomicity_test \
@@ -1195,6 +1222,7 @@ jobs:
             --test age_gate_tests \
             --test scan_policy_validation_tests \
             --test ansible_galaxy_tests \
+            --test agent_plugins_tests \
             --test admin_middleware_fresh_user_tests \
             --test backup_cleanup_reclaims_storage_tests \
             --test catalog_keyset_tests \
@@ -1204,17 +1232,24 @@ jobs:
             --test conda_environment_tests \
             --test conda_promotion_predicate_tests \
             --test conda_upload_scan_grading_tests \
+            --test generic_put_format_parity_tests \
             --test gitlfs_locks_tests \
             --test grouped_listing_keyset_tests \
+            --test listing_totals_tests \
             --test manifest_blob_refs_tests \
             --test maven_virtual_groupid_shadowing_test \
+            --test mcp_registry_proxy_tests \
             --test migration_storage_path_tests \
             --test oci_packages_index_tests \
             --test oci_upload_range_test \
             --test oci_virtual_resolution_tests \
+            --test mcp_virtual_resolution_tests \
+            --test mcp_auth_namespaces_tests \
+            --test mcp_introspection_queue_tests \
             --test optional_auth_deactivation_tests \
             --test promotion_block_unscanned_tests \
             --test promotion_open_cve_gating_tests \
+            --test proxy_stale_if_error_tests \
             --test pypi_proxy_upload_time_tests \
             --test rpm_generic_upload_metadata_tests \
             --test sbom_cached_artifact_not_analyzable_tests \
@@ -1263,6 +1298,7 @@ jobs:
             --test grpc_sbom_tests \
             --test search_reindex_tests \
             --test scan_convert_to_reused_tests \
+            --test finding_acknowledgement_tests \
             --test stuck_scan_janitor_tests \
             --test virtual_docker_grouped_listing_test \
             --test virtual_members_atomicity_test \
@@ -1275,6 +1311,7 @@ jobs:
             --test age_gate_tests \
             --test scan_policy_validation_tests \
             --test ansible_galaxy_tests \
+            --test agent_plugins_tests \
             --test admin_middleware_fresh_user_tests \
             --test backup_cleanup_reclaims_storage_tests \
             --test catalog_keyset_tests \
@@ -1284,17 +1321,24 @@ jobs:
             --test conda_environment_tests \
             --test conda_promotion_predicate_tests \
             --test conda_upload_scan_grading_tests \
+            --test generic_put_format_parity_tests \
             --test gitlfs_locks_tests \
             --test grouped_listing_keyset_tests \
+            --test listing_totals_tests \
             --test manifest_blob_refs_tests \
             --test maven_virtual_groupid_shadowing_test \
+            --test mcp_registry_proxy_tests \
             --test migration_storage_path_tests \
             --test oci_packages_index_tests \
             --test oci_upload_range_test \
             --test oci_virtual_resolution_tests \
+            --test mcp_virtual_resolution_tests \
+            --test mcp_auth_namespaces_tests \
+            --test mcp_introspection_queue_tests \
             --test optional_auth_deactivation_tests \
             --test promotion_block_unscanned_tests \
             --test promotion_open_cve_gating_tests \
+            --test proxy_stale_if_error_tests \
             --test pypi_proxy_upload_time_tests \
             --test rpm_generic_upload_metadata_tests \
             --test sbom_cached_artifact_not_analyzable_tests \
@@ -1429,6 +1473,20 @@ jobs:
       - name: dtrack-init regression test
         run: bash docker/test-init-dtrack.sh
 
+      # Stock compose secrets (#4478): docker-compose.yml and .env.example
+      # shipped JWT_SECRET / AK_WEBHOOK_SECRET_KEY values the backend refuses
+      # at startup, so the quickstart stack restarted forever. Pure file
+      # inspection, ~1s.
+      - name: Check the stock compose ships no secret the backend rejects
+        run: bash scripts/ci/check-compose-secret-defaults.sh
+
+      # Quickstart installer (#4313): the generated .env must use the compose
+      # file's ports, set Dependency-Track's flag only with its profile, keep
+      # AK_ADMIN_PASSWORD, and fall back to Podman when the docker daemon is
+      # unreachable. Runs the installer against stubs, ~1s.
+      - name: Check the quickstart installer matches the compose defaults
+        run: bash scripts/ci/check-installer-quickstart.sh
+
       # The cache-correctness E2E reads its verdict off the mock upstream's
       # counters, so a wrong mock reports a product bug that is not there. It
       # did: the backend revalidates an expired TTL with a CONDITIONAL HEAD
@@ -1441,6 +1499,9 @@ jobs:
       # no Docker, no network.
       - name: mock-upstream HTTP contract test
         run: bash scripts/native-tests/mock-upstream/test_mock_upstream.sh
+
+      - name: Check the stock compose names every image's registry
+        run: bash scripts/ci/check-compose-image-names.sh
 
       - name: Check release-preflight gates block on what they measure
         run: bash scripts/ci/test-release-preflight.sh
@@ -1492,6 +1553,8 @@ jobs:
         run: bash scripts/ci/test-registry-tag-digest.sh
       - name: Check the scanner-adapter exact-version parity check
         run: bash scripts/ci/test-assert-adapter-exact-version.sh
+      - name: Check the candidate certifies the scanner-adapter digest that ships
+        run: bash scripts/ci/test-pin-adapter-digest.sh
       - name: Check the dispatched-run follower selects the right run
         run: bash scripts/ci/test-follow-dispatched-run.sh
       - name: Check the CHANGELOG-documents-version gate
@@ -1524,6 +1587,13 @@ jobs:
       # silently rot. ~1s, no dependencies.
       - name: Check duplicate-migration gate catches what it must
         run: bash scripts/ci/test-check-duplicate-migrations.sh
+
+      # Stock compose exposure (#4480): Postgres (fixed login), OpenSearch
+      # (no security plugin), Trivy and OpenSCAP were published on 0.0.0.0.
+      # Only Caddy may publish beyond loopback in the default stack. Pure
+      # YAML inspection, ~1s.
+      - name: Check the stock compose publishes only the proxy beyond loopback
+        run: bash scripts/ci/check-compose-published-ports.sh
 
       # A release prep that renames `## [Unreleased]` to `## [X.Y.Z]` without
       # opening a fresh empty one strands every entry that lands after it:
@@ -1572,6 +1642,12 @@ jobs:
       - name: Check the conflict-marker gate catches what it must
         run: bash scripts/ci/test-check-conflict-markers.sh
 
+      # Stock compose version pins (#4481): openscap and web were hardcoded to
+      # :latest, so setting ARTIFACT_KEEPER_VERSION still left two images
+      # floating. Pure YAML inspection, ~1s.
+      - name: Check every first-party compose image follows a version pin
+        run: bash scripts/ci/check-compose-version-pins.sh
+
       # The other half of the CHANGELOG bookkeeping (#3797). A branch cut
       # before a release cut anchors its bullet to `## [Unreleased]`; the cut
       # renames that heading and opens a fresh one, so when the branch merges
@@ -1610,6 +1686,13 @@ jobs:
       - name: Check the instrumented-build retry only retries SIGKILLs
         run: bash scripts/ci/test-run-measured-build.sh
 
+      # Stock Caddyfile format routes (#4482, #1772): /pacman and /bazel were
+      # never routed to the backend and /general only via unreleased web
+      # code. Derives the prefixes from routes.rs `format_routes` and checks
+      # the Caddyfile routes each one. Pure file inspection, ~1s.
+      - name: Check the stock Caddyfile routes every backend format prefix
+        run: bash scripts/ci/check-caddy-format-routes.sh
+
       # The release-branch gate only runs on PRs against `release/*` — a
       # handful of runs per release, far too rare to notice a regression in.
       # It matters most for the two exemptions #3422 added (release prep,
@@ -1634,6 +1717,9 @@ jobs:
 
       - name: Check the docs/CI drift gate catches what it must
         run: bash scripts/ci/test-check-docs-test-command.sh
+
+      - name: Check the pre-push hook runs what it documents
+        run: bash scripts/ci/test-pre-push-hook.sh
 
       - name: Check the Rust toolchain pin has not re-floated
         run: ./scripts/ci/check-toolchain-pin.sh
@@ -1696,6 +1782,9 @@ jobs:
       - name: Check the published-attestation audit catches what it must
         run: bash scripts/ci/test-audit-published-attestations.sh
 
+      - name: Check the adapter published-set resolver fails closed
+        run: bash scripts/ci/test-adapter-published-set.sh
+
       # Release binaries shipped with only a `<name>.sha256` beside them, which
       # is served from the same place, by the same authority, as the artifact it
       # describes -- so whoever can replace the tarball can replace the checksum
@@ -1728,6 +1817,14 @@ jobs:
       # on throwaway files, ~1s.
       - name: Check the duplication gate's source preparation
         run: bash scripts/ci/test-jscpd-prepare-sources.sh
+
+      # The weekly whole-repo duplication scan (scheduled-tests.yml,
+      # duplication-report, #1619) is only worth its red run if it reports a
+      # regression exactly when there is one, and treats a source jscpd
+      # silently skipped as "not a measurement" rather than a clean 0%.
+      # Pure python on throwaway files, ~1s.
+      - name: Check the whole-repo duplication report
+        run: bash scripts/ci/test-jscpd-repo-report.sh
 
       # The unit-test matrix runs one shard of the inline tests per leg and
       # the coverage gates read the legs' merged lcov. Both scripts fail
@@ -1773,6 +1870,14 @@ jobs:
       # that must surface as INFRA rather than a pass. Offline.
       - name: Check the pinned base-image watch catches what it must
         run: bash scripts/ci/test-check-pinned-base-images.sh
+      # #4852's own lesson, made mechanical. The watch above named ONE image
+      # carrying stdlib v1.27.2; `GO_MIN_PATCH=1.27.2` was sitting in three
+      # Dockerfiles, and only a human noticing all three fixes the class rather
+      # than the image that was scanned. Disagreement between those floors can
+      # only mean one of them is behind, so it is drift, not a policy choice.
+      # Offline (it reads Dockerfiles, not the Go release index), ~1s.
+      - name: Check the Go toolchain floors agree
+        run: bash scripts/ci/test-check-go-floor-agreement.sh
 
       # The `changes` gate above decides whether the four Rust jobs run at
       # all, and a wrong "no" is invisible: the required contexts report the
@@ -1844,6 +1949,84 @@ jobs:
             echo "::error title=Version-pin gate could not be measured::The registry or the component table could not be read (exit 2). This is NOT a verdict about this PR and NOT a pass; re-run the job. See the INFRA line above."
           fi
           exit "$rc"
+
+  # The Go toolchain floor is written in several Dockerfiles and must name one
+  # version (#4852). The pinned-base-image watch named ONE image carrying
+  # stdlib v1.27.2, but `GO_MIN_PATCH=1.27.2` was in three files -- so the
+  # obvious repair, bumping the Dockerfile that was reported, leaves the same
+  # vulnerable stdlib in grype and buildctl on a floor nobody re-read. The
+  # invariant that stops that is agreement, and it is checked here at PR time
+  # because a scheduled watch can only ever see the image it scanned.
+  #
+  # Offline and instant: it reads Dockerfiles, not the Go release index (that
+  # question -- is this the newest patch of its minor -- is answered by the
+  # pinned-base-image watch scanning the published images). Gated on
+  # `docker/**` so it runs exactly when a floor can move, and -- like Version
+  # Pin Bump -- reported through ✅ CI Complete rather than as a new required
+  # context, so a failure blocks without a branch-protection change.
+  go-floor-agreement:
+    name: 🐹 Go Floor Agreement
+    needs: detect-changes
+    if: ${{ !cancelled() && needs.detect-changes.result == 'success' && needs.detect-changes.outputs.docker == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check every Dockerfile's Go toolchain floor agrees
+        run: bash scripts/ci/check-go-floor-agreement.sh
+
+  # The scanner adapter (docker/scanner-adapter, #2091) is a stdlib-only Go
+  # module with its own test suite, and nothing else ever runs it:
+  # Dockerfile.scanner-adapter only runs `go build`, so before #4437 the
+  # adapter's tests executed only on authors' machines (found reviewing #4352
+  # and #4395). This runs gofmt, go vet and the race-enabled tests whenever
+  # the `changes` gate sees an adapter input, on the Go version go.mod
+  # declares (the language floor; the image builds with a newer toolchain).
+  #
+  # Reported through ✅ CI Complete rather than as a new required context,
+  # like Version Pin Bump: a failure blocks, a skip passes only when the gate
+  # found no adapter input.
+  scanner-adapter-go:
+    name: 🐹 Scanner Adapter (Go)
+    needs: changes
+    if: ${{ needs.changes.outputs.scanner_adapter != 'false' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: docker/scanner-adapter
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: docker/scanner-adapter
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: docker/scanner-adapter/go.mod
+          # Stdlib-only module with no go.sum: nothing to cache.
+          cache: false
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error title=gofmt::These files need gofmt -w:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race ./...
 
   # The coverage GATES, evaluated from the reports the unit-test legs
   # (`test-backend-unit-shard`) wrote, merged into one report here first.
@@ -1934,7 +2117,7 @@ jobs:
         id: download
         if: steps.mb.outputs.rust_changed == 'true'
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: lcov-shard-*
           path: coverage-shards
@@ -2063,7 +2246,7 @@ jobs:
       - name: Setup Node.js for jscpd
         if: ${{ !cancelled() && steps.mb.outcome == 'success' }}
         continue-on-error: true
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v7.1.0
         with:
           node-version: '20'
 
@@ -2358,9 +2541,9 @@ jobs:
     # run 35878583014) against 3.5-6.5 min on ak-e2e-runners the same day.
     # The docker daemon and the compose plugin ship with the hosted image;
     # the two steps below that wait for / install them are no-ops there.
-    # The in-cluster suites (e2e.yml, scheduled-tests.yml, mesh, cache-
-    # correctness, concurrency, the scheduled trivy scan) stay on
-    # ak-e2e-runners.
+    # The in-cluster suites (e2e.yml, cache-correctness, concurrency, the
+    # scheduled trivy scan) stay on ak-e2e-runners; scheduled-tests.yml's
+    # nightly smoke moved here too, onto a prebuilt image (#4723).
     runs-on: ubuntu-24.04
     # Depend on the required fast-CI gates as well as the image build so a
     # known-red Check Rust or unit-test run never launches smoke. Smoke only
@@ -2423,7 +2606,7 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Download backend image from build job
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: backend-image
           path: /tmp
@@ -2738,7 +2921,7 @@ jobs:
     # Not smoke-e2e, build-backend-image or build-openscap-image: they are
     # advisory (see the container-chain note in the step below), and a
     # `needs` edge would make this required context wait ~25 min for them.
-    needs: [changes, release-bump, check-rust, test-backend-unit-shard, test-backend-unit, shell-tests, version-pin-bump, coverage-gates, security-audit]
+    needs: [changes, detect-changes, release-bump, check-rust, test-backend-unit-shard, test-backend-unit, shell-tests, version-pin-bump, scanner-adapter-go, go-floor-agreement, coverage-gates, security-audit]
     if: always()
     # The coverage decision reads the PR's live labels/draft state, the
     # override label's `labeled` events and `/coverage-override` comments,
@@ -2767,6 +2950,8 @@ jobs:
           RESULT_UNIT_SHARDS: ${{ needs.test-backend-unit-shard.result }}
           RESULT_SHELL: ${{ needs.shell-tests.result }}
           RESULT_VERSION_PIN: ${{ needs.version-pin-bump.result }}
+          RESULT_GO_FLOOR: ${{ needs.go-floor-agreement.result }}
+          RESULT_SCANNER_ADAPTER: ${{ needs.scanner-adapter-go.result }}
           RESULT_COVERAGE: ${{ needs.coverage-gates.result }}
           RESULT_SECURITY: ${{ needs.security-audit.result }}
           CODE_CHANGED: ${{ needs.changes.outputs.code }}
@@ -2774,6 +2959,8 @@ jobs:
           RUST_CHANGED: ${{ needs.changes.outputs.rust }}
           RUST_SKIP_REASON: ${{ needs.changes.outputs.rust_skip_reason }}
           MANIFEST_CHANGED: ${{ needs.changes.outputs.manifest }}
+          SCANNER_ADAPTER_CHANGED: ${{ needs.changes.outputs.scanner_adapter }}
+          DOCKER_CHANGED: ${{ needs.detect-changes.outputs.docker }}
           BUMP_ONLY: ${{ needs.release-bump.outputs.bump_only }}
           COVERAGE_FLOOR: ${{ needs.coverage-gates.outputs.floor }}
           COVERAGE_FLOOR_PCT: ${{ needs.coverage-gates.outputs.floor_pct }}
@@ -2923,6 +3110,36 @@ jobs:
             require_success "version-pin-bump" "$RESULT_VERSION_PIN"
           else
             allow_skip "version-pin-bump" "$RESULT_VERSION_PIN"
+          fi
+
+          # The Go-floor agreement gate runs only when `docker/**` changed, so a
+          # skip is expected on almost every PR. Only an explicit "false" lets
+          # it pass -- an empty DOCKER_CHANGED (detect-changes itself died, or
+          # the event is a merge group, where detect-changes does not run at
+          # all: see its `if:`) makes a skip fatal, matching the job's own
+          # fail-open-to-running condition. In a merge group the group contains
+          # a PR that already had the gate evaluated, and the group adds no
+          # change of its own, so a fatal skip there would be a false block --
+          # hence the event check, as for version-pin-bump. On a push the tree
+          # is the protected branch's own commit and detect-changes reports
+          # docker=true for any docker/ file in it, so a real failure is never
+          # skipped.
+          if [[ "$GITHUB_EVENT_NAME" == "merge_group" ]]; then
+            allow_skip "go-floor-agreement" "$RESULT_GO_FLOOR"
+          elif [[ "${DOCKER_CHANGED:-}" == "false" ]]; then
+            allow_skip "go-floor-agreement" "$RESULT_GO_FLOOR"
+          else
+            require_success "go-floor-agreement" "$RESULT_GO_FLOOR"
+          fi
+
+          # The scanner adapter's Go job (#4437) runs only when the `changes`
+          # gate saw an adapter input. Only an explicit "false" lets its skip
+          # pass -- an empty output (the gate died) makes a skip fatal,
+          # matching the job's own fail-open `!= 'false'` condition.
+          if [[ "${SCANNER_ADAPTER_CHANGED:-}" == "false" ]]; then
+            allow_skip "scanner-adapter-go" "$RESULT_SCANNER_ADAPTER"
+          else
+            require_success "scanner-adapter-go" "$RESULT_SCANNER_ADAPTER"
           fi
 
           # Container chain (build-backend-image -> smoke-e2e, plus the

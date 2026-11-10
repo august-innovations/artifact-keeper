@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::models::curation::{CurationDecision, CurationPackage, CurationRule};
+use crate::services::version_order::{compare_digit_runs, compare_natural_segment};
 
 /// Result of evaluating a package against curation rules.
 #[derive(Debug, Clone, Serialize)]
@@ -990,7 +991,7 @@ impl CurationService {
         // One cached source for the whole batch: repeated evaluations of the
         // same package hit the in-memory TTL cache, not the public APIs.
         let popularity_source =
-            crate::services::curation::popularity_source::HttpPopularitySource::new().cached();
+            crate::services::curation::popularity_source::HttpPopularitySource::from_env().cached();
 
         // #3230: re-evaluation must not lose a verification the scheduler
         // already computed and persisted. Without this the marker is per-tick
@@ -1068,36 +1069,46 @@ impl CurationService {
 // ---------------------------------------------------------------------------
 
 /// Compare two version strings. Returns -1, 0, or 1.
-/// Splits on `.` and `-`, compares segments numerically when possible.
+///
+/// A leading epoch, Debian/RPM `N:` or PEP 440 / conda `N!`, is compared
+/// numerically first, a missing epoch counting as 0 (#4507). The rest is split
+/// on `.` and `-` and compared segment by segment in natural order: the
+/// leading digits by value, then the rest lexically.
 pub(crate) fn version_compare(a: &str, b: &str) -> i32 {
-    let seg_a: Vec<&str> = a.split(['.', '-']).collect();
-    let seg_b: Vec<&str> = b.split(['.', '-']).collect();
+    let (epoch_a, rest_a) = split_epoch(a);
+    let (epoch_b, rest_b) = split_epoch(b);
+    match compare_digit_runs(epoch_a, epoch_b) {
+        std::cmp::Ordering::Less => return -1,
+        std::cmp::Ordering::Greater => return 1,
+        std::cmp::Ordering::Equal => {}
+    }
+
+    let seg_a: Vec<&str> = rest_a.split(['.', '-']).collect();
+    let seg_b: Vec<&str> = rest_b.split(['.', '-']).collect();
 
     for i in 0..seg_a.len().max(seg_b.len()) {
         let sa = seg_a.get(i).unwrap_or(&"0");
         let sb = seg_b.get(i).unwrap_or(&"0");
 
-        // Try numeric comparison first
-        match (sa.parse::<u64>(), sb.parse::<u64>()) {
-            (Ok(na), Ok(nb)) => {
-                if na < nb {
-                    return -1;
-                }
-                if na > nb {
-                    return 1;
-                }
-            }
-            _ => {
-                // Lexicographic fallback
-                match sa.cmp(sb) {
-                    std::cmp::Ordering::Less => return -1,
-                    std::cmp::Ordering::Greater => return 1,
-                    std::cmp::Ordering::Equal => {}
-                }
-            }
+        match compare_natural_segment(sa, sb) {
+            std::cmp::Ordering::Less => return -1,
+            std::cmp::Ordering::Greater => return 1,
+            std::cmp::Ordering::Equal => {}
         }
     }
     0
+}
+
+/// Split a leading epoch off a version: a non-empty run of ASCII digits
+/// followed by `:` (Debian/RPM) or `!` (PEP 440 / conda). A version without
+/// one has epoch `"0"`. Anything else before a `:` or `!` is not an epoch and
+/// stays part of the version.
+fn split_epoch(version: &str) -> (&str, &str) {
+    let digits = version.bytes().take_while(u8::is_ascii_digit).count();
+    match version.as_bytes().get(digits) {
+        Some(b':' | b'!') if digits > 0 => (&version[..digits], &version[digits + 1..]),
+        _ => ("0", version),
+    }
 }
 
 #[cfg(ak_test_shard = "services-1")]
@@ -1105,6 +1116,132 @@ pub(crate) fn version_compare(a: &str, b: &str) -> i32 {
 #[allow(clippy::cloned_ref_to_slice_refs)]
 mod tests {
     use super::*;
+
+    // -- version_compare --
+
+    #[test]
+    fn test_version_compare_orders_hash_and_numeric_segments_consistently() {
+        // A lexical fallback for the mixed case made 74 < 103 < 2150693d < 74.
+        assert!(version_compare("2.0.0-next.74", "2.0.0-next.103") < 0);
+        assert!(version_compare("2.0.0-next.103", "2.0.0-next.2150693d") < 0);
+        assert!(version_compare("2.0.0-next.74", "2.0.0-next.2150693d") < 0);
+        assert!(version_compare("1.0.0-1", "1.0.0-alpha") < 0);
+    }
+
+    #[test]
+    fn test_version_compare_keeps_digit_led_suffixes_below_the_next_release() {
+        // PEP 440 pre-releases and local versions, Debian revisions, Go
+        // `+incompatible`: a segment that starts with digits ranks by them.
+        assert!(version_compare("1.1rc1", "1.2") < 0);
+        assert!(version_compare("2.0.0rc1", "2.0.1") < 0);
+        assert!(version_compare("2.0.0+cu118", "2.0.1") < 0);
+        assert!(version_compare("v2.0.0+incompatible", "v2.0.1") < 0);
+        assert!(version_compare("2.30-1ubuntu1", "2.30-2") < 0);
+    }
+
+    #[test]
+    fn test_version_compare_is_transitive_on_mixed_prereleases() {
+        // confusing-browser-globals mixes `next.<n>` and `next.<hash>`
+        // prereleases. A lexical fallback for the mixed case made
+        // `74 < 103 < 2150693d < 74`. Check every triple rather than sort:
+        // whether `sort_by` notices a cycle depends on the input order.
+        let versions: Vec<&str> = concat!(
+            "1.0.5 1.0.5-next.9b4009d7 1.0.10 1.0.11 1.1.0-next.14 1.1.0-next.103 ",
+            "2.0.0-next.03604a46 2.0.0-next.096703ab 2.0.0-next.101 2.0.0-next.103 ",
+            "2.0.0-next.2150693d 2.0.0-next.300 2.0.0-next.3e165448 2.0.0-next.74 ",
+            "2.0.0-next.91 2.0.0-next.9754a231 2.0.0-next.fb6e6f70 ",
+        )
+        .split_whitespace()
+        .collect();
+        for a in &versions {
+            for b in &versions {
+                for c in &versions {
+                    if version_compare(a, b) < 0 && version_compare(b, c) < 0 {
+                        assert!(version_compare(a, c) < 0, "{a} < {b} < {c}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// #4507: a Debian/RPM `N:` or PEP 440 / conda `N!` epoch is compared
+    /// numerically before the rest of the version, and a missing epoch is 0.
+    #[test]
+    fn test_version_compare_orders_epochs_first_4507() {
+        // Debian/RPM: an epoch of 1 outranks every epoch-0 version.
+        assert_eq!(version_compare("1:2.0-1", "10.0-1"), 1);
+        assert_eq!(version_compare("10.0-1", "1:2.0-1"), -1);
+        assert_eq!(version_compare("1:1.0", "2.0"), 1);
+        assert_eq!(version_compare("2:0.1", "1:99.0"), 1);
+        assert_eq!(version_compare("10:1.0", "9:1.0"), 1);
+        // An explicit zero epoch equals no epoch.
+        assert_eq!(version_compare("0:1.0", "1.0"), 0);
+        assert_eq!(version_compare("0:1.0-1", "1.0-1"), 0);
+        // PEP 440 / conda.
+        assert_eq!(version_compare("1!2.0", "2.0"), 1);
+        assert_eq!(version_compare("1!1.0", "999.0"), 1);
+        assert_eq!(version_compare("0!1.0", "1.0"), 0);
+        // Same epoch: the rest decides, in the existing natural order.
+        assert_eq!(version_compare("1:2.0-1", "1:10.0-1"), -1);
+        assert_eq!(version_compare("1!2.0", "1!2.0"), 0);
+    }
+
+    /// #4507: the epoch decides curation rule matches for deb and rpm
+    /// versions, in both directions.
+    #[test]
+    fn test_version_matches_honours_epochs_4507() {
+        assert!(!CurationService::version_matches("< 10.0", "1:2.0-1"));
+        assert!(CurationService::version_matches(">= 10.0", "1:2.0-1"));
+        assert!(CurationService::version_matches("> 2.0", "1:1.0"));
+        assert!(CurationService::version_matches("= 1.0", "0:1.0"));
+        assert!(CurationService::version_matches("< 1:0.1", "99.0"));
+    }
+
+    /// #4507: parsing epochs must keep the comparator a total order, or the
+    /// `sort_by` callers (Hex, NuGet, packages) can panic.
+    #[test]
+    fn test_version_compare_with_epochs_is_a_total_order_4507() {
+        let corpus = [
+            "",
+            "0",
+            "1.0",
+            "1.0-1",
+            "2.0",
+            "10.0-1",
+            "0:1.0",
+            "1:1.0",
+            "1:2.0-1",
+            "2:0.1",
+            "1!2.0",
+            "0!1.0",
+            "1!1.0",
+            "1:",
+            ":1.0",
+            "a:1.0",
+            "1:a",
+            "1.0:2",
+            "x!1",
+            "01:1.0",
+            "2.0.0-next.74",
+            "2.0.0-next.2150693d",
+            "1.0rc1",
+        ];
+        for a in &corpus {
+            assert_eq!(version_compare(a, a), 0, "{a:?} must equal itself");
+            for b in &corpus {
+                assert_eq!(
+                    version_compare(a, b),
+                    -version_compare(b, a),
+                    "{a:?} vs {b:?}"
+                );
+                for c in &corpus {
+                    if version_compare(a, b) <= 0 && version_compare(b, c) <= 0 {
+                        assert!(version_compare(a, c) <= 0, "{a:?} <= {b:?} <= {c:?}");
+                    }
+                }
+            }
+        }
+    }
 
     // -- glob matching --
 
@@ -1452,8 +1589,9 @@ mod tests {
         );
 
         // Epoch: `>= 2.0` admits 1!2.0 under conda semantics (the epoch
-        // dominates); the generic comparator saw "1!2" < "2". Both conda
-        // format spellings route here (#4039).
+        // dominates). Both conda format spellings route here (#4039). Since
+        // #4507 the generic comparator parses epochs too, so an rpm version
+        // with an epoch (`1:2.0`) satisfies the same rule.
         let epoch_rule = make_rule("zlib", ">= 2.0", "*", "block");
         let conda = CurationService::evaluate_typed_rule(
             &epoch_rule,
@@ -1472,12 +1610,15 @@ mod tests {
             &epoch_rule,
             "rpm",
             "zlib",
-            "1!2.0",
+            "1:2.0",
             &serde_json::json!({}),
             &no_source(),
         )
         .await;
-        assert_eq!(generic, CurationDecision::NotApplicable);
+        assert!(
+            matches!(generic, CurationDecision::Block(_)),
+            "generic semantics: the rpm epoch dominates (#4507), got {generic:?}"
+        );
     }
 
     #[tokio::test]
@@ -1793,8 +1934,7 @@ mod tests {
     // `RowNotFound` (update). These tests are DB-backed and skip silently when
     // `DATABASE_URL` is unset so offline `cargo test --lib` stays usable.
     async fn try_service() -> Option<CurationService> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = sqlx::PgPool::connect(&url).await.ok()?;
+        let pool = crate::testing::try_pool_with(5).await?;
         Some(CurationService::new(pool))
     }
 

@@ -6,7 +6,8 @@
 
 use axum::{
     body::Body,
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, RawQuery, State},
+    http::{header, HeaderMap, HeaderValue},
     response::Response,
     routing::{delete, get},
     Json, Router,
@@ -173,6 +174,7 @@ pub fn router() -> Router<SharedState> {
             get(proxy_get)
                 .post(proxy_post)
                 .put(proxy_put)
+                .patch(proxy_patch)
                 .delete(proxy_delete),
         )
 }
@@ -281,6 +283,23 @@ fn validate_proxy_path(path: &str) -> Result<()> {
             "Proxy path must start with api/ or health".into(),
         ));
     }
+    // Refuse relay-of-relay: the remote's own `/api/v1/instances` surface
+    // (instance management and its proxy) must not be reachable through this
+    // relay, otherwise one relay could chain to another server. Compare on a
+    // lowercased, slash-collapsed form so `api//v1/Instances/` is caught too.
+    let collapsed = normalized
+        .split('/')
+        .filter(|seg| !seg.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_ascii_lowercase();
+    if collapsed == "api/v1/instances" || collapsed.starts_with("api/v1/instances/") {
+        return Err(AppError::Validation(
+            "Proxy path must not target api/v1/instances: relaying to another \
+             instance's relay or instance registry is not allowed"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -289,8 +308,64 @@ fn build_target_url(base: &str, path: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), path)
 }
 
+/// Append the caller's raw query string (as received, still percent-encoded)
+/// to the target URL so pagination, search and filter parameters reach the
+/// remote. An absent or empty query leaves the URL unchanged.
+fn append_query(target: String, query: Option<&str>) -> String {
+    match query {
+        Some(q) if !q.is_empty() => format!("{target}?{q}"),
+        _ => target,
+    }
+}
+
+/// Upstream response headers relayed back to the caller. `content-length` is
+/// forwarded only when the upstream sent one (a chunked upstream stays chunked);
+/// hop-by-hop headers (`transfer-encoding`, `connection`, ...) and headers that
+/// would point the caller at the remote host (`location`, `set-cookie`) are
+/// deliberately not relayed.
+const FORWARDED_RESPONSE_HEADERS: &[header::HeaderName] = &[
+    header::CONTENT_TYPE,
+    header::CONTENT_LENGTH,
+    header::CONTENT_DISPOSITION,
+    header::CONTENT_RANGE,
+    header::ACCEPT_RANGES,
+    header::ETAG,
+    header::LAST_MODIFIED,
+    header::CACHE_CONTROL,
+    header::LINK,
+    header::RETRY_AFTER,
+];
+
+/// Non-standard upstream response headers relayed back to the caller
+/// (pagination counters some API responses carry).
+const FORWARDED_RESPONSE_EXTRA_HEADERS: &[&str] = &["x-total-count"];
+
+/// Build the upstream request. The caller's `content-type` is passed through
+/// for verbs that carry a body; when the caller sent none the relay keeps its
+/// historical `application/json` default so existing JSON callers are
+/// unaffected.
+fn build_upstream_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    target: &str,
+    api_key: &str,
+    content_type: Option<&HeaderValue>,
+    body: Option<axum::body::Bytes>,
+) -> reqwest::RequestBuilder {
+    let mut req = client.request(method, target).bearer_auth(api_key);
+    if let Some(body) = body {
+        let ct = content_type
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+        req = req
+            .header(header::CONTENT_TYPE, ct)
+            .body(reqwest::Body::from(body));
+    }
+    req
+}
+
 /// Convert a reqwest response into an axum response, forwarding status and
-/// content-type.
+/// the [`FORWARDED_RESPONSE_HEADERS`] allow-list.
 ///
 /// The upstream body is *streamed* straight through to the client via
 /// [`Body::from_stream`] rather than being buffered into memory first. This
@@ -310,11 +385,20 @@ fn reqwest_to_axum(
 ) -> Result<Response> {
     let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-    let content_type = resp.headers().get("content-type").cloned();
-    // Forward the upstream content-length when present; omit it for chunked
-    // upstreams (Body::from_stream yields a chunked response) rather than
-    // fabricate one.
-    let content_length = resp.headers().get("content-length").cloned();
+    // Forward an allow-list of upstream headers. content-length is forwarded
+    // only when present; for chunked upstreams it is omitted
+    // (Body::from_stream yields a chunked response) rather than fabricated.
+    let mut forwarded = HeaderMap::new();
+    for name in FORWARDED_RESPONSE_HEADERS {
+        for value in resp.headers().get_all(name) {
+            forwarded.append(name.clone(), value.clone());
+        }
+    }
+    for name in FORWARDED_RESPONSE_EXTRA_HEADERS {
+        for value in resp.headers().get_all(*name) {
+            forwarded.append(header::HeaderName::from_static(name), value.clone());
+        }
+    }
 
     let body = GuardedProxyBody {
         inner: Box::pin(resp.bytes_stream()),
@@ -322,23 +406,20 @@ fn reqwest_to_axum(
         _permit: permit,
     };
 
-    let mut builder = Response::builder().status(status);
-    if let Some(ct) = content_type {
-        builder = builder.header("content-type", ct);
-    }
-    if let Some(cl) = content_length {
-        builder = builder.header("content-length", cl);
-    }
-    builder
+    let mut response = Response::builder()
+        .status(status)
         .body(Body::from_stream(body))
-        .map_err(|e| AppError::Internal(format!("Failed to build response: {e}")))
+        .map_err(|e| AppError::Internal(format!("Failed to build response: {e}")))?;
+    response.headers_mut().extend(forwarded);
+    Ok(response)
 }
 
-/// Shared proxy dispatch for all four verbs. Validates the sub-path, resolves
+/// Shared proxy dispatch for all five verbs. Validates the sub-path, resolves
 /// the decrypted remote URL + API key, forwards the request to the remote
 /// instance and streams the response back. `body` is `Some` only for verbs
-/// that carry a request body (POST/PUT); it is attached zero-copy via
-/// [`reqwest::Body::from`] with a JSON content-type.
+/// that carry a request body (POST/PUT/PATCH); it is attached zero-copy via
+/// [`reqwest::Body::from`] with the caller's content-type (JSON when absent).
+/// The caller's raw query string is appended to the target URL.
 ///
 /// Three layers bound resource use so a hostile/slow upstream cannot exhaust the
 /// backend: the proxy client's idle connect/read timeout (bounds inactivity), an
@@ -346,12 +427,15 @@ fn reqwest_to_axum(
 /// body via [`GuardedProxyBody`] (bounds a cooperative trickle that never idles),
 /// and a per-user concurrency cap (bounds file-descriptor/socket exhaustion;
 /// over the cap → 429).
+#[allow(clippy::too_many_arguments)]
 async fn send_proxy_request(
     state: &SharedState,
     auth: &AuthExtension,
     id: Uuid,
     path: &str,
+    query: Option<&str>,
     method: reqwest::Method,
+    content_type: Option<&HeaderValue>,
     body: Option<axum::body::Bytes>,
 ) -> Result<Response> {
     validate_proxy_path(path)?;
@@ -370,19 +454,19 @@ async fn send_proxy_request(
     };
 
     let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
-    let target = build_target_url(&url, path);
+    let target = append_query(build_target_url(&url, path), query);
 
     // Absolute deadline for the entire relay (headers + full body transfer).
     let deadline = tokio::time::Instant::now() + proxy_total_timeout();
 
-    let mut req = crate::services::http_client::proxy_client()
-        .request(method, &target)
-        .bearer_auth(&api_key);
-    if let Some(body) = body {
-        req = req
-            .header("content-type", "application/json")
-            .body(reqwest::Body::from(body));
-    }
+    let req = build_upstream_request(
+        &crate::services::http_client::proxy_client(),
+        method,
+        &target,
+        &api_key,
+        content_type,
+        body,
+    );
 
     // Bound the header/connect phase by the same total budget; the body phase is
     // bounded by GuardedProxyBody using the shared deadline.
@@ -404,6 +488,35 @@ async fn send_proxy_request(
 // Proxy handlers
 // ---------------------------------------------------------------------------
 
+/// Relay a body-carrying request (POST/PUT/PATCH) to the remote instance.
+///
+/// The three verbs differ only in the upstream method; sharing this entry point
+/// keeps their content-type passthrough and body handling identical instead of
+/// letting a newly added verb drift (#4795).
+#[allow(clippy::too_many_arguments)]
+async fn relay_with_body(
+    state: SharedState,
+    auth: AuthExtension,
+    id: Uuid,
+    path: String,
+    query: Option<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+    method: reqwest::Method,
+) -> Result<Response> {
+    send_proxy_request(
+        &state,
+        &auth,
+        id,
+        &path,
+        query.as_deref(),
+        method,
+        headers.get(header::CONTENT_TYPE),
+        Some(body),
+    )
+    .await
+}
+
 /// Proxy a GET request to a remote instance
 #[utoipa::path(
     get,
@@ -423,8 +536,19 @@ async fn proxy_get(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path((id, path)): Path<(Uuid, String)>,
+    RawQuery(query): RawQuery,
 ) -> Result<Response> {
-    send_proxy_request(&state, &auth, id, &path, reqwest::Method::GET, None).await
+    send_proxy_request(
+        &state,
+        &auth,
+        id,
+        &path,
+        query.as_deref(),
+        reqwest::Method::GET,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Proxy a POST request to a remote instance
@@ -447,9 +571,21 @@ async fn proxy_post(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path((id, path)): Path<(Uuid, String)>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response> {
-    send_proxy_request(&state, &auth, id, &path, reqwest::Method::POST, Some(body)).await
+    relay_with_body(
+        state,
+        auth,
+        id,
+        path,
+        query,
+        headers,
+        body,
+        reqwest::Method::POST,
+    )
+    .await
 }
 
 /// Proxy a PUT request to a remote instance
@@ -472,9 +608,58 @@ async fn proxy_put(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path((id, path)): Path<(Uuid, String)>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response> {
-    send_proxy_request(&state, &auth, id, &path, reqwest::Method::PUT, Some(body)).await
+    relay_with_body(
+        state,
+        auth,
+        id,
+        path,
+        query,
+        headers,
+        body,
+        reqwest::Method::PUT,
+    )
+    .await
+}
+
+/// Proxy a PATCH request to a remote instance
+#[utoipa::path(
+    patch,
+    path = "/{id}/proxy/{path}",
+    context_path = "/api/v1/instances",
+    tag = "admin",
+    params(
+        ("id" = Uuid, Path, description = "Remote instance ID"),
+        ("path" = String, Path, description = "Sub-path to proxy"),
+    ),
+    request_body(content = inline(String), content_type = "application/octet-stream"),
+    responses(
+        (status = 200, description = "Proxied response"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn proxy_patch(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path((id, path)): Path<(Uuid, String)>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response> {
+    relay_with_body(
+        state,
+        auth,
+        id,
+        path,
+        query,
+        headers,
+        body,
+        reqwest::Method::PATCH,
+    )
+    .await
 }
 
 /// Proxy a DELETE request to a remote instance
@@ -496,8 +681,19 @@ async fn proxy_delete(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path((id, path)): Path<(Uuid, String)>,
+    RawQuery(query): RawQuery,
 ) -> Result<Response> {
-    send_proxy_request(&state, &auth, id, &path, reqwest::Method::DELETE, None).await
+    send_proxy_request(
+        &state,
+        &auth,
+        id,
+        &path,
+        query.as_deref(),
+        reqwest::Method::DELETE,
+        None,
+        None,
+    )
+    .await
 }
 
 #[derive(OpenApi)]
@@ -509,6 +705,7 @@ async fn proxy_delete(
         proxy_get,
         proxy_post,
         proxy_put,
+        proxy_patch,
         proxy_delete,
     ),
     components(schemas(CreateInstanceRequest, RemoteInstanceResponse,))
@@ -913,5 +1110,298 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "must abort at the ~150ms deadline, not hang"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #4776: query forwarding, content-type passthrough, response headers,
+    // relay-of-relay refusal
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_append_query_forwards_raw_query_string() {
+        let target = build_target_url("http://remote.example", "api/v1/repositories");
+        assert_eq!(
+            append_query(target.clone(), Some("per_page=5&page=2&q=a%20b")),
+            "http://remote.example/api/v1/repositories?per_page=5&page=2&q=a%20b"
+        );
+        assert_eq!(append_query(target.clone(), None), target);
+        assert_eq!(append_query(target.clone(), Some("")), target);
+    }
+
+    #[test]
+    fn test_validate_proxy_path_refuses_relay_of_relay() {
+        let id = Uuid::new_v4();
+        for path in [
+            format!("api/v1/instances/{id}/proxy/health"),
+            format!("/api/v1/instances/{id}/proxy/api/v1/repositories"),
+            "api/v1/instances".to_string(),
+            "api/v1/instances/".to_string(),
+            format!("api//v1/Instances/{id}"),
+            "api/V1/INSTANCES".to_string(),
+        ] {
+            let err = validate_proxy_path(&path).expect_err(&path);
+            assert!(
+                matches!(&err, AppError::Validation(msg) if msg.contains("api/v1/instances")),
+                "{path}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_proxy_path_still_allows_regular_paths() {
+        for path in [
+            "api/v1/repositories",
+            "/api/v1/repositories/my-repo",
+            "api/v1/instances-stats",
+            "api/v1/system/instances",
+            "health",
+        ] {
+            assert!(validate_proxy_path(path).is_ok(), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_build_upstream_request_passes_caller_content_type() {
+        let client = reqwest::Client::new();
+        let ct = HeaderValue::from_static("multipart/form-data; boundary=xyz");
+        let req = build_upstream_request(
+            &client,
+            reqwest::Method::POST,
+            "http://remote.example/api/v1/upload",
+            "key",
+            Some(&ct),
+            Some(Bytes::from_static(b"--xyz--")),
+        )
+        .build()
+        .expect("request builds");
+        assert_eq!(
+            req.headers().get("content-type").unwrap(),
+            "multipart/form-data; boundary=xyz"
+        );
+        assert_eq!(req.headers().get("authorization").unwrap(), "Bearer key");
+    }
+
+    #[test]
+    fn test_build_upstream_request_defaults_body_content_type_to_json() {
+        let client = reqwest::Client::new();
+        let req = build_upstream_request(
+            &client,
+            reqwest::Method::PUT,
+            "http://remote.example/api/v1/x",
+            "key",
+            None,
+            Some(Bytes::from_static(b"{}")),
+        )
+        .build()
+        .expect("request builds");
+        assert_eq!(
+            req.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+
+        // Bodyless verbs carry no content-type at all.
+        let ct = HeaderValue::from_static("application/json");
+        let req = build_upstream_request(
+            &client,
+            reqwest::Method::GET,
+            "http://remote.example/api/v1/x?page=2",
+            "key",
+            Some(&ct),
+            None,
+        )
+        .build()
+        .expect("request builds");
+        assert!(req.headers().get("content-type").is_none());
+        assert_eq!(req.url().query(), Some("page=2"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #4795: PATCH relay
+    // -----------------------------------------------------------------------
+
+    /// The relay used to answer `405 Method Not Allowed` for PATCH, so the web
+    /// UI could not forward a partial update (repository settings edits,
+    /// chunked-upload session updates) to a remote instance. Drive the real
+    /// router with a PATCH and a wiremock upstream, asserting the method, body,
+    /// query string and content-type reach the remote and its response comes
+    /// back.
+    #[tokio::test]
+    async fn test_relay_patch_forwards_partial_update() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use tower::ServiceExt;
+        use wiremock::matchers::{body_bytes, header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fixture) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/repositories/repo-1"))
+            .and(query_param("force", "true"))
+            .and(header("authorization", "Bearer peer-key"))
+            .and(header("content-type", "application/json"))
+            .and(body_bytes(r#"{"description":"updated"}"#))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(
+                        r#"{"id":"repo-1","description":"updated"}"#,
+                        "application/json",
+                    )
+                    .insert_header("etag", "\"v2\""),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let instance = RemoteInstanceService::create(
+            &fixture.pool,
+            fixture.user_id,
+            "peer",
+            &upstream.uri(),
+            "peer-key",
+        )
+        .await
+        .expect("create remote instance");
+
+        let app = tdh::router_with_auth_ext(
+            router(),
+            fixture.state.clone(),
+            tdh::make_auth(fixture.user_id, &fixture.username),
+        );
+        let request = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!(
+                "/{}/proxy/api/v1/repositories/repo-1?force=true",
+                instance.id
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"description":"updated"}"#))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("router handles PATCH");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            response.headers().get("etag").and_then(|v| v.to_str().ok()),
+            Some("\"v2\"")
+        );
+        // Test-only: drain the streamed body to assert it was relayed intact.
+        #[allow(clippy::disallowed_methods)]
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        assert_eq!(&body[..], br#"{"id":"repo-1","description":"updated"}"#);
+        upstream.verify().await;
+    }
+
+    /// #4795: PATCH goes through the same guards as the other verbs. A path
+    /// outside the relay allow-list, a relay-of-relay path and another user's
+    /// instance are all refused before anything reaches the upstream.
+    #[tokio::test]
+    async fn test_relay_patch_keeps_path_and_owner_guards() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use tower::ServiceExt;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fixture) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let instance = RemoteInstanceService::create(
+            &fixture.pool,
+            fixture.user_id,
+            "peer",
+            &upstream.uri(),
+            "peer-key",
+        )
+        .await
+        .expect("create remote instance");
+        let (other_id, other_name) = tdh::create_user(&fixture.pool).await;
+
+        let patch = |auth: AuthExtension, uri: String| {
+            let app = tdh::router_with_auth_ext(router(), fixture.state.clone(), auth);
+            let req = axum::http::Request::builder()
+                .method("PATCH")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"description":"x"}"#))
+                .expect("build request");
+            async move { app.oneshot(req).await.expect("router").status() }
+        };
+        let owner = tdh::make_auth(fixture.user_id, &fixture.username);
+
+        for sub in [
+            "admin/settings",
+            "api/v1/instances/00000000-0000-0000-0000-000000000000",
+            "api/../admin",
+        ] {
+            assert_eq!(
+                patch(owner.clone(), format!("/{}/proxy/{sub}", instance.id)).await,
+                axum::http::StatusCode::BAD_REQUEST,
+                "PATCH to {sub} must be refused"
+            );
+        }
+        assert_eq!(
+            patch(
+                tdh::make_auth(other_id, &other_name),
+                format!("/{}/proxy/api/v1/repositories/r", instance.id)
+            )
+            .await,
+            axum::http::StatusCode::NOT_FOUND,
+            "another user's instance must not be relayable"
+        );
+
+        upstream.verify().await;
+        tdh::cleanup_user(&fixture.pool, other_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_reqwest_to_axum_forwards_allow_listed_headers_only() {
+        let upstream = http::response::Builder::new()
+            .status(200)
+            .header("content-type", "application/octet-stream")
+            .header("content-length", "3")
+            .header("content-disposition", "attachment; filename=\"a.tgz\"")
+            .header("etag", "\"abc\"")
+            .header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+            .header("x-total-count", "42")
+            .header("link", "</api/v1/x?page=2>; rel=\"next\"")
+            .header("set-cookie", "remote=1")
+            .header("location", "http://remote.example/elsewhere")
+            .body(b"abc".to_vec())
+            .unwrap();
+        let (deadline, permit) = test_deadline_and_permit();
+        let resp = reqwest_to_axum(reqwest::Response::from(upstream), deadline, permit)
+            .expect("conversion should succeed");
+        let h = resp.headers();
+        assert_eq!(h.get("content-type").unwrap(), "application/octet-stream");
+        assert_eq!(h.get("content-length").unwrap(), "3");
+        assert_eq!(
+            h.get("content-disposition").unwrap(),
+            "attachment; filename=\"a.tgz\""
+        );
+        assert_eq!(h.get("etag").unwrap(), "\"abc\"");
+        assert_eq!(
+            h.get("last-modified").unwrap(),
+            "Wed, 21 Oct 2015 07:28:00 GMT"
+        );
+        assert_eq!(h.get("x-total-count").unwrap(), "42");
+        assert_eq!(h.get("link").unwrap(), "</api/v1/x?page=2>; rel=\"next\"");
+        assert!(h.get("set-cookie").is_none());
+        assert!(h.get("location").is_none());
     }
 }

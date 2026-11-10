@@ -81,8 +81,7 @@
 use axum::body::Body;
 use axum::extract::{Multipart, OriginalUri, Path, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
-use axum::http::Uri;
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
@@ -191,19 +190,39 @@ pub(crate) async fn serve_galaxy_api_path(
         // `*.tar.gz` collections, so no stored path is shadowed by it.
         ["api"] | ["api", ""] => api_root(st, Path(key)).await,
         ["api", "v3", ""] => api_v3_root(st, Path(key), ouri()).await,
-        ["api", "v3", "collections", ""] => list_collections(st, Path(key), ouri()).await,
+        ["api", "v3", "collections", ""] => {
+            list_collections(st, Extension(auth.clone()), Path(key), ouri()).await
+        }
         ["api", "v3", "collections", ns, name, ""] if !ns.is_empty() && !name.is_empty() => {
-            collection_info(st, Path((key, own(ns), own(name))), ouri()).await
+            collection_info(
+                st,
+                Extension(auth.clone()),
+                Path((key, own(ns), own(name))),
+                ouri(),
+            )
+            .await
         }
         ["api", "v3", "collections", ns, name, "versions", ""]
             if !ns.is_empty() && !name.is_empty() =>
         {
-            version_list(st, Path((key, own(ns), own(name))), ouri()).await
+            version_list(
+                st,
+                Extension(auth.clone()),
+                Path((key, own(ns), own(name))),
+                ouri(),
+            )
+            .await
         }
         ["api", "v3", "collections", ns, name, "versions", version, ""]
             if !ns.is_empty() && !name.is_empty() && !version.is_empty() =>
         {
-            version_info(st, Path((key, own(ns), own(name), own(version))), ouri()).await
+            version_info(
+                st,
+                Extension(auth.clone()),
+                Path((key, own(ns), own(name), own(version))),
+                ouri(),
+            )
+            .await
         }
         // The `download_url` the documents above advertise on this mount
         // (`{base}/download/{file}`): served by the Galaxy download route so
@@ -476,6 +495,18 @@ fn galaxy_page_params(query: Option<&str>) -> (Option<usize>, usize) {
     (limit, offset)
 }
 
+/// One page of a collection's upstream version list, relative to the
+/// remote's base (#4365 item 3: the query carries no `/`, so
+/// `ProxyService::check_upstream_fetch_path` accepts it).
+pub(crate) fn upstream_versions_page_path(namespace: &str, name: &str, page: usize) -> String {
+    format!(
+        "api/v3/collections/{}/{}/versions/?limit={}&offset={}",
+        namespace,
+        name,
+        UPSTREAM_VERSIONS_PAGE_SIZE,
+        page * UPSTREAM_VERSIONS_PAGE_SIZE
+    )
+}
 /// Fetch every version an upstream Galaxy server publishes for one collection.
 ///
 /// # Why offset paging rather than following `links.next`
@@ -508,13 +539,7 @@ async fn fetch_upstream_versions(
     let mut versions: Vec<String> = Vec::new();
 
     for page in 0..UPSTREAM_VERSIONS_MAX_PAGES {
-        let upstream_path = format!(
-            "api/v3/collections/{}/{}/versions/?limit={}&offset={}",
-            namespace,
-            name,
-            UPSTREAM_VERSIONS_PAGE_SIZE,
-            page * UPSTREAM_VERSIONS_PAGE_SIZE
-        );
+        let upstream_path = upstream_versions_page_path(namespace, name, page);
 
         // Buffered and byte-capped by design: a version list is a small
         // metadata document that has to be parsed in-process before anything
@@ -951,11 +976,101 @@ fn rewrite_upstream_version_info(
 }
 
 // ---------------------------------------------------------------------------
+// Metadata sources: the addressed repository, or a Virtual's members (#4379)
+// ---------------------------------------------------------------------------
+
+/// One repository a Galaxy metadata document is built from.
+///
+/// For a Hosted or Remote repository that is the repository the request
+/// addressed. A Virtual repository holds no `artifacts` rows of its own, so
+/// building its documents from its own id answered `versions/` with an empty
+/// list and both detail routes with 404, and `ansible-galaxy` could not
+/// resolve an install that `download/` would have served (#4379). Its
+/// sources are its members instead, the ones the caller may read, in
+/// priority order. Every document is still spelled against the URL the
+/// client addressed (`base`), so the tarball is fetched back through the
+/// virtual.
+struct GalaxySource {
+    id: uuid::Uuid,
+    key: String,
+    is_remote: bool,
+    upstream_url: Option<String>,
+}
+
+/// The sources the metadata routes read for `repo` on behalf of `auth`.
+async fn galaxy_sources(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+) -> Result<Vec<GalaxySource>, Response> {
+    if repo.repo_type != RepositoryType::Virtual {
+        return Ok(vec![GalaxySource {
+            id: repo.id,
+            key: repo.key.clone(),
+            is_remote: repo.repo_type == RepositoryType::Remote,
+            upstream_url: repo.upstream_url.clone(),
+        }]);
+    }
+    // Caller-authorized (#3323): a member the caller could not read directly
+    // must not contribute versions or documents. A failed authorization query
+    // is a retryable error, not an empty walk (#4308).
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    Ok(members
+        .into_iter()
+        .map(|m| GalaxySource {
+            id: m.id,
+            is_remote: m.repo_type == RepositoryType::Remote,
+            key: m.key,
+            upstream_url: m.upstream_url,
+        })
+        .collect())
+}
+
+/// First-match walk over `sources` for a detail document: the first source
+/// that has the document answers. With none, the first failure that is not a
+/// plain 404 is returned, so an upstream outage behind a Virtual answers the
+/// same retryable error the Remote would have rather than a definitive miss.
+#[derive(Default)]
+struct FirstGalaxyDocument {
+    failure: Option<Response>,
+}
+
+impl FirstGalaxyDocument {
+    /// Record one source's answer; `Some` is the document to serve.
+    fn offer(
+        &mut self,
+        source: &GalaxySource,
+        answer: Result<Option<serde_json::Value>, Response>,
+    ) -> Option<serde_json::Value> {
+        match answer {
+            Ok(doc) => doc,
+            Err(resp) if resp.status() == StatusCode::NOT_FOUND => None,
+            Err(resp) => {
+                tracing::warn!(
+                    member = %source.key,
+                    status = %resp.status(),
+                    "galaxy metadata source failed; trying the next member"
+                );
+                self.failure.get_or_insert(resp);
+                None
+            }
+        }
+    }
+
+    /// No source had the document.
+    fn miss(self, not_found: &'static str) -> Response {
+        self.failure
+            .unwrap_or_else(|| (StatusCode::NOT_FOUND, not_found).into_response())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GET /ansible/{repo_key}/api/v3/collections/ — List collections (paginated)
 // ---------------------------------------------------------------------------
 
 async fn list_collections(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Response> {
@@ -963,6 +1078,29 @@ async fn list_collections(
     // `{base}/api/v3/collections/`
     let base = galaxy_base(&uri, 4);
 
+    // A Virtual lists what its members hold, first member first (#4379).
+    let mut seen = std::collections::HashSet::new();
+    let mut data: Vec<serde_json::Value> = Vec::new();
+    for source in galaxy_sources(&state, auth.as_ref(), &repo).await? {
+        for entry in held_collections(&state.db, source.id, &base).await? {
+            let name = entry["namespace"].as_str().unwrap_or_default().to_string()
+                + "."
+                + entry["name"].as_str().unwrap_or_default();
+            if seen.insert(name.to_ascii_lowercase()) {
+                data.push(entry);
+            }
+        }
+    }
+
+    Ok(super::json_response(&galaxy_paginated_list(&uri, data)))
+}
+
+/// The collections one repository holds, newest version of each.
+async fn held_collections(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    base: &str,
+) -> Result<Vec<serde_json::Value>, Response> {
     let artifacts = sqlx::query!(
         r#"
         SELECT DISTINCT ON (LOWER(name)) name, version
@@ -971,13 +1109,13 @@ async fn list_collections(
           AND is_deleted = false
         ORDER BY LOWER(name), created_at DESC
         "#,
-        repo.id
+        repository_id
     )
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await
     .map_err(super::db_err)?;
 
-    let data: Vec<serde_json::Value> = artifacts
+    Ok(artifacts
         .iter()
         .filter_map(|a| {
             let name = a.name.clone();
@@ -993,13 +1131,11 @@ async fn list_collections(
                 "href": format!("{}/api/v3/collections/{}/{}/", base, namespace, coll_name),
                 "highest_version": {
                     "version": latest_version,
-                    "href": version_href(&base, &namespace, &coll_name, &latest_version),
+                    "href": version_href(base, &namespace, &coll_name, &latest_version),
                 },
             }))
         })
-        .collect();
-
-    Ok(super::json_response(&galaxy_paginated_list(&uri, data)))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1144,7 @@ async fn list_collections(
 
 async fn collection_info(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, namespace, name)): Path<(String, String, String)>,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Response> {
@@ -1020,9 +1157,28 @@ async fn collection_info(
     let _ = AnsibleHandler::parse_path(&validate_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
 
+    let mut walk = FirstGalaxyDocument::default();
+    for source in galaxy_sources(&state, auth.as_ref(), &repo).await? {
+        let answer = collection_info_from(&state, &source, &base, &namespace, &name).await;
+        if let Some(doc) = walk.offer(&source, answer) {
+            return Ok(super::json_response(&doc));
+        }
+    }
+    Err(walk.miss("Collection not found"))
+}
+
+/// [`collection_info`] for one source: `Ok(None)` when it neither holds nor
+/// (as a Remote) proxies the collection.
+async fn collection_info_from(
+    state: &SharedState,
+    source: &GalaxySource,
+    base: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<serde_json::Value>, Response> {
     let collection_name = format!("{}-{}", namespace, name);
     let local =
-        proxy_helpers::find_artifact_by_name_lowercase(&state.db, repo.id, &collection_name)
+        proxy_helpers::find_artifact_by_name_lowercase(&state.db, source.id, &collection_name)
             .await?;
 
     // Remote (proxy) repository: answering 404 here does not merely omit a
@@ -1038,12 +1194,13 @@ async fn collection_info(
     // Reproduced live: identical requirements file, install succeeds against an
     // ad-hoc `source:` (cache off) and fails against a configured
     // `[galaxy_server.*]` (cache on) until this branch exists.
-    if local.is_none() && repo.repo_type == RepositoryType::Remote {
-        if let (Some(proxy), Some(upstream_url)) =
-            (state.proxy_service.as_deref(), repo.upstream_url.as_deref())
-        {
-            if !galaxy_coordinate_is_addressable(&namespace)
-                || !galaxy_coordinate_is_addressable(&name)
+    if local.is_none() && source.is_remote {
+        if let (Some(proxy), Some(upstream_url)) = (
+            state.proxy_service.as_deref(),
+            source.upstream_url.as_deref(),
+        ) {
+            if !galaxy_coordinate_is_addressable(namespace)
+                || !galaxy_coordinate_is_addressable(name)
             {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -1056,20 +1213,21 @@ async fn collection_info(
             // surfaced as `map_proxy_error` classifies it.
             let upstream = fetch_upstream_collection_info(
                 proxy,
-                repo.id,
-                &repo_key,
-                &base,
+                source.id,
+                &source.key,
+                base,
                 upstream_url,
-                &namespace,
-                &name,
+                namespace,
+                name,
             )
             .await?;
-            return Ok(super::json_response(&upstream));
+            return Ok(Some(upstream));
         }
     }
 
-    let artifact =
-        local.ok_or_else(|| (StatusCode::NOT_FOUND, "Collection not found").into_response())?;
+    let Some(artifact) = local else {
+        return Ok(None);
+    };
 
     let latest_version = artifact.version.clone().unwrap_or_default();
     let description = artifact
@@ -1080,25 +1238,23 @@ async fn collection_info(
         .unwrap_or("")
         .to_string();
 
-    let json = serde_json::json!({
+    Ok(Some(serde_json::json!({
         "namespace": namespace,
         "name": name,
         "description": description,
         "highest_version": {
             "version": latest_version,
-            "href": version_href(&base, &namespace, &name, &latest_version),
+            "href": version_href(base, namespace, name, &latest_version),
         },
         "versions_url": format!("{}/api/v3/collections/{}/{}/versions/", base, namespace, name),
         "download_url": collection_download_url(
-            &base,
+            base,
             &artifact.path,
-            &namespace,
-            &name,
+            namespace,
+            name,
             &latest_version,
         ),
-    });
-
-    Ok(super::json_response(&json))
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,6 +1263,7 @@ async fn collection_info(
 
 async fn version_list(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, namespace, name)): Path<(String, String, String)>,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Response> {
@@ -1114,9 +1271,55 @@ async fn version_list(
     // `{base}/api/v3/collections/{ns}/{name}/versions/`
     let base = galaxy_base(&uri, 7);
 
+    // A Virtual's list is the union of its members' lists, in priority order
+    // (#4379): `ansible-galaxy` resolves a pinned version by membership here,
+    // and the virtual's download route can serve any member's version.
+    let mut versions: Vec<serde_json::Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut failure: Option<Response> = None;
+    for source in galaxy_sources(&state, auth.as_ref(), &repo).await? {
+        match versions_from(&state, &source, &base, &namespace, &name).await {
+            Ok(list) => {
+                for entry in list {
+                    let version = entry["version"].as_str().unwrap_or_default().to_string();
+                    if seen.insert(version) {
+                        versions.push(entry);
+                    }
+                }
+            }
+            Err(resp) => {
+                tracing::warn!(
+                    member = %source.key,
+                    status = %resp.status(),
+                    "galaxy version list source failed"
+                );
+                failure.get_or_insert(resp);
+            }
+        }
+    }
+    // With nothing to serve, a source's failure is the honest answer: an
+    // empty `data` reads as "no such versions" (see `versions_from`).
+    if versions.is_empty() {
+        if let Some(resp) = failure {
+            return Err(resp);
+        }
+    }
+
+    Ok(super::json_response(&galaxy_paginated_list(&uri, versions)))
+}
+
+/// [`version_list`] for one source: what it holds, plus (for a Remote) what
+/// its upstream publishes.
+async fn versions_from(
+    state: &SharedState,
+    source: &GalaxySource,
+    base: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<Vec<serde_json::Value>, Response> {
     let collection_name = format!("{}-{}", namespace, name);
     let artifacts =
-        proxy_helpers::list_artifacts_by_name_lowercase(&state.db, repo.id, &collection_name)
+        proxy_helpers::list_artifacts_by_name_lowercase(&state.db, source.id, &collection_name)
             .await?;
 
     let mut versions: Vec<serde_json::Value> = artifacts
@@ -1125,7 +1328,7 @@ async fn version_list(
             let version = a.version.clone().unwrap_or_default();
             serde_json::json!({
                 "version": version,
-                "href": version_href(&base, &namespace, &name, &version),
+                "href": version_href(base, namespace, name, &version),
             })
         })
         .collect();
@@ -1139,15 +1342,16 @@ async fn version_list(
     // though `download_collection` could already serve the tarball by name
     // (#3365). Serve what the upstream publishes, merged over whatever is held
     // locally, which is the same set the download route can actually resolve.
-    if repo.repo_type == RepositoryType::Remote {
-        if let (Some(proxy), Some(upstream_url)) =
-            (state.proxy_service.as_deref(), repo.upstream_url.as_deref())
-        {
+    if source.is_remote {
+        if let (Some(proxy), Some(upstream_url)) = (
+            state.proxy_service.as_deref(),
+            source.upstream_url.as_deref(),
+        ) {
             // The coordinates are interpolated into an upstream request path,
             // so they are checked before they leave this process rather than
             // trusted to the cache-path validator downstream.
-            if !galaxy_coordinate_is_addressable(&namespace)
-                || !galaxy_coordinate_is_addressable(&name)
+            if !galaxy_coordinate_is_addressable(namespace)
+                || !galaxy_coordinate_is_addressable(name)
             {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -1157,19 +1361,19 @@ async fn version_list(
             }
             match fetch_upstream_versions(
                 proxy,
-                repo.id,
-                &repo_key,
+                source.id,
+                &source.key,
                 upstream_url,
-                &namespace,
-                &name,
+                namespace,
+                name,
             )
             .await
             {
                 Ok(upstream) => merge_upstream_versions(
-                    &repo_key,
-                    &base,
-                    &namespace,
-                    &name,
+                    &source.key,
+                    base,
+                    namespace,
+                    name,
                     upstream,
                     &mut versions,
                 ),
@@ -1190,7 +1394,7 @@ async fn version_list(
                 Err(err) if versions.is_empty() => return Err(err),
                 Err(err) => {
                     tracing::warn!(
-                        repository = %repo_key,
+                        repository = %source.key,
                         collection = %format!("{}.{}", namespace, name),
                         status = %err.status(),
                         "upstream collection version list unavailable; serving \
@@ -1201,7 +1405,7 @@ async fn version_list(
         }
     }
 
-    Ok(super::json_response(&galaxy_paginated_list(&uri, versions)))
+    Ok(versions)
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,6 +1414,7 @@ async fn version_list(
 
 async fn version_info(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, namespace, name, version)): Path<(String, String, String, String)>,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Response> {
@@ -1225,12 +1430,32 @@ async fn version_info(
     let _ = AnsibleHandler::parse_path(&validate_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
 
+    let mut walk = FirstGalaxyDocument::default();
+    for source in galaxy_sources(&state, auth.as_ref(), &repo).await? {
+        let answer = version_info_from(&state, &source, &base, &namespace, &name, &version).await;
+        if let Some(doc) = walk.offer(&source, answer) {
+            return Ok(super::json_response(&doc));
+        }
+    }
+    Err(walk.miss("Collection version not found"))
+}
+
+/// [`version_info`] for one source: `Ok(None)` when it neither holds nor (as
+/// a Remote) proxies the version.
+async fn version_info_from(
+    state: &SharedState,
+    source: &GalaxySource,
+    base: &str,
+    namespace: &str,
+    name: &str,
+    version: &str,
+) -> Result<Option<serde_json::Value>, Response> {
     let collection_name = format!("{}-{}", namespace, name);
     let local = proxy_helpers::find_artifact_by_name_version(
         &state.db,
-        repo.id,
+        source.id,
         &collection_name,
-        &version,
+        version,
     )
     .await?;
 
@@ -1271,7 +1496,7 @@ async fn version_info(
             .filter(|s| !s.is_empty())
         else {
             tracing::error!(
-                repository = %repo_key,
+                repository = %source.key,
                 collection = %format!("{}.{}", namespace, name),
                 version = %version,
                 artifact_id = %artifact.id,
@@ -1286,37 +1511,37 @@ async fn version_info(
                 .into_response());
         };
 
-        let json = version_info_document(
-            &base,
-            &namespace,
-            &name,
-            &version,
+        return Ok(Some(version_info_document(
+            base,
+            namespace,
+            name,
+            version,
             &proxy_helpers::advertised_download_filename(
                 &artifact.path,
-                &collection_filename(&namespace, &name, &version),
+                &collection_filename(namespace, name, version),
             ),
-            &collection_download_url(&base, &artifact.path, &namespace, &name, &version),
+            &collection_download_url(base, &artifact.path, namespace, name, version),
             artifact.size_bytes.unwrap_or(0),
             sha256,
             dependencies,
             metadata,
             None,
             download_count,
-        );
-        return Ok(super::json_response(&json));
+        )));
     }
 
     // Remote (proxy) repository: the version this metadata describes is not
     // held locally, so ask the upstream that publishes it. Without this the
     // route 404s for every collection a proxy has not already cached, which
     // fails the install one step after the version list resolved it (#3365).
-    if repo.repo_type == RepositoryType::Remote {
-        if let (Some(proxy), Some(upstream_url)) =
-            (state.proxy_service.as_deref(), repo.upstream_url.as_deref())
-        {
-            if !galaxy_coordinate_is_addressable(&namespace)
-                || !galaxy_coordinate_is_addressable(&name)
-                || !galaxy_coordinate_is_addressable(&version)
+    if source.is_remote {
+        if let (Some(proxy), Some(upstream_url)) = (
+            state.proxy_service.as_deref(),
+            source.upstream_url.as_deref(),
+        ) {
+            if !galaxy_coordinate_is_addressable(namespace)
+                || !galaxy_coordinate_is_addressable(name)
+                || !galaxy_coordinate_is_addressable(version)
             {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -1332,20 +1557,20 @@ async fn version_info(
             // unaffected by an upstream outage.
             let upstream = fetch_upstream_version_info(
                 proxy,
-                repo.id,
-                &repo_key,
-                &base,
+                source.id,
+                &source.key,
+                base,
                 upstream_url,
-                &namespace,
-                &name,
-                &version,
+                namespace,
+                name,
+                version,
             )
             .await?;
-            return Ok(super::json_response(&upstream));
+            return Ok(Some(upstream));
         }
     }
 
-    Err((StatusCode::NOT_FOUND, "Collection version not found").into_response())
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,6 +1633,7 @@ async fn upload_collection(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "ansible", "write:artifacts")?.user_id;
@@ -1423,10 +1649,14 @@ async fn upload_collection(
     // older clients still send a `collection` or `metadata` JSON field, so
     // accept either source for the namespace/name/version. The filename
     // takes precedence because it is what the CLI ships with.
-    // Spool the tarball straight to a bounded scratch file instead of buffering
-    // the whole body in memory; the small text/JSON fields are still read
-    // in-hand. See proxy_helpers::stage_upload_field / put_artifact_stream.
-    let mut staged: Option<proxy_helpers::StagedUpload> = None;
+    // Stage the tarball on the repository's backend when it streams natively,
+    // else in bounded local scratch, instead of buffering the whole body in
+    // memory; the small text/JSON fields are still read in-hand. See
+    // repositories::stage_upload_field_for_repo.
+    let mut staged: Option<(
+        super::repositories::GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    )> = None;
     let mut file_name: Option<String> = None;
     let mut declared_sha256: Option<String> = None;
     let mut collection_json: Option<serde_json::Value> = None;
@@ -1439,7 +1669,8 @@ async fn upload_collection(
         let field_name = field.name().unwrap_or("").to_string();
         if field_name == "file" {
             file_name = field.file_name().map(|s| s.to_string());
-            staged = Some(proxy_helpers::stage_upload_field(&state, field).await?);
+            staged =
+                Some(super::repositories::stage_upload_field_for_repo(&state, &repo, field).await?);
         } else if field_name == "sha256" {
             declared_sha256 = Some(field.text().await.map_err(|e| {
                 (
@@ -1468,7 +1699,7 @@ async fn upload_collection(
         }
     }
 
-    let staged =
+    let (staged, digests) =
         staged.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing file field").into_response())?;
     if staged.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty tarball").into_response());
@@ -1564,21 +1795,33 @@ async fn upload_collection(
     // the staged file before the tarball is streamed away, and let an optional
     // client-sent `collection`/`metadata` part overlay the keys it actually
     // carries so those clients keep the behaviour they had.
-    let collection_json = match (
-        extract_collection_info_from_staged(staged.path()).await,
-        collection_json,
-    ) {
-        (Some(serde_json::Value::Object(mut base)), Some(serde_json::Value::Object(sent))) => {
-            base.extend(sent);
-            Some(serde_json::Value::Object(base))
+    let collection_json = {
+        let local =
+            super::repositories::materialize_staged_for_repo(&state, &repo, &staged).await?;
+        match (
+            extract_collection_info_from_staged(local.path()).await,
+            collection_json,
+        ) {
+            (Some(serde_json::Value::Object(mut base)), Some(serde_json::Value::Object(sent))) => {
+                base.extend(sent);
+                Some(serde_json::Value::Object(base))
+            }
+            (manifest, sent) => sent.or(manifest),
         }
-        (manifest, sent) => sent.or(manifest),
     };
 
-    // Stream the staged tarball into the repo's StorageBackend via `put_stream`,
-    // which computes the SHA-256 incrementally as it copies (no re-hash).
+    // Stream the staged tarball into the repo's StorageBackend, from local
+    // scratch or by copying the object the backend already staged (#4990).
     let storage_key = format!("ansible/{}/{}/{}", full_name, collection_version, filename);
-    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    let put = proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
     let computed_sha256 = put.checksum_sha256;
 
     // If the client supplied a digest, verify the upload was not corrupted in
@@ -1633,6 +1876,42 @@ async fn upload_collection(
         repo.id,
         "ansible",
         &ansible_metadata,
+    )
+    .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
+
+    // Catalog row + the one artifact.uploaded webhook event this publish fires
+    // (#3659, #3939). Not inside `insert_artifact`: its other callers already
+    // register, so emitting there would double-deliver.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "ansible",
+        &full_name,
+        &collection_version,
+        size_bytes,
+        &computed_sha256,
+        ansible_metadata
+            .pointer("/collection_json/description")
+            .and_then(|d| d.as_str()),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -1701,7 +1980,7 @@ async fn extract_collection_info_from_staged(path: &std::path::Path) -> Option<s
                         .unwrap_or(false)
                 },
                 crate::util::bounded_archive::max_ingest_decompressed_bytes(),
-                crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES,
+                crate::util::bounded_archive::max_ingest_archive_entries(),
                 MAX_COLLECTION_MANIFEST_BYTES,
             )
         })
@@ -2375,6 +2654,7 @@ mod tests {
         let multipart =
             galaxy_cli_multipart("BOUNDARY", "community-hashi_vault-7.1.0.tar.gz", body, &sha);
 
+        let mut events = f.state.event_bus.subscribe();
         let app = f.router_with_auth(super::router());
         let req = tdh::post(
             format!("/{}/api/v3/artifacts/collections/", f.repo_key),
@@ -2392,7 +2672,87 @@ mod tests {
         assert_eq!(json["namespace"], "community");
         assert_eq!(json["name"], "hashi_vault");
         assert_eq!(json["version"], "7.1.0");
+        // #3939: the publish registers its catalog row and fires exactly one
+        // artifact.uploaded (it used to fire none).
+        tdh::assert_one_artifact_uploaded(
+            &mut events,
+            &f.pool,
+            f.repo_id,
+            "community-hashi_vault",
+            "7.1.0",
+        )
+        .await;
+        let row = tdh::catalog_row(&f.pool, f.repo_id, "community-hashi_vault").await;
         f.teardown().await;
+        assert!(
+            row.is_some(),
+            "an ansible publish must write a packages row"
+        );
+    }
+
+    /// #4725: a collection publish to a hosted repository must queue a push
+    /// sync task for a subscribed push peer, and a publish that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn ansible_upload_queues_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "ansible").await;
+
+        let body = b"fake-tar-content-4725";
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        let sha = format!("{:x}", hasher.finalize());
+        let multipart =
+            galaxy_cli_multipart("BOUNDARY", "community-repl4725-1.0.0.tar.gz", body, &sha);
+        let app = f.router_with_auth(super::router());
+        let (status, resp) = tdh::send(
+            app,
+            tdh::post(
+                format!("/{}/api/v3/artifacts/collections/", f.repo_key),
+                "multipart/form-data; boundary=BOUNDARY",
+                multipart,
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "collection publish must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        // A replicated publish (as the sync worker sends it) stores the
+        // collection but must not queue another task.
+        let multipart =
+            galaxy_cli_multipart("BOUNDARY", "community-repl4725-2.0.0.tar.gz", body, &sha);
+        let mut req = tdh::post(
+            format!("/{}/api/v3/artifacts/collections/", f.repo_key),
+            "multipart/form-data; boundary=BOUNDARY",
+            multipart,
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let app = f.router_with_auth(super::router());
+        let (status, resp) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated collection publish must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["community-repl4725/1.0.0/community-repl4725-1.0.0.tar.gz".to_string()],
+            "only the client publish queues a push task; the replicated one must not"
+        );
     }
 
     #[tokio::test]
@@ -3754,6 +4114,133 @@ mod tests {
             "112653d7e4e462827f1521130849c650e9dbc403f8b2e9dd5040f2ddabff33ed"
         );
         assert_eq!(doc["metadata"]["dependencies"]["testns.other"], ">=1.0.0");
+    }
+
+    /// #4379: a Virtual Ansible repository must resolve an install, not only
+    /// serve bytes. `ansible-galaxy` reads `versions/`, the collection detail
+    /// and the version detail before it requests a tarball, and all three were
+    /// built from the virtual's OWN `artifacts` rows, which a virtual never
+    /// has: `versions/` answered 200 with no versions and the two detail
+    /// routes 404ed, while `download/` already walked the members. The
+    /// metadata now walks the caller's members in priority order: the version
+    /// list is the union (a hosted member's 3.1.0, a remote member's 1.5.1),
+    /// the detail documents come from the first member that has them, and
+    /// every advertised URL points back at the virtual.
+    #[tokio::test]
+    async fn test_virtual_metadata_resolves_members_collections_4379() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(v) = tdh::Fixture::setup("virtual", "ansible").await else {
+            return;
+        };
+        tdh::publish_repo(&v.pool, v.repo_id).await;
+        let (local_id, local_key, local_dir) = tdh::create_repo(&v.pool, "local", "ansible").await;
+        tdh::publish_repo(&v.pool, local_id).await;
+        tdh::link_virtual_member(&v.pool, v.repo_id, local_id, 1).await;
+        let local_info = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        tdh::seed_artifact(
+            &v.state,
+            &v.pool,
+            &local_info,
+            "ansible/testns-testcoll-3.1.0.tar.gz",
+            "testns-testcoll-3.1.0.tar.gz",
+            "testns-testcoll",
+            "3.1.0",
+            "application/gzip",
+            bytes::Bytes::from_static(b"hosted collection bytes"),
+            v.user_id,
+        )
+        .await;
+
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/collections/testns/testcoll/versions/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(upstream_versions_page(
+                    &["1.5.1", "3.1.0"],
+                    2,
+                    None,
+                )),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/collections/testns/testcoll/versions/1.5.1/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_version_info_doc()))
+            .mount(&server)
+            .await;
+        let (remote_id, _remote_key, remote_dir) =
+            tdh::create_repo(&v.pool, "remote", "ansible").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(server.uri())
+            .bind(remote_id)
+            .execute(&v.pool)
+            .await
+            .expect("configure remote member");
+        tdh::publish_repo(&v.pool, remote_id).await;
+        tdh::link_virtual_member(&v.pool, v.repo_id, remote_id, 2).await;
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let proxy =
+            tdh::build_proxy_service_with_fs(v.pool.clone(), cache_dir.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(v.pool.clone(), v.storage_dir.to_str().unwrap(), proxy);
+        let get = |uri: String| {
+            let app = tdh::router_anon(ansible_mount(), state.clone());
+            async move { tdh::send(app, tdh::get(uri)).await }
+        };
+        let api = format!("/ansible/{}/api/v3/collections/testns/testcoll", v.repo_key);
+        let (list_status, list_body) = get(format!("{api}/versions/")).await;
+        let (info_status, info_body) = get(format!("{api}/")).await;
+        let (hosted_status, hosted_body) = get(format!("{api}/versions/3.1.0/")).await;
+        let (remote_status, remote_body) = get(format!("{api}/versions/1.5.1/")).await;
+        let (dl_status, dl_body) = get(format!(
+            "/ansible/{}/download/testns-testcoll-3.1.0.tar.gz",
+            v.repo_key
+        ))
+        .await;
+
+        tdh::cleanup_member_repo(&v.pool, local_id, &local_dir).await;
+        tdh::cleanup_member_repo(&v.pool, remote_id, &remote_dir).await;
+        v.teardown().await;
+
+        let body = |b: &bytes::Bytes| String::from_utf8_lossy(b).into_owned();
+        assert_eq!(list_status, StatusCode::OK, "{}", body(&list_body));
+        let list: serde_json::Value = serde_json::from_slice(&list_body).expect("json");
+        let versions: Vec<&str> = list["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .filter_map(|e| e["version"].as_str())
+            .collect();
+        assert_eq!(
+            versions,
+            vec!["3.1.0", "1.5.1"],
+            "the virtual's version list is its members' union, in priority order"
+        );
+        assert_eq!(info_status, StatusCode::OK, "{}", body(&info_body));
+        assert_eq!(hosted_status, StatusCode::OK, "{}", body(&hosted_body));
+        let hosted: serde_json::Value = serde_json::from_slice(&hosted_body).expect("json");
+        assert_eq!(
+            hosted["download_url"],
+            format!(
+                "/ansible/{}/download/testns-testcoll-3.1.0.tar.gz",
+                v.repo_key
+            ),
+            "the tarball is fetched back through the virtual"
+        );
+        assert_eq!(remote_status, StatusCode::OK, "{}", body(&remote_body));
+        let remote: serde_json::Value = serde_json::from_slice(&remote_body).expect("json");
+        assert_eq!(
+            remote["download_url"],
+            format!(
+                "/ansible/{}/download/testns-testcoll-1.5.1.tar.gz",
+                v.repo_key
+            )
+        );
+        assert_eq!(dl_status, StatusCode::OK);
+        assert_eq!(&dl_body[..], b"hosted collection bytes");
     }
 
     /// End-to-end shape of the sha256 refusal: an upstream version document

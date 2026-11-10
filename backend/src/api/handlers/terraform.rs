@@ -19,27 +19,43 @@
 //!   GET  /terraform/{repo_key}/v1/providers/{namespace}/{type}/versions
 //!   GET  /terraform/{repo_key}/v1/providers/{namespace}/{type}/{version}/download/{os}/{arch}
 //!   GET  /terraform/{repo_key}/v1/providers/{namespace}/{type}/{version}/binary/{os}/{arch}
+//!   GET  /terraform/{repo_key}/v1/providers/{namespace}/{type}/{version}/SHA256SUMS
+//!   GET  /terraform/{repo_key}/v1/providers/{namespace}/{type}/{version}/SHA256SUMS.sig
 //!   PUT  /terraform/{repo_key}/v1/providers/{namespace}/{type}/{version}/{os}/{arch}
+//!
+//! Host-level discovery (mounted by `crate::api::routes`, not by [`router`]):
+//!   GET  /.well-known/terraform.json   (see [`host_service_discovery`])
 //!
 //! Note the two distinct provider endpoints, which the Provider Registry
 //! Protocol keeps separate: `.../download/{os}/{arch}` returns the JSON
 //! *package document*, whose `download_url` field then points at
 //! `.../binary/{os}/{arch}`, which streams the `.zip` itself.
+//!
+//! # Hosted repos as an origin provider registry
+//!
+//! A hosted repo can be used directly as `host/namespace/type` (no
+//! `network_mirror`). For that, the package document also carries
+//! `shasums_url`, `shasums_signature_url` and `signing_keys`: `SHA256SUMS` is
+//! computed from the stored packages and signed per request with the
+//! repository's active OpenPGP signing key (the same key and service that sign
+//! Debian/RPM metadata). A repo with no usable key never gets a signing-less
+//! `SHA256SUMS`: those routes fail closed, and the package document falls back
+//! to its legacy shape. See `docs/terraform-registry.md`.
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::Extension;
 use axum::Router;
-// `Bytes` and the `sha2` digest types are now only referenced by the unit
-// tests: the upload handlers stream the body and take their digests from the
-// shared staging primitive (#2517), so gate these imports to test builds to
-// keep the production build free of unused-import warnings.
-#[cfg(test)]
 use bytes::Bytes;
+// The `sha2` digest types are now only referenced by the unit tests: the
+// upload handlers stream the body and take their digests from the shared
+// staging primitive (#2517), so gate this import to test builds to keep the
+// production build free of unused-import warnings.
+use futures::StreamExt;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -50,6 +66,7 @@ use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::services::signing_service::SigningService;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -114,6 +131,17 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/:repo_key/v1/providers/:namespace/:type_name/:version/binary/:os/:arch",
             get(download_provider_binary),
+        )
+        // Provider registry - checksum list and its detached signature, the
+        // locations `download_provider`'s `shasums_url` /
+        // `shasums_signature_url` advertise (hosted repos only).
+        .route(
+            "/:repo_key/v1/providers/:namespace/:type_name/:version/SHA256SUMS",
+            get(provider_shasums),
+        )
+        .route(
+            "/:repo_key/v1/providers/:namespace/:type_name/:version/SHA256SUMS.sig",
+            get(provider_shasums_signature),
         )
         // Provider upload
         .route(
@@ -210,13 +238,66 @@ fn build_service_discovery_json(repo_key: &str) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 async fn service_discovery(Path(repo_key): Path<String>) -> Result<Response, Response> {
-    let json = build_service_discovery_json(&repo_key);
+    Ok(service_discovery_response(&repo_key))
+}
 
-    Ok(Response::builder()
+fn service_discovery_response(repo_key: &str) -> Response {
+    let json = build_service_discovery_json(repo_key);
+
+    Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+        .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// GET /.well-known/terraform.json — host-level Service Discovery
+//
+// Terraform/OpenTofu discover a registry per *host*: for the source address
+// `artifacts.example.com/ns/type` the client fetches
+// `https://artifacts.example.com/.well-known/terraform.json`, with no
+// repository key anywhere in the request. The per-repo document above can only
+// be reached by a client that already knows the repo key, so it cannot serve an
+// origin-registry source address on its own.
+//
+// The host document therefore points at ONE operator-chosen repository
+// (`TERRAFORM_DEFAULT_REPO`). Unset, the route answers 404, exactly as before
+// this route existed. The route is mounted by `crate::api::routes`.
+// ---------------------------------------------------------------------------
+
+/// The response for an unconfigured or unusable default repo. One generic body
+/// for every reason, so the anonymous route cannot be used to probe which
+/// repository keys exist or what format they are.
+fn host_discovery_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "No default Terraform registry is configured on this host",
+    )
+        .into_response()
+}
+
+pub async fn host_service_discovery(
+    State(state): State<SharedState>,
+) -> Result<Response, Response> {
+    let Some(repo_key) = state.config.terraform_default_repo.as_deref() else {
+        return Err(host_discovery_not_configured());
+    };
+
+    // Advertise the repo only while it still resolves to a Terraform repo, so a
+    // stale setting never points clients at a registry that does not exist.
+    match resolve_terraform_repo(&state.db, repo_key).await {
+        Ok(_) => Ok(service_discovery_response(repo_key)),
+        Err(resp)
+            if matches!(
+                resp.status(),
+                StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST
+            ) =>
+        {
+            Err(host_discovery_not_configured())
+        }
+        Err(resp) => Err(resp),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,31 +306,51 @@ async fn service_discovery(Path(repo_key): Path<String>) -> Result<Response, Res
 
 async fn list_module_versions(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, namespace, name, provider)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     let module_name = build_module_name(&namespace, &name, &provider);
+    let upstream_path = format!("v1/modules/{namespace}/{name}/{provider}/versions");
 
-    let versions: Vec<Option<String>> = sqlx::query_scalar!(
-        r#"
-        SELECT DISTINCT version
-        FROM artifacts
-        WHERE repository_id = $1
-          AND name = $2
-          AND is_deleted = false
-          AND version IS NOT NULL
-        ORDER BY version
-        "#,
-        repo.id,
-        module_name
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(crate::api::handlers::db_err)?;
-
-    let versions: Vec<String> = versions.into_iter().flatten().collect();
+    // #4598: `terraform init` / `tofu init` list a module's versions before
+    // they ask for `/download`, so a remote (its upstream's versions) and a
+    // virtual (the union over the members the caller may read) must answer
+    // here too, not only a hosted repository.
+    let mut upstream_err: Option<Response> = None;
+    let versions: Vec<String> = if repo.repo_type == RepositoryType::Virtual {
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
+        let mut all = std::collections::BTreeSet::new();
+        for member in &members {
+            if member.repo_type.is_hosted() {
+                all.extend(hosted_module_versions(&state.db, member.id, &module_name).await?);
+            } else if member.repo_type == RepositoryType::Remote {
+                let info = proxy_helpers::repo_info_from_member(member);
+                match remote_module_versions(&state, &info, &upstream_path).await {
+                    Ok(v) => all.extend(v),
+                    Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+                    Err(resp) => {
+                        upstream_err.get_or_insert(resp);
+                    }
+                }
+            }
+        }
+        all.into_iter().collect()
+    } else if repo.repo_type == RepositoryType::Remote {
+        match remote_module_versions(&state, &repo, &upstream_path).await {
+            Ok(v) => v,
+            Err(resp) if resp.status() == StatusCode::NOT_FOUND => Vec::new(),
+            Err(resp) => return Err(resp),
+        }
+    } else {
+        hosted_module_versions(&state.db, repo.id, &module_name).await?
+    };
 
     if versions.is_empty() {
+        if let Some(resp) = upstream_err {
+            return Err(resp);
+        }
         return Err((
             StatusCode::NOT_FOUND,
             format!("Module {} not found", module_name),
@@ -264,6 +365,77 @@ async fn list_module_versions(
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&json).unwrap()))
         .unwrap())
+}
+
+/// The versions a hosted repository holds of a module.
+async fn hosted_module_versions(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    module_name: &str,
+) -> Result<Vec<String>, Response> {
+    let versions: Vec<Option<String>> = sqlx::query_scalar!(
+        r#"
+        SELECT DISTINCT version
+        FROM artifacts
+        WHERE repository_id = $1
+          AND name = $2
+          AND is_deleted = false
+          AND version IS NOT NULL
+        ORDER BY version
+        "#,
+        repository_id,
+        module_name
+    )
+    .fetch_all(db)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
+    Ok(versions.into_iter().flatten().collect())
+}
+
+/// The versions a remote repository's upstream registry lists for a module
+/// (`{"modules":[{"versions":[{"version":"..."}]}]}`), through the proxy.
+/// A remote without an upstream or proxy lists none.
+async fn remote_module_versions(
+    state: &SharedState,
+    repo: &RepoInfo,
+    upstream_path: &str,
+) -> Result<Vec<String>, Response> {
+    let (Some(upstream_url), Some(proxy)) =
+        (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+    else {
+        return Ok(Vec::new());
+    };
+    let (content, _ct) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await?;
+    let value: serde_json::Value = serde_json::from_slice(&content).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Invalid upstream registry response: {}", e),
+        )
+            .into_response()
+    })?;
+    Ok(module_versions_from_registry(&value))
+}
+
+/// The version strings of a module registry `versions` document.
+fn module_versions_from_registry(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("modules")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("versions").and_then(|v| v.as_array()))
+        .flatten()
+        .filter_map(|v| v.get("version").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +456,12 @@ async fn download_module(
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     let module_name = build_module_name(&namespace, &name, &provider);
+    let coords = ModuleCoords {
+        namespace: &namespace,
+        name: &name,
+        provider: &provider,
+        version: &version,
+    };
 
     let artifact = sqlx::query!(
         r#"
@@ -320,75 +498,28 @@ async fn download_module(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let upstream_path = format!(
-                        "v1/modules/{}/{}/{}/{}/download",
-                        namespace, name, provider, version
-                    );
-                    // #1608 Phase 4: stream the terraform module archive to the
-                    // client while teeing to the proxy cache, instead of
-                    // buffering the whole module in memory. Single-flight via
-                    // the merged coordinator (#1609).
-                    let response = proxy_helpers::proxy_fetch_streaming(
-                        proxy,
-                        repo.id,
-                        &repo_key,
+                    // #4590: answer with the protocol's own `204` +
+                    // `X-Terraform-Get`, pointing at this server's `/archive`
+                    // (which streams the upstream archive through the proxy
+                    // cache) with the archive-type hint the client needs.
+                    // This used to stream the upstream `/download` response
+                    // body back as a `200`, which no client can use: a
+                    // registry answers with an empty `204` whose location is
+                    // in a header that was dropped.
+                    let remote = RemoteModuleUpstream {
+                        repo: &repo,
                         upstream_url,
-                        &upstream_path,
-                        "application/octet-stream",
-                    )
-                    .await?;
-                    // #3649: count the proxied serve. The streaming helper answers a warm
-                    // cache HIT from storage and a cold MISS from upstream through the same
-                    // call, so recording once it resolves counts both -- the cache hit #3649
-                    // reported as invisible included -- while a 404/502 still counts nothing.
-                    // Keyed on the proxy-cache path this fetch commits under, so the count
-                    // lines up with the catalog row the artifact listing renders.
-                    proxy_helpers::record_proxy_download(
-                        &state,
-                        repo.id,
-                        &repo_key,
-                        &upstream_path,
-                        &ctx,
-                    )
-                    .await;
-                    return Ok(response);
+                        proxy,
+                    };
+                    return remote_module_download(&remote, &coords).await;
                 }
             }
-            // Virtual repo: try each member in priority order
+            // Virtual repo (#4598): answer the way the resolving member does,
+            // a `204` whose `X-Terraform-Get` points at this virtual's own
+            // `/archive`. This used to stream the member's archive back as a
+            // `200`, which no client can use.
             if repo.repo_type == RepositoryType::Virtual {
-                let db = state.db.clone();
-                let upstream_path = format!(
-                    "v1/modules/{}/{}/{}/{}/download",
-                    namespace, name, provider, version
-                );
-                let vname = module_name.clone();
-                let vversion = version.clone();
-                let result = proxy_helpers::resolve_virtual_download(
-                    &state.db,
-                    auth.as_ref(),
-                    state.proxy_service.as_deref(),
-                    repo.id,
-                    &upstream_path,
-                    |member_id, location| {
-                        let db = db.clone();
-                        let state = state.clone();
-                        let vname = vname.clone();
-                        let vversion = vversion.clone();
-                        async move {
-                            proxy_helpers::local_fetch_by_name_version(
-                                &db, &state, member_id, &location, &vname, &vversion,
-                            )
-                            .await
-                        }
-                    },
-                )
-                .await?;
-
-                return proxy_helpers::stream_fetch_result(
-                    result,
-                    "application/octet-stream",
-                    None,
-                );
+                return virtual_module_download(&state, auth.as_ref(), &repo, &coords, &ctx).await;
             }
             return Err(not_found);
         }
@@ -398,8 +529,10 @@ async fn download_module(
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
     // Return 204 with X-Terraform-Get header pointing to the archive download
-    // URL served by `download_module_archive`.
-    let download_url = build_module_archive_url(&repo_key, &namespace, &name, &provider, &version);
+    // URL served by `download_module_archive`, carrying the archive-type hint
+    // go-getter needs to unpack it (#4590).
+    let archive = hosted_module_archive_type(&state, &repo, artifact.id, &coords).await;
+    let download_url = coords.archive_url(&repo_key, archive, None);
 
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -415,23 +548,49 @@ async fn download_module(
 /// The location [`download_module`] advertises in `X-Terraform-Get`. Built here
 /// (rather than inline) so the advertised URL and the registered route are
 /// derived from one shared definition.
+///
+/// #4590: the URL always carries go-getter's `archive=<type>` hint. Terraform
+/// and OpenTofu hand this location to go-getter, which only unpacks a plain
+/// HTTP URL as an archive when the URL names the archive type (that query
+/// parameter, or a file extension); without it go-getter fetches the URL as an
+/// HTML page looking for a `terraform-get` meta tag and fails on the archive
+/// bytes. `subdir` is go-getter's `//<subdir>` component, placed before the
+/// query exactly as go-getter splits it back off.
 fn build_module_archive_url(
     repo_key: &str,
     namespace: &str,
     name: &str,
     provider: &str,
     version: &str,
+    archive: ModuleArchiveType,
+    subdir: Option<&str>,
 ) -> String {
+    let subdir = subdir
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("//{s}"))
+        .unwrap_or_default();
     format!(
-        "{}/{}/v1/modules/{}/{}/{}/{}/archive",
-        MOUNT_PREFIX, repo_key, namespace, name, provider, version
+        "{}/{}/v1/modules/{}/{}/{}/{}/archive{}?archive={}",
+        MOUNT_PREFIX,
+        repo_key,
+        namespace,
+        name,
+        provider,
+        version,
+        subdir,
+        archive.getter_hint()
     )
 }
 
-/// Stream a hosted module's stored archive — the bytes `X-Terraform-Get`
-/// points a client at.
+/// Stream a module's archive — the bytes `X-Terraform-Get` points a client at.
+///
+/// Hosted: the stored upload. Remote: the archive the upstream registry names,
+/// fetched through the proxy cache (#4590). The `?archive=` hint on the
+/// advertised URL is for the client's getter and is ignored here; the served
+/// file's name and `Content-Type` follow the bytes themselves.
 async fn download_module_archive(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, namespace, name, provider, version)): Path<(
         String,
         String,
@@ -442,14 +601,35 @@ async fn download_module_archive(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
-    let artifact_path = build_module_artifact_path(&namespace, &name, &provider, &version);
+    let coords = ModuleCoords {
+        namespace: &namespace,
+        name: &name,
+        provider: &provider,
+        version: &version,
+    };
+
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            let remote = RemoteModuleUpstream {
+                repo: &repo,
+                upstream_url,
+                proxy,
+            };
+            return remote_module_archive(&state, &remote, &coords, &ctx).await;
+        }
+    }
+    if repo.repo_type == RepositoryType::Virtual {
+        return virtual_module_archive(&state, auth.as_ref(), &repo, &coords, &ctx).await;
+    }
 
     let result = proxy_helpers::local_fetch_by_path(
         &state.db,
         &state,
         repo.id,
         &repo.storage_location(),
-        &artifact_path,
+        &coords.artifact_path(),
     )
     .await?;
 
@@ -458,8 +638,842 @@ async fn download_module_archive(
     // `block_unscanned` / `block_on_fail` / `max_severity` should have blocked.
     proxy_helpers::gate_and_record_streamed_local(&state.db, result.artifact_id, &ctx).await?;
 
-    let filename = format!("{}-{}-{}-{}.tar.gz", namespace, name, provider, version);
-    proxy_helpers::stream_fetch_result(result, "application/gzip", Some(&filename))
+    serve_module_archive(result, &coords).await
+}
+
+// ---------------------------------------------------------------------------
+// Module archive types (#4590)
+// ---------------------------------------------------------------------------
+
+/// A module version's registry coordinate, grouped so the archive helpers
+/// below take one argument instead of four.
+struct ModuleCoords<'a> {
+    namespace: &'a str,
+    name: &'a str,
+    provider: &'a str,
+    version: &'a str,
+}
+
+impl ModuleCoords<'_> {
+    fn artifact_path(&self) -> String {
+        build_module_artifact_path(self.namespace, self.name, self.provider, self.version)
+    }
+
+    /// The upstream registry's download endpoint for this version.
+    fn upstream_download_path(&self) -> String {
+        format!(
+            "v1/modules/{}/{}/{}/{}/download",
+            self.namespace, self.name, self.provider, self.version
+        )
+    }
+
+    /// Proxy-cache path a remote module's archive is stored under: derived
+    /// from the coordinate, never from the upstream archive URL, which may be
+    /// absolute or signed (the #1998 lesson).
+    fn archive_cache_path(&self) -> String {
+        format!(
+            "v1/modules/{}/{}/{}/{}/archive",
+            self.namespace, self.name, self.provider, self.version
+        )
+    }
+
+    fn archive_url(
+        &self,
+        repo_key: &str,
+        archive: ModuleArchiveType,
+        subdir: Option<&str>,
+    ) -> String {
+        build_module_archive_url(
+            repo_key,
+            self.namespace,
+            self.name,
+            self.provider,
+            self.version,
+            archive,
+            subdir,
+        )
+    }
+
+    /// Attachment filename for the served archive.
+    fn filename(&self, archive: Option<ModuleArchiveType>) -> String {
+        let stem = format!(
+            "{}-{}-{}-{}",
+            self.namespace, self.name, self.provider, self.version
+        );
+        match archive {
+            Some(a) => format!("{stem}.{}", a.extension()),
+            None => stem,
+        }
+    }
+}
+
+/// The archive formats a module archive is recognised as.
+///
+/// Detected from the bytes, never from the upload's name or `Content-Type`, so
+/// the hint `X-Terraform-Get` advertises always matches what is served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModuleArchiveType {
+    /// `PK\x03\x04` — a ZIP local file header.
+    Zip,
+    /// `\x1f\x8b` — gzip; a module tarball.
+    TarGz,
+    /// `ustar` at offset 257 — an uncompressed POSIX tar. Recognised so it can
+    /// be named precisely, but neither Terraform nor OpenTofu can install one:
+    /// their module getter registers no plain-`tar` decompressor, so
+    /// `?archive=tar` falls back to the same HTML-page parse as no hint at all.
+    /// New uploads are therefore refused (see [`classify_module_upload`]).
+    Tar,
+}
+
+/// The type assumed for a stored module whose bytes cannot be read or are not
+/// recognised: every module was labelled a gzip tarball before #4590, so this
+/// keeps such an artifact exactly as it was advertised.
+const LEGACY_MODULE_ARCHIVE_TYPE: ModuleArchiveType = ModuleArchiveType::TarGz;
+
+/// `artifact_metadata.metadata` key the detected type is recorded under.
+const MODULE_ARCHIVE_METADATA_KEY: &str = "archive_type";
+
+/// Leading bytes needed to tell the types apart: a tar header's `ustar` magic
+/// spans offsets 257..262.
+const MODULE_ARCHIVE_SNIFF_LEN: usize = 262;
+
+impl ModuleArchiveType {
+    /// Identify an archive from its leading bytes (at least
+    /// [`MODULE_ARCHIVE_SNIFF_LEN`] of them for a plain tar to be recognised).
+    fn sniff(head: &[u8]) -> Option<Self> {
+        if head.starts_with(b"PK\x03\x04") {
+            Some(Self::Zip)
+        } else if head.starts_with(&[0x1f, 0x8b]) {
+            Some(Self::TarGz)
+        } else if head.get(257..MODULE_ARCHIVE_SNIFF_LEN) == Some(&b"ustar"[..]) {
+            Some(Self::Tar)
+        } else {
+            None
+        }
+    }
+
+    /// go-getter's name for the type: the `archive=` query value.
+    fn getter_hint(self) -> &'static str {
+        match self {
+            Self::Zip => "zip",
+            Self::TarGz => "tar.gz",
+            Self::Tar => "tar",
+        }
+    }
+
+    /// File extension of the served archive.
+    fn extension(self) -> &'static str {
+        self.getter_hint()
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Zip => "application/zip",
+            Self::TarGz => "application/gzip",
+            Self::Tar => "application/x-tar",
+        }
+    }
+
+    /// Parse a go-getter `archive=` value (also the recorded metadata value).
+    fn from_getter_hint(hint: &str) -> Option<Self> {
+        match hint.to_ascii_lowercase().as_str() {
+            "zip" => Some(Self::Zip),
+            "tar.gz" | "tgz" => Some(Self::TarGz),
+            "tar" => Some(Self::Tar),
+            _ => None,
+        }
+    }
+
+    /// The type recorded in a module's `artifact_metadata` at upload.
+    fn from_metadata(metadata: &serde_json::Value) -> Option<Self> {
+        metadata
+            .get(MODULE_ARCHIVE_METADATA_KEY)
+            .and_then(|v| v.as_str())
+            .and_then(Self::from_getter_hint)
+    }
+}
+
+/// What a URL path's extension tells go-getter about the archive behind it.
+#[derive(Debug, PartialEq, Eq)]
+enum GetterExtension {
+    /// An archive type this server serves and hints.
+    Known(ModuleArchiveType),
+    /// An archive go-getter unpacks that is not one of ours (`.tar.xz`,
+    /// `.tar.bz2`, ...): left for the client's getter to handle itself.
+    Foreign,
+    /// No archive extension.
+    None,
+}
+
+/// go-getter's own extension match, in its order (longest suffixes first).
+fn getter_extension(path: &str) -> GetterExtension {
+    let path = path.to_ascii_lowercase();
+    for (ext, archive) in [
+        (".tar.gz", Some(ModuleArchiveType::TarGz)),
+        (".tgz", Some(ModuleArchiveType::TarGz)),
+        (".zip", Some(ModuleArchiveType::Zip)),
+        (".tar.bz2", None),
+        (".tar.tbz2", None),
+        (".tbz2", None),
+        (".tar.xz", None),
+        (".txz", None),
+        (".tar.zst", None),
+        (".tzst", None),
+        (".bz2", None),
+        (".gz", None),
+        (".xz", None),
+        (".zst", None),
+    ] {
+        if path.ends_with(ext) {
+            return match archive {
+                Some(a) => GetterExtension::Known(a),
+                None => GetterExtension::Foreign,
+            };
+        }
+    }
+    GetterExtension::None
+}
+
+/// Decide whether an uploaded module archive is accepted, from its leading
+/// bytes. ZIP and gzip-compressed tar are what `terraform init` / `tofu init`
+/// can install; anything else is refused with the reason.
+fn classify_module_upload(head: &[u8]) -> Result<ModuleArchiveType, &'static str> {
+    match ModuleArchiveType::sniff(head) {
+        Some(ModuleArchiveType::Tar) => Err(
+            "Module archive is an uncompressed tar, which terraform/tofu cannot install \
+             (their module getter has no plain-tar support); upload it gzip-compressed \
+             (.tar.gz) or as a .zip",
+        ),
+        Some(archive) => Ok(archive),
+        None => Err(
+            "Module archive is not a ZIP or gzip-compressed tar (.tar.gz); \
+             terraform/tofu modules must be uploaded in one of those formats",
+        ),
+    }
+}
+
+/// Read the leading bytes of a staged upload and classify it, mapping a
+/// refusal to `400 Bad Request`.
+#[allow(clippy::result_large_err)]
+async fn sniff_staged_module_archive(
+    path: &std::path::Path,
+) -> Result<ModuleArchiveType, Response> {
+    use tokio::io::AsyncReadExt;
+
+    // #3718: the IO error text names the scratch path; keep it in the log.
+    let read_failed = |e: std::io::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::internal_err_message("Failed to read staged module archive", &e),
+        )
+            .into_response()
+    };
+    let mut head = Vec::with_capacity(MODULE_ARCHIVE_SNIFF_LEN);
+    tokio::fs::File::open(path)
+        .await
+        .map_err(read_failed)?
+        .take(MODULE_ARCHIVE_SNIFF_LEN as u64)
+        .read_to_end(&mut head)
+        .await
+        .map_err(read_failed)?;
+    classify_module_upload(&head).map_err(|msg| (StatusCode::BAD_REQUEST, msg).into_response())
+}
+
+type ByteStream = futures::stream::BoxStream<'static, crate::error::Result<Bytes>>;
+
+/// Read just enough of `body` to identify the archive, returning the type and
+/// a stream that replays those bytes followed by the rest — so the caller can
+/// still serve the whole body. A stream error is replayed in place, not
+/// swallowed.
+async fn peek_module_archive(mut body: ByteStream) -> (Option<ModuleArchiveType>, ByteStream) {
+    let mut head = Vec::with_capacity(MODULE_ARCHIVE_SNIFF_LEN);
+    let mut replay = Vec::new();
+    let mut finished = false;
+    while head.len() < MODULE_ARCHIVE_SNIFF_LEN {
+        match body.next().await {
+            Some(Ok(chunk)) => {
+                head.extend_from_slice(&chunk);
+                replay.push(Ok(chunk));
+            }
+            Some(Err(e)) => {
+                replay.push(Err(e));
+                finished = true;
+                break;
+            }
+            None => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    let rest = if finished {
+        futures::stream::empty().boxed()
+    } else {
+        body
+    };
+    (
+        ModuleArchiveType::sniff(&head),
+        futures::stream::iter(replay).chain(rest).boxed(),
+    )
+}
+
+/// Serve a module archive with the filename and `Content-Type` its bytes call
+/// for (a stored module used to be named `.tar.gz` whatever it held).
+async fn serve_module_archive(
+    mut result: crate::services::proxy_service::StreamingFetchResult,
+    coords: &ModuleCoords<'_>,
+) -> Result<Response, Response> {
+    let body = std::mem::replace(&mut result.body, futures::stream::empty().boxed());
+    let (archive, body) = peek_module_archive(body).await;
+    result.body = body;
+    if let Some(a) = archive {
+        result.content_type = Some(a.content_type().to_string());
+    }
+    proxy_helpers::stream_fetch_result(
+        result,
+        "application/octet-stream",
+        Some(&coords.filename(archive)),
+    )
+}
+
+/// The archive type of a hosted module version: the type recorded at upload,
+/// or — for a module uploaded before #4590 recorded one — the type of its
+/// stored bytes. Falls back to [`LEGACY_MODULE_ARCHIVE_TYPE`] when the bytes
+/// cannot be read (e.g. a quarantined artifact, which `/archive` refuses
+/// anyway) or are not recognised.
+async fn hosted_module_archive_type(
+    state: &SharedState,
+    repo: &RepoInfo,
+    artifact_id: uuid::Uuid,
+    coords: &ModuleCoords<'_>,
+) -> ModuleArchiveType {
+    let recorded: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    if let Some(archive) = recorded.as_ref().and_then(ModuleArchiveType::from_metadata) {
+        return archive;
+    }
+
+    match proxy_helpers::local_fetch_by_path(
+        &state.db,
+        state,
+        repo.id,
+        &repo.storage_location(),
+        &coords.artifact_path(),
+    )
+    .await
+    {
+        Ok(result) => peek_module_archive(result.body)
+            .await
+            .0
+            .unwrap_or(LEGACY_MODULE_ARCHIVE_TYPE),
+        Err(_) => LEGACY_MODULE_ARCHIVE_TYPE,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote modules (#4590)
+// ---------------------------------------------------------------------------
+
+/// A remote Terraform repository together with its upstream and proxy.
+struct RemoteModuleUpstream<'a> {
+    repo: &'a RepoInfo,
+    upstream_url: &'a str,
+    proxy: &'a crate::services::proxy_service::ProxyService,
+}
+
+/// Where an upstream registry says a module version's source lives.
+#[derive(Debug, PartialEq, Eq)]
+enum UpstreamModuleSource {
+    /// A plain HTTP(S) URL this server fetches through its proxy cache and
+    /// serves back under `/archive`.
+    Http {
+        /// The URL to fetch: absolute, with go-getter's `archive=` parameter
+        /// removed (the client's getter strips it before fetching too).
+        fetch_url: String,
+        /// go-getter `//<subdir>` component, if any.
+        subdir: Option<String>,
+        /// The type the location names, if it names one.
+        archive: Option<ModuleArchiveType>,
+        /// The location as an absolute address, for handing to the client
+        /// unchanged when the archive turns out not to be one we serve.
+        absolute: String,
+    },
+    /// A source this server does not proxy — a forced getter (`git::`,
+    /// `s3::`, ...), a non-HTTP scheme, or an archive format go-getter knows
+    /// and we do not — handed to the client as an absolute address.
+    Passthrough(String),
+}
+
+/// go-getter's `SourceDirSubdir`: split a `//<subdir>` component off a source
+/// address (ignoring the scheme's own `//`), keeping any query on the source.
+fn split_getter_subdir(src: &str) -> (String, Option<String>) {
+    let stop = src.find('?').unwrap_or(src.len());
+    let offset = src[..stop].find("://").map_or(0, |i| i + 3);
+    let Some(idx) = src[offset..stop].find("//") else {
+        return (src.to_string(), None);
+    };
+    let idx = idx + offset;
+    let mut source = src[..idx].to_string();
+    let mut subdir = src[idx + 2..].to_string();
+    if let Some(q) = subdir.find('?') {
+        source.push_str(&subdir[q..]);
+        subdir.truncate(q);
+    }
+    (source, Some(subdir).filter(|s| !s.is_empty()))
+}
+
+/// Classify the location an upstream registry returned for a module version.
+///
+/// Mirrors the Terraform client: a location starting with `/`, `./` or `../`
+/// is a URL relative to `base_url` (the URL that answered); anything else is a
+/// go-getter source address taken as written (`git::...`, `github.com/...`,
+/// an absolute URL).
+fn classify_upstream_module_location(location: &str, base_url: &str) -> UpstreamModuleSource {
+    let location = location.trim();
+    let relative = ["/", "./", "../"].iter().any(|p| location.starts_with(p));
+    let resolve = |source: &str| -> Option<reqwest::Url> {
+        if relative {
+            reqwest::Url::parse(base_url).ok()?.join(source).ok()
+        } else {
+            reqwest::Url::parse(source).ok()
+        }
+    };
+    let absolute = resolve(location)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| location.to_string());
+
+    // A forced getter (`git::https://...`) names its own protocol.
+    if let Some(forced) = location.find("::") {
+        if location.find("://").is_none_or(|scheme| forced < scheme) {
+            return UpstreamModuleSource::Passthrough(location.to_string());
+        }
+    }
+
+    let (source, subdir) = split_getter_subdir(location);
+    let Some(mut url) = resolve(&source) else {
+        return UpstreamModuleSource::Passthrough(absolute);
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return UpstreamModuleSource::Passthrough(absolute);
+    }
+
+    let mut hint = None;
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, v)| {
+            if k == "archive" {
+                hint = Some(v.to_string());
+                false
+            } else {
+                true
+            }
+        })
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    let archive = match hint {
+        Some(hint) => {
+            // Only rewrite the query when there is a hint to drop, so a signed
+            // URL's query string otherwise reaches upstream byte for byte.
+            url.set_query(None);
+            if !kept.is_empty() {
+                url.query_pairs_mut().extend_pairs(kept);
+            }
+            match ModuleArchiveType::from_getter_hint(&hint) {
+                Some(ModuleArchiveType::Tar) | None => {
+                    return UpstreamModuleSource::Passthrough(absolute)
+                }
+                Some(archive) => Some(archive),
+            }
+        }
+        None => match getter_extension(url.path()) {
+            GetterExtension::Known(archive) => Some(archive),
+            GetterExtension::Foreign => return UpstreamModuleSource::Passthrough(absolute),
+            GetterExtension::None => None,
+        },
+    };
+
+    UpstreamModuleSource::Http {
+        fetch_url: url.to_string(),
+        subdir,
+        archive,
+        absolute,
+    }
+}
+
+/// Pull the module location out of an upstream registry's download answer:
+/// the `X-Terraform-Get` header, else a `{"location": ...}` JSON body — the
+/// Terraform client's own precedence.
+fn upstream_module_location_value(header: Option<&str>, body: &[u8]) -> Option<String> {
+    header
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            serde_json::from_slice::<serde_json::Value>(body)
+                .ok()?
+                .get("location")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .filter(|l| !l.is_empty())
+}
+
+/// Ask the upstream registry where a module version lives and classify it.
+async fn resolve_upstream_module_source(
+    remote: &RemoteModuleUpstream<'_>,
+    coords: &ModuleCoords<'_>,
+) -> Result<UpstreamModuleSource, Response> {
+    let answer = proxy_helpers::proxy_fetch_terraform_module_location(
+        remote.proxy,
+        remote.repo.id,
+        &remote.repo.key,
+        remote.upstream_url,
+        &coords.upstream_download_path(),
+    )
+    .await?;
+    let location =
+        upstream_module_location_value(answer.x_terraform_get.as_deref(), &answer.content)
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "Upstream registry returned no module location",
+                )
+                    .into_response()
+            })?;
+    Ok(classify_upstream_module_location(
+        &location,
+        &answer.effective_url,
+    ))
+}
+
+/// Whether two URLs share scheme, host and port.
+fn same_origin(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(a), Ok(b)) => a.origin() == b.origin(),
+        _ => false,
+    }
+}
+
+/// Apply the outbound-URL (anti-SSRF) policy to an upstream-named archive URL
+/// before fetching it. A URL on the configured upstream's own origin is as
+/// trusted as the upstream itself and is exempt, so a registry on a private
+/// network can still serve its archives from relative locations; any other
+/// host is checked like the mirror's `download_url`.
+#[allow(clippy::result_large_err)]
+fn check_upstream_archive_url(
+    remote: &RemoteModuleUpstream<'_>,
+    fetch_url: &str,
+) -> Result<(), Response> {
+    if same_origin(fetch_url, remote.upstream_url) {
+        return Ok(());
+    }
+    validate_outbound_url(fetch_url, "Terraform upstream module archive URL").map_err(|e| {
+        // The URL is registry-controlled and may be signed; `e` names the
+        // blocked host without echoing it.
+        tracing::warn!(
+            "SSRF check rejected upstream module archive URL for repo {}: {}",
+            remote.repo.key,
+            e
+        );
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Upstream registry returned a disallowed module location: {e}"),
+        )
+            .into_response()
+    })
+}
+
+/// Fetch an upstream module archive through the proxy cache.
+///
+/// Always a body fetch (`is_head = false` below, #5343): both callers read
+/// the archive's first bytes, the sniff to learn its type and `/archive` to
+/// name the type in `Content-Type` and the attachment file name, so an
+/// upstream `HEAD` could not answer either.
+async fn fetch_upstream_module_archive(
+    remote: &RemoteModuleUpstream<'_>,
+    coords: &ModuleCoords<'_>,
+    fetch_url: &str,
+) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
+    check_upstream_archive_url(remote, fetch_url)?;
+    proxy_helpers::proxy_fetch_streaming_with_cache_key(
+        remote.proxy,
+        remote.repo.id,
+        &remote.repo.key,
+        remote.upstream_url,
+        fetch_url,
+        &coords.archive_cache_path(),
+        RepositoryFormat::Terraform,
+        false,
+    )
+    .await
+}
+
+/// Identify an upstream archive whose location names no type by reading its
+/// bytes. The archive is read to the end, through the proxy cache, so the
+/// client's `/archive` request that follows is served from the cache rather
+/// than abandoning a half-written cache entry here. Any failure is `None`:
+/// the caller then hands the client the upstream location unchanged.
+async fn sniff_upstream_module_archive(
+    remote: &RemoteModuleUpstream<'_>,
+    coords: &ModuleCoords<'_>,
+    fetch_url: &str,
+) -> Option<ModuleArchiveType> {
+    let result = fetch_upstream_module_archive(remote, coords, fetch_url)
+        .await
+        .ok()?;
+    let (archive, mut body) = peek_module_archive(result.body).await;
+    while let Some(chunk) = body.next().await {
+        chunk.ok()?;
+    }
+    archive
+}
+
+/// `GET .../download` on a remote repository: the `204` + `X-Terraform-Get`
+/// answer, pointing at this server's `/archive` with the archive hint when the
+/// upstream archive is one we serve, or at the upstream's own location when
+/// it is not.
+async fn remote_module_download(
+    remote: &RemoteModuleUpstream<'_>,
+    coords: &ModuleCoords<'_>,
+) -> Result<Response, Response> {
+    let location = remote_module_location(remote, coords, &remote.repo.key).await?;
+    Ok(module_location_response(location))
+}
+
+/// The `204` + `X-Terraform-Get` answer to a module `/download`.
+fn module_location_response(location: String) -> Response {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("X-Terraform-Get", location)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Where a remote's module version is to be fetched from: `advertise_key`'s
+/// own `/archive` with the archive hint when the upstream archive is one we
+/// serve, or the upstream's own location when it is not. `advertise_key` is
+/// the remote itself, or the virtual a client reached it through (#4598).
+async fn remote_module_location(
+    remote: &RemoteModuleUpstream<'_>,
+    coords: &ModuleCoords<'_>,
+    advertise_key: &str,
+) -> Result<String, Response> {
+    let location = match resolve_upstream_module_source(remote, coords).await? {
+        UpstreamModuleSource::Passthrough(location) => location,
+        UpstreamModuleSource::Http {
+            fetch_url,
+            subdir,
+            archive,
+            absolute,
+        } => {
+            let archive = match archive {
+                Some(archive) => Some(archive),
+                None => sniff_upstream_module_archive(remote, coords, &fetch_url).await,
+            };
+            match archive {
+                Some(archive) if archive != ModuleArchiveType::Tar => {
+                    coords.archive_url(advertise_key, archive, subdir.as_deref())
+                }
+                _ => absolute,
+            }
+        }
+    };
+    Ok(location)
+}
+
+/// `GET .../archive` on a remote repository: stream the upstream archive
+/// through the proxy cache.
+async fn remote_module_archive(
+    state: &SharedState,
+    remote: &RemoteModuleUpstream<'_>,
+    coords: &ModuleCoords<'_>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let UpstreamModuleSource::Http { fetch_url, .. } =
+        resolve_upstream_module_source(remote, coords).await?
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "The upstream registry serves this module from a source this \
+             repository does not proxy; use the location its download endpoint returns",
+        )
+            .into_response());
+    };
+    let result = fetch_upstream_module_archive(remote, coords, &fetch_url).await?;
+    // #3649: count the proxied serve, keyed on the cache path it commits under.
+    proxy_helpers::record_proxy_download(
+        state,
+        remote.repo.id,
+        &remote.repo.key,
+        &coords.archive_cache_path(),
+        ctx,
+    )
+    .await;
+    serve_module_archive(result, coords).await
+}
+
+// ---------------------------------------------------------------------------
+// Virtual modules (#4598)
+// ---------------------------------------------------------------------------
+
+/// A hosted repository's artifact id for a module version, if it holds one.
+async fn hosted_module_artifact_id(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    coords: &ModuleCoords<'_>,
+) -> Result<Option<uuid::Uuid>, Response> {
+    sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM artifacts
+        WHERE repository_id = $1
+          AND name = $2
+          AND version = $3
+          AND is_deleted = false
+        LIMIT 1
+        "#,
+    )
+    .bind(repository_id)
+    .bind(build_module_name(
+        coords.namespace,
+        coords.name,
+        coords.provider,
+    ))
+    .bind(coords.version)
+    .fetch_optional(db)
+    .await
+    .map_err(crate::api::handlers::db_err)
+}
+
+/// The `404` a virtual answers when no member holds the module version. The
+/// member walks below move past a member's `404`, keep its first other
+/// failure, and surface that failure instead of this one, so an upstream
+/// outage is not reported as "not found".
+fn virtual_module_not_found(coords: &ModuleCoords<'_>) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "Module {}/{}/{} version {} not found",
+            coords.namespace, coords.name, coords.provider, coords.version
+        ),
+    )
+        .into_response()
+}
+
+/// `GET .../download` on a virtual repository (#4598): resolve the member in
+/// priority order and answer as that member would, a `204` whose
+/// `X-Terraform-Get` points at this virtual's own `/archive` with the
+/// member's archive hint. A remote member's source this server does not
+/// proxy (`git::`, `s3::`, ...) is handed through unchanged, as by the remote
+/// itself.
+async fn virtual_module_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    coords: &ModuleCoords<'_>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    let mut upstream_err: Option<Response> = None;
+    for member in &members {
+        let info = proxy_helpers::repo_info_from_member(member);
+        if member.repo_type.is_hosted() {
+            let Some(artifact_id) = hosted_module_artifact_id(&state.db, member.id, coords).await?
+            else {
+                continue;
+            };
+            crate::services::artifact_service::record_download(&state.db, artifact_id, ctx).await;
+            let archive = hosted_module_archive_type(state, &info, artifact_id, coords).await;
+            return Ok(module_location_response(
+                coords.archive_url(&repo.key, archive, None),
+            ));
+        }
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        let (Some(upstream_url), Some(proxy)) =
+            (info.upstream_url.as_deref(), state.proxy_service.as_deref())
+        else {
+            continue;
+        };
+        let remote = RemoteModuleUpstream {
+            repo: &info,
+            upstream_url,
+            proxy,
+        };
+        match remote_module_location(&remote, coords, &repo.key).await {
+            Ok(location) => return Ok(module_location_response(location)),
+            Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+            Err(resp) => {
+                upstream_err.get_or_insert(resp);
+            }
+        }
+    }
+    Err(upstream_err.unwrap_or_else(|| virtual_module_not_found(coords)))
+}
+
+/// `GET .../archive` on a virtual repository (#4598): the archive
+/// [`virtual_module_download`] advertised, from the same member, found by the
+/// same priority walk: a hosted member's stored bytes (quarantine and scan
+/// policy enforced), or a remote member's upstream archive through its proxy
+/// cache.
+async fn virtual_module_archive(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    coords: &ModuleCoords<'_>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    let mut upstream_err: Option<Response> = None;
+    for member in &members {
+        let info = proxy_helpers::repo_info_from_member(member);
+        if member.repo_type.is_hosted() {
+            let result = match proxy_helpers::local_fetch_by_path(
+                &state.db,
+                state,
+                member.id,
+                &info.storage_location(),
+                &coords.artifact_path(),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(resp) if resp.status() == StatusCode::NOT_FOUND => continue,
+                Err(resp) => return Err(resp),
+            };
+            proxy_helpers::gate_and_record_streamed_local(&state.db, result.artifact_id, ctx)
+                .await?;
+            return serve_module_archive(result, coords).await;
+        }
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        let (Some(upstream_url), Some(proxy)) =
+            (info.upstream_url.as_deref(), state.proxy_service.as_deref())
+        else {
+            continue;
+        };
+        let remote = RemoteModuleUpstream {
+            repo: &info,
+            upstream_url,
+            proxy,
+        };
+        match remote_module_archive(state, &remote, coords, ctx).await {
+            Ok(response) => return Ok(response),
+            Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+            Err(resp) => {
+                upstream_err.get_or_insert(resp);
+            }
+        }
+    }
+    Err(upstream_err.unwrap_or_else(|| virtual_module_not_found(coords)))
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +1631,7 @@ async fn upload_module(
         String,
         String,
     )>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -647,13 +1662,22 @@ async fn upload_module(
             .into_response());
     }
 
-    // Stream the request body to a bounded scratch file, computing the content
-    // digests in one pass — never buffering the module archive in memory
-    // (#2517). The stager enforces `max_upload_size_bytes` mid-stream.
-    let (staged, digests) =
-        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+    // Stream the request body to the repository's backend when it supports
+    // native streaming, else to local scratch, computing the content digests in
+    // one pass — never buffering the module archive in memory (#2517, #4990).
+    let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
+        &state,
+        &repo,
+        body.into_data_stream(),
+    )
+    .await?;
     let checksum = digests.sha256.clone();
     let size_bytes = staged.size_bytes();
+
+    // #4590: the archive type decides the hint `X-Terraform-Get` advertises,
+    // so it is detected from the bytes now and recorded with the artifact.
+    let local = super::repositories::materialize_staged_for_repo(&state, &repo, &staged).await?;
+    let archive = sniff_staged_module_archive(local.path()).await?;
 
     let artifact_path = build_module_artifact_path(&namespace, &name, &provider, &version);
     let storage_key = build_module_storage_key(&namespace, &name, &provider, &version);
@@ -665,12 +1689,27 @@ async fn upload_module(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Store the file, streamed from the staged scratch file.
-    // `put_artifact_stream` runs the cross-repo write guard (#2584) before
-    // writing, then streams the object to storage.
-    proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    // Store the file, from local scratch or by copying the object the
+    // repository's backend already staged. `put_staged_body` runs the
+    // cross-repo write guard (#2584) and the quota preflight before writing.
+    proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -686,19 +1725,27 @@ async fn upload_module(
         version,
         size_bytes,
         checksum,
-        "application/gzip",
+        archive.content_type(),
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Store metadata
-    let metadata = build_module_metadata(&namespace, &name, &provider, &version);
+    let metadata = build_module_metadata(&namespace, &name, &provider, &version, archive);
 
     let _ = sqlx::query!(
         r#"
@@ -732,6 +1779,17 @@ async fn upload_module(
         size_bytes,
         &checksum,
         None,
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -905,6 +1963,7 @@ async fn download_provider(
                         upstream_url,
                         &upstream_path,
                         "application/octet-stream",
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -939,6 +1998,7 @@ async fn download_provider(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -972,8 +2032,70 @@ async fn download_provider(
     // Per the Provider Registry Protocol this endpoint returns the package
     // *document*, not the package: `download_url` points at the separate route
     // that streams the archive (`download_provider_binary`).
-    let download_url =
+    let binary_path =
         build_provider_binary_url(&repo_key, &namespace, &type_name, &version, &os, &arch);
+
+    // Protocols the uploader declared (or the manifest in the archive did); a
+    // package stored before this was recorded keeps the legacy default.
+    let metadata: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(artifact.id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(crate::api::handlers::db_err)?;
+    let protocols = provider_protocols_from_metadata(metadata.as_ref());
+
+    // Only a hosted repo can vouch for its packages: it holds the bytes the
+    // checksum list is computed from. A repo with no usable OpenPGP key keeps
+    // the legacy, unsigned package document (see the module docs).
+    let mut signing = if classify_mirror_repo(&repo.repo_type, false, false) == MirrorGuard::Local {
+        active_openpgp_key(&state, repo.id)
+            .await?
+            .map(|key| provider_signing_doc(&key, &repo_key, &namespace, &type_name, &version))
+    } else {
+        None
+    };
+
+    // Terraform/OpenTofu fetch `download_url`, `shasums_url` and
+    // `shasums_signature_url` without the registry credentials they sent for
+    // this document, so a private repo would answer each with 401. As for the
+    // mirror archives (#3588), an authenticated caller gets single-use tickets
+    // bound to each exact path; an anonymous caller (public repo) gets the
+    // plain paths it can already reach.
+    let download_url = ticketed_path(
+        mint_path_ticket(
+            &state,
+            auth.as_ref(),
+            &binary_path,
+            "terraform-provider-archive",
+        )
+        .await,
+        binary_path,
+    );
+    if let Some(doc) = signing.as_mut() {
+        let shasums_path = std::mem::take(&mut doc.shasums_url);
+        let signature_path = std::mem::take(&mut doc.shasums_signature_url);
+        doc.shasums_url = ticketed_path(
+            mint_path_ticket(
+                &state,
+                auth.as_ref(),
+                &shasums_path,
+                "terraform-provider-shasums",
+            )
+            .await,
+            shasums_path,
+        );
+        doc.shasums_signature_url = ticketed_path(
+            mint_path_ticket(
+                &state,
+                auth.as_ref(),
+                &signature_path,
+                "terraform-provider-shasums-sig",
+            )
+            .await,
+            signature_path,
+        );
+    }
 
     let json = build_provider_download_json(
         &os,
@@ -981,12 +2103,156 @@ async fn download_provider(
         &filename,
         &download_url,
         &artifact.checksum_sha256,
+        &protocols,
+        signing.as_ref(),
     );
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&json).unwrap()))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/providers/{namespace}/{type}/{version}/SHA256SUMS[.sig]
+//
+// The signed checksum list an origin registry must publish. Hosted repos only,
+// computed from the stored packages on every request (no stored copy to go
+// stale, nothing to backfill for packages uploaded before these routes), and
+// signed with the repository's active OpenPGP key.
+// ---------------------------------------------------------------------------
+
+/// The repo's active signing key if it can sign OpenPGP; `None` when the repo
+/// has no active key or the key is not a `gpg` one. A lookup failure is an
+/// (already stabilised, #3667) error response, never a silent downgrade.
+async fn active_openpgp_key(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+) -> Result<Option<crate::models::signing_key::SigningKey>, Response> {
+    let svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    match svc.get_active_key_for_repo(repo_id).await {
+        Ok(key) => Ok(key.filter(|k| k.supports_openpgp())),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to load repository signing key");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load signing key",
+            )
+                .into_response())
+        }
+    }
+}
+
+/// Everything both checksum routes need: the key that signs and the exact
+/// document that is signed. Fails closed — no key, no document.
+async fn load_provider_shasums(
+    state: &SharedState,
+    repo_key: &str,
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+) -> Result<(crate::models::signing_key::SigningKey, String), Response> {
+    let repo = resolve_terraform_repo(&state.db, repo_key).await?;
+    if classify_mirror_repo(&repo.repo_type, false, false) != MirrorGuard::Local {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Provider checksums are only published by hosted Terraform repositories",
+        )
+            .into_response());
+    }
+
+    let svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let key = crate::api::handlers::error_helpers::require_signing_key(
+        svc.get_active_key_for_repo(repo.id).await,
+    )?;
+    let key = crate::api::handlers::error_helpers::require_openpgp_capable_key(key)?;
+
+    let packages = local_provider_packages(&state.db, &repo, namespace, type_name, version).await?;
+    if packages.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "Provider version not found").into_response());
+    }
+    Ok((key, build_provider_shasums(type_name, version, &packages)))
+}
+
+async fn provider_shasums(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, type_name, version)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let (_key, shasums) =
+        load_provider_shasums(&state, &repo_key, &namespace, &type_name, &version).await?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(shasums))
+        .unwrap())
+}
+
+/// How long a `SHA256SUMS.sig` is reused. Far below the minimum signature
+/// expiry the signing service allows (`MIN_SIGNATURE_EXPIRY_SECONDS`), so a
+/// cached signature is never served stale.
+const SHASUMS_SIGNATURE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Binary `SHA256SUMS.sig` per (signing key id, SHA-256 of the signed
+/// `SHA256SUMS`). `try_get_with` single-flights a miss; a failed signing is
+/// never cached. Per replica: each replica signs at most once per entry.
+static SHASUMS_SIGNATURE_CACHE: once_cell::sync::Lazy<
+    moka::future::Cache<(uuid::Uuid, [u8; 32]), Bytes>,
+> = once_cell::sync::Lazy::new(|| {
+    moka::future::Cache::builder()
+        .max_capacity(10_000)
+        .time_to_live(SHASUMS_SIGNATURE_TTL)
+        .build()
+});
+
+/// Convert an ASCII-armored detached signature into the binary OpenPGP packet
+/// stream. Terraform/OpenTofu read `SHA256SUMS.sig` as raw packets (the same
+/// bytes `gpg --detach-sign` writes without `--armor`) and reject armor.
+fn dearmor_signature(armored: &str) -> crate::error::Result<Vec<u8>> {
+    use pgp::composed::{Deserializable, StandaloneSignature};
+    use pgp::ser::Serialize;
+    let (signature, _) = StandaloneSignature::from_string(armored)
+        .map_err(|e| crate::error::AppError::Internal(format!("Invalid signature armor: {e}")))?;
+    signature.to_bytes().map_err(|e| {
+        crate::error::AppError::Internal(format!("Failed to serialize signature: {e}"))
+    })
+}
+
+async fn provider_shasums_signature(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, type_name, version)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let (key, shasums) =
+        load_provider_shasums(&state, &repo_key, &namespace, &type_name, &version).await?;
+
+    // The signature carries the configured signature expiry, like every other
+    // detached signature the signing service makes. Signing decrypts the
+    // private key, so a signature is reused for a short while per
+    // (key, SHA256SUMS digest); a key rotation or a changed package set is a
+    // different cache key and is signed afresh.
+    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(shasums.as_bytes()).into();
+    let signature = SHASUMS_SIGNATURE_CACHE
+        .try_get_with((key.id, digest), async {
+            let svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+            let armored = svc
+                .sign_openpgp_detached_with_key(&key, shasums.as_bytes())
+                .await?;
+            let _ = svc.mark_key_used(key.id).await;
+            dearmor_signature(&armored).map(Bytes::from)
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::internal_err_message("Failed to sign provider checksums", &e),
+            )
+                .into_response()
+        })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/pgp-signature")
+        .body(Body::from(signature))
         .unwrap())
 }
 
@@ -1118,6 +2384,7 @@ async fn upload_provider(
         String,
         String,
     )>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -1125,6 +2392,8 @@ async fn upload_provider(
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
+    let declared_protocols = parse_protocols_header(&headers)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg).into_response())?;
     let provider_name = build_provider_name(&namespace, &type_name);
     let platform = build_platform(&os, &arch);
 
@@ -1162,22 +2431,53 @@ async fn upload_provider(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Stream the request body to a bounded scratch file, computing the content
-    // digests in one pass — never buffering the provider archive in memory
-    // (#2517). The stager enforces `max_upload_size_bytes` mid-stream.
-    let (staged, digests) =
-        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+    // Stream the request body to the repository's backend when it supports
+    // native streaming, else to local scratch, computing the content digests in
+    // one pass — never buffering the provider archive in memory (#2517, #4990).
+    let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
+        &state,
+        &repo,
+        body.into_data_stream(),
+    )
+    .await?;
     let checksum = digests.sha256.clone();
     let size_bytes = staged.size_bytes();
 
+    // Header wins; otherwise the registry manifest shipped inside the archive
+    // (the file `terraform-provider-*` release zips carry); otherwise nothing
+    // is recorded and the package keeps the legacy default.
+    let protocols = match declared_protocols {
+        Some(p) => Some(p),
+        None => {
+            let local =
+                super::repositories::materialize_staged_for_repo(&state, &repo, &staged).await?;
+            read_manifest_protocols(local.path().to_path_buf()).await
+        }
+    };
+
     let storage_key = build_provider_storage_key(&namespace, &type_name, &version, &platform);
 
-    // Store the file, streamed from the staged scratch file.
-    // `put_artifact_stream` runs the cross-repo write guard (#2584) before
-    // writing, then streams the object to storage.
-    proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    // Store the file, from local scratch or by copying the object the
+    // repository's backend already staged. `put_staged_body` runs the
+    // cross-repo write guard (#2584) and the quota preflight before writing.
+    proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -1197,15 +2497,30 @@ async fn upload_provider(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Store metadata
-    let metadata = build_provider_metadata(&namespace, &type_name, &version, &os, &arch);
+    let metadata = build_provider_metadata(
+        &namespace,
+        &type_name,
+        &version,
+        &os,
+        &arch,
+        protocols.as_deref(),
+    );
 
     let _ = sqlx::query!(
         r#"
@@ -1243,6 +2558,17 @@ async fn upload_provider(
     )
     .await;
 
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await;
+
     info!(
         "Terraform provider upload: {}/{} v{} ({}) to repo {}",
         namespace, type_name, version, platform, repo_key
@@ -1259,6 +2585,7 @@ async fn upload_provider(
                 "os": os,
                 "arch": arch,
                 "checksum": checksum,
+                "protocols": protocols.unwrap_or_else(default_provider_protocols),
             }))
             .unwrap(),
         ))
@@ -1525,11 +2852,18 @@ fn provider_platform_from(
 fn provider_versions_from_rows(
     rows: &[(String, Option<serde_json::Value>, String)],
 ) -> Vec<serde_json::Value> {
-    let mut version_map: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+    type VersionEntry = (Vec<serde_json::Value>, Vec<String>);
+    let mut version_map: std::collections::BTreeMap<String, VersionEntry> =
         std::collections::BTreeMap::new();
 
     for (version, metadata, path) in rows {
-        let platforms = version_map.entry(version.clone()).or_default();
+        let (platforms, protocols) = version_map.entry(version.clone()).or_default();
+        // A version advertises every protocol any of its packages speaks.
+        for protocol in provider_protocols_from_metadata(metadata.as_ref()) {
+            if !protocols.contains(&protocol) {
+                protocols.push(protocol);
+            }
+        }
         if let Some((os, arch)) = provider_platform_from(metadata.as_ref(), path) {
             let platform = serde_json::json!({ "os": os, "arch": arch });
             if !platforms.contains(&platform) {
@@ -1540,10 +2874,12 @@ fn provider_versions_from_rows(
 
     version_map
         .into_iter()
-        .map(|(version, platforms)| {
+        .map(|(version, (platforms, protocols))| {
+            let protocols = normalize_protocols(protocols.iter().map(String::as_str))
+                .unwrap_or_else(default_provider_protocols);
             serde_json::json!({
                 "version": version,
-                "protocols": ["5.0"],
+                "protocols": protocols,
                 "platforms": platforms,
             })
         })
@@ -1918,31 +3254,60 @@ async fn mint_mirror_archive_tickets(
     platforms: &[(String, String)],
 ) -> std::collections::HashMap<(String, String), String> {
     let mut tickets = std::collections::HashMap::new();
-    let Some(user_id) = auth.map(|a| a.user_id) else {
+    if auth.is_none() {
         return tickets;
-    };
+    }
     for (os, arch) in platforms {
         let resource_path = coords.download_request_path(os, arch);
-        match crate::services::auth_config_service::AuthConfigService::create_download_ticket_with_ttl(
-            &state.db,
-            user_id,
-            "terraform-mirror-archive",
-            Some(&resource_path),
-            MIRROR_TICKET_TTL_SECS,
-        )
-        .await
+        if let Some(ticket) =
+            mint_path_ticket(state, auth, &resource_path, "terraform-mirror-archive").await
         {
-            Ok(ticket) => {
-                tickets.insert((os.clone(), arch.clone()), ticket);
-            }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "terraform mirror: could not mint archive download ticket for {}",
-                resource_path
-            ),
+            tickets.insert((os.clone(), arch.clone()), ticket);
         }
     }
     tickets
+}
+
+/// Mint one single-use download ticket bound to exactly `resource_path` for
+/// the authenticated caller, or `None` for an anonymous caller or when minting
+/// fails (the URL then behaves exactly as it would without a ticket).
+async fn mint_path_ticket(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    resource_path: &str,
+    purpose: &str,
+) -> Option<String> {
+    let auth = auth?;
+    // The ticket carries the caller's repository restriction
+    // (GHSA-2mfv-xg68-gq4p).
+    match crate::services::auth_config_service::AuthConfigService::create_download_ticket_with_ttl(
+        &state.db,
+        auth.user_id,
+        &auth.allowed_repo_ids,
+        purpose,
+        Some(resource_path),
+        MIRROR_TICKET_TTL_SECS,
+    )
+    .await
+    {
+        Ok(ticket) => Some(ticket),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "terraform: could not mint download ticket for {}",
+                resource_path
+            );
+            None
+        }
+    }
+}
+
+/// `path?ticket=<t>` when a ticket was minted, else `path` unchanged.
+fn ticketed_path(ticket: Option<String>, path: String) -> String {
+    match ticket {
+        Some(t) => format!("{path}?ticket={t}"),
+        None => path,
+    }
 }
 
 /// GET /:repo_key/:hostname/:namespace/:type/index.json — mirror version list.
@@ -2121,25 +3486,51 @@ async fn mirror_download(
     let cache_path =
         mirror_archive_cache_path(&namespace, &type_name, &version, &os, &arch, archive_url);
 
-    let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+    serve_mirror_archive(&state, &remote, &repo_key, archive_url, &cache_path, &ctx).await
+}
+
+/// Serve a remote mirror's provider archive through the proxy cache: a
+/// presigned redirect to object storage when the cached copy is fresh and the
+/// backend can sign, else the archive streamed from the cache or, on a miss,
+/// from `archive_url` (cached under `cache_path`).
+async fn serve_mirror_archive(
+    state: &SharedState,
+    remote: &MirrorRemote<'_>,
+    repo_key: &str,
+    archive_url: &str,
+    cache_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let response = match proxy_helpers::proxy_cache_fresh_redirect(
         remote.proxy,
-        remote.repo.id,
-        &repo_key,
-        &remote.upstream_url,
-        archive_url,
-        &cache_path,
-        "application/zip",
-        RepositoryFormat::Terraform,
+        state,
+        repo_key,
+        cache_path,
+        ctx,
     )
-    .await?;
-    // #3649: count the proxied serve. The streaming helper answers a warm
-    // cache HIT from storage and a cold MISS from upstream through the same
-    // call, so recording once it resolves counts both -- the cache hit #3649
-    // reported as invisible included -- while a 404/502 still counts nothing.
-    // Keyed on `cache_path`, the scheme-less canonical key this fetch commits
-    // under, so the count lines up with the catalog row the listing renders.
-    proxy_helpers::record_proxy_download(&state, remote.repo.id, &repo_key, &cache_path, &ctx)
-        .await;
+    .await?
+    {
+        Some(redirect) => redirect,
+        None => {
+            proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+                remote.proxy,
+                remote.repo.id,
+                repo_key,
+                &remote.upstream_url,
+                archive_url,
+                cache_path,
+                "application/zip",
+                RepositoryFormat::Terraform,
+                ctx.is_head,
+            )
+            .await?
+        }
+    };
+    // #3649: count the proxied serve, a redirect, a warm cache HIT and a cold
+    // MISS alike, while a 404/502 still counts nothing. Keyed on `cache_path`,
+    // the scheme-less canonical key the fetch commits under, so the count lines
+    // up with the catalog row the listing renders.
+    proxy_helpers::record_proxy_download(state, remote.repo.id, repo_key, cache_path, ctx).await;
     Ok(response)
 }
 
@@ -2180,11 +3571,15 @@ fn build_provider_storage_key(
 }
 
 /// Build module metadata JSON.
+///
+/// `archive_type` records the detected archive format (#4590) as its go-getter
+/// hint (`zip` / `tar.gz`), which is what `download_module` advertises.
 fn build_module_metadata(
     namespace: &str,
     name: &str,
     provider: &str,
     version: &str,
+    archive: ModuleArchiveType,
 ) -> serde_json::Value {
     serde_json::json!({
         "kind": "module",
@@ -2192,6 +3587,7 @@ fn build_module_metadata(
         "name": name,
         "provider": provider,
         "version": version,
+        MODULE_ARCHIVE_METADATA_KEY: archive.getter_hint(),
     })
 }
 
@@ -2202,15 +3598,22 @@ fn build_provider_metadata(
     version: &str,
     os: &str,
     arch: &str,
+    protocols: Option<&[String]>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut metadata = serde_json::json!({
         "kind": "provider",
         "namespace": namespace,
         "type": type_name,
         "version": version,
         "os": os,
         "arch": arch,
-    })
+    });
+    // Recorded only when actually declared, so a package without a declaration
+    // stays indistinguishable from one uploaded before protocols were tracked.
+    if let Some(protocols) = protocols {
+        metadata["protocols"] = serde_json::json!(protocols);
+    }
+    metadata
 }
 
 /// Build the version list JSON for a module.
@@ -2228,15 +3631,23 @@ fn build_version_list_json(versions: &[String]) -> serde_json::Value {
 
 /// Build the provider download JSON response (the Provider Registry Protocol
 /// package *document*; `download_url` points at the separate binary route).
+///
+/// With `signing`, the document additionally advertises the signed checksum
+/// list (`shasums_url` / `shasums_signature_url`) and the public key that
+/// verifies it — everything OpenTofu/Terraform need to authenticate the
+/// package against an origin registry. Without it the legacy shape (empty
+/// `gpg_public_keys`, no checksum URLs) is produced.
 fn build_provider_download_json(
     os: &str,
     arch: &str,
     filename: &str,
     download_url: &str,
     shasum: &str,
+    protocols: &[String],
+    signing: Option<&ProviderSigningDoc>,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "protocols": ["5.0"],
+    let mut doc = serde_json::json!({
+        "protocols": protocols,
         "os": os,
         "arch": arch,
         "filename": filename,
@@ -2245,7 +3656,214 @@ fn build_provider_download_json(
         "signing_keys": {
             "gpg_public_keys": []
         },
+    });
+    if let Some(signing) = signing {
+        doc["shasums_url"] = serde_json::json!(signing.shasums_url);
+        doc["shasums_signature_url"] = serde_json::json!(signing.shasums_signature_url);
+        doc["signing_keys"]["gpg_public_keys"] = serde_json::json!([{
+            "key_id": signing.key_id,
+            "ascii_armor": signing.ascii_armor,
+        }]);
+    }
+    doc
+}
+
+/// The signing-related fields of a provider package document.
+struct ProviderSigningDoc {
+    key_id: String,
+    /// ASCII-armored OpenPGP *public* key.
+    ascii_armor: String,
+    shasums_url: String,
+    shasums_signature_url: String,
+}
+
+/// Path-absolute location of a provider version's checksum list.
+fn build_provider_shasums_url(
+    repo_key: &str,
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+) -> String {
+    format!(
+        "{}/{}/v1/providers/{}/{}/{}/SHA256SUMS",
+        MOUNT_PREFIX, repo_key, namespace, type_name, version
+    )
+}
+
+/// Assemble [`ProviderSigningDoc`] for the repo's active signing key. Only the
+/// public half of the key is ever read here.
+fn provider_signing_doc(
+    key: &crate::models::signing_key::SigningKey,
+    repo_key: &str,
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+) -> ProviderSigningDoc {
+    let shasums_url = build_provider_shasums_url(repo_key, namespace, type_name, version);
+    ProviderSigningDoc {
+        key_id: key
+            .key_id
+            .clone()
+            .or_else(|| key.fingerprint.clone())
+            .unwrap_or_default(),
+        ascii_armor: key.public_key_pem.clone(),
+        shasums_signature_url: format!("{shasums_url}.sig"),
+        shasums_url,
+    }
+}
+
+/// Build the `SHA256SUMS` document for one provider version: one
+/// `<sha256>  <filename>` line per published platform archive, sorted by
+/// filename and de-duplicated, so the same stored packages always yield the
+/// same bytes (and therefore a signature over a stable payload).
+fn build_provider_shasums(
+    type_name: &str,
+    version: &str,
+    packages: &[LocalProviderPackage],
+) -> String {
+    let mut lines: Vec<(String, String)> = packages
+        .iter()
+        .map(|pkg| {
+            (
+                build_provider_filename(type_name, version, &build_platform(&pkg.os, &pkg.arch)),
+                pkg.shasum.to_ascii_lowercase(),
+            )
+        })
+        .collect();
+    lines.sort();
+    lines.dedup();
+    lines
+        .into_iter()
+        .map(|(filename, sha)| format!("{sha}  {filename}\n"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Provider protocol versions
+//
+// The registry protocol version(s) a provider speaks ("5.0", "6.0") are listed
+// in the `versions` document and in each package document. A hosted upload may
+// declare them with `X-Terraform-Protocols: 5.0,6.0` or by carrying the
+// standard `terraform-registry-manifest.json` in the archive.
+// ---------------------------------------------------------------------------
+
+const PROTOCOLS_HEADER: &str = "x-terraform-protocols";
+const REGISTRY_MANIFEST_NAME: &str = "terraform-registry-manifest.json";
+/// A manifest is a few dozen bytes; refuse to inflate anything larger.
+const REGISTRY_MANIFEST_MAX_BYTES: u64 = 16 * 1024;
+const MAX_PROTOCOL_VERSIONS: usize = 8;
+
+/// What a package is assumed to speak when nothing was declared — the value
+/// every package was advertised under before protocols were tracked.
+fn default_provider_protocols() -> Vec<String> {
+    vec!["5.0".to_string()]
+}
+
+/// `major.minor` as numbers, or `None` for anything else.
+fn parse_protocol_version(raw: &str) -> Option<(u32, u32)> {
+    let (major, minor) = raw.split_once('.')?;
+    let digits = |s: &str| !s.is_empty() && s.len() <= 4 && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(major) || !digits(minor) {
+        return None;
+    }
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// Validate, de-duplicate and numerically sort protocol versions. `None` when
+/// the list is empty, too long or contains a malformed entry.
+fn normalize_protocols<'a>(raw: impl IntoIterator<Item = &'a str>) -> Option<Vec<String>> {
+    let mut parsed = Vec::new();
+    for item in raw {
+        let version = parse_protocol_version(item.trim())?;
+        if !parsed.contains(&version) {
+            parsed.push(version);
+        }
+        if parsed.len() > MAX_PROTOCOL_VERSIONS {
+            return None;
+        }
+    }
+    if parsed.is_empty() {
+        return None;
+    }
+    parsed.sort_unstable();
+    Some(
+        parsed
+            .into_iter()
+            .map(|(major, minor)| format!("{major}.{minor}"))
+            .collect(),
+    )
+}
+
+/// Read the optional `X-Terraform-Protocols` upload header. `Ok(None)` when
+/// absent; an error message when present but malformed (rejecting is safer than
+/// silently advertising a different protocol than the uploader declared).
+fn parse_protocols_header(headers: &HeaderMap) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = headers.get(PROTOCOLS_HEADER) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .ok()
+        .and_then(|v| normalize_protocols(v.split(',')))
+        .map(Some)
+        .ok_or_else(|| {
+            "Invalid X-Terraform-Protocols header: expected a comma-separated list of \
+             'major.minor' versions, e.g. '5.0' or '5.0,6.0'"
+                .to_string()
+        })
+}
+
+/// Extract `metadata.protocol_versions` from the text of a
+/// `terraform-registry-manifest.json`.
+fn protocols_from_manifest_json(raw: &[u8]) -> Option<Vec<String>> {
+    let doc: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let versions = doc.get("metadata")?.get("protocol_versions")?.as_array()?;
+    normalize_protocols(
+        versions
+            .iter()
+            .map(|v| v.as_str())
+            .collect::<Option<Vec<_>>>()?,
+    )
+}
+
+/// Best-effort read of the registry manifest from the staged archive. Any
+/// failure (not a zip, no manifest, oversized, malformed) yields `None`: the
+/// manifest is an optional hint, never a reason to reject an upload.
+async fn read_manifest_protocols(zip_path: std::path::PathBuf) -> Option<Vec<String>> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let file = std::fs::File::open(zip_path).ok()?;
+        let mut archive = zip::ZipArchive::new(file).ok()?;
+        let entry = archive.by_name(REGISTRY_MANIFEST_NAME).ok()?;
+        if entry.size() > REGISTRY_MANIFEST_MAX_BYTES {
+            return None;
+        }
+        let mut raw = Vec::new();
+        entry
+            .take(REGISTRY_MANIFEST_MAX_BYTES)
+            .read_to_end(&mut raw)
+            .ok()?;
+        protocols_from_manifest_json(&raw)
     })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Protocols recorded in a package's metadata, or the legacy default.
+fn provider_protocols_from_metadata(metadata: Option<&serde_json::Value>) -> Vec<String> {
+    metadata
+        .and_then(|m| m.get("protocols"))
+        .and_then(|p| p.as_array())
+        .and_then(|items| {
+            normalize_protocols(
+                items
+                    .iter()
+                    .map(|v| v.as_str())
+                    .collect::<Option<Vec<_>>>()?,
+            )
+        })
+        .unwrap_or_else(default_provider_protocols)
 }
 
 /// Parse a module name into (namespace, name, provider).
@@ -2269,8 +3887,13 @@ fn build_search_pattern(query: &str) -> String {
 #[cfg(test)]
 mod tests {
 
+    /// Remote module chain as a client walks it (#4590, replacing the #1608
+    /// test that pinned the old body-streaming `/download`): the upstream
+    /// registry answers `/download` with `204` + a relative `X-Terraform-Get`;
+    /// AK answers with its own `/archive?archive=zip`, and that streams the
+    /// upstream archive (#1608 Phase 4 streaming, through the proxy cache).
     #[tokio::test]
-    async fn test_remote_module_download_streams_upstream_blob_1608() {
+    async fn test_remote_module_download_advertises_hinted_archive_4590() {
         use crate::api::handlers::test_db_helpers as tdh;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2279,34 +3902,147 @@ mod tests {
             return;
         };
         let server = MockServer::start().await;
-        // A small deterministic body stands in for a large artifact; the point
-        // is to exercise the streaming pull-through branch (proxy_fetch_streaming)
-        // added in #1608 Phase 4, not the body size.
-        let blob: &[u8] = b"\x00\x01\x02 #1608 phase4 streamed proxy blob \x03\x04\x05";
+        let blob: &[u8] = b"PK\x03\x04 #4590 remote module zip bytes";
         Mock::given(method("GET"))
             .and(path("/v1/modules/hashicorp/consul/aws/1.2.3/download"))
+            .respond_with(
+                ResponseTemplate::new(204).insert_header("X-Terraform-Get", "/files/consul-1.2.3"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files/consul-1.2.3"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(blob))
             .mount(&server)
             .await;
 
         let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
-        let app = tdh::router_anon(super::router(), state);
-        let (status, body) = tdh::send(
-            app,
+        let (doc_status, _, doc_headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
             tdh::get(format!(
                 "/{key}/v1/modules/hashicorp/consul/aws/1.2.3/download",
                 key = fx.repo_key
             )),
         )
         .await;
+        let advertised = doc_headers
+            .get("X-Terraform-Get")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        // The router under test is not mounted at the prefix.
+        let archive_path = advertised
+            .strip_prefix(MOUNT_PREFIX)
+            .unwrap_or(&advertised)
+            .to_string();
+        let (status, body, headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state),
+            tdh::get(archive_path),
+        )
+        .await;
+        fx.teardown().await;
 
-        let teardown = || async { fx.teardown().await };
-        if status != axum::http::StatusCode::OK {
-            teardown().await;
-            panic!("expected 200 from streamed remote download, got {status}");
-        }
+        assert_eq!(doc_status, axum::http::StatusCode::NO_CONTENT);
+        // The location named no type, so the bytes decided it.
+        assert_eq!(
+            advertised,
+            format!(
+                "/terraform/{}/v1/modules/hashicorp/consul/aws/1.2.3/archive?archive=zip",
+                fx.repo_key
+            )
+        );
+        assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
-        teardown().await;
+        assert_eq!(headers["content-type"], "application/zip");
+    }
+
+    /// #4590: the hint comes from the upstream location when it names one (a
+    /// JSON `location` body here, the newer protocol form), and a `//subdir`
+    /// survives onto AK's location.
+    #[tokio::test]
+    async fn test_remote_module_hint_from_upstream_location_4590() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "terraform").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/net/aws/2.0.0/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "location": "./blob//modules/vpc?archive=tar.gz"
+            })))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let (status, _, headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{key}/v1/modules/acme/net/aws/2.0.0/download",
+                key = fx.repo_key
+            )),
+        )
+        .await;
+        let requests = server.received_requests().await.unwrap_or_default();
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            headers["X-Terraform-Get"],
+            format!(
+                "/terraform/{}/v1/modules/acme/net/aws/2.0.0/archive//modules/vpc?archive=tar.gz",
+                fx.repo_key
+            )
+            .as_str()
+        );
+        // A named type needs no sniffing fetch of the archive.
+        assert_eq!(requests.len(), 1, "only the location document is fetched");
+    }
+
+    /// #4590: a source AK does not proxy (a `git::` address) goes to the client
+    /// as the upstream wrote it, and `/archive` refuses it rather than guess.
+    #[tokio::test]
+    async fn test_remote_module_git_source_passes_through_4590() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "terraform").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let git = "git::https://github.com/acme/terraform-aws-net?ref=v3.0.0";
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/net/aws/3.0.0/download"))
+            .respond_with(ResponseTemplate::new(204).insert_header("X-Terraform-Get", git))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let (status, _, headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(format!(
+                "/{key}/v1/modules/acme/net/aws/3.0.0/download",
+                key = fx.repo_key
+            )),
+        )
+        .await;
+        let (archive_status, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{key}/v1/modules/acme/net/aws/3.0.0/archive?archive=zip",
+                key = fx.repo_key
+            )),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+        assert_eq!(headers["X-Terraform-Get"], git);
+        assert_eq!(archive_status, axum::http::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2776,8 +4512,412 @@ mod tests {
 
     #[test]
     fn test_build_module_archive_url() {
-        let url = build_module_archive_url("repo", "ns", "name", "prov", "1.0.0");
-        assert_eq!(url, "/terraform/repo/v1/modules/ns/name/prov/1.0.0/archive");
+        // #4590: the hint is what makes go-getter unpack the location as an
+        // archive instead of parsing it as an HTML page.
+        let url = build_module_archive_url(
+            "repo",
+            "ns",
+            "name",
+            "prov",
+            "1.0.0",
+            ModuleArchiveType::Zip,
+            None,
+        );
+        assert_eq!(
+            url,
+            "/terraform/repo/v1/modules/ns/name/prov/1.0.0/archive?archive=zip"
+        );
+        let url = build_module_archive_url(
+            "repo",
+            "ns",
+            "name",
+            "prov",
+            "1.0.0",
+            ModuleArchiveType::TarGz,
+            None,
+        );
+        assert_eq!(
+            url,
+            "/terraform/repo/v1/modules/ns/name/prov/1.0.0/archive?archive=tar.gz"
+        );
+        let url = build_module_archive_url(
+            "repo",
+            "ns",
+            "name",
+            "prov",
+            "1.0.0",
+            ModuleArchiveType::Tar,
+            None,
+        );
+        assert_eq!(
+            url,
+            "/terraform/repo/v1/modules/ns/name/prov/1.0.0/archive?archive=tar"
+        );
+    }
+
+    #[test]
+    fn test_build_module_archive_url_with_subdir_4590() {
+        // go-getter splits `//subdir` off before the query and moves the query
+        // back onto the source, so the subdir must sit between path and query.
+        let url = build_module_archive_url(
+            "repo",
+            "ns",
+            "name",
+            "prov",
+            "1.0.0",
+            ModuleArchiveType::Zip,
+            Some("modules/vpc"),
+        );
+        assert_eq!(
+            url,
+            "/terraform/repo/v1/modules/ns/name/prov/1.0.0/archive//modules/vpc?archive=zip"
+        );
+        assert_eq!(
+            split_getter_subdir(&url),
+            (
+                "/terraform/repo/v1/modules/ns/name/prov/1.0.0/archive?archive=zip".to_string(),
+                Some("modules/vpc".to_string())
+            )
+        );
+        // An empty subdir is no subdir.
+        assert!(!build_module_archive_url(
+            "repo",
+            "ns",
+            "name",
+            "prov",
+            "1.0.0",
+            ModuleArchiveType::Zip,
+            Some("")
+        )
+        .contains("//"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #4590: module archive sniffing, upload classification, upstream hints
+    // -----------------------------------------------------------------------
+
+    /// A 512-byte POSIX tar header block with the `ustar` magic at 257.
+    fn tar_header() -> Vec<u8> {
+        let mut block = vec![0u8; 512];
+        block[..7].copy_from_slice(b"main.tf");
+        block[257..263].copy_from_slice(b"ustar\0");
+        block
+    }
+
+    #[test]
+    fn test_module_archive_sniff_4590() {
+        assert_eq!(
+            ModuleArchiveType::sniff(b"PK\x03\x04rest-of-zip"),
+            Some(ModuleArchiveType::Zip)
+        );
+        assert_eq!(
+            ModuleArchiveType::sniff(&[0x1f, 0x8b, 0x08, 0x00]),
+            Some(ModuleArchiveType::TarGz)
+        );
+        assert_eq!(
+            ModuleArchiveType::sniff(&tar_header()),
+            Some(ModuleArchiveType::Tar)
+        );
+        // A tar header cut short of the magic is not recognised.
+        assert_eq!(ModuleArchiveType::sniff(&tar_header()[..260]), None);
+        // Empty-archive ZIP marker, HTML, plain text, empty: none of ours.
+        assert_eq!(ModuleArchiveType::sniff(b"PK\x05\x06"), None);
+        assert_eq!(ModuleArchiveType::sniff(b"<html><head>"), None);
+        assert_eq!(ModuleArchiveType::sniff(b"module-archive-bytes"), None);
+        assert_eq!(ModuleArchiveType::sniff(b""), None);
+        assert_eq!(ModuleArchiveType::sniff(&[0x1f]), None);
+    }
+
+    #[test]
+    fn test_module_archive_type_names_4590() {
+        for (archive, hint, ct) in [
+            (ModuleArchiveType::Zip, "zip", "application/zip"),
+            (ModuleArchiveType::TarGz, "tar.gz", "application/gzip"),
+            (ModuleArchiveType::Tar, "tar", "application/x-tar"),
+        ] {
+            assert_eq!(archive.getter_hint(), hint);
+            assert_eq!(archive.extension(), hint);
+            assert_eq!(archive.content_type(), ct);
+            assert_eq!(ModuleArchiveType::from_getter_hint(hint), Some(archive));
+            assert_eq!(
+                ModuleArchiveType::from_metadata(&serde_json::json!({ "archive_type": hint })),
+                Some(archive)
+            );
+        }
+        assert_eq!(
+            ModuleArchiveType::from_getter_hint("TGZ"),
+            Some(ModuleArchiveType::TarGz)
+        );
+        assert_eq!(ModuleArchiveType::from_getter_hint("tar.xz"), None);
+        assert_eq!(ModuleArchiveType::from_getter_hint("false"), None);
+        // A module uploaded before #4590 has no recorded type.
+        assert_eq!(
+            ModuleArchiveType::from_metadata(&serde_json::json!({ "kind": "module" })),
+            None
+        );
+    }
+
+    #[test]
+    fn test_classify_module_upload_4590() {
+        assert_eq!(
+            classify_module_upload(b"PK\x03\x04..."),
+            Ok(ModuleArchiveType::Zip)
+        );
+        assert_eq!(
+            classify_module_upload(&[0x1f, 0x8b, 0x08]),
+            Ok(ModuleArchiveType::TarGz)
+        );
+        let tar = classify_module_upload(&tar_header()).unwrap_err();
+        assert!(tar.contains("uncompressed tar"), "{tar}");
+        let junk = classify_module_upload(b"module-archive-bytes").unwrap_err();
+        assert!(junk.contains("not a ZIP or gzip-compressed tar"), "{junk}");
+        assert!(classify_module_upload(b"").is_err());
+    }
+
+    #[test]
+    fn test_module_coords_filename_follows_type_4590() {
+        let c = ModuleCoords {
+            namespace: "acme",
+            name: "demo",
+            provider: "aws",
+            version: "1.0.0",
+        };
+        assert_eq!(
+            c.filename(Some(ModuleArchiveType::Zip)),
+            "acme-demo-aws-1.0.0.zip"
+        );
+        assert_eq!(
+            c.filename(Some(ModuleArchiveType::TarGz)),
+            "acme-demo-aws-1.0.0.tar.gz"
+        );
+        assert_eq!(c.filename(None), "acme-demo-aws-1.0.0");
+        assert_eq!(
+            c.archive_cache_path(),
+            "v1/modules/acme/demo/aws/1.0.0/archive"
+        );
+        assert_eq!(
+            c.upstream_download_path(),
+            "v1/modules/acme/demo/aws/1.0.0/download"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_peek_module_archive_replays_every_byte_4590() {
+        use futures::StreamExt;
+        // The magic arrives split across chunks and the body continues past
+        // the sniff window: the type is still found and nothing is lost.
+        let mut tar = tar_header();
+        tar.extend_from_slice(b"trailing body bytes");
+        let chunks: Vec<crate::error::Result<Bytes>> = tar
+            .chunks(100)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let (archive, body) = peek_module_archive(futures::stream::iter(chunks).boxed()).await;
+        assert_eq!(archive, Some(ModuleArchiveType::Tar));
+        let replayed: Vec<u8> = body
+            .map(|c| c.unwrap().to_vec())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert_eq!(replayed, tar);
+
+        // A body shorter than the window ends cleanly.
+        let short: Vec<crate::error::Result<Bytes>> = vec![Ok(Bytes::from_static(b"PK\x03\x04z"))];
+        let (archive, body) = peek_module_archive(futures::stream::iter(short).boxed()).await;
+        assert_eq!(archive, Some(ModuleArchiveType::Zip));
+        assert_eq!(body.collect::<Vec<_>>().await.len(), 1);
+
+        // A stream error is replayed, not swallowed.
+        let failing: Vec<crate::error::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(&[0x1f, 0x8b])),
+            Err(crate::error::AppError::BadGateway("cut".into())),
+        ];
+        let (archive, body) = peek_module_archive(futures::stream::iter(failing).boxed()).await;
+        assert_eq!(archive, Some(ModuleArchiveType::TarGz));
+        let items = body.collect::<Vec<_>>().await;
+        assert_eq!(items.len(), 2);
+        assert!(items[1].is_err());
+    }
+
+    #[test]
+    fn test_split_getter_subdir_4590() {
+        assert_eq!(
+            split_getter_subdir("https://h/a.zip"),
+            ("https://h/a.zip".to_string(), None)
+        );
+        assert_eq!(
+            split_getter_subdir("https://h/a.zip//sub/dir?archive=zip"),
+            (
+                "https://h/a.zip?archive=zip".to_string(),
+                Some("sub/dir".to_string())
+            )
+        );
+        assert_eq!(
+            split_getter_subdir("/rel/a.tgz//mod"),
+            ("/rel/a.tgz".to_string(), Some("mod".to_string()))
+        );
+        // A `//` inside the query is not a subdir.
+        assert_eq!(
+            split_getter_subdir("https://h/a?u=https://x"),
+            ("https://h/a?u=https://x".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn test_getter_extension_4590() {
+        assert_eq!(
+            getter_extension("/m/x.ZIP"),
+            GetterExtension::Known(ModuleArchiveType::Zip)
+        );
+        assert_eq!(
+            getter_extension("/m/x.tar.gz"),
+            GetterExtension::Known(ModuleArchiveType::TarGz)
+        );
+        assert_eq!(
+            getter_extension("/m/x.tgz"),
+            GetterExtension::Known(ModuleArchiveType::TarGz)
+        );
+        assert_eq!(getter_extension("/m/x.tar.xz"), GetterExtension::Foreign);
+        assert_eq!(getter_extension("/m/x.tar.bz2"), GetterExtension::Foreign);
+        assert_eq!(getter_extension("/m/archive"), GetterExtension::None);
+        // Plain `.tar` is not a go-getter extension at all.
+        assert_eq!(getter_extension("/m/x.tar"), GetterExtension::None);
+    }
+
+    #[test]
+    fn test_classify_upstream_module_location_4590() {
+        let base = "https://reg.example/v1/modules/acme/demo/aws/1.0.0/download";
+
+        // Relative location with an extension: resolved against the answering
+        // URL, typed from the extension.
+        assert_eq!(
+            classify_upstream_module_location("/files/demo.zip", base),
+            UpstreamModuleSource::Http {
+                fetch_url: "https://reg.example/files/demo.zip".into(),
+                subdir: None,
+                archive: Some(ModuleArchiveType::Zip),
+                absolute: "https://reg.example/files/demo.zip".into(),
+            }
+        );
+
+        // `archive=` wins over the extension, is stripped from the fetch URL,
+        // and other query parameters (a signature) survive.
+        assert_eq!(
+            classify_upstream_module_location(
+                "https://cdn.example/blob?sig=abc&archive=tar.gz",
+                base
+            ),
+            UpstreamModuleSource::Http {
+                fetch_url: "https://cdn.example/blob?sig=abc".into(),
+                subdir: None,
+                archive: Some(ModuleArchiveType::TarGz),
+                absolute: "https://cdn.example/blob?sig=abc&archive=tar.gz".into(),
+            }
+        );
+
+        // A query without a hint is left exactly as the upstream sent it.
+        assert_eq!(
+            classify_upstream_module_location(
+                "https://cdn.example/m.tgz?X-Amz-Signature=a%2Fb",
+                base
+            ),
+            UpstreamModuleSource::Http {
+                fetch_url: "https://cdn.example/m.tgz?X-Amz-Signature=a%2Fb".into(),
+                subdir: None,
+                archive: Some(ModuleArchiveType::TarGz),
+                absolute: "https://cdn.example/m.tgz?X-Amz-Signature=a%2Fb".into(),
+            }
+        );
+
+        // Subdir is carried separately.
+        assert_eq!(
+            classify_upstream_module_location("https://cdn.example/m.zip//modules/vpc", base),
+            UpstreamModuleSource::Http {
+                fetch_url: "https://cdn.example/m.zip".into(),
+                subdir: Some("modules/vpc".into()),
+                archive: Some(ModuleArchiveType::Zip),
+                absolute: "https://cdn.example/m.zip//modules/vpc".into(),
+            }
+        );
+
+        // No type named: the bytes will decide.
+        assert_eq!(
+            classify_upstream_module_location("https://cdn.example/latest", base),
+            UpstreamModuleSource::Http {
+                fetch_url: "https://cdn.example/latest".into(),
+                subdir: None,
+                archive: None,
+                absolute: "https://cdn.example/latest".into(),
+            }
+        );
+
+        // Forced getters, other schemes, foreign archive types, an explicit
+        // `archive=false` and plain tar go to the client unchanged (absolute).
+        for (loc, want) in [
+            (
+                "git::https://github.com/acme/demo?ref=v1.0.0",
+                "git::https://github.com/acme/demo?ref=v1.0.0",
+            ),
+            (
+                "s3::https://s3.amazonaws.com/b/m.zip",
+                "s3::https://s3.amazonaws.com/b/m.zip",
+            ),
+            ("github.com/acme/demo", "github.com/acme/demo"),
+            ("ftp://files.example/m.zip", "ftp://files.example/m.zip"),
+            (
+                "https://cdn.example/m.tar.xz",
+                "https://cdn.example/m.tar.xz",
+            ),
+            (
+                "https://cdn.example/m?archive=false",
+                "https://cdn.example/m?archive=false",
+            ),
+            (
+                "https://cdn.example/m?archive=tar",
+                "https://cdn.example/m?archive=tar",
+            ),
+            ("/m.tar.bz2", "https://reg.example/m.tar.bz2"),
+        ] {
+            assert_eq!(
+                classify_upstream_module_location(loc, base),
+                UpstreamModuleSource::Passthrough(want.into()),
+                "{loc}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_upstream_module_location_value_4590() {
+        assert_eq!(
+            upstream_module_location_value(Some(" /a.zip "), b""),
+            Some("/a.zip".into())
+        );
+        // Header wins over a JSON body.
+        assert_eq!(
+            upstream_module_location_value(Some("/h.zip"), br#"{"location":"/b.zip"}"#),
+            Some("/h.zip".into())
+        );
+        assert_eq!(
+            upstream_module_location_value(None, br#"{"location":"/b.zip"}"#),
+            Some("/b.zip".into())
+        );
+        assert_eq!(upstream_module_location_value(Some(""), b""), None);
+        assert_eq!(upstream_module_location_value(None, b"not json"), None);
+        assert_eq!(
+            upstream_module_location_value(None, br#"{"location":""}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn test_same_origin_4590() {
+        assert!(same_origin(
+            "https://r.example/a",
+            "https://r.example:443/b"
+        ));
+        assert!(!same_origin("https://r.example/a", "http://r.example/a"));
+        assert!(!same_origin("https://r.example/a", "https://cdn.example/a"));
+        assert!(!same_origin("not a url", "https://r.example"));
     }
 
     #[test]
@@ -2887,7 +5027,14 @@ mod tests {
 
     #[test]
     fn test_build_module_metadata() {
-        let meta = build_module_metadata("hashicorp", "consul", "aws", "0.1.0");
+        let meta = build_module_metadata(
+            "hashicorp",
+            "consul",
+            "aws",
+            "0.1.0",
+            ModuleArchiveType::Zip,
+        );
+        assert_eq!(meta["archive_type"], "zip");
         assert_eq!(meta["kind"], "module");
         assert_eq!(meta["namespace"], "hashicorp");
         assert_eq!(meta["name"], "consul");
@@ -2897,12 +5044,22 @@ mod tests {
 
     #[test]
     fn test_build_provider_metadata() {
-        let meta = build_provider_metadata("hashicorp", "aws", "5.0.0", "linux", "amd64");
+        let meta = build_provider_metadata("hashicorp", "aws", "5.0.0", "linux", "amd64", None);
         assert_eq!(meta["kind"], "provider");
         assert_eq!(meta["namespace"], "hashicorp");
         assert_eq!(meta["type"], "aws");
         assert_eq!(meta["os"], "linux");
         assert_eq!(meta["arch"], "amd64");
+        // Undeclared protocols are not recorded, so the package stays
+        // indistinguishable from one uploaded before protocols were tracked.
+        assert!(meta.get("protocols").is_none());
+    }
+
+    #[test]
+    fn test_build_provider_metadata_records_declared_protocols() {
+        let protocols = vec!["5.0".to_string(), "6.0".to_string()];
+        let meta = build_provider_metadata("a", "b", "1.0.0", "linux", "arm64", Some(&protocols));
+        assert_eq!(meta["protocols"], serde_json::json!(["5.0", "6.0"]));
     }
 
     // -----------------------------------------------------------------------
@@ -2943,6 +5100,8 @@ mod tests {
             "terraform-provider-aws_5.0.0_linux_amd64.zip",
             "/download/url",
             "sha256hash",
+            &default_provider_protocols(),
+            None,
         );
         assert_eq!(json["os"], "linux");
         assert_eq!(json["arch"], "amd64");
@@ -2959,7 +5118,15 @@ mod tests {
 
     #[test]
     fn test_build_provider_download_json_darwin() {
-        let json = build_provider_download_json("darwin", "arm64", "file.zip", "/url", "hash");
+        let json = build_provider_download_json(
+            "darwin",
+            "arm64",
+            "file.zip",
+            "/url",
+            "hash",
+            &default_provider_protocols(),
+            None,
+        );
         assert_eq!(json["os"], "darwin");
         assert_eq!(json["arch"], "arm64");
     }
@@ -3838,6 +6005,125 @@ mod tests {
         status
     }
 
+    /// #4725: a hosted module upload must queue a push sync task for a
+    /// subscribed push peer, and an upload arriving as peer replication must
+    /// not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn terraform_module_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "terraform").await;
+
+        let (status, body) = tdh::send(
+            fx.router_with_auth(mounted_router()),
+            tdh::put(
+                format!(
+                    "{}/{}/v1/modules/acme/pushsync/aws/1.0.0",
+                    MOUNT_PREFIX, fx.repo_key
+                ),
+                // #4590: a module upload must be a real archive type.
+                Bytes::from_static(b"PK\x03\x04module-archive-bytes"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "module upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the module
+        // but must not queue another task.
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "{}/{}/v1/modules/acme/pushsync/aws/2.0.0",
+                MOUNT_PREFIX, fx.repo_key
+            ))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(bytes::Bytes::from_static(
+                b"PK\x03\x04module-archive-bytes",
+            )))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(mounted_router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated module upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["acme/pushsync/aws/1.0.0".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
+    }
+
+    /// #4725: a hosted provider upload must queue a push sync task for a
+    /// subscribed push peer, and an upload arriving as peer replication must
+    /// not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn terraform_provider_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "terraform").await;
+
+        let (status, body) = tdh::send(
+            fx.router_with_auth(mounted_router()),
+            tdh::put(
+                format!(
+                    "{}/{}/v1/providers/acme/pushsync/1.0.0/linux/arm64",
+                    MOUNT_PREFIX, fx.repo_key
+                ),
+                bytes::Bytes::from_static(b"PK\x03\x04provider-zip-bytes"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "provider upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the package
+        // but must not queue another task.
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "{}/{}/v1/providers/acme/pushsync/2.0.0/linux/arm64",
+                MOUNT_PREFIX, fx.repo_key
+            ))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(bytes::Bytes::from_static(
+                b"PK\x03\x04provider-zip-bytes",
+            )))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(mounted_router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated provider upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["acme/pushsync/1.0.0/linux_arm64".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
+    }
+
     /// Resolve a (possibly relative) advertised URL the way a client does —
     /// against the URL of the document that advertised it — and return the
     /// path+query to request.
@@ -3996,8 +6282,16 @@ mod tests {
              (Terraform sends no credentials there), got {advertised:?}"
         );
 
-        let (ticket_user, purpose, bound_path) =
-            redeemed.expect("the advertised ticket must be a live, redeemable ticket");
+        let crate::services::auth_config_service::DownloadTicket {
+            user_id: ticket_user,
+            purpose,
+            resource_path: bound_path,
+            repo_scope,
+        } = redeemed.expect("the advertised ticket must be a live, redeemable ticket");
+        assert!(
+            repo_scope.is_some(),
+            "the ticket must record the caller's repository scope (GHSA-2mfv-xg68-gq4p)"
+        );
         assert_eq!(
             ticket_user, user_id,
             "the ticket must be user-specific: it authenticates as the caller \
@@ -4139,6 +6433,244 @@ mod tests {
             tarball,
             "archive must serve the published bytes"
         );
+    }
+
+    /// Publish a module through the real upload handler, returning the status
+    /// and response body.
+    async fn publish_module(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        coord: &str,
+        bytes: Vec<u8>,
+    ) -> (axum::http::StatusCode, Bytes) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        tdh::send(
+            fx.router_with_auth(mounted_router()),
+            tdh::put(
+                format!("{}/{}/v1/modules/{coord}", MOUNT_PREFIX, fx.repo_key),
+                Bytes::from(bytes),
+            ),
+        )
+        .await
+    }
+
+    /// Walk what `tofu init` walks for a module version: `.../download`, then
+    /// the advertised `X-Terraform-Get`. Returns the advertised location and
+    /// the archive response (status, body, headers).
+    async fn fetch_module_like_client(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        coord: &str,
+    ) -> (
+        axum::http::StatusCode,
+        String,
+        axum::http::StatusCode,
+        Bytes,
+        axum::http::HeaderMap,
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let doc_path = format!(
+            "{}/{}/v1/modules/{coord}/download",
+            MOUNT_PREFIX, fx.repo_key
+        );
+        let (doc_status, _, doc_headers) =
+            tdh::send_with_headers(fx.router_anon(mounted_router()), tdh::get(doc_path.clone()))
+                .await;
+        let advertised = doc_headers
+            .get("X-Terraform-Get")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let path = resolve_advertised(&format!("http://ak.test{doc_path}"), &advertised);
+        let (status, body, headers) =
+            tdh::send_with_headers(fx.router_anon(mounted_router()), tdh::get(path)).await;
+        (doc_status, advertised, status, body, headers)
+    }
+
+    /// A small real ZIP module (one `main.tf`).
+    fn zip_module() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            zip.start_file("main.tf", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"output \"x\" { value = 1 }\n").unwrap();
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// A small real tar.gz module (one `main.tf`).
+    fn tar_gz_module() -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let content = b"output \"x\" { value = 1 }\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "main.tf", &content[..])
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// #4590: a ZIP upload and a tar.gz upload each advertise the matching
+    /// go-getter hint, and the archive is served under the matching name and
+    /// type. Before the fix the location had no hint (go-getter parsed the
+    /// ZIP as HTML) and every module was served as `.tar.gz`.
+    #[tokio::test]
+    async fn test_module_archive_hint_follows_upload_type_4590() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let zip = zip_module();
+        let tgz = tar_gz_module();
+        let (zip_pub, _) = publish_module(&fx, "acme/zipmod/aws/1.0.0", zip.clone()).await;
+        let (tgz_pub, _) = publish_module(&fx, "acme/tgzmod/aws/1.0.0", tgz.clone()).await;
+        let zip_dl = fetch_module_like_client(&fx, "acme/zipmod/aws/1.0.0").await;
+        let tgz_dl = fetch_module_like_client(&fx, "acme/tgzmod/aws/1.0.0").await;
+        let recorded: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT a.name, m.metadata->>'archive_type', a.content_type
+               FROM artifacts a LEFT JOIN artifact_metadata m ON m.artifact_id = a.id
+              WHERE a.repository_id = $1 ORDER BY a.name",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .unwrap();
+        fx.teardown().await;
+
+        assert_eq!(zip_pub, axum::http::StatusCode::CREATED);
+        assert_eq!(tgz_pub, axum::http::StatusCode::CREATED);
+        assert_eq!(
+            recorded,
+            vec![
+                (
+                    "acme/tgzmod/aws".to_string(),
+                    Some("tar.gz".to_string()),
+                    "application/gzip".to_string()
+                ),
+                (
+                    "acme/zipmod/aws".to_string(),
+                    Some("zip".to_string()),
+                    "application/zip".to_string()
+                ),
+            ]
+        );
+
+        for ((doc, advertised, status, body, headers), coord, hint, ct, ext, bytes) in [
+            (zip_dl, "zipmod", "zip", "application/zip", "zip", &zip),
+            (
+                tgz_dl,
+                "tgzmod",
+                "tar.gz",
+                "application/gzip",
+                "tar.gz",
+                &tgz,
+            ),
+        ] {
+            assert_eq!(doc, axum::http::StatusCode::NO_CONTENT, "{coord}");
+            assert!(
+                advertised.ends_with(&format!(
+                    "/v1/modules/acme/{coord}/aws/1.0.0/archive?archive={hint}"
+                )),
+                "{coord}: X-Terraform-Get must carry the {hint} hint, got {advertised}"
+            );
+            assert_eq!(status, axum::http::StatusCode::OK, "{coord}");
+            assert_eq!(&body[..], &bytes[..], "{coord}: archive bytes");
+            assert_eq!(headers["content-type"], ct, "{coord}");
+            let disposition = headers["content-disposition"].to_str().unwrap();
+            assert!(
+                disposition.contains(&format!("acme-{coord}-aws-1.0.0.{ext}")),
+                "{coord}: {disposition}"
+            );
+        }
+    }
+
+    /// #4590: a body that is not a ZIP or tar.gz is refused at upload with the
+    /// reason, and nothing is stored. Plain tar is refused too: neither client
+    /// can install it.
+    #[tokio::test]
+    async fn test_module_upload_rejects_non_archive_4590() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let (junk, junk_body) = publish_module(
+            &fx,
+            "acme/junk/aws/1.0.0",
+            b"<html>not an archive</html>".to_vec(),
+        )
+        .await;
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_ustar();
+        header.set_size(1);
+        header.set_cksum();
+        tar.append_data(&mut header, "main.tf", &b"x"[..]).unwrap();
+        let (plain_tar, tar_body) =
+            publish_module(&fx, "acme/plain/aws/1.0.0", tar.into_inner().unwrap()).await;
+        let stored: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        fx.teardown().await;
+
+        assert_eq!(junk, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            String::from_utf8_lossy(&junk_body).contains("not a ZIP or gzip-compressed tar"),
+            "{}",
+            String::from_utf8_lossy(&junk_body)
+        );
+        assert_eq!(plain_tar, axum::http::StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&tar_body).contains("uncompressed tar"));
+        assert_eq!(stored, 0, "a refused upload must store nothing");
+    }
+
+    /// #4590: a module uploaded before the type was recorded (no
+    /// `archive_type` in its metadata, `.tar.gz` content type whatever it
+    /// holds) gets its hint from its stored bytes.
+    #[tokio::test]
+    async fn test_module_without_recorded_type_is_sniffed_4590() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let zip = zip_module();
+        let (published, _) = publish_module(&fx, "acme/legacy/aws/1.0.0", zip.clone()).await;
+        // Make it look exactly like a pre-#4590 upload.
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = metadata - 'archive_type'
+              WHERE artifact_id IN (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE artifacts SET content_type = 'application/gzip' WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let (doc, advertised, status, body, headers) =
+            fetch_module_like_client(&fx, "acme/legacy/aws/1.0.0").await;
+        fx.teardown().await;
+
+        assert_eq!(published, axum::http::StatusCode::CREATED);
+        assert_eq!(doc, axum::http::StatusCode::NO_CONTENT);
+        assert!(advertised.ends_with("/archive?archive=zip"), "{advertised}");
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(&body[..], &zip[..]);
+        assert_eq!(headers["content-type"], "application/zip");
     }
 
     // -----------------------------------------------------------------------
@@ -4596,7 +7128,8 @@ mod catalog_registration_tests {
                     super::MOUNT_PREFIX,
                     fx.repo_key
                 ),
-                bytes::Bytes::from_static(b"module-archive-bytes"),
+                // #4590: a module upload must be a real archive type.
+                bytes::Bytes::from_static(b"PK\x03\x04module-archive-bytes"),
             ),
         )
         .await;
@@ -4648,5 +7181,1090 @@ mod catalog_registration_tests {
         let row = row.expect("a terraform provider upload must write a packages row (#3659)");
         assert_eq!(row.version, "2.0.0");
         assert_eq!(row.versions, vec!["2.0.0".to_string()]);
+    }
+}
+
+/// #4598: a virtual Terraform repository answers module `/download` the way
+/// its resolving member does, `204` + `X-Terraform-Get` pointing at the
+/// virtual's own `/archive` with the archive hint, and that `/archive`
+/// streams the member's archive (hosted bytes, or the remote's upstream file).
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod virtual_module_download_4598 {
+    use super::MOUNT_PREFIX;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::SharedState;
+    use axum::http::StatusCode;
+    use axum::Router;
+    use bytes::Bytes;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest(MOUNT_PREFIX, super::router())
+    }
+
+    fn zip_module() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            zip.start_file("main.tf", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"output \"x\" { value = \"hosted\" }\n")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// `.../download` then the advertised location, as `tofu init` walks it.
+    async fn walk(
+        state: &SharedState,
+        repo_key: &str,
+        coord: &str,
+    ) -> (StatusCode, String, StatusCode, Bytes, axum::http::HeaderMap) {
+        let doc_path = format!("{MOUNT_PREFIX}/{repo_key}/v1/modules/{coord}/download");
+        let (doc_status, doc_body, doc_headers) = tdh::send_with_headers(
+            tdh::router_anon(mounted_router(), state.clone()),
+            tdh::get(doc_path.clone()),
+        )
+        .await;
+        let advertised = doc_headers
+            .get("X-Terraform-Get")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if advertised.is_empty() {
+            return (
+                doc_status,
+                format!("<no X-Terraform-Get; body {} bytes>", doc_body.len()),
+                StatusCode::NOT_FOUND,
+                Bytes::new(),
+                axum::http::HeaderMap::new(),
+            );
+        }
+        let base = reqwest::Url::parse(&format!("http://ak.test{doc_path}")).unwrap();
+        let joined = base.join(&advertised).unwrap();
+        let archive_path = joined[url::Position::BeforePath..].to_string();
+        let (status, body, headers) = tdh::send_with_headers(
+            tdh::router_anon(mounted_router(), state.clone()),
+            tdh::get(archive_path),
+        )
+        .await;
+        (doc_status, advertised, status, body, headers)
+    }
+
+    #[tokio::test]
+    async fn virtual_answers_204_with_hint_and_streams_hosted_and_remote_archives() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "terraform").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+
+        // Upstream registry for the remote member: relative location, no
+        // archive type named, so the bytes decide the hint.
+        let server = MockServer::start().await;
+        let remote_blob = {
+            let mut b = Vec::new();
+            let mut gz = flate2::write::GzEncoder::new(&mut b, flate2::Compression::default());
+            std::io::Write::write_all(&mut gz, b"not really a tar, gzip is enough").unwrap();
+            gz.finish().unwrap();
+            b
+        };
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/proxied/aws/2.0.0/download"))
+            .respond_with(
+                ResponseTemplate::new(204).insert_header("X-Terraform-Get", "/files/proxied-2.0.0"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/proxied/aws/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "modules": [{"versions": [{"version": "2.0.0"}]}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files/proxied-2.0.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(remote_blob.clone()))
+            .mount(&server)
+            .await;
+
+        let (hosted_id, hosted_key, hosted_dir) =
+            tdh::create_repo(&fx.pool, "local", "terraform").await;
+        tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+        tdh::publish_repo(&fx.pool, hosted_id).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 1).await;
+        let (remote_id, _remote_key, remote_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "terraform", &server.uri(), 2).await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), cache.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), hosted_dir.to_str().unwrap(), proxy);
+
+        let zip = zip_module();
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (published, _) = tdh::send(
+            tdh::router_with_auth(mounted_router(), state.clone(), auth),
+            tdh::put(
+                format!("{MOUNT_PREFIX}/{hosted_key}/v1/modules/acme/hosted/aws/1.0.0"),
+                Bytes::from(zip.clone()),
+            ),
+        )
+        .await;
+
+        // `tofu init` lists versions before it downloads.
+        let mut listed = Vec::new();
+        for module in ["acme/hosted/aws", "acme/proxied/aws"] {
+            let (status, body) = tdh::send(
+                tdh::router_anon(mounted_router(), state.clone()),
+                tdh::get(format!(
+                    "{MOUNT_PREFIX}/{}/v1/modules/{module}/versions",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            listed.push((status, String::from_utf8_lossy(&body).into_owned()));
+        }
+        let hosted = walk(&state, &fx.repo_key, "acme/hosted/aws/1.0.0").await;
+        let proxied = walk(&state, &fx.repo_key, "acme/proxied/aws/2.0.0").await;
+        let missing = walk(&state, &fx.repo_key, "acme/nothere/aws/9.9.9").await;
+
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(published, StatusCode::CREATED);
+        assert_eq!(listed[0].0, StatusCode::OK, "{}", listed[0].1);
+        assert!(listed[0].1.contains("\"1.0.0\""), "{}", listed[0].1);
+        assert_eq!(listed[1].0, StatusCode::OK, "{}", listed[1].1);
+        assert!(listed[1].1.contains("\"2.0.0\""), "{}", listed[1].1);
+
+        let (doc, advertised, status, body, headers) = hosted;
+        assert_eq!(
+            doc,
+            StatusCode::NO_CONTENT,
+            "hosted member via virtual: {advertised}"
+        );
+        assert_eq!(
+            advertised,
+            format!(
+                "/terraform/{}/v1/modules/acme/hosted/aws/1.0.0/archive?archive=zip",
+                fx.repo_key
+            )
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &zip[..]);
+        assert_eq!(headers["content-type"], "application/zip");
+
+        let (doc, advertised, status, body, headers) = proxied;
+        assert_eq!(
+            doc,
+            StatusCode::NO_CONTENT,
+            "remote member via virtual: {advertised}"
+        );
+        assert_eq!(
+            advertised,
+            format!(
+                "/terraform/{}/v1/modules/acme/proxied/aws/2.0.0/archive?archive=tar.gz",
+                fx.repo_key
+            )
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &remote_blob[..]);
+        assert_eq!(headers["content-type"], "application/gzip");
+
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+    }
+
+    /// A source the proxy does not fetch (`git::`) is handed through unchanged
+    /// by a virtual, exactly as by the remote itself.
+    #[tokio::test]
+    async fn virtual_passes_a_git_source_through() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "terraform").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let server = MockServer::start().await;
+        let git = "git::https://example.com/acme/vpc.git?ref=v3.0.0";
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/vpc/aws/3.0.0/download"))
+            .respond_with(ResponseTemplate::new(204).insert_header("X-Terraform-Get", git))
+            .mount(&server)
+            .await;
+        let (remote_id, _k, remote_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "terraform", &server.uri(), 1).await;
+        let cache = tempfile::tempdir().unwrap();
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), cache.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), cache.path().to_str().unwrap(), proxy);
+
+        let (status, _, headers) = tdh::send_with_headers(
+            tdh::router_anon(mounted_router(), state),
+            tdh::get(format!(
+                "{MOUNT_PREFIX}/{}/v1/modules/acme/vpc/aws/3.0.0/download",
+                fx.repo_key
+            )),
+        )
+        .await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(headers["x-terraform-get"], git);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Origin provider registry: signed SHA256SUMS, package-document signing
+// fields, protocol versions and host-level discovery.
+// ---------------------------------------------------------------------------
+
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod origin_registry_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::signing_service::{verify_detached, CreateKeyRequest};
+    use axum::http::Request;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn dearmor_signature_rejects_garbage() {
+        assert!(dearmor_signature("not a signature").is_err());
+    }
+
+    fn pkg(os: &str, arch: &str, shasum: &str) -> LocalProviderPackage {
+        LocalProviderPackage {
+            os: os.to_string(),
+            arch: arch.to_string(),
+            shasum: shasum.to_string(),
+        }
+    }
+
+    fn protocols(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn mounted() -> Router<SharedState> {
+        Router::new().nest(MOUNT_PREFIX, router())
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(data))
+    }
+
+    // -- SHA256SUMS builder --------------------------------------------------
+
+    #[test]
+    fn shasums_has_one_sorted_line_per_platform_archive() {
+        let doc = build_provider_shasums(
+            "contrail",
+            "0.5.0",
+            &[
+                pkg("linux", "arm64", "BBBB"),
+                pkg("darwin", "amd64", "cccc"),
+                pkg("linux", "amd64", "aaaa"),
+            ],
+        );
+        assert_eq!(
+            doc,
+            "cccc  terraform-provider-contrail_0.5.0_darwin_amd64.zip\n\
+             aaaa  terraform-provider-contrail_0.5.0_linux_amd64.zip\n\
+             bbbb  terraform-provider-contrail_0.5.0_linux_arm64.zip\n"
+        );
+    }
+
+    #[test]
+    fn shasums_is_independent_of_input_order_and_duplicates() {
+        let a = pkg("linux", "amd64", "aa");
+        let b = pkg("linux", "arm64", "bb");
+        let forward = build_provider_shasums("t", "1.0.0", &[a.clone_pkg(), b.clone_pkg()]);
+        let backward = build_provider_shasums("t", "1.0.0", &[b.clone_pkg(), a.clone_pkg(), a]);
+        assert_eq!(forward, backward);
+        assert_eq!(forward.lines().count(), 2);
+    }
+
+    impl LocalProviderPackage {
+        fn clone_pkg(&self) -> Self {
+            pkg(&self.os, &self.arch, &self.shasum)
+        }
+    }
+
+    #[test]
+    fn shasums_line_format_is_two_spaces_between_hash_and_name() {
+        let hash = "0".repeat(64);
+        let doc = build_provider_shasums("t", "1.0.0", &[pkg("linux", "amd64", &hash)]);
+        assert_eq!(
+            doc,
+            format!("{hash}  terraform-provider-t_1.0.0_linux_amd64.zip\n")
+        );
+    }
+
+    #[test]
+    fn shasums_url_is_under_the_mount_point() {
+        assert_eq!(
+            build_provider_shasums_url("tf", "ns", "type", "1.2.3"),
+            "/terraform/tf/v1/providers/ns/type/1.2.3/SHA256SUMS"
+        );
+    }
+
+    // -- package document ----------------------------------------------------
+
+    fn signing_doc() -> ProviderSigningDoc {
+        ProviderSigningDoc {
+            key_id: "ABCD1234".to_string(),
+            ascii_armor:
+                "-----BEGIN PGP PUBLIC KEY BLOCK-----\nx\n-----END PGP PUBLIC KEY BLOCK-----\n"
+                    .to_string(),
+            shasums_url: "/terraform/tf/v1/providers/ns/t/1.0.0/SHA256SUMS".to_string(),
+            shasums_signature_url: "/terraform/tf/v1/providers/ns/t/1.0.0/SHA256SUMS.sig"
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn download_json_without_signing_keeps_legacy_shape() {
+        let json = build_provider_download_json(
+            "linux",
+            "amd64",
+            "f.zip",
+            "/u",
+            "h",
+            &protocols(&["5.0"]),
+            None,
+        );
+        assert!(json.get("shasums_url").is_none());
+        assert!(json.get("shasums_signature_url").is_none());
+        assert!(json["signing_keys"]["gpg_public_keys"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn download_json_with_signing_advertises_checksums_and_key() {
+        let signing = signing_doc();
+        let json = build_provider_download_json(
+            "linux",
+            "amd64",
+            "f.zip",
+            "/u",
+            "h",
+            &protocols(&["5.0", "6.0"]),
+            Some(&signing),
+        );
+        assert_eq!(json["protocols"], serde_json::json!(["5.0", "6.0"]));
+        assert_eq!(json["shasums_url"], signing.shasums_url);
+        assert_eq!(json["shasums_signature_url"], signing.shasums_signature_url);
+        let keys = json["signing_keys"]["gpg_public_keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["key_id"], "ABCD1234");
+        assert_eq!(keys[0]["ascii_armor"], signing.ascii_armor);
+    }
+
+    fn test_key(
+        key_id: Option<&str>,
+        fingerprint: Option<&str>,
+    ) -> crate::models::signing_key::SigningKey {
+        crate::models::signing_key::SigningKey {
+            id: uuid::Uuid::new_v4(),
+            repository_id: None,
+            name: "k".to_string(),
+            key_type: "gpg".to_string(),
+            fingerprint: fingerprint.map(str::to_string),
+            key_id: key_id.map(str::to_string),
+            public_key_pem: "PUBLIC".to_string(),
+            private_key_enc: b"never-served-private-material".to_vec(),
+            algorithm: "rsa2048".to_string(),
+            uid_name: None,
+            uid_email: None,
+            expires_at: None,
+            is_active: true,
+            created_at: chrono::Utc::now(),
+            created_by: None,
+            rotated_from: None,
+            last_used_at: None,
+        }
+    }
+
+    #[test]
+    fn signing_doc_prefers_key_id_then_fingerprint_and_only_exposes_public_half() {
+        let doc = provider_signing_doc(
+            &test_key(Some("KID"), Some("FPR")),
+            "tf",
+            "ns",
+            "t",
+            "1.0.0",
+        );
+        assert_eq!(doc.key_id, "KID");
+        assert_eq!(doc.ascii_armor, "PUBLIC");
+        assert_eq!(
+            doc.shasums_signature_url,
+            format!("{}.sig", doc.shasums_url)
+        );
+        let serialised =
+            build_provider_download_json("l", "a", "f", "u", "h", &protocols(&["5.0"]), Some(&doc))
+                .to_string();
+        assert!(!serialised.contains("never-served-private-material"));
+
+        let doc = provider_signing_doc(&test_key(None, Some("FPR")), "tf", "ns", "t", "1.0.0");
+        assert_eq!(doc.key_id, "FPR");
+        let doc = provider_signing_doc(&test_key(None, None), "tf", "ns", "t", "1.0.0");
+        assert_eq!(doc.key_id, "");
+    }
+
+    // -- protocols -------------------------------------------------------------
+
+    #[test]
+    fn protocol_normalisation_sorts_numerically_and_dedups() {
+        assert_eq!(
+            normalize_protocols(["6.0", "5.0", " 5.0 ", "10.1"]),
+            Some(protocols(&["5.0", "6.0", "10.1"]))
+        );
+    }
+
+    #[test]
+    fn protocol_normalisation_rejects_malformed_empty_and_oversized() {
+        assert_eq!(normalize_protocols(["5"]), None);
+        assert_eq!(normalize_protocols(["5.x"]), None);
+        assert_eq!(normalize_protocols(["a.b"]), None);
+        assert_eq!(normalize_protocols(["5.0", ""]), None);
+        assert_eq!(normalize_protocols(["99999.0"]), None);
+        assert_eq!(normalize_protocols(Vec::<&str>::new()), None);
+        let many: Vec<String> = (0..=MAX_PROTOCOL_VERSIONS)
+            .map(|i| format!("{i}.0"))
+            .collect();
+        assert_eq!(normalize_protocols(many.iter().map(String::as_str)), None);
+    }
+
+    #[test]
+    fn protocols_header_absent_valid_and_malformed() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(parse_protocols_header(&headers), Ok(None));
+        headers.insert(PROTOCOLS_HEADER, "6.0, 5.0".parse().unwrap());
+        assert_eq!(
+            parse_protocols_header(&headers),
+            Ok(Some(protocols(&["5.0", "6.0"])))
+        );
+        headers.insert(PROTOCOLS_HEADER, "five".parse().unwrap());
+        assert!(parse_protocols_header(&headers)
+            .unwrap_err()
+            .contains("X-Terraform-Protocols"));
+    }
+
+    #[test]
+    fn protocols_from_manifest_json_reads_metadata_protocol_versions() {
+        let raw = br#"{"version":1,"metadata":{"protocol_versions":["6.0","5.0"]}}"#;
+        assert_eq!(
+            protocols_from_manifest_json(raw),
+            Some(protocols(&["5.0", "6.0"]))
+        );
+        assert_eq!(protocols_from_manifest_json(b"not json"), None);
+        assert_eq!(protocols_from_manifest_json(br#"{"version":1}"#), None);
+        assert_eq!(
+            protocols_from_manifest_json(br#"{"metadata":{"protocol_versions":[6]}}"#),
+            None
+        );
+    }
+
+    fn zip_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, body) in entries {
+                w.start_file(*name, opts).unwrap();
+                w.write_all(body).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    fn scratch_file(name: &str, body: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tf-origin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn manifest_protocols_are_read_from_the_archive() {
+        let zip = zip_with(&[
+            ("terraform-provider-x_v1.0.0", b"placeholder"),
+            (
+                REGISTRY_MANIFEST_NAME,
+                br#"{"version":1,"metadata":{"protocol_versions":["6.0"]}}"#,
+            ),
+        ]);
+        let path = scratch_file("p.zip", &zip);
+        assert_eq!(
+            read_manifest_protocols(path.clone()).await,
+            Some(protocols(&["6.0"]))
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn manifest_protocols_are_none_for_missing_oversized_or_non_zip() {
+        let no_manifest = scratch_file("a.zip", &zip_with(&[("terraform-provider-x_v1", b"x")]));
+        assert_eq!(read_manifest_protocols(no_manifest.clone()).await, None);
+
+        let big = vec![b' '; (REGISTRY_MANIFEST_MAX_BYTES + 1) as usize];
+        let oversized = scratch_file("b.zip", &zip_with(&[(REGISTRY_MANIFEST_NAME, &big)]));
+        assert_eq!(read_manifest_protocols(oversized.clone()).await, None);
+
+        let not_zip = scratch_file("c.zip", b"definitely not a zip");
+        assert_eq!(read_manifest_protocols(not_zip.clone()).await, None);
+
+        assert_eq!(
+            read_manifest_protocols(std::path::PathBuf::from("/nonexistent/nope.zip")).await,
+            None
+        );
+        for p in [no_manifest, oversized, not_zip] {
+            std::fs::remove_dir_all(p.parent().unwrap()).ok();
+        }
+    }
+
+    #[test]
+    fn protocols_from_metadata_default_for_legacy_or_garbage() {
+        assert_eq!(provider_protocols_from_metadata(None), protocols(&["5.0"]));
+        let legacy = serde_json::json!({"kind": "provider"});
+        assert_eq!(
+            provider_protocols_from_metadata(Some(&legacy)),
+            protocols(&["5.0"])
+        );
+        let garbage = serde_json::json!({"protocols": ["x"]});
+        assert_eq!(
+            provider_protocols_from_metadata(Some(&garbage)),
+            protocols(&["5.0"])
+        );
+        let recorded = serde_json::json!({"protocols": ["6.0"]});
+        assert_eq!(
+            provider_protocols_from_metadata(Some(&recorded)),
+            protocols(&["6.0"])
+        );
+    }
+
+    #[test]
+    fn version_list_unions_protocols_across_platform_packages() {
+        let rows = vec![
+            (
+                "1.0.0".to_string(),
+                Some(serde_json::json!({"os":"linux","arch":"amd64","protocols":["6.0"]})),
+                "ns/t/1.0.0/linux/amd64".to_string(),
+            ),
+            (
+                "1.0.0".to_string(),
+                Some(serde_json::json!({"os":"linux","arch":"arm64"})),
+                "ns/t/1.0.0/linux/arm64".to_string(),
+            ),
+        ];
+        let versions = provider_versions_from_rows(&rows);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0]["protocols"], serde_json::json!(["5.0", "6.0"]));
+    }
+
+    // -- host-level discovery ----------------------------------------------------
+
+    fn discovery_router(state: SharedState) -> Router {
+        Router::new()
+            .route("/.well-known/terraform.json", get(host_service_discovery))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn host_discovery_is_404_when_no_default_repo_is_configured() {
+        // Never touches the database: the unset case short-circuits.
+        let state = tdh::build_state(tdh::lazy_pool(), "/nonexistent-storage");
+        let (status, body) = tdh::send(
+            discovery_router(state),
+            tdh::get("/.well-known/terraform.json".to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(String::from_utf8_lossy(&body).contains("No default Terraform registry"));
+    }
+
+    #[tokio::test]
+    async fn host_discovery_points_at_the_configured_terraform_repo() {
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let key = fx.repo_key.clone();
+        let state = tdh::build_state_with(
+            fx.pool.clone(),
+            &fx.storage_dir.to_string_lossy(),
+            move |c| c.terraform_default_repo = Some(key),
+        );
+        let (status, body) = tdh::send(
+            discovery_router(state),
+            tdh::get("/.well-known/terraform.json".to_string()),
+        )
+        .await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            doc["providers.v1"],
+            format!("/terraform/{}/v1/providers/", fx.repo_key)
+        );
+        assert_eq!(doc, build_service_discovery_json(&fx.repo_key));
+    }
+
+    #[tokio::test]
+    async fn host_discovery_hides_missing_and_non_terraform_repos_behind_one_404() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let mut bodies = Vec::new();
+        for configured in [fx.repo_key.clone(), "no-such-repo-key".to_string()] {
+            let state = tdh::build_state_with(
+                fx.pool.clone(),
+                &fx.storage_dir.to_string_lossy(),
+                move |c| c.terraform_default_repo = Some(configured),
+            );
+            let (status, body) = tdh::send(
+                discovery_router(state),
+                tdh::get("/.well-known/terraform.json".to_string()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            bodies.push(body);
+        }
+        fx.teardown().await;
+        assert_eq!(
+            bodies[0], bodies[1],
+            "the 404 must not reveal which case it was"
+        );
+    }
+
+    // -- hosted registry end to end (router level) ----------------------------------
+
+    async fn attach_key(fx: &tdh::Fixture, key_type: &str) -> String {
+        let svc = SigningService::new(fx.pool.clone(), &fx.state.config.jwt_secret);
+        let key = svc
+            .create_key(CreateKeyRequest {
+                repository_id: Some(fx.repo_id),
+                name: format!("tf-sign-{}", fx.repo_key),
+                key_type: key_type.to_string(),
+                algorithm: "rsa2048".to_string(),
+                uid_name: Some("AK Terraform".to_string()),
+                uid_email: Some("tf@example.com".to_string()),
+                created_by: None,
+            })
+            .await
+            .expect("create signing key");
+        svc.update_signing_config(fx.repo_id, Some(key.id), true, false, false)
+            .await
+            .expect("attach signing key");
+        key.public_key_pem
+    }
+
+    async fn upload(
+        fx: &tdh::Fixture,
+        version: &str,
+        platform: &str,
+        body: &[u8],
+        protocols_header: Option<&str>,
+    ) -> StatusCode {
+        let mut req = Request::builder().method("PUT").uri(format!(
+            "{}/{}/v1/providers/ns/ty/{}/{}",
+            MOUNT_PREFIX, fx.repo_key, version, platform
+        ));
+        if let Some(value) = protocols_header {
+            req = req.header(PROTOCOLS_HEADER, value);
+        }
+        let (status, _) = tdh::send(
+            fx.router_with_auth(mounted()),
+            req.body(axum::body::Body::from(body.to_vec())).unwrap(),
+        )
+        .await;
+        status
+    }
+
+    async fn get_path(fx: &tdh::Fixture, suffix: &str) -> (StatusCode, bytes::Bytes) {
+        tdh::send(
+            fx.router_anon(mounted()),
+            tdh::get(format!(
+                "{}/{}/v1/providers/ns/ty/{}",
+                MOUNT_PREFIX, fx.repo_key, suffix
+            )),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn hosted_origin_registry_serves_verifiable_signed_checksums() {
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let amd64: &[u8] = b"PK placeholder provider zip amd64";
+        let arm64: &[u8] = b"PK placeholder provider zip arm64";
+        assert!(upload(&fx, "1.0.0", "linux/amd64", amd64, Some("6.0"))
+            .await
+            .is_success());
+        assert!(upload(&fx, "1.0.0", "linux/arm64", arm64, None)
+            .await
+            .is_success());
+
+        // A package uploaded before any key existed: legacy document, no URLs.
+        let (status, body) = get_path(&fx, "1.0.0/download/linux/amd64").await;
+        assert_eq!(status, StatusCode::OK);
+        let legacy: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(legacy.get("shasums_url").is_none());
+        assert_eq!(legacy["protocols"], serde_json::json!(["6.0"]));
+
+        // Fail closed without a signing key.
+        let (status, _) = get_path(&fx, "1.0.0/SHA256SUMS").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = get_path(&fx, "1.0.0/SHA256SUMS.sig").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Attaching a key needs no re-upload: the document is computed from the
+        // stored artifacts.
+        let public_key = attach_key(&fx, "gpg").await;
+
+        let (status, sums) = get_path(&fx, "1.0.0/SHA256SUMS").await;
+        assert_eq!(status, StatusCode::OK);
+        let expected = build_provider_shasums(
+            "ty",
+            "1.0.0",
+            &[
+                pkg("linux", "amd64", &sha256_hex(amd64)),
+                pkg("linux", "arm64", &sha256_hex(arm64)),
+            ],
+        );
+        assert_eq!(String::from_utf8_lossy(&sums), expected);
+        assert_eq!(expected.lines().count(), 2);
+
+        // Deterministic bytes across requests.
+        let (_, again) = get_path(&fx, "1.0.0/SHA256SUMS").await;
+        assert_eq!(sums, again);
+
+        // The detached signature verifies against the advertised key.
+        let (status, sig) = get_path(&fx, "1.0.0/SHA256SUMS.sig").await;
+        assert_eq!(status, StatusCode::OK);
+        // Binary packets (what OpenTofu expects), not ASCII armor.
+        assert!(!sig.starts_with(b"-----BEGIN"));
+        assert_eq!(sig[0] & 0x80, 0x80, "must start with an OpenPGP packet tag");
+        let armored_sig = {
+            use pgp::composed::{Deserializable, StandaloneSignature};
+            use pgp::ArmorOptions;
+            StandaloneSignature::from_bytes(&sig[..])
+                .unwrap()
+                .to_armored_string(ArmorOptions::default())
+                .unwrap()
+        };
+        verify_detached(&public_key, &sums, &armored_sig).expect("signature must verify");
+        // ... and not against different data.
+        assert!(verify_detached(&public_key, b"tampered", &armored_sig).is_err());
+
+        // The package document now advertises everything a client needs.
+        let (status, body) = get_path(&fx, "1.0.0/download/linux/amd64").await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            doc["shasums_url"],
+            format!(
+                "/terraform/{}/v1/providers/ns/ty/1.0.0/SHA256SUMS",
+                fx.repo_key
+            )
+        );
+        assert_eq!(
+            doc["shasums_signature_url"],
+            format!("{}.sig", doc["shasums_url"].as_str().unwrap())
+        );
+        assert_eq!(doc["shasum"], sha256_hex(amd64));
+        let keys = doc["signing_keys"]["gpg_public_keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["ascii_armor"], public_key);
+        assert!(!keys[0]["key_id"].as_str().unwrap().is_empty());
+
+        // The advertised URLs resolve against the document's own URL.
+        let doc_url = format!(
+            "http://h{}/{}/v1/providers/ns/ty/1.0.0/download/linux/amd64",
+            MOUNT_PREFIX, fx.repo_key
+        );
+        let advertised = resolve_url(&doc_url, doc["shasums_url"].as_str().unwrap());
+        let (status, via_doc) = tdh::send(fx.router_anon(mounted()), tdh::get(advertised)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(via_doc, sums);
+
+        // Unknown version.
+        let (status, _) = get_path(&fx, "9.9.9/SHA256SUMS").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        fx.teardown().await;
+    }
+
+    /// Terraform/OpenTofu fetch `download_url`, `shasums_url` and
+    /// `shasums_signature_url` without the credentials they sent for the
+    /// package document, so an authenticated caller must get a single-use
+    /// ticket bound to each exact path (as for the #3588 mirror archives),
+    /// and an anonymous caller the plain paths.
+    #[tokio::test]
+    async fn package_document_tickets_every_advertised_url_for_an_authenticated_caller() {
+        use crate::services::auth_config_service::AuthConfigService;
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let zip: &[u8] = b"PK placeholder provider zip for tickets";
+        assert!(upload(&fx, "2.0.0", "linux/amd64", zip, None)
+            .await
+            .is_success());
+        attach_key(&fx, "gpg").await;
+
+        let doc_path = format!(
+            "{}/{}/v1/providers/ns/ty/2.0.0/download/linux/amd64",
+            MOUNT_PREFIX, fx.repo_key
+        );
+        let (status, body) =
+            tdh::send(fx.router_with_auth(mounted()), tdh::get(doc_path.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let base = format!("{}/{}/v1/providers/ns/ty/2.0.0", MOUNT_PREFIX, fx.repo_key);
+        let expected = [
+            (
+                "download_url",
+                format!("{base}/binary/linux/amd64"),
+                "terraform-provider-archive",
+            ),
+            (
+                "shasums_url",
+                format!("{base}/SHA256SUMS"),
+                "terraform-provider-shasums",
+            ),
+            (
+                "shasums_signature_url",
+                format!("{base}/SHA256SUMS.sig"),
+                "terraform-provider-shasums-sig",
+            ),
+        ];
+        let mut redeemed = Vec::new();
+        for (field, path, _) in &expected {
+            let url = doc[*field].as_str().unwrap_or_default().to_string();
+            let (url_path, ticket) = url
+                .split_once("?ticket=")
+                .unwrap_or_else(|| panic!("{field} must carry a ticket, got {url:?}"));
+            assert_eq!(url_path, path, "{field} path");
+            redeemed.push(
+                AuthConfigService::validate_download_ticket(&fx.pool, ticket)
+                    .await
+                    .unwrap_or_else(|e| panic!("{field} ticket must be live: {e}")),
+            );
+        }
+
+        let (status, body) = tdh::send(fx.router_anon(mounted()), tdh::get(doc_path.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        let anon: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let user_id = fx.user_id;
+        fx.teardown().await;
+
+        for ((field, path, purpose), ticket) in expected.iter().zip(redeemed) {
+            assert_eq!(ticket.user_id, user_id, "{field} ticket owner");
+            assert_eq!(ticket.purpose, *purpose, "{field} ticket purpose");
+            assert_eq!(
+                ticket.resource_path.as_deref(),
+                Some(path.as_str()),
+                "{field} ticket must be bound to exactly the advertised path"
+            );
+            assert!(
+                ticket.repo_scope.is_some(),
+                "{field} ticket must carry the caller's repository scope"
+            );
+            assert_eq!(anon[*field], *path, "anonymous {field} carries no ticket");
+        }
+    }
+
+    /// A `SHA256SUMS.sig` is reused per (key, checksum list) instead of
+    /// decrypting the private key on every anonymous request.
+    #[tokio::test]
+    async fn checksum_signature_is_reused_for_the_same_key_and_checksums() {
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        assert!(upload(&fx, "3.0.0", "linux/amd64", b"PK sig cache", None)
+            .await
+            .is_success());
+        attach_key(&fx, "gpg").await;
+
+        let (status, first) = get_path(&fx, "3.0.0/SHA256SUMS.sig").await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, second) = get_path(&fx, "3.0.0/SHA256SUMS.sig").await;
+        // A fresh signature embeds a new creation time, so identical bytes
+        // mean the cached one was served.
+        assert_eq!(first, second);
+
+        // A new package changes the checksum list, which is signed afresh.
+        assert!(
+            upload(&fx, "3.0.0", "linux/arm64", b"PK sig cache arm", None)
+                .await
+                .is_success()
+        );
+        let (status, third) = get_path(&fx, "3.0.0/SHA256SUMS.sig").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(first, third);
+
+        fx.teardown().await;
+    }
+
+    fn resolve_url(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).unwrap();
+        base.join(advertised).unwrap()[url::Position::BeforePath..].to_string()
+    }
+
+    #[tokio::test]
+    async fn non_openpgp_key_fails_closed_and_keeps_the_legacy_document() {
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        assert!(upload(&fx, "1.0.0", "linux/amd64", b"zip", None)
+            .await
+            .is_success());
+        attach_key(&fx, "rsa").await;
+
+        let (status, _) = get_path(&fx, "1.0.0/SHA256SUMS").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = get_path(&fx, "1.0.0/SHA256SUMS.sig").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, body) = get_path(&fx, "1.0.0/download/linux/amd64").await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(doc.get("shasums_url").is_none());
+        assert!(doc["signing_keys"]["gpg_public_keys"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_malformed_protocols_header_and_records_manifest_protocols() {
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        assert_eq!(
+            upload(&fx, "1.0.0", "linux/amd64", b"zip", Some("bogus")).await,
+            StatusCode::BAD_REQUEST
+        );
+
+        let manifest_zip = zip_with(&[
+            ("terraform-provider-ty_v2.0.0", b"placeholder"),
+            (
+                REGISTRY_MANIFEST_NAME,
+                br#"{"version":1,"metadata":{"protocol_versions":["6.0"]}}"#,
+            ),
+        ]);
+        assert!(upload(&fx, "2.0.0", "linux/amd64", &manifest_zip, None)
+            .await
+            .is_success());
+        let (status, body) = get_path(&fx, "versions").await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions = doc["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 1, "the rejected upload must not be stored");
+        assert_eq!(versions[0]["version"], "2.0.0");
+        assert_eq!(versions[0]["protocols"], serde_json::json!(["6.0"]));
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn checksums_are_not_published_for_non_hosted_repos() {
+        let Some(fx) = tdh::Fixture::setup("remote", "terraform").await else {
+            return;
+        };
+        let (status, _) = get_path(&fx, "1.0.0/SHA256SUMS").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = get_path(&fx, "1.0.0/SHA256SUMS.sig").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        fx.teardown().await;
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod mirror_archive_redirect {
+    use super::{serve_mirror_archive, MirrorRemote};
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::middleware::download_telemetry::DownloadContext;
+    use crate::services::proxy_cache_scope::ProxyCacheScope;
+    use crate::services::proxy_service::ProxyService;
+    use axum::http::{header, StatusCode};
+    use axum::response::Response;
+
+    const REPO_KEY: &str = "tf-mirror";
+    const UPSTREAM: &str = "https://registry.invalid";
+    const CACHE_PATH: &str =
+        "hashicorp/null/3.2.3/linux/amd64/terraform-provider-null_3.2.3_linux_amd64.zip";
+
+    /// Serve a fresh cached archive from a presign-capable cache. The archive
+    /// URL does not resolve, so any upstream fetch would fail the request.
+    async fn serve(is_head: bool) -> Response {
+        let pool = tdh::lazy_pool();
+        let scope = ProxyCacheScope::unscoped();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+        backend.seed_fresh_entry(
+            &ProxyService::cache_storage_key(&scope, REPO_KEY, CACHE_PATH).unwrap(),
+            &ProxyService::cache_metadata_key(&scope, REPO_KEY, CACHE_PATH).unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state_with_proxy_presigned(
+            pool,
+            dir.path().to_str().unwrap(),
+            proxy.clone(),
+        );
+        let remote = MirrorRemote {
+            repo: tdh::make_repo_info(
+                uuid::Uuid::new_v4(),
+                REPO_KEY,
+                dir.path(),
+                "remote",
+                Some(UPSTREAM),
+            ),
+            upstream_url: UPSTREAM.to_string(),
+            proxy: proxy.as_ref(),
+        };
+        let ctx = DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head,
+        };
+        serve_mirror_archive(
+            &state,
+            &remote,
+            REPO_KEY,
+            &format!("{UPSTREAM}/p.zip"),
+            CACHE_PATH,
+            &ctx,
+        )
+        .await
+        .unwrap_or_else(|err| err)
+    }
+
+    #[tokio::test]
+    async fn cached_archive_is_redirected_to_object_storage() {
+        let resp = serve(false).await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let loc = resp.headers()[header::LOCATION].to_str().unwrap();
+        assert!(loc.contains(CACHE_PATH), "signed the wrong key: {loc}");
+    }
+
+    #[tokio::test]
+    async fn head_is_answered_from_the_cache_not_redirected() {
+        assert_eq!(serve(true).await.status(), StatusCode::OK);
     }
 }

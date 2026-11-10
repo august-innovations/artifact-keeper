@@ -14,15 +14,18 @@
 #
 # Container images are available from two registries:
 #   ghcr.io (default):  ghcr.io/artifact-keeper/artifact-keeper-{backend,web,openscap}
-#   Docker Hub:         artifactkeeper/{backend,web,openscap}
+#   Docker Hub:         docker.io/artifactkeeper/{backend,web,openscap}
 #
 # To use Docker Hub instead, replace image references below. For example:
 #   ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
-#     -> artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
+#     -> docker.io/artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
 #
 # Pin a specific release by setting ARTIFACT_KEEPER_VERSION in a .env file
-# alongside this compose file (e.g. ARTIFACT_KEEPER_VERSION=1.1.0). Omit the
-# "v" prefix. If unset, "latest" is used.
+# alongside this compose file (e.g. ARTIFACT_KEEPER_VERSION=1.1.0). It pins the
+# backend and openscap images, which are released together with the same tag.
+# The web UI is released on its own cadence (#2708), so pin it separately with
+# ARTIFACT_KEEPER_WEB_VERSION (e.g. ARTIFACT_KEEPER_WEB_VERSION=1.10.1). Omit
+# the "v" prefix. If either is unset, "latest" is used for those images.
 # =============================================================================
 
 services:
@@ -33,7 +36,7 @@ services:
   # In production, replace this with certs issued by your internal CA or use a
   # managed database service that handles TLS for you.
   pg-certs:
-    image: alpine:3.24
+    image: docker.io/library/alpine:3.24
     container_name: artifact-keeper-pg-certs
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -75,7 +78,7 @@ services:
   # with proper backups, replication, and connection pooling.
   # Default credentials below are for local evaluation only.
   postgres:
-    image: postgres:18-alpine
+    image: docker.io/library/postgres:18-alpine
     container_name: artifact-keeper-db
     depends_on:
       pg-certs:
@@ -93,8 +96,14 @@ services:
       - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro,z
       - ./docker/init-pg-ssl.sh:/docker-entrypoint-initdb.d/init-pg-ssl.sh:ro,z
       - pg_certs:/var/lib/postgresql/certs:ro
+    # Loopback only (#4480). The backend reaches Postgres as postgres:5432 on
+    # the compose network and needs no published port; this one exists for
+    # running the backend from a host checkout (CONTRIBUTING.md: `docker
+    # compose up -d postgres opensearch` then `cargo run`). The credentials
+    # above are fixed, so never publish it on all interfaces. To reach it
+    # from another machine, replace the line with "30432:5432" knowingly.
     ports:
-      - "30432:5432"
+      - "127.0.0.1:30432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
       interval: 10s
@@ -119,7 +128,7 @@ services:
   # shell-free) while providing sh + curl + jq. Mirrors the pg-certs init
   # container's `apk add` pattern above.
   dtrack-init:
-    image: alpine:3.24
+    image: docker.io/library/alpine:3.24
     container_name: artifact-keeper-dtrack-init
     profiles:
       - dtrack  # Only starts with: docker compose --profile dtrack up
@@ -165,7 +174,7 @@ services:
   # (issue #1563). This one-shot root init container chowns the volume to
   # 1001:0 before the backend starts. Mirrors the pg-certs init pattern above.
   scan-workspace-init:
-    image: alpine:3.24
+    image: docker.io/library/alpine:3.24
     container_name: artifact-keeper-scan-ws-init
     user: "0:0"
     entrypoint: ["/bin/sh", "-c"]
@@ -186,10 +195,12 @@ services:
   # ---------------------------------------------------------------------------
   # The core Artifact Keeper service. Handles all API requests, package format
   # protocols, storage, and integrations with scanners.
-  # Docker Hub alternative: artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
+  # Docker Hub alternative: docker.io/artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
   #
   # Key environment variables to review for your deployment:
-  #   JWT_SECRET        - MUST be changed for production (use a random 32+ char string)
+  #   JWT_SECRET        - REQUIRED, no default. Generate with: openssl rand -base64 48
+  #   AK_WEBHOOK_SECRET_KEY - webhook signing-secret key, generate with:
+  #                       openssl rand -base64 32 (webhooks are disabled until set)
   #   ADMIN_PASSWORD    - if unset, a random password is generated on first boot
   #   STORAGE_PATH      - where artifacts are stored on disk (or configure S3 below)
   #   CORS_ORIGINS      - set to your actual domain(s) in production
@@ -222,11 +233,20 @@ services:
       STORAGE_PATH: /data/storage
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
-      JWT_SECRET: ${JWT_SECRET:-change-me-in-production-please}
+      # REQUIRED. There is deliberately no default (#4478): the backend
+      # refuses every placeholder, so a shipped default could only ever make
+      # it restart forever. Unset, the backend exits once with an error that
+      # names the variable and the command to generate it. Put the output of
+      #   openssl rand -base64 48
+      # in a .env file next to this compose file (see .env.example).
+      JWT_SECRET: ${JWT_SECRET:-}
       # ADMIN_PASSWORD: set this to skip first-boot setup lock.
       # If unset, a random password is generated and written to
-      # /data/storage/admin.password on each boot until it is changed.
+      # /data/storage/admin.password, and regenerated on boot while that file
+      # is missing and the password has not been changed.
       # Read it with: docker exec artifact-keeper-backend cat /data/storage/admin.password
+      # Applied only when the admin account is FIRST created (#4313): editing
+      # it afterwards changes nothing (the backend logs that it is ignored).
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       # INITIAL_ADMIN_PASSWORD / INITIAL_ADMIN_PASSWORD_FILE: preset the
       # first-boot admin password instead of reading a generated one out of
@@ -237,7 +257,8 @@ services:
       # visible in `docker inspect`. Weak values abort startup.
       INITIAL_ADMIN_PASSWORD_FILE: ${INITIAL_ADMIN_PASSWORD_FILE:-}
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
-      LOG_FORMAT: ${LOG_FORMAT:-pretty}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+      LOG_ANSI: ${LOG_ANSI:-auto}
       AUDIT_STREAM: ${AUDIT_STREAM:-off}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,https://localhost}
@@ -255,6 +276,18 @@ services:
       # keying on the real client IP. Override for bare-metal / custom bridge
       # subnets; keep it in sync with the actual proxy network.
       RATE_LIMIT_TRUSTED_PROXY_CIDRS: ${RATE_LIMIT_TRUSTED_PROXY_CIDRS:-172.30.0.0/24}
+      # Whether the XFF-derived client IP may also be used for IP-conditioned
+      # permission rules (allowed_cidrs, #1849) and audit-row client IPs.
+      # Default false: requests that arrive through a trusted proxy have an
+      # unknown client IP for those purposes (conditioned grants do not match,
+      # audit rows record no IP). Set true only after confirming every proxy
+      # in RATE_LIMIT_TRUSTED_PROXY_CIDRS appends or overwrites XFF with its
+      # own peer address. The bundled Caddy does, so this is safe when Caddy is
+      # the only way in; it is not when another proxy or load balancer in front
+      # of Caddy forwards a client-supplied XFF unchanged. Behind SNAT no XFF
+      # setting recovers the client IP, and an allowed_cidrs condition that
+      # covers the proxy network is meaningless. See .env.example.
+      XFF_TRUSTED_FOR_AUTHZ: ${XFF_TRUSTED_FOR_AUTHZ:-false}
       TRIVY_URL: http://trivy:8090
       # Trivy scanner-adapter URL (container-image scanning, #2471 / #2305).
       # TRIVY_URL above only wires the legacy trivy *server* used for
@@ -294,12 +327,14 @@ services:
       ALLOW_HTTP_INTEGRATIONS: "1"
       # Webhooks v2 signing-secret encryption key. 32 bytes, base64 encoded.
       # Generate with: openssl rand -base64 32, then set the variable in
-      # your shell or a .env file before docker compose up. The placeholder
-      # below is intentionally invalid base64 so the backend fails fast at
-      # boot (ensure_configured) with a clear error rather than running
-      # with a known-weak key. Without a key set, webhook create and
-      # rotate-secret endpoints return HTTP 500.
-      AK_WEBHOOK_SECRET_KEY: ${AK_WEBHOOK_SECRET_KEY:-REPLACE_ME_WITH_OUTPUT_OF_openssl_rand_base64_32}
+      # your shell or a .env file before docker compose up. No value here on
+      # purpose (#4478, #4313, #1350): when the variable is not set at all
+      # the backend starts and only warns, and webhook create and
+      # rotate-secret return HTTP 500 until a key is set. A value that is
+      # set but malformed (including an empty string or the old
+      # REPLACE_ME placeholder) still makes the backend refuse to start, so
+      # this passes the variable through only when you define it.
+      AK_WEBHOOK_SECRET_KEY:
       # Toggle the webhooks v2 EventBus producer. Default off. Flip to true
       # once you have rotated migrated webhook secrets via /rotate-secret
       # and verified delivery against your receivers.
@@ -338,7 +373,7 @@ services:
   # ---------------------------------------------------------------------------
   # Powers artifact and package search in the UI and API.
   opensearch:
-    image: opensearchproject/opensearch:2.19.6
+    image: docker.io/opensearchproject/opensearch:2.19.6
     container_name: artifact-keeper-opensearch
     environment:
       discovery.type: single-node
@@ -347,8 +382,12 @@ services:
       DISABLE_INSTALL_DEMO_CONFIG: "true"
     volumes:
       - opensearch_data:/usr/share/opensearch/data
+    # Loopback only (#4480): the security plugin is disabled, so anyone who
+    # can reach this port can read and change the index. The backend uses
+    # opensearch:9200 on the compose network; the published port is only for
+    # host-side development (see the postgres service above).
     ports:
-      - "9200:9200"
+      - "127.0.0.1:9200:9200"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
       interval: 10s
@@ -364,11 +403,18 @@ services:
   # the backend calls on demand. Optional: remove this service and unset
   # TRIVY_URL on the backend if you do not need vulnerability scanning.
   trivy:
-    image: ghcr.io/aquasecurity/trivy:0.74.0
+    image: ghcr.io/aquasecurity/trivy:0.76.0
     container_name: artifact-keeper-trivy
     command: ["server", "--listen", "0.0.0.0:8090"]
-    ports:
-      - "8090:8090"
+    # Air-gapped (#5287): stop the server reaching out for its DB at start
+    # and on every refresh. trivy refuses --skip-db-update on a first run, so
+    # `trivy_cache` must already hold db/trivy.db + db/metadata.json (the
+    # db.tar.gz from `oras pull ghcr.io/aquasecurity/trivy-db:2`, unpacked).
+    # command: ["server", "--listen", "0.0.0.0:8090", "--skip-db-update"]
+    # Not published (#4480): the backend calls trivy:8090 on the compose
+    # network. For host-side debugging, opt in on loopback only:
+    # ports:
+    #   - "127.0.0.1:8090:8090"
     volumes:
       - trivy_cache:/root/.cache/trivy
       - scan_workspace:/scan-workspace:ro
@@ -392,6 +438,12 @@ services:
   #     # Pull image manifests/blobs from the AK registry over the compose
   #     # network's plain HTTP. Leave true on the internal network.
   #     SCANNER_TRIVY_INSECURE: "true"
+  #     # Air-gapped (#5287): never download the vulnerability or Java DB and
+  #     # scan with --offline-scan. The adapter stays not-ready until a DB is
+  #     # imported with PUT /api/v1/vulndb (see docker/scanner-adapter/README.md),
+  #     # which needs the shared token below; unset, the DB routes are off.
+  #     # SCANNER_OFFLINE: "true"
+  #     # SCANNER_ADAPTER_TOKEN: ${SCANNER_ADAPTER_TOKEN:-}
   #   volumes:
   #     # Dedicated cache volume — do NOT reuse `trivy_cache`: that volume is
   #     # owned by root (the trivy *server* above runs as root and mounts it at
@@ -408,10 +460,14 @@ services:
   # Runs SCAP compliance checks against container images. Optional: remove
   # this service and unset OPENSCAP_URL on the backend if not needed.
   openscap:
-    image: ghcr.io/artifact-keeper/artifact-keeper-openscap:latest  # or artifactkeeper/openscap:latest
+    # Same release tag as the backend: both are published by every backend
+    # release (#4481).
+    image: ghcr.io/artifact-keeper/artifact-keeper-openscap:${ARTIFACT_KEEPER_VERSION:-latest}  # or artifactkeeper/openscap:${ARTIFACT_KEEPER_VERSION:-latest}
     container_name: artifact-keeper-openscap
-    ports:
-      - "8091:8091"
+    # Not published (#4480): the backend calls openscap:8091 on the compose
+    # network. For host-side debugging, opt in on loopback only:
+    # ports:
+    #   - "127.0.0.1:8091:8091"
     volumes:
       - scan_workspace:/scan-workspace:ro
     healthcheck:
@@ -435,7 +491,7 @@ services:
   #   docker compose --profile dtrack --profile dtrack-ui up
   # https://dependencytrack.org/
   dependency-track-apiserver:
-    image: dependencytrack/apiserver:4.14.3
+    image: docker.io/dependencytrack/apiserver:4.14.3
     container_name: artifact-keeper-dtrack-api
     profiles:
       - dtrack  # Only starts with: docker compose --profile dtrack up
@@ -475,7 +531,7 @@ services:
   # apiserver). Run with:
   #   docker compose --profile dtrack --profile dtrack-ui up
   dependency-track-frontend:
-    image: dependencytrack/frontend:4.14.3
+    image: docker.io/dependencytrack/frontend:4.14.3
     container_name: artifact-keeper-dtrack-frontend
     profiles:
       - dtrack-ui  # Requires the `dtrack` profile too; see comment above.
@@ -495,7 +551,9 @@ services:
   # internal Docker network. No ports are exposed directly; Caddy handles
   # external access and routes requests to the appropriate service.
   web:
-    image: ghcr.io/artifact-keeper/artifact-keeper-web:latest  # or artifactkeeper/web:latest
+    # Web releases are decoupled from backend releases (#2708), so the web
+    # image has its own pin (#4481).
+    image: ghcr.io/artifact-keeper/artifact-keeper-web:${ARTIFACT_KEEPER_WEB_VERSION:-latest}  # or artifactkeeper/web:${ARTIFACT_KEEPER_WEB_VERSION:-latest}
     container_name: artifact-keeper-web
     depends_on:
       backend:
@@ -513,7 +571,7 @@ services:
   # cert. In production, you may replace Caddy with your own reverse proxy
   # (nginx, Traefik, a cloud load balancer, etc.).
   caddy:
-    image: caddy:2-alpine
+    image: docker.io/library/caddy:2-alpine
     container_name: artifact-keeper-caddy
     depends_on:
       backend:
@@ -584,8 +642,9 @@ volumes:
 # Network
 # =============================================================================
 # A single bridge network for all services. All inter-container communication
-# stays on this network; only Caddy (and optionally Postgres/OpenSearch for
-# debugging) expose ports to the host.
+# stays on this network. Only Caddy is published on all host interfaces;
+# Postgres and OpenSearch are published on 127.0.0.1 for host-side
+# development, and Trivy/OpenSCAP are not published at all (#4480).
 #
 # The subnet is PINNED so it is deterministic: the backend's
 # RATE_LIMIT_TRUSTED_PROXY_CIDRS (see the backend service) must match the

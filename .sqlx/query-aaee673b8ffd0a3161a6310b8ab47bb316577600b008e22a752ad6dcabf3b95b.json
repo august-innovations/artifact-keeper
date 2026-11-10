@@ -6,57 +6,123 @@
       {
         "ordinal": 0,
         "name": "checksum_sha256",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "proxy_scan_results",
+            "name": "checksum_sha256"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "scan_type",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "proxy_scan_results",
+            "name": "scan_type"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "verdict",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "proxy_scan_results",
+            "name": "verdict"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "findings_count",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "proxy_scan_results",
+            "name": "findings_count"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "critical_count",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "proxy_scan_results",
+            "name": "critical_count"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "high_count",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "proxy_scan_results",
+            "name": "high_count"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "medium_count",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "proxy_scan_results",
+            "name": "medium_count"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "low_count",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "proxy_scan_results",
+            "name": "low_count"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "max_severity",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "proxy_scan_results",
+            "name": "max_severity"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "scanner_version",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "proxy_scan_results",
+            "name": "scanner_version"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "scanned_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "proxy_scan_results",
+            "name": "scanned_at"
+          }
+        }
       }
     ],
     "parameters": {

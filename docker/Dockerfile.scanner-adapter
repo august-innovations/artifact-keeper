@@ -37,11 +37,41 @@
 # a stale builder cache into a loud build failure instead of a silently
 # vulnerable stdlib. Raise GO_MIN_PATCH in lockstep with the backend
 # Dockerfiles when a new Go stdlib advisory lands.
+#
+# 1.26.6 -> 1.27.2 on 2026-10-10. Two reasons, and the first is the one that
+# matters for next time. (1) The floor had gone INERT: #3579 moved the
+# FROM from `golang:1.26-alpine` to `golang:1.27-alpine` and left the floor
+# on 1.26.6, and the check is a `sort -V`, so every 1.27.x passed it and no
+# lagging mirror could fail it. That is the exact bug #3655 fixed in the backend
+# Dockerfiles ("keep the floor on the newest patch of whatever minor the FROM
+# line names, or this check goes inert again"); this file missed that fix.
+# The "Go 1.26 toolchain" and "floating `1.26` tag" wording above is from
+# before #3579 as well: the FROM floats on 1.27. (2) go1.27.2 is Go's
+# 2026-10 security release (CVE-2026-78667 net/http, CVE-2026-78669 HTTP/2,
+# CVE-2026-97031 crypto/tls, all HIGH), raised in lockstep with the backend.
+# The adapter binary itself scanned CLEAN in the run that failed on those
+# CVEs (main, a8fd2b47, run 38087035953), because the floating FROM had
+# already served go1.27.2; the floor makes that a guarantee rather than a
+# coincidence of build timing. The adapter is still stdlib-only, so there is
+# no golang.org/x/net in it to bump: its go.mod has no require block and no
+# go.sum, and adding x/net would add a dependency nothing imports (`go mod
+# tidy` removes it again). The x/net findings in this image are in the
+# bundled trivy, below.
+#
+# 1.27.2 -> 1.27.3 on 2026-10-21, for CVE-2026-111943 (HIGH) against stdlib
+# v1.27.2. Found not by a red publish but by the pinned-base-image watch
+# (#4852) -- which is the whole point of that workflow, since a stdlib CVE in
+# the ADAPTER binary is ours to fix here while one in the bundled trivy is
+# fixed in artifact-keeper/trivy and reached by moving the digest below. Both
+# halves are in this change. Same rule as #3655: the floor stays on the newest
+# patch of the minor the floating FROM names, never on the minimum go.mod
+# permits. CVE-2026-111943 is also fixed in go1.26.10, which is irrelevant
+# here -- this binary is built on 1.27.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 
 ARG TARGETOS
 ARG TARGETARCH
-ARG GO_MIN_PATCH=1.26.6
+ARG GO_MIN_PATCH=1.27.3
 
 RUN set -eu; \
     have="$(go env GOVERSION | sed 's/^go//')"; \
@@ -66,7 +96,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/scanner-adapter .
 
 # ---------- Stage 2: pull the matching trivy binary ----------
-# Our own build of upstream trivy v0.74.0 (artifact-keeper/trivy): the same
+# Our own build of upstream trivy v0.76.0 (artifact-keeper/trivy): the same
 # upstream source tag, built with our pinned Go toolchain plus the documented
 # dependency overrides in that repo's overrides.yaml.
 #
@@ -117,20 +147,111 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # so the override stays an override (artifact-keeper/trivy#14); the backend's
 # grype carries the same bump in Dockerfile.backend{,.alpine} (#3792).
 #
+# 0.74.0-r3 -> 0.74.0-r4 (2026-10-10) is Go's October security release, and
+# the first r-build that moves the toolchain and an override together. The r3
+# binary was compiled on go1.26.7 with golang.org/x/net v0.58.0 and failed
+# the gate on four HIGHs: CVE-2026-78669 against x/net (fixed in v0.60.0) and
+# CVE-2026-78667 / -78669 / -97031 against the stdlib (fixed in go1.26.9 /
+# go1.27.2). r4 builds on go1.26.9 and overrides x/net to v0.60.0, plus the
+# six golang.org/x modules MVS moves with it, all at the versions upstream
+# v0.75.0 already ships. Upstream has not bumped x/net anywhere yet, so that
+# entry is a declared exception to the trivy repo's "upstream already made
+# the bump" rule, and it says so in overrides.yaml. The backend's grype and
+# buildctl carry the same x/net override in docker/Dockerfile.backend.
+#
+# 0.74.0-r4 -> 0.74.0-r5 (2026-10-17, #4713) is a dependency override alone,
+# no toolchain move: CVE-2026-95837 (HIGH, containerd's CRI checkpoint restore
+# bypasses the destination security context) was published against
+# github.com/containerd/containerd/v2 v2.3.3, which the r4 binary links for
+# trivy's containerd image source, and failed the gate on every main build
+# from 2026-10-17 with no byte of this repo changing. Upstream's fix is
+# v2.4.1 in trivy 0.75.0 and 0.76.0, and the trivy repo's policy would be to
+# bump TRIVY_VERSION to one of those; it cannot, because this adapter's
+# checkTrivyServer (remote.go) requires the bundled client and the trivy
+# server sidecar to report the same version, and the sidecar is pinned at
+# 0.74.0 in the compose files, the workflows and the chart. So r5 takes the
+# containerd patch-line fix (v2.3.4, plus the k8s.io/client-go and
+# k8s.io/component-base v0.36.3 that MVS moves with it) as a declared
+# exception in that repo's overrides.yaml (artifact-keeper/trivy#17). The
+# coordinated client+server move to 0.76.0, which empties that override list,
+# is #4712. VERSION moves 1.4.1 -> 1.4.2 because this file is part of the
+# adapter's versioned source set (RELEASING.md step 5).
+#
+# 0.74.0-r5 -> 0.76.0-r1 (#4712) is that coordinated move: the bundled client
+# and the trivy server sidecar go to 0.76.0 in the same change, because
+# checkTrivyServer and clientModeProvenance (remote.go) refuse a server that
+# reports a different release than this binary. The sidecar pin moves in
+# docker-compose{,.local-dev,.test}.yml and in the docker-publish,
+# scheduled-container-scan and scheduled-base-image-watch workflows; the Helm
+# chart's trivy.image.tag moves in artifact-keeper-iac. Upstream v0.76.0
+# (531360e5) pins every module the r-builds were overriding at or above the
+# override version (grpc v1.84.0, golang.org/x/net v0.60.0, containerd/v2
+# v2.4.1 and the k8s.io 0.37 line with it), so that repo's overrides.yaml is
+# empty again and 0.76.0-r1 is pristine upstream built on go1.27.2 (v0.75.0
+# raised go.mod to `go 1.27.0`). Upstream 0.75/0.76 also changed client/server
+# mode itself: cryptographic assets now travel with the blob and the result
+# (aquasecurity/trivy#11141), and packages keep their modularity label, build
+# info and installed files across the RPC (aquasecurity/trivy#11188), which
+# fixes silent false negatives on RHEL-family modular packages and Red Hat
+# SBOM properties that only client/server mode lost. Both add RPC fields, so
+# mixing releases is unsupported; the report's `Trivy.Server` block the
+# adapter verifies is unchanged in shape. VERSION moves 1.4.2 -> 1.5.0, a
+# minor, because the trivy server release the adapter requires changes.
+#
 # Pinned by DIGEST, not tag: that repo rebuilds weekly to pick up RPM errata,
 # so its tags are moving targets by design. buildx selects the TARGETPLATFORM
 # variant from the multi-arch index automatically, so the arm64 build gets the
 # arm64 trivy and the amd64 build gets amd64 — both are published.
-# This digest is the manifest-list digest of tag 0.74.0-r3 (note: no leading
+# This digest is the manifest-list digest of tag 0.76.0-r4 (note: no leading
 # `v` on the published tag — the publish job renders it with
 # docker/metadata-action `type=semver,pattern={{version}}`).
 #
 # Nothing couples the backend to a specific trivy version: the 0.71.2 strings
 # in backend/scanner-adapter tests are mock/stub fixtures, and the adapter
 # probes the real version at startup (ProbeVersion). The upstream source tag
-# DID move this time — the bundled binary now reports `Version: 0.74.0` — and
+# DID move this time — the bundled binary now reports `Version: 0.76.0` — and
 # nothing in the backend reads that string, so no test or config follows it.
-FROM ghcr.io/artifact-keeper/trivy@sha256:29a423b8a34a642b78c1c6d3677759cb41a8aa42df53fd542ba44d745d954410 AS trivy
+#
+# This digest is the manifest-list digest of tag 0.76.0-r2 (artifact-keeper/
+# trivy#19, tag v0.76.0-r2, published 2026-10-21; verified with `skopeo
+# inspect --raw`). The bundled binary is unchanged upstream v0.76.0
+# (531360e5) rebuilt on go1.27.3; `go version -m` on it reports go1.27.3.
+#
+# 0.76.0-r1 -> 0.76.0-r2 (#4852): the pinned-base-image watch reported HIGH
+# CVE-2026-111943 in the bundled trivy (stdlib v1.27.2, fixed in 1.27.3). A
+# stdlib advisory has no module to override, so the fix in artifact-keeper/
+# trivy is a GO_VERSION bump alone (trivy#19); nothing else moved there. It
+# was merged, tagged v0.76.0-r2, and this FROM repoints to the published
+# digest. docker/scanner-adapter/VERSION moves 1.5.0 -> 1.6.0 with it, because
+# exact versions are never republished (scripts/ci/check-version-pin-bump.sh).
+#
+# 0.76.0-r2 -> 0.76.0-r3 (#5041): Docker Publish's gate reported HIGH
+# CVE-2026-116587 (GHSA-mgcc-cww5-fp2q, go-jose v4.1.5, fixed in 4.1.6) in
+# the bundled trivy on main from 79e52871 (run 40671050571). No Trivy release
+# carries the fix (v0.76.0 and v0.76.1 pin v4.1.5); upstream main made the
+# bump in aquasecurity/trivy#11488, so artifact-keeper/trivy added a go-jose
+# override on top of the unchanged v0.76.0 source (trivy#20), tagged
+# v0.76.0-r3, and this FROM repoints to that published manifest-list digest
+# (verified with `skopeo inspect --raw`). docker/scanner-adapter/VERSION moves
+# 1.6.0 -> 1.6.1 with it.
+#
+# 0.76.0-r3 -> 0.76.0-r4 (#5571): Docker Publish's gate reported HIGH
+# CVE-2026-78661 (GO-2026-6860, golang.org/x/net v0.60.0, fixed in v0.62.0,
+# denial of service in x/net/html) in the bundled trivy on main from
+# 2026-11-07, alongside the same finding in the backend image's grype and
+# buildctl (fixed by #5567). Upstream Trivy v0.76.2 pins x/net v0.62.0, but
+# the adapter must run the same Trivy release as its server sidecar, so the
+# server-side release is not moved for a client-only dependency fix:
+# artifact-keeper/trivy added an x/net override on top of the unchanged
+# v0.76.0 source (trivy#21, with the four minimum-version-selection
+# companions x/net v0.62.0 pulls in), tagged v0.76.0-r4, and this FROM
+# repoints to that published manifest-list digest (read back from the
+# registry's Docker-Content-Digest for the tag; the build's own CVE gate ran
+# on those exact bytes). Go stays 1.27.3; the binary still reports `Version:
+# 0.76.0`. docker/scanner-adapter/VERSION stays 1.7.0: that version is not
+# published yet (scripts/ci/check-version-pin-bump.sh), so the cut creates
+# it.
+FROM ghcr.io/artifact-keeper/trivy@sha256:47199755ccf75b3c6776b0e6bca8a95ed8ca83fe330c7458bec30e661ded5835 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security

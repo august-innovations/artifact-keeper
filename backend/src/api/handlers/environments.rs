@@ -36,11 +36,16 @@ use utoipa::{IntoParams, OpenApi};
 use uuid::Uuid;
 
 use crate::api::handlers::repositories::{
-    member_read_visibility, require_repo_action, require_visible,
+    hide_write_denial_from_non_readers, member_read_visibility, require_repo_action,
+    require_visible,
 };
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::repository::Repository;
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::environment_lock;
 use crate::services::environment_reeval::{
     AffectednessRecord, EnvironmentReevalService, TransitionFilter, TransitionRecord,
@@ -128,7 +133,10 @@ async fn ingest_environment(
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_repo_action(&auth, repo.id, "write", &state.permission_service).await?;
+    // #5458: a refusal to a caller who cannot read the repository is the
+    // unknown-key 404.
+    let gate = require_repo_action(&auth, repo.id, "write", &state.permission_service).await;
+    hide_write_denial_from_non_readers(gate, &auth, &repo, &repo_service).await?;
 
     let env = environment_lock::parse_named_lockfile(&query.filename, body.as_ref())?;
     let name = query.name.as_deref().unwrap_or_else(|| {
@@ -143,6 +151,16 @@ async fn ingest_environment(
     let outcome = EnvironmentService::new(state.db.clone())
         .ingest(repo.id, name, &content_sha256, &env)
         .await?;
+    audit_environment(
+        &state,
+        AuditAction::EnvironmentRegistered,
+        &auth,
+        &repo,
+        outcome.id,
+        name,
+        registered_audit_details(&env, &query.filename, &content_sha256, &outcome),
+    )
+    .await;
 
     let status = if outcome.replaced {
         StatusCode::OK
@@ -278,16 +296,90 @@ async fn delete_environment(
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_repo_action(&auth, repo.id, "delete", &state.permission_service).await?;
+    // #5458: a refusal to a caller who cannot read the repository is the
+    // unknown-key 404.
+    let gate = require_repo_action(&auth, repo.id, "delete", &state.permission_service).await;
+    hide_write_denial_from_non_readers(gate, &auth, &repo, &repo_service).await?;
 
-    let deleted = EnvironmentService::new(state.db.clone())
-        .delete(repo.id, id)
-        .await?;
-    if deleted {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(AppError::NotFound("Environment not found".to_string()))
+    let service = EnvironmentService::new(state.db.clone());
+    // Read the row first so the audit trail can name what was deleted; a
+    // missing environment is the same 404 the delete itself would give.
+    let (environment, _) = service.get(repo.id, id).await?;
+    let deleted = service.delete(repo.id, id).await?;
+    if !deleted {
+        return Err(AppError::NotFound("Environment not found".to_string()));
     }
+    audit_environment(
+        &state,
+        AuditAction::EnvironmentDeleted,
+        &auth,
+        &repo,
+        environment.id,
+        &environment.name,
+        serde_json::json!({
+            "lockfile_format": environment.lockfile_format,
+            "content_sha256": environment.content_sha256,
+            "summary": environment.summary,
+        }),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `details` for `ENVIRONMENT_REGISTERED` (#4709): what was ingested, how
+/// big it is, and which scopes (named environments x platforms) it covers.
+/// Pure, so the shape is unit-testable without a database.
+pub(crate) fn registered_audit_details(
+    env: &environment_lock::LockedEnvironment,
+    filename: &str,
+    content_sha256: &str,
+    outcome: &crate::services::environment_service::IngestOutcome,
+) -> serde_json::Value {
+    let summary = &outcome.summary;
+    serde_json::json!({
+        "lockfile_format": env.format.as_str(),
+        "lockfile_filename": filename,
+        "content_sha256": content_sha256,
+        "replaced": outcome.replaced,
+        "package_count": summary.distinct_packages,
+        "memberships": summary.memberships,
+        "scope": {
+            "count": summary.scopes,
+            "environments": env.environments,
+            "platforms": env.platforms,
+        },
+    })
+}
+
+/// Write one environment audit row (#4709), best-effort: an audit-table
+/// outage never fails the request. `details` gains the repository and the
+/// environment's id and name.
+async fn audit_environment(
+    state: &SharedState,
+    action: AuditAction,
+    auth: &AuthExtension,
+    repo: &Repository,
+    environment_id: Uuid,
+    name: &str,
+    mut details: serde_json::Value,
+) {
+    if let Some(map) = details.as_object_mut() {
+        map.insert("repository".into(), repo.key.clone().into());
+        map.insert("repository_id".into(), repo.id.to_string().into());
+        map.insert("environment_id".into(), environment_id.to_string().into());
+        map.insert("name".into(), name.into());
+    }
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(action, ResourceType::Environment)
+            .user(auth.user_id)
+            .resource(environment_id)
+            .actor_name(auth.username.clone())
+            .resource_name(format!("{}/{}", repo.key, name))
+            .with_request_client_ip()
+            .details(details),
+    )
+    .await;
 }
 
 /// The reverse index: which stored environments contain a component (#4054).
@@ -680,6 +772,66 @@ package:
         );
         owner.teardown().await;
         stranger.teardown().await;
+    }
+
+    /// #4709: ingest writes `ENVIRONMENT_REGISTERED` (format, package count,
+    /// scope) and delete writes `ENVIRONMENT_DELETED`, both with the actor
+    /// and repository.
+    #[tokio::test]
+    async fn register_and_delete_are_audited() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let router = tdh::router_with_auth_ext(
+            repo_router(),
+            fx.state.clone(),
+            tdh::admin_auth(fx.user_id, &fx.username),
+        );
+        let (status, created) = post_lockfile(&router, &fx.repo_key, "audited-env", ENV_A).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+        let registered = tdh::audit_row_eventually(&fx.pool, id, "ENVIRONMENT_REGISTERED").await;
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/{}/environments/{id}", fx.repo_key))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("delete response");
+        let delete_status = response.status();
+        let deleted = tdh::audit_row_eventually(&fx.pool, id, "ENVIRONMENT_DELETED").await;
+        fx.teardown().await;
+
+        let tdh::AuditRow {
+            user_id, details, ..
+        } = registered;
+        assert_eq!(user_id, Some(fx.user_id));
+        assert_eq!(details["repository"], fx.repo_key.as_str(), "{details}");
+        assert_eq!(details["name"], "audited-env");
+        assert_eq!(details["lockfile_format"], "conda-lock");
+        assert_eq!(details["lockfile_filename"], "conda-lock.yml");
+        assert_eq!(details["package_count"], 2);
+        assert_eq!(details["replaced"], false);
+        assert_eq!(
+            details["scope"],
+            serde_json::json!({"count": 1, "environments": [], "platforms": ["linux-64"]}),
+            "{details}"
+        );
+
+        assert_eq!(delete_status, StatusCode::NO_CONTENT);
+        let tdh::AuditRow {
+            user_id, details, ..
+        } = deleted;
+        assert_eq!(user_id, Some(fx.user_id));
+        assert_eq!(details["repository"], fx.repo_key.as_str(), "{details}");
+        assert_eq!(details["name"], "audited-env");
+        assert_eq!(details["environment_id"], id.to_string());
+        assert_eq!(details["lockfile_format"], "conda-lock");
     }
 
     #[test]

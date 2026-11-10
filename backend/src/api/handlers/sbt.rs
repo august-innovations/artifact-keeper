@@ -13,7 +13,7 @@
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::handlers::maven;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
@@ -56,6 +57,242 @@ async fn resolve_sbt_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 }
 
 // ---------------------------------------------------------------------------
+// Remote serve + #4100 scan-on-proxy
+// ---------------------------------------------------------------------------
+
+/// Stream one proxied sbt/Ivy file from a Remote repository's upstream
+/// through the proxy cache (the unscanned serve; the caller records it).
+///
+/// #1608 Phase 4: the body (sbt/ivy `.jar` and friends can be large) streams
+/// to the client while teeing to the proxy cache, single-flight via the
+/// merged coordinator (#1609). #3459: the real format is carried, because
+/// `proxy_fetch_streaming` synthesizes a `Generic` repository with no
+/// `cache_classifier` arm, which cached every sbt/ivy file with the
+/// conservative 5-minute mutable TTL. Sbt shares Maven's classifier rules.
+async fn sbt_remote_stream(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    is_head: bool,
+) -> Result<Response, Response> {
+    proxy_helpers::proxy_fetch_streaming_with_format(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        "application/octet-stream",
+        RepositoryFormat::Sbt,
+        is_head,
+    )
+    .await
+}
+
+/// Whether a proxied sbt path is a package archive the scan-on-proxy gate
+/// grades (#4100) — the same allowlist rule as Maven
+/// ([`maven::is_unscanned_jvm_companion`]) — and, if so, the coordinate it is
+/// requested as: Ivy layout
+/// `<org>/<module>/[scala_<v>/][sbt_<v>/]<revision>/<type>s/<file>` or, for an
+/// sbt repository proxying a Maven-layout upstream, the Maven path grammar.
+/// A scannable archive whose path names no coordinate is still scanned, with
+/// no identity pin. Classified on the cache-normalized path, exactly as
+/// [`maven::maven_scan_target`] is, so no alias of an archive's cache entry
+/// (a trailing `/`, an upper-case extension) skips the gate.
+fn sbt_scan_target(path: &str) -> Option<maven::JvmScanTarget> {
+    let key = maven::jvm_proxy_serve_key(path);
+    if !key.scannable {
+        return None;
+    }
+    let path = key.cache_key.as_str();
+    let segments: Vec<&str> = path.split('/').collect();
+    let filename = segments.last().copied().unwrap_or_default();
+    if !maven::is_jvm_archive_name(filename) {
+        return Some(maven::JvmScanTarget {
+            path: path.to_string(),
+            coordinate: None,
+        });
+    }
+    let n = segments.len();
+    if n >= 5 && matches!(segments[n - 2], "jars" | "bundles" | "wars" | "ears") {
+        let version = segments[n - 3];
+        let mut module_at = n - 4;
+        while module_at > 0
+            && (segments[module_at].starts_with("scala_")
+                || segments[module_at].starts_with("sbt_"))
+        {
+            module_at -= 1;
+        }
+        let org = segments[..module_at].join(".");
+        let coordinate = (module_at > 0 && !org.is_empty() && !version.is_empty()).then(|| {
+            maven::JvmArchiveCoordinate {
+                group_id: org,
+                artifact_id: segments[module_at].to_string(),
+                version: version.to_string(),
+            }
+        });
+        return Some(maven::JvmScanTarget {
+            path: path.to_string(),
+            coordinate,
+        });
+    }
+    maven::maven_scan_target(path)
+}
+
+/// Inline scan-and-block for one proxied sbt package archive (#4100), on the
+/// generic gate, cached under the same path the streaming route commits to.
+async fn serve_scanned_sbt_archive(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    path: &str,
+    coordinate: Option<&maven::JvmArchiveCoordinate>,
+    (action, severity_gate): (
+        crate::services::proxy_scan_service::ProxyScanAction,
+        crate::services::proxy_scan_service::ProxySeverityGate,
+    ),
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: RepositoryFormat::Sbt,
+        source_path: path,
+        cache_path: path,
+        filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = SbtScannedArchive {
+        proxy,
+        upstream_url,
+        coordinate,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The sbt Virtual download of a scannable archive (#4100). The member set
+/// is authorized ONCE: a scanning Remote member serves through the gate
+/// (see [`proxy_helpers::walk_virtual_members_with_scan`]); when no member
+/// scans, the same authorized set goes to the untouched resolver.
+async fn serve_scanned_sbt_virtual(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    proxy: &crate::services::proxy_service::ProxyService,
+    virtual_id: uuid::Uuid,
+    request_path: &str,
+    target: &maven::JvmScanTarget,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_id).await?;
+    let local_fetch = |member_id: uuid::Uuid, location: crate::storage::StorageLocation| async move {
+        proxy_helpers::local_fetch_by_path(&state.db, state, member_id, &location, request_path)
+            .await
+    };
+    // sbt's resolver path records no hosted download today (unlike Maven's,
+    // #4268), so the walk keeps that: `record` is `None`.
+    let resolve_run = |run: Vec<crate::models::repository::Repository>| {
+        proxy_helpers::resolve_unscanned_member_run(
+            run,
+            Some(proxy),
+            request_path,
+            &local_fetch,
+            "application/octet-stream",
+            None,
+            Some(ctx),
+        )
+    };
+    let scanned = |member: crate::models::repository::Repository, policy| async move {
+        let upstream_url = member.upstream_url.clone().unwrap_or_default();
+        serve_scanned_sbt_archive(
+            state,
+            proxy,
+            (member.id, &member.key, &upstream_url),
+            &target.path,
+            target.coordinate.as_ref(),
+            policy,
+            ctx,
+        )
+        .await
+    };
+    if let Some(served) = proxy_helpers::walk_virtual_members_with_scan(
+        &state.db,
+        virtual_id,
+        members.clone(),
+        resolve_run,
+        scanned,
+    )
+    .await
+    {
+        return served;
+    }
+    let result = proxy_helpers::resolve_virtual_download_from_members(
+        members,
+        Some(proxy),
+        request_path,
+        Some(ctx),
+        &local_fetch,
+    )
+    .await?;
+    proxy_helpers::stream_fetch_result(result, "application/octet-stream", None)
+}
+
+/// The sbt half of the generic proxy scan gate. The wrapper records the
+/// download on both serve arms, including the unscanned over-cap stream.
+struct SbtScannedArchive<'a> {
+    proxy: &'a crate::services::proxy_service::ProxyService,
+    upstream_url: &'a str,
+    coordinate: Option<&'a maven::JvmArchiveCoordinate>,
+}
+
+#[async_trait::async_trait]
+impl proxy_helpers::ScannedProxyFile for SbtScannedArchive<'_> {
+    const LABEL: &'static str = "sbt archive";
+
+    fn synthetic_content_type(filename: &str) -> String {
+        maven::content_type_for_path(filename).to_string()
+    }
+
+    fn identity(
+        &self,
+        _req: &proxy_helpers::ScannedProxyRequest<'_>,
+        bytes: &Bytes,
+        _digest: &str,
+    ) -> proxy_helpers::ProxyScanIdentity {
+        maven::jvm_archive_identity(self.coordinate, bytes)
+    }
+
+    async fn serve_unscanned_stream(
+        &self,
+        _state: &SharedState,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+    ) -> Result<Response, Response> {
+        sbt_remote_stream(
+            self.proxy,
+            req.repo_id,
+            req.repo_key,
+            self.upstream_url,
+            req.source_path,
+            req.is_head(),
+        )
+        .await
+    }
+
+    fn scanned_response(
+        &self,
+        _req: &proxy_helpers::ScannedProxyRequest<'_>,
+        body: proxy_helpers::ScannedProxyBody,
+        _pending: bool,
+    ) -> Response {
+        maven::scanned_jvm_archive_response("application/octet-stream", body)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GET /ivy/{repo_key}/*path — Download artifact by path
 // ---------------------------------------------------------------------------
 
@@ -68,6 +305,10 @@ async fn download_by_path(
     let repo = resolve_sbt_repo(&state.db, &repo_key).await?;
 
     let artifact_path = artifact_path.trim_start_matches('/');
+    // #4100: see `maven::reject_ambiguous_proxy_path`.
+    if repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual {
+        maven::reject_ambiguous_proxy_path(artifact_path)?;
+    }
 
     let artifact = sqlx::query!(
         r#"
@@ -92,24 +333,34 @@ async fn download_by_path(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    // #1608 Phase 4: stream the artifact body (sbt/ivy .jar and
-                    // friends can be large) to the client while teeing to the
-                    // proxy cache, instead of buffering it in memory.
-                    // Single-flight via the merged coordinator (#1609).
-                    // #3459: carry the real format. `proxy_fetch_streaming`
-                    // synthesizes a `Generic` repository, and `Generic` has no
-                    // `cache_classifier` arm, so every sbt/ivy `.jar`, `.pom`
-                    // and checksum sidecar was cached with the conservative
-                    // 5-minute mutable TTL and re-fetched from upstream after
-                    // it. Sbt shares Maven's classifier rules.
-                    let response = proxy_helpers::proxy_fetch_streaming_with_format(
+                    // #4100: scan-on-proxy gates the package archives (jar /
+                    // war / ear, Ivy or Maven layout; see `sbt_scan_target`).
+                    // Ivy descriptors, POMs, sources/javadoc jars and
+                    // checksums pass through, and a repository that has not
+                    // enabled scan-on-proxy keeps the streaming path below.
+                    if let Some(target) = sbt_scan_target(artifact_path) {
+                        if let Some(policy) =
+                            proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+                        {
+                            return serve_scanned_sbt_archive(
+                                &state,
+                                proxy,
+                                (repo.id, &repo_key, upstream_url),
+                                &target.path,
+                                target.coordinate.as_ref(),
+                                policy,
+                                &ctx,
+                            )
+                            .await;
+                        }
+                    }
+                    let response = sbt_remote_stream(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         artifact_path,
-                        "application/octet-stream",
-                        RepositoryFormat::Sbt,
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -132,6 +383,22 @@ async fn download_by_path(
 
             // Virtual repo: try each member in priority order
             if repo.repo_type == RepositoryType::Virtual {
+                // #4100: a scanning Remote member serves its package archive
+                // through the scan gate; everything else keeps the resolver.
+                if let (Some(target), Some(proxy)) =
+                    (sbt_scan_target(artifact_path), state.proxy_service.as_ref())
+                {
+                    return serve_scanned_sbt_virtual(
+                        &state,
+                        auth.as_ref(),
+                        proxy,
+                        repo.id,
+                        artifact_path,
+                        &target,
+                        &ctx,
+                    )
+                    .await;
+                }
                 let db = state.db.clone();
                 let path_clone = artifact_path.to_string();
                 let result = proxy_helpers::resolve_virtual_download(
@@ -140,6 +407,7 @@ async fn download_by_path(
                     state.proxy_service.as_deref(),
                     repo.id,
                     artifact_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -233,6 +501,7 @@ async fn upload_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, artifact_path)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "ivy", "write:artifacts")?.user_id;
@@ -292,6 +561,14 @@ async fn upload_artifact(
         "application/java-archive"
     };
 
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        body.len() as i64,
+    )
+    .await?;
+
     // Store the file. #2624: on shared cloud namespaces new objects embed the
     // repository id (`sbt/{repository_id}/{path}`) so keys can never collide
     // across repositories; filesystem backends and STORAGE_KEY_SCHEME=flat
@@ -331,6 +608,13 @@ async fn upload_artifact(
 
     let size_bytes = body.len() as i64;
 
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -350,12 +634,20 @@ async fn upload_artifact(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     let _ = sqlx::query!(
         r#"
@@ -395,6 +687,17 @@ async fn upload_artifact(
         )
         .await;
     }
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await;
 
     info!(
         "SBT upload: {} {} to repo {}",
@@ -915,5 +1218,502 @@ mod catalog_registration_tests {
             filename_keyed.is_none(),
             "the catalog must not be keyed on the filename stem"
         );
+    }
+
+    /// #4725: a hosted Ivy upload must queue a push sync task for a
+    /// subscribed push peer, and an upload arriving as peer replication must
+    /// not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn sbt_upload_queues_push_sync_task_4725() {
+        let Some(fx) = tdh::Fixture::setup("local", "sbt").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "sbt").await;
+
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!(
+                    "/{}/com.example/push-sync/1.0.0/jars/push-sync-1.0.0.jar",
+                    fx.repo_key
+                ),
+                bytes::Bytes::from_static(b"jar-bytes"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "sbt upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the artifact
+        // but must not queue another task.
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/com.example/push-sync/2.0.0/jars/push-sync-2.0.0.jar",
+                fx.repo_key
+            ))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(bytes::Bytes::from_static(
+                b"jar-bytes",
+            )))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated sbt upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["com.example/push-sync/1.0.0/jars/push-sync-1.0.0.jar".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
+    }
+}
+
+/// #4100: scan-on-proxy on sbt's Ivy route, Remote and Virtual.
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod scan_on_proxy_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{method, path as wpath};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const IVY_JAR: &str = "org.acme/widget_2.13/1.0/jars/widget_2.13.jar";
+
+    async fn mount(server: &MockServer, route: &str, body: Vec<u8>) {
+        Mock::given(method("GET"))
+            .and(wpath(format!("/{route}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(server)
+            .await;
+    }
+
+    #[test]
+    fn scan_targets_read_ivy_and_maven_layouts() {
+        let ivy = sbt_scan_target(IVY_JAR).expect("an Ivy jar is scanned");
+        assert_eq!(ivy.path, IVY_JAR);
+        assert_eq!(
+            ivy.coordinate,
+            Some(maven::JvmArchiveCoordinate {
+                group_id: "org.acme".into(),
+                artifact_id: "widget_2.13".into(),
+                version: "1.0".into(),
+            })
+        );
+        // sbt plugin layout with cross-version segments.
+        let plugin =
+            sbt_scan_target("org.acme/sbt-thing/scala_2.12/sbt_1.0/0.3.1/jars/sbt-thing.jar")
+                .unwrap()
+                .coordinate
+                .unwrap();
+        assert_eq!(plugin.artifact_id, "sbt-thing");
+        assert_eq!(plugin.version, "0.3.1");
+        // A Maven-layout upstream behind an sbt repository.
+        let mvn = sbt_scan_target("org/acme/widget_2.13/1.0/widget_2.13-1.0.jar")
+            .unwrap()
+            .coordinate
+            .unwrap();
+        assert_eq!(mvn.group_id, "org.acme");
+        // Cache-key aliases classify as the key itself, and any archive
+        // spelling is scanned.
+        for alias in [format!("{IVY_JAR}/"), format!("/{IVY_JAR}")] {
+            assert_eq!(sbt_scan_target(&alias).expect("alias").path, IVY_JAR);
+        }
+        let upper = sbt_scan_target("org.acme/widget_2.13/1.0/jars/widget_2.13.JAR").unwrap();
+        assert!(upper.coordinate.is_some());
+        assert!(sbt_scan_target("odd/thing.jar")
+            .unwrap()
+            .coordinate
+            .is_none());
+        for passthrough in [
+            "org.acme/widget_2.13/1.0/ivys/ivy.xml",
+            "org.acme/widget_2.13/1.0/srcs/widget_2.13-sources.jar",
+            "org.acme/widget_2.13/1.0/docs/widget_2.13-javadoc.jar",
+            "org.acme/widget_2.13/1.0/jars/widget_2.13.jar.sha1",
+            "org/acme/widget_2.13/1.0/widget_2.13-1.0.pom",
+            "org.acme/widget_2.13/1.0/ivys/ivy-1.0.XML",
+        ] {
+            assert!(sbt_scan_target(passthrough).is_none(), "{passthrough}");
+        }
+        // Outside the allowlist everything is scanned, unpinned unless it is
+        // a jar/war/ear naming a coordinate.
+        for unknown in [
+            "org.acme/widget_2.13/1.0/natives/widget.so",
+            "org.acme/widget_2.13/1.0/jars/widget_2.13.jar.bak",
+        ] {
+            assert!(sbt_scan_target(unknown)
+                .expect(unknown)
+                .coordinate
+                .is_none());
+        }
+    }
+
+    /// Remote: a vulnerable Ivy jar is blocked, a clean one is served and
+    /// recorded once, and the Ivy descriptor passes through unscanned.
+    #[tokio::test]
+    async fn remote_ivy_jar_is_gated_and_descriptor_passes_through() {
+        let Some(fx) = tdh::Fixture::setup("remote", "sbt").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bad_route = "org.acme/bad/1.0/jars/bad.jar";
+        let bad = tdh::maven_jar_fixture("org.acme", "bad", "1.0");
+        let good = tdh::maven_jar_fixture("org.acme", "widget_2.13", "1.0");
+        let descriptor_route = "org.acme/widget_2.13/1.0/ivys/ivy.xml";
+        let descriptor = format!(
+            "<ivy-module version=\"2.0\"><!-- {} --></ivy-module>",
+            uuid::Uuid::new_v4()
+        );
+        mount(&server, bad_route, bad.clone()).await;
+        mount(&server, IVY_JAR, good.clone()).await;
+        mount(&server, descriptor_route, descriptor.clone().into_bytes()).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let digests = vec![
+            tdh::seed_proxy_verdict(&fx.pool, &bad, fx.repo_id, true).await,
+            tdh::seed_proxy_verdict(&fx.pool, &good, fx.repo_id, false).await,
+            tdh::seed_proxy_verdict(&fx.pool, descriptor.as_bytes(), fx.repo_id, true).await,
+        ];
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digests[1],
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Maven,
+                "org.acme:widget_2.13",
+                "1.0",
+            ),
+        )
+        .await;
+        let pull = |route: &str| {
+            tdh::send_with_headers(
+                tdh::router_anon(super::router(), state.clone()),
+                tdh::get(format!("/{}/{route}", fx.repo_key)),
+            )
+        };
+
+        let (status, body, _) = pull(bad_route).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "scan_blocked");
+        assert_eq!(
+            tdh::proxy_downloads_recorded(&fx.pool, fx.repo_id, bad_route).await,
+            0
+        );
+
+        let (status, body, headers) = pull(IVY_JAR).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &good[..]);
+        assert_eq!(headers["X-AK-Scan"], "clean");
+        assert_eq!(
+            tdh::proxy_downloads_recorded(&fx.pool, fx.repo_id, IVY_JAR).await,
+            1
+        );
+
+        let (status, body, headers) = pull(descriptor_route).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], descriptor.as_bytes());
+        assert!(headers.get("X-AK-Scan").is_none());
+
+        tdh::drop_proxy_verdicts(&fx.pool, &digests).await;
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// The trailing-slash alias of a refused Ivy jar reads the same cache
+    /// entry, so it must be refused too: Remote and Virtual.
+    #[tokio::test]
+    async fn archive_aliases_are_gated_on_remote_and_virtual() {
+        let Some(fx) = tdh::Fixture::setup("local", "sbt").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bytes = tdh::maven_jar_fixture("org.acme", "widget_2.13", "1.0");
+        let upper = "org.acme/widget_2.13/1.0/jars/widget_2.13.JAR";
+        mount(&server, IVY_JAR, bytes.clone()).await;
+        mount(&server, upper, bytes.clone()).await;
+        let (remote_id, remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "sbt", &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, remote_id, "fail_closed").await;
+        let digest = tdh::seed_proxy_verdict(&fx.pool, &bytes, remote_id, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+
+        for key in [&remote_key, &virtual_key] {
+            for route in [
+                IVY_JAR.to_string(),
+                format!("{IVY_JAR}/"),
+                upper.to_string(),
+            ] {
+                let (status, body) = tdh::send(
+                    tdh::router_anon(super::router(), state.clone()),
+                    tdh::get(format!("/{key}/{route}")),
+                )
+                .await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{key} {route}");
+                assert_ne!(&body[..], &bytes[..], "{key} {route}");
+            }
+        }
+
+        tdh::drop_proxy_verdicts(&fx.pool, &[digest]).await;
+        drop(server);
+        tdh::cleanup_member_repo(&fx.pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&fx.pool, virtual_id, dir.path()).await;
+        fx.teardown().await;
+    }
+
+    /// Ambiguous spellings are refused (400), an unknown extension is
+    /// scanned, and the allowlisted Ivy descriptor passes through: Remote and
+    /// Virtual.
+    #[tokio::test]
+    async fn ambiguous_paths_refused_unknown_extensions_gated_on_remote_and_virtual() {
+        let Some(fx) = tdh::Fixture::setup("local", "sbt").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let blob_route = "org.acme/widget_2.13/1.0/natives/widget.so";
+        let ivy_route = "org.acme/widget_2.13/1.0/ivys/ivy.xml";
+        let blob = format!("native-{}", uuid::Uuid::new_v4()).into_bytes();
+        let ivy =
+            format!("<ivy-module><!-- {} --></ivy-module>", uuid::Uuid::new_v4()).into_bytes();
+        mount(&server, blob_route, blob.clone()).await;
+        mount(&server, ivy_route, ivy.clone()).await;
+        let (remote_id, remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "sbt", &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, remote_id, "fail_closed").await;
+        let digests = vec![
+            tdh::seed_proxy_verdict(&fx.pool, &blob, remote_id, true).await,
+            tdh::seed_proxy_verdict(&fx.pool, &ivy, remote_id, true).await,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+        let pull = |key: &str, route: &str| {
+            tdh::send_with_headers(
+                tdh::router_anon(super::router(), state.clone()),
+                tdh::get(format!("/{key}/{route}")),
+            )
+        };
+
+        for key in [&remote_key, &virtual_key] {
+            for route in [
+                format!("{IVY_JAR}%3Fx"),
+                format!("{IVY_JAR}%23x"),
+                format!("{IVY_JAR};jsessionid=x"),
+                format!("{IVY_JAR}%3Bjsessionid=x"),
+                format!("{IVY_JAR}."),
+                format!("{IVY_JAR}%09"),
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.ja%09r".to_string(),
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.ja%2572".to_string(),
+                "org.acme/widget_2.13/1.0/jars/widget%202.13.jar".to_string(),
+            ] {
+                let (status, _, _) = pull(key, &route).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{key} {route}");
+            }
+            let (status, body, _) = pull(key, blob_route).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{key}");
+            assert_ne!(&body[..], &blob[..], "{key}");
+            let (status, body, headers) = pull(key, ivy_route).await;
+            assert_eq!(status, StatusCode::OK, "{key}");
+            assert_eq!(&body[..], &ivy[..], "{key}");
+            assert!(headers.get("X-AK-Scan").is_none(), "{key}");
+        }
+
+        tdh::drop_proxy_verdicts(&fx.pool, &digests).await;
+        drop(server);
+        tdh::cleanup_member_repo(&fx.pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&fx.pool, virtual_id, dir.path()).await;
+        fx.teardown().await;
+    }
+
+    /// Virtual: a scanning member's vulnerable jar is blocked, and its
+    /// quarantine hold is final rather than a miss.
+    #[tokio::test]
+    async fn virtual_member_scan_blocks_and_holds_are_final() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "sbt").await else {
+            return;
+        };
+        let bad = tdh::maven_jar_fixture("org.acme", "widget_2.13", "1.0");
+        let first_up = MockServer::start().await;
+        mount(&first_up, IVY_JAR, bad.clone()).await;
+        let (first, _, first_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "sbt", &first_up.uri(), 1).await;
+        tdh::enable_proxy_scan(&fx.pool, first, "fail_open").await;
+        let digest = tdh::seed_proxy_verdict(&fx.pool, &bad, first, true).await;
+        let storage = fx.storage_dir.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+        let get = || {
+            tdh::send(
+                tdh::router_anon(super::router(), state.clone()),
+                tdh::get(format!("/{}/{IVY_JAR}", fx.repo_key)),
+            )
+        };
+
+        let (status, _) = get().await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "vulnerable member bytes");
+
+        // A held (quarantined) scanning member stops the walk before a
+        // lower-priority member could serve a different copy.
+        let held_route = "org.acme/held/1.0/jars/held.jar";
+        let held_jar = tdh::maven_jar_fixture("org.acme", "held", "1.0");
+        let held_up = MockServer::start().await;
+        mount(&held_up, held_route, held_jar.clone()).await;
+        let fallback = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wpath(format!("/{held_route}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(held_jar))
+            .expect(0)
+            .mount(&fallback)
+            .await;
+        sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        let (held, _, held_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "sbt", &held_up.uri(), 1).await;
+        let (second, _, second_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "sbt", &fallback.uri(), 2).await;
+        for member in [held, second] {
+            tdh::enable_proxy_scan(&fx.pool, member, "fail_open").await;
+        }
+        tdh::enable_proxy_quarantine(&fx.pool, held, 60).await;
+        let (status, _) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(format!("/{}/{held_route}", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the hold is final, not a miss"
+        );
+        fallback.verify().await;
+
+        tdh::drop_proxy_verdicts(&fx.pool, &[digest]).await;
+        tdh::cleanup_member_repo(&fx.pool, first, &first_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, held, &held_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, second, &second_dir).await;
+        fx.teardown().await;
+    }
+}
+
+/// #4365 item 1: sbt `(cache_key, scannable)` decisions, through the Maven
+/// helper both JVM routes share, for the Ivy and the Maven layouts.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn sbt_serve_key_table() {
+        for (path, key, scannable) in [
+            (
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                true,
+            ),
+            (
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar/",
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                true,
+            ),
+            (
+                "org.acme/widget_2.13/1.0/ivys/ivy.xml",
+                "org.acme/widget_2.13/1.0/ivys/ivy.xml",
+                false,
+            ),
+            (
+                "org/acme/widget_2.13/1.0/widget_2.13-1.0.pom",
+                "org/acme/widget_2.13/1.0/widget_2.13-1.0.pom",
+                false,
+            ),
+        ] {
+            let got = maven::jvm_proxy_serve_key(path);
+            assert_eq!(
+                (got.cache_key.as_str(), got.scannable),
+                (key, scannable),
+                "{path}"
+            );
+            let target = sbt_scan_target(path);
+            assert_eq!(target.is_some(), scannable, "{path}");
+            if let Some(target) = target {
+                assert_eq!(target.path, key, "{path}");
+            }
+        }
+    }
+}
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::{identities_for_test, ProxyScanIdentity};
+    use crate::api::handlers::test_db_helpers as dup_tdh;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{
+        tar_bz2_with, tar_gz_with, tar_with, tar_zst_with, zip_with,
+    };
+
+    fn proxy_for_test() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::services::proxy_service::ProxyService>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = dup_tdh::build_proxy_service_with_fs(
+            dup_tdh::lazy_pool(),
+            dir.path().to_str().unwrap(),
+        );
+        (dir, proxy)
+    }
+
+    fn established(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Established(_))
+    }
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_jar_with_two_pom_properties_entries_is_not_established() {
+        let (_dir, proxy) = proxy_for_test();
+        let coordinate = maven::JvmArchiveCoordinate {
+            group_id: "org.demo".to_string(),
+            artifact_id: "demo".to_string(),
+            version: "1.0.0".to_string(),
+        };
+        let file = SbtScannedArchive {
+            proxy: &proxy,
+            upstream_url: "http://upstream.invalid",
+            coordinate: Some(&coordinate),
+        };
+        let entry = "META-INF/maven/org.demo/demo/pom.properties";
+        let good: &[u8] = b"groupId=org.demo\nartifactId=demo\nversion=1.0.0\n";
+        let other: &[u8] = b"groupId=org.demo\nartifactId=demo\nversion=0.1.0\n";
+        let check =
+            |bytes: &[u8]| identities_for_test(&file, DupFormat::Sbt, "demo-1.0.0.jar", bytes);
+        let dup = zip_with(&[(entry, good), (&format!("./{entry}"), other)]);
+        let (own, gate) = check(&dup);
+        assert!(established(&own));
+        assert!(unestablished(&gate));
+        assert!(established(&check(&zip_with(&[(entry, good)])).1));
     }
 }

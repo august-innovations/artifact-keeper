@@ -495,6 +495,31 @@ pub struct GcsBackendWrapper {
 
 impl_storage_wrapper!(GcsBackendWrapper, crate::storage::gcs::GcsBackend);
 
+/// Azure Blob storage backend (wrapper for the proxy-cache facade, #4320).
+///
+/// Forwards like the S3 and GCS wrappers: `list` is List Blobs, `copy` the
+/// server-side Put Blob From URL, `size` a HEAD, and presigning the client SAS.
+pub struct AzureBackendWrapper {
+    inner: Arc<crate::storage::azure::AzureBackend>,
+}
+
+impl_storage_wrapper!(AzureBackendWrapper, crate::storage::azure::AzureBackend);
+
+/// Environment switch that puts the proxy cache of an Azure deployment on
+/// Azure Blob storage (#4320). Off by default: an Azure deployment keeps the
+/// #3923 filesystem proxy cache under `STORAGE_PATH` unless it opts in.
+pub const AZURE_PROXY_CACHE_ENV: &str = "AZURE_PROXY_CACHE_ENABLED";
+
+/// Whether [`AZURE_PROXY_CACHE_ENV`] is set to `true` or `1`.
+pub fn azure_proxy_cache_enabled() -> bool {
+    azure_proxy_cache_enabled_from(std::env::var(AZURE_PROXY_CACHE_ENV).ok().as_deref())
+}
+
+/// [`azure_proxy_cache_enabled`] for a given value of the variable.
+pub fn azure_proxy_cache_enabled_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+}
+
 /// Storage service facade
 pub struct StorageService {
     /// Single backend handle. Presign capability is type-enforced on this
@@ -509,20 +534,29 @@ pub struct StorageService {
     /// while `ArtifactSource` keeps the configured `S3_PREFIX` so artifact
     /// bytes are read at the key primary storage wrote them under (#3171).
     backend: Arc<dyn StorageBackend>,
+    /// The `STORAGE_BACKEND` value this handle was built for (`filesystem`,
+    /// `s3`, `gcs`, `azure`), or `custom` for a handle built around an arbitrary
+    /// backend with [`StorageService::new`]. A metrics label (#4319), so it is
+    /// a fixed string and never operator-supplied text.
+    backend_kind: &'static str,
 }
 
 /// Whether the given `STORAGE_BACKEND` value can back the proxy-cache
 /// [`StorageService`] facade used for remote/proxy repositories.
 ///
 /// `filesystem`, `s3`, and `gcs` each have an arm in
-/// [`StorageService::from_config`]. Azure deliberately does not (#1555):
-/// `main.rs` builds an Azure *primary* backend for hosted repositories, but the
-/// proxy facade has no `AzureBackendWrapper`, so the proxy cache cannot live on
-/// Azure. [`proxy_cache_backend_for`] turns that into a filesystem fallback
-/// facade, and [`remote_repository_backend_error`] into a per-repository
-/// create-time check (#3923). Kept in lockstep with the arms in `from_config`.
+/// [`StorageService::from_config`]. Azure has one since #4320
+/// ([`AzureBackendWrapper`]), used only when the deployment opts in with
+/// [`AZURE_PROXY_CACHE_ENV`]; otherwise [`proxy_cache_backend_for`] keeps the
+/// #3923 filesystem fallback facade and [`remote_repository_backend_error`]
+/// the per-repository create-time check. Kept in lockstep with the arms in
+/// `from_config`.
 pub fn backend_supports_proxy_cache(storage_backend: &str) -> bool {
-    matches!(storage_backend, "filesystem" | "s3" | "gcs")
+    match storage_backend {
+        "filesystem" | "s3" | "gcs" => true,
+        "azure" => azure_proxy_cache_enabled(),
+        _ => false,
+    }
 }
 
 /// The backend the proxy-cache facade is built on for a deployment whose
@@ -671,50 +705,57 @@ impl StorageService {
 
     /// Create storage service from config for an explicit [`StorageRole`].
     pub async fn from_config_for_role(config: &Config, role: StorageRole) -> Result<Self> {
-        let backend: Arc<dyn StorageBackend> = match config.storage_backend.as_str() {
-            "filesystem" => {
-                let path = PathBuf::from(&config.storage_path);
-                fs::create_dir_all(&path).await?;
-                Arc::new(FilesystemBackend::new(path))
-            }
-            "s3" => {
-                // Build the S3 backend from the SAME env-derived config the
-                // primary storage uses (redirect_downloads, presign creds,
-                // CloudFront, path_format, TLS, pool tuning). Reusing
-                // from_env() (instead of S3Config::new, which hardcodes
-                // redirect_downloads=false and no presign creds) is what makes
-                // presigning actually fire on this handle (#1555).
-                //
-                // The key-prefix policy is the one thing that depends on what
-                // the handle is for, so it is delegated to the role (#3171):
-                // ProxyCache forces the prefix off, ArtifactSource keeps it.
-                let mut s3_config = crate::storage::s3::S3Config::from_env()?;
-                role.apply_s3_prefix_policy(&mut s3_config);
-                let inner = Arc::new(crate::storage::s3::S3Backend::new(s3_config).await?);
-                Arc::new(S3BackendWrapper { inner })
-            }
-            "gcs" => {
-                let gcs_config = crate::storage::gcs::GcsConfig::from_env()?;
-                let inner = Arc::new(crate::storage::gcs::GcsBackend::new(gcs_config).await?);
-                Arc::new(GcsBackendWrapper { inner })
-            }
-            // TODO(#1555): Azure has no arm here. main.rs builds an Azure
-            // primary backend, but this facade has no AzureBackendWrapper
-            // (the `impl_storage_wrapper!` macro forwards inherent
-            // list/copy/size, which AzureBackend does not yet expose). An
-            // Azure deployment therefore errors loudly below rather than
-            // silently losing presign capability. Wire up a wrapper +
-            // no-prefix presign handle (mirroring the s3/gcs arms) before
-            // enabling Azure for the proxy cache.
-            other => {
-                return Err(AppError::Config(format!(
-                    "Unknown storage backend: {}",
-                    other
-                )))
-            }
-        };
+        let (backend_kind, backend): (&'static str, Arc<dyn StorageBackend>) =
+            match config.storage_backend.as_str() {
+                "filesystem" => {
+                    let path = PathBuf::from(&config.storage_path);
+                    fs::create_dir_all(&path).await?;
+                    ("filesystem", Arc::new(FilesystemBackend::new(path)))
+                }
+                "s3" => {
+                    // Build the S3 backend from the SAME env-derived config the
+                    // primary storage uses (redirect_downloads, presign creds,
+                    // CloudFront, path_format, TLS, pool tuning). Reusing
+                    // from_env() (instead of S3Config::new, which hardcodes
+                    // redirect_downloads=false and no presign creds) is what makes
+                    // presigning actually fire on this handle (#1555).
+                    //
+                    // The key-prefix policy is the one thing that depends on what
+                    // the handle is for, so it is delegated to the role (#3171):
+                    // ProxyCache forces the prefix off, ArtifactSource keeps it.
+                    let mut s3_config = crate::storage::s3::S3Config::from_env()?;
+                    role.apply_s3_prefix_policy(&mut s3_config);
+                    let inner = Arc::new(crate::storage::s3::S3Backend::new(s3_config).await?);
+                    ("s3", Arc::new(S3BackendWrapper { inner }))
+                }
+                "gcs" => {
+                    let gcs_config = crate::storage::gcs::GcsConfig::from_env()?;
+                    let inner = Arc::new(crate::storage::gcs::GcsBackend::new(gcs_config).await?);
+                    ("gcs", Arc::new(GcsBackendWrapper { inner }))
+                }
+                // #4320: the proxy cache on Azure Blob storage, when the
+                // deployment opts in. Only for the proxy-cache role: artifact
+                // bytes on Azure are read through the primary backend main.rs
+                // builds, unchanged. Azure has no key prefix, so the role's
+                // prefix policy has nothing to apply.
+                "azure" if role == StorageRole::ProxyCache && azure_proxy_cache_enabled() => {
+                    let azure_config = crate::storage::azure::AzureConfig::from_env()?;
+                    let inner =
+                        Arc::new(crate::storage::azure::AzureBackend::new(azure_config).await?);
+                    ("azure", Arc::new(AzureBackendWrapper { inner }))
+                }
+                other => {
+                    return Err(AppError::Config(format!(
+                        "Unknown storage backend: {}",
+                        other
+                    )))
+                }
+            };
 
-        Ok(Self { backend })
+        Ok(Self {
+            backend,
+            backend_kind,
+        })
     }
 
     /// Resolve the dedicated S3 bucket that backup archives should be routed
@@ -757,9 +798,9 @@ impl StorageService {
                 s3_config.prefix = None;
                 s3_config.bucket = bucket;
                 let inner = Arc::new(crate::storage::s3::S3Backend::new(s3_config).await?);
-                Ok(Arc::new(StorageService::new(Arc::new(S3BackendWrapper {
-                    inner,
-                }))))
+                Ok(Arc::new(
+                    StorageService::new(Arc::new(S3BackendWrapper { inner })).with_kind("s3"),
+                ))
             }
             None => Ok(primary.clone()),
         }
@@ -767,7 +808,23 @@ impl StorageService {
 
     /// Create with a specific backend (for testing)
     pub fn new(backend: Arc<dyn StorageBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            backend_kind: "custom",
+        }
+    }
+
+    /// Name the backend this handle runs on (see
+    /// [`StorageService::backend_kind`]).
+    pub fn with_kind(mut self, backend_kind: &'static str) -> Self {
+        self.backend_kind = backend_kind;
+        self
+    }
+
+    /// The `STORAGE_BACKEND` value this handle was built for, or `custom`
+    /// (#4319: the `backend` label of the proxy-cache publish failure count).
+    pub fn backend_kind(&self) -> &'static str {
+        self.backend_kind
     }
 
     /// Calculate SHA-256 hash of content
@@ -880,6 +937,16 @@ impl StorageService {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_azure_proxy_cache_is_opt_in_4320() {
+        assert!(!azure_proxy_cache_enabled_from(None));
+        assert!(!azure_proxy_cache_enabled_from(Some("false")));
+        assert!(!azure_proxy_cache_enabled_from(Some("yes")));
+        assert!(azure_proxy_cache_enabled_from(Some("true")));
+        assert!(azure_proxy_cache_enabled_from(Some(" TRUE ")));
+        assert!(azure_proxy_cache_enabled_from(Some("1")));
+    }
 
     fn create_test_storage() -> (StorageService, TempDir) {
         let temp_dir = TempDir::new().unwrap();

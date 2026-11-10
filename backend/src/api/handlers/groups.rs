@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Extension, Path, Query, State},
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -79,7 +79,12 @@ pub fn router() -> Router<SharedState> {
             "/:id",
             get(get_group).put(update_group).delete(delete_group),
         )
-        .route("/:id/members", post(add_members).delete(remove_members))
+        .route(
+            "/:id/members",
+            get(list_group_members)
+                .post(add_members)
+                .delete(remove_members),
+        )
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -173,6 +178,15 @@ impl From<MemberRow> for GroupMemberResponse {
             joined_at: row.joined_at,
         }
     }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GroupMemberListResponse {
+    /// Paginated list of group members.
+    pub members: Vec<GroupMemberResponse>,
+    /// Total number of members in the group. Clients can compare this against
+    /// the length of `members` to determine whether additional pages exist.
+    pub members_total: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -432,6 +446,36 @@ pub async fn get_group(
 ) -> Result<Json<GroupDetailResponse>> {
     let auth = require_auth(auth)?;
 
+    let group = load_visible_group(&state, &auth, id).await?;
+
+    let member_limit = query.limit();
+    let member_offset = query.offset();
+
+    let members = fetch_group_members(&state.db, id, member_limit, member_offset).await?;
+
+    // member_count from the group query already holds the total; reuse it
+    // instead of issuing a separate COUNT query.
+    let members_total = group.member_count;
+
+    Ok(Json(GroupDetailResponse {
+        group: GroupResponse::from(group),
+        members: members.into_iter().map(GroupMemberResponse::from).collect(),
+        members_total,
+    }))
+}
+
+/// Load a group the caller is allowed to read, or a 404 that is byte-identical
+/// for a missing id and an out-of-scope one (no existence oracle).
+///
+/// Non-admins are filtered to a group they can reach (membership UNION a group
+/// permission grant) via [`visible_groups_predicate`]; admins are unscoped.
+/// Shared by `GET /api/v1/groups/{id}` and its members sub-resource so both
+/// enforce the same visibility rule and both 404 identically.
+async fn load_visible_group(
+    state: &SharedState,
+    auth: &AuthExtension,
+    id: Uuid,
+) -> Result<GroupRow> {
     // Check if groups table exists first
     let table_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'groups')",
@@ -444,11 +488,7 @@ pub async fn get_group(
         return Err(AppError::NotFound("Group not found".to_string()));
     }
 
-    // Non-admins may only read a group they can reach (membership UNION a group
-    // permission grant); an out-of-scope group yields no row and therefore a
-    // 404 that is byte-identical to a genuinely-missing id (no existence
-    // oracle). Admins are unscoped. The $2 placeholder carries the caller's
-    // user id when scoping is applied.
+    // The $2 placeholder carries the caller's user id when scoping is applied.
     let scoped = !group_read_unscoped(auth.is_admin);
     let get_scope = if scoped {
         format!(" AND {}", visible_groups_predicate("g.id", "$2"))
@@ -469,42 +509,40 @@ pub async fn get_group(
     if scoped {
         group_query = group_query.bind(auth.user_id);
     }
-    let group: GroupRow = group_query
+    group_query
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Group not found".to_string()))
+}
 
-    let member_limit = query.limit();
-    let member_offset = query.offset();
-
-    let members: Vec<MemberRow> = sqlx::query_as(
+/// Load a page of a group's members in join order (oldest `joined_at` first,
+/// `user_id` breaking ties so pages never overlap or skip a member when several
+/// members joined in the same transaction). Shared by `GET /api/v1/groups/{id}`
+/// and `GET /api/v1/groups/{id}/members`.
+async fn fetch_group_members(
+    db: &sqlx::PgPool,
+    group_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<MemberRow>> {
+    sqlx::query_as(
         r#"
         SELECT ugm.user_id, u.username, u.display_name, ugm.joined_at
         FROM user_group_members ugm
         JOIN users u ON u.id = ugm.user_id
         WHERE ugm.group_id = $1
-        ORDER BY ugm.joined_at
+        ORDER BY ugm.joined_at, ugm.user_id
         LIMIT $2
         OFFSET $3
         "#,
     )
-    .bind(id)
-    .bind(member_limit)
-    .bind(member_offset)
-    .fetch_all(&state.db)
+    .bind(group_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    // member_count from the group query already holds the total; reuse it
-    // instead of issuing a separate COUNT query.
-    let members_total = group.member_count;
-
-    Ok(Json(GroupDetailResponse {
-        group: GroupResponse::from(group),
-        members: members.into_iter().map(GroupMemberResponse::from).collect(),
-        members_total,
-    }))
+    .map_err(|e| AppError::Database(e.to_string()))
 }
 
 /// Update a group
@@ -668,6 +706,45 @@ async fn ensure_membership_editable(db: &sqlx::PgPool, id: Uuid) -> Result<()> {
     check_membership_editable(external_source)
 }
 
+/// List a group's members
+#[utoipa::path(
+    get,
+    path = "/{id}/members",
+    context_path = "/api/v1/groups",
+    tag = "groups",
+    params(
+        ("id" = Uuid, Path, description = "Group ID"),
+        GetGroupQuery,
+    ),
+    responses(
+        (status = 200, description = "Group members", body = GroupMemberListResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Group not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_group_members(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<GetGroupQuery>,
+) -> Result<Json<GroupMemberListResponse>> {
+    let auth = require_auth(auth)?;
+
+    // Same visibility rule as `GET /api/v1/groups/{id}`: 404 for both a
+    // missing id and an out-of-scope one, so membership is never readable
+    // for a group the caller cannot see.
+    let group = load_visible_group(&state, &auth, id).await?;
+
+    let members = fetch_group_members(&state.db, id, query.limit(), query.offset()).await?;
+
+    Ok(Json(GroupMemberListResponse {
+        members: members.into_iter().map(GroupMemberResponse::from).collect(),
+        members_total: group.member_count,
+    }))
+}
+
 /// Add members to a group
 #[utoipa::path(
     post,
@@ -798,6 +875,7 @@ pub async fn remove_members(
         get_group,
         update_group,
         delete_group,
+        list_group_members,
         add_members,
         remove_members,
     ),
@@ -805,6 +883,7 @@ pub async fn remove_members(
         GroupRow,
         GroupResponse,
         GroupMemberResponse,
+        GroupMemberListResponse,
         GroupDetailResponse,
         GroupListResponse,
         CreateGroupRequest,
@@ -2011,6 +2090,360 @@ mod tests {
             .execute(&pool)
             .await;
         tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // GroupMemberListResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_group_member_list_response_serialize() {
+        let now = Utc::now();
+        let resp = GroupMemberListResponse {
+            members: vec![
+                GroupMemberResponse {
+                    user_id: Uuid::nil(),
+                    username: "alice".to_string(),
+                    display_name: Some("Alice".to_string()),
+                    joined_at: now,
+                },
+                GroupMemberResponse {
+                    user_id: Uuid::nil(),
+                    username: "bob".to_string(),
+                    display_name: None,
+                    joined_at: now,
+                },
+            ],
+            members_total: 2,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        let members = json["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0]["username"], "alice");
+        assert_eq!(members[1]["username"], "bob");
+        assert!(members[1]["display_name"].is_null());
+        assert_eq!(json["members_total"], 2);
+    }
+
+    #[test]
+    fn test_group_member_list_response_empty() {
+        let resp = GroupMemberListResponse {
+            members: vec![],
+            members_total: 0,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json["members"].as_array().unwrap().is_empty());
+        assert_eq!(json["members_total"], 0);
+    }
+
+    #[test]
+    fn test_group_member_list_response_total_exceeds_page() {
+        // Only one member on the page but the group holds 500: `members_total`
+        // is the count for the whole group, not the page.
+        let resp = GroupMemberListResponse {
+            members: vec![GroupMemberResponse {
+                user_id: Uuid::nil(),
+                username: "first".to_string(),
+                display_name: None,
+                joined_at: Utc::now(),
+            }],
+            members_total: 500,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["members"].as_array().unwrap().len(), 1);
+        assert_eq!(json["members_total"], 500);
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /api/v1/groups/{id}/members (#4027)
+    //
+    // The members sub-resource previously registered only POST and DELETE, so
+    // GET fell through to a 405 even though the sibling projects resource
+    // serves all three. These tests pin the GET registration in the generated
+    // spec (the leak that let the asymmetry sit un-noticed) and the read gate.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_openapi_doc_registers_get_on_group_members_path() {
+        use utoipa::OpenApi;
+
+        let doc = GroupsApiDoc::openapi();
+        let item = doc
+            .paths
+            .paths
+            .get("/api/v1/groups/{id}/members")
+            .expect("group members path must be registered (#4027)");
+        assert!(
+            item.get.is_some(),
+            "GET /api/v1/groups/{{id}}/members must be registered (#4027)"
+        );
+        assert!(item.post.is_some(), "POST must stay registered");
+        assert!(item.delete.is_some(), "DELETE must stay registered");
+    }
+
+    #[test]
+    fn test_openapi_doc_registers_group_member_list_response_schema() {
+        use utoipa::OpenApi;
+
+        let doc = GroupsApiDoc::openapi();
+        let schemas = doc
+            .components
+            .as_ref()
+            .expect("components present")
+            .schemas
+            .keys()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            schemas.contains(&"GroupMemberListResponse"),
+            "GroupMemberListResponse must be a registered schema: {schemas:?}"
+        );
+    }
+
+    #[test]
+    fn test_list_group_members_requires_auth_anonymous_denied() {
+        // list_group_members calls require_auth before touching the DB, so an
+        // anonymous caller gets 401 rather than the member list.
+        let result = require_auth(None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Authentication(msg) => assert!(msg.contains("Authentication required")),
+            other => panic!("Expected Authentication error, got: {:?}", other),
+        }
+    }
+
+    /// DB-backed: `GET /api/v1/groups/{id}/members` returns the group's members
+    /// paginated, and enforces the same visibility rule as `GET /groups/{id}`
+    /// (non-admins 404 on a group they cannot reach; members never leak).
+    #[tokio::test]
+    async fn test_list_group_members_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, Query, State};
+        use axum::Extension;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-grp-members-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (viewer_id, viewer_name) = tdh::create_user(&pool).await;
+        let (member_id, member_name) = tdh::create_user(&pool).await;
+
+        let group = Uuid::new_v4();
+        let group_name = format!("ph-grp-members-{group}");
+        let other = Uuid::new_v4();
+        let other_name = format!("ph-grp-members-other-{other}");
+        sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2), ($3, $4)")
+            .bind(group)
+            .bind(&group_name)
+            .bind(other)
+            .bind(&other_name)
+            .execute(&pool)
+            .await
+            .expect("seed groups");
+        // The viewer is a member of `group` (so it may read it) and `member`
+        // is the listed user.
+        sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2), ($3, $2)")
+            .bind(viewer_id)
+            .bind(group)
+            .bind(member_id)
+            .execute(&pool)
+            .await
+            .expect("seed membership");
+
+        let viewer = tdh::make_auth(viewer_id, &viewer_name); // is_admin = false
+        let admin = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(viewer_id, &viewer_name)
+        };
+        let q = || GetGroupQuery {
+            member_limit: None,
+            member_offset: None,
+        };
+
+        // A group member reads the member list; both members are present.
+        let listed = list_group_members(
+            State(state.clone()),
+            Extension(Some(viewer.clone())),
+            Path(group),
+            Query(q()),
+        )
+        .await
+        .expect("member may list members")
+        .0;
+        assert_eq!(listed.members_total, 2);
+        let names: Vec<&str> = listed.members.iter().map(|m| m.username.as_str()).collect();
+        assert!(names.contains(&viewer_name.as_str()), "{names:?}");
+        assert!(names.contains(&member_name.as_str()), "{names:?}");
+
+        // Pagination mirrors GET /groups/{id}: limit 1 returns one member but the
+        // total still reflects the whole group.
+        let page = list_group_members(
+            State(state.clone()),
+            Extension(Some(viewer.clone())),
+            Path(group),
+            Query(GetGroupQuery {
+                member_limit: Some(1),
+                member_offset: None,
+            }),
+        )
+        .await
+        .expect("paged list ok")
+        .0;
+        assert_eq!(page.members.len(), 1, "limit=1 must return a single member");
+        assert_eq!(
+            page.members_total, 2,
+            "total is the group count, not the page"
+        );
+
+        // A non-admin that cannot reach the group gets a 404 (no existence
+        // oracle and no membership leak), not a 200 or a 403.
+        let denied = list_group_members(
+            State(state.clone()),
+            Extension(Some(viewer)),
+            Path(other),
+            Query(q()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member must get NotFound for another group's members: {denied:?}"
+        );
+
+        // An admin is unscoped and can list members of any group.
+        assert!(
+            list_group_members(
+                State(state.clone()),
+                Extension(Some(admin)),
+                Path(other),
+                Query(q()),
+            )
+            .await
+            .is_ok(),
+            "admin must be able to list any group's members"
+        );
+
+        let _ = sqlx::query("DELETE FROM groups WHERE id IN ($1, $2)")
+            .bind(group)
+            .bind(other)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, viewer_id).await;
+        tdh::cleanup_user(&pool, member_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Router-level (#4027): `GET /{id}/members` dispatches to the list handler
+    /// instead of answering 405, also for an LDAP-synced group whose membership
+    /// is read-only locally, and pages walk the whole group in a stable order
+    /// even when every member shares one `joined_at`.
+    #[tokio::test]
+    async fn test_group_members_get_route_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-grp-members-rt-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (outsider_id, outsider_name) = tdh::create_user(&pool).await;
+        let mut members = Vec::new();
+        for _ in 0..3 {
+            members.push(tdh::create_user(&pool).await.0);
+        }
+
+        let group = Uuid::new_v4();
+        sqlx::query("INSERT INTO groups (id, name, external_source) VALUES ($1, $2, 'ldap')")
+            .bind(group)
+            .bind(format!("ph-grp-members-ldap-{group}"))
+            .execute(&pool)
+            .await
+            .expect("seed ldap group");
+        // One statement, so all three rows share the same joined_at.
+        sqlx::query(
+            "INSERT INTO user_group_members (user_id, group_id) \
+             SELECT u, $1 FROM UNNEST($2::uuid[]) AS u",
+        )
+        .bind(group)
+        .bind(&members)
+        .execute(&pool)
+        .await
+        .expect("seed membership");
+
+        let admin = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(admin_id, &admin_name)
+        };
+        let outsider = tdh::make_auth(outsider_id, &outsider_name);
+        let app = |auth: AuthExtension| tdh::router_with_auth_ext(router(), state.clone(), auth);
+        let page = |status: axum::http::StatusCode, body: &[u8]| {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+            let v: serde_json::Value = serde_json::from_slice(body).expect("json");
+            assert_eq!(v["members_total"], 3);
+            v["members"]
+                .as_array()
+                .expect("members array")
+                .iter()
+                .map(|m| m["user_id"].as_str().unwrap().parse::<Uuid>().unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let (s1, b1) = tdh::send(
+            app(admin.clone()),
+            tdh::get(format!("/{group}/members?member_limit=2")),
+        )
+        .await;
+        let mut seen = page(s1, &b1);
+        assert_eq!(seen.len(), 2);
+        let (s2, b2) = tdh::send(
+            app(admin.clone()),
+            tdh::get(format!("/{group}/members?member_limit=2&member_offset=2")),
+        )
+        .await;
+        seen.extend(page(s2, &b2));
+        let mut expected = members.clone();
+        expected.sort();
+        assert_eq!(
+            seen, expected,
+            "pages must cover every member once, in order"
+        );
+
+        // Reading stays allowed for an LDAP-synced group; writes keep their 409.
+        let (post_status, _) = tdh::send(
+            app(admin.clone()),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{group}/members"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(format!(
+                    r#"{{"user_ids":["{outsider_id}"]}}"#
+                )))
+                .expect("build POST"),
+        )
+        .await;
+        assert_eq!(post_status, axum::http::StatusCode::CONFLICT);
+
+        // A non-admin outside the group gets the same 404 as GET /groups/{id}.
+        let (out_status, _) =
+            tdh::send(app(outsider.clone()), tdh::get(format!("/{group}/members"))).await;
+        assert_eq!(out_status, axum::http::StatusCode::NOT_FOUND);
+        let (detail_status, _) = tdh::send(app(outsider), tdh::get(format!("/{group}"))).await;
+        assert_eq!(detail_status, axum::http::StatusCode::NOT_FOUND);
+
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+            .bind(group)
+            .execute(&pool)
+            .await;
+        for id in members.into_iter().chain([admin_id, outsider_id]) {
+            tdh::cleanup_user(&pool, id).await;
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

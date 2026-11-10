@@ -431,10 +431,10 @@ impl ArtifactoryImporter {
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) => {
-                    current_tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    current_tag = e.name().as_ref().to_string();
                 }
                 Ok(Event::Text(e)) => {
-                    let text = String::from_utf8_lossy(&e).to_string();
+                    let text = e.to_string();
                     match current_tag.as_str() {
                         "key" => repo.key = text,
                         "type" | "rclass" => repo.repo_type = text,
@@ -704,7 +704,7 @@ impl ArtifactoryImporter {
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) => {
-                    let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    let tag = e.name().as_ref().to_string();
                     current_tag = tag.clone();
 
                     if tag == "user" {
@@ -721,7 +721,7 @@ impl ArtifactoryImporter {
                     }
                 }
                 Ok(Event::End(ref e)) => {
-                    let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    let tag = e.name().as_ref().to_string();
                     if tag == "user" {
                         if let Some(user) = current_user.take() {
                             if !user.username.is_empty() {
@@ -733,7 +733,7 @@ impl ArtifactoryImporter {
                     }
                 }
                 Ok(Event::Text(e)) => {
-                    let text = String::from_utf8_lossy(&e).to_string();
+                    let text = e.to_string();
                     if let Some(ref mut user) = current_user {
                         match current_tag.as_str() {
                             "username" | "name" => user.username = text,
@@ -795,7 +795,7 @@ impl ArtifactoryImporter {
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) => {
-                    let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    let tag = e.name().as_ref().to_string();
                     current_tag = tag.clone();
 
                     if tag == "group" {
@@ -809,7 +809,7 @@ impl ArtifactoryImporter {
                     }
                 }
                 Ok(Event::End(ref e)) => {
-                    let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    let tag = e.name().as_ref().to_string();
                     if tag == "group" {
                         if let Some(group) = current_group.take() {
                             if !group.name.is_empty() {
@@ -819,7 +819,7 @@ impl ArtifactoryImporter {
                     }
                 }
                 Ok(Event::Text(e)) => {
-                    let text = String::from_utf8_lossy(&e).to_string();
+                    let text = e.to_string();
                     if let Some(ref mut group) = current_group {
                         match current_tag.as_str() {
                             "name" | "groupName" => group.name = text,
@@ -919,7 +919,7 @@ impl PermXmlState {
     }
 
     fn handle_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+        let tag = e.name().as_ref().to_string();
         self.current_tag = tag.clone();
 
         if tag == "permissionTarget" || tag == "permission" {
@@ -939,15 +939,15 @@ impl PermXmlState {
             self.in_groups = true;
         } else if (tag == "user" || tag == "group") && (self.in_users || self.in_groups) {
             for attr in e.attributes().filter_map(|a| a.ok()) {
-                if attr.key.as_ref() == b"name" {
-                    self.current_principal = String::from_utf8_lossy(&attr.value).to_string();
+                if attr.key.as_ref() == "name" {
+                    self.current_principal = attr.value.to_string();
                 }
             }
         }
     }
 
     fn handle_end(&mut self, e: &quick_xml::events::BytesEnd<'_>) {
-        let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+        let tag = e.name().as_ref().to_string();
         if tag == "permissionTarget" || tag == "permission" {
             if let Some(perm) = self.current_perm.take() {
                 if !perm.name.is_empty() {
@@ -966,7 +966,7 @@ impl PermXmlState {
     }
 
     fn handle_text(&mut self, e: &quick_xml::events::BytesText<'_>) {
-        let text = String::from_utf8_lossy(e).to_string();
+        let text = e.to_string();
         let Some(ref mut perm) = self.current_perm else {
             return;
         };

@@ -14,7 +14,12 @@
 //!    [`is_blocked_url`] on every redirect hop. This closes the
 //!    redirect-follow bypass — without it, an upstream returning
 //!    `302 Location: http://[::ffff:127.0.0.1]/` would defeat layer 1.
-//! 3. Egress NetworkPolicy at the cluster layer is a defense-in-depth
+//! 3. Under an environment proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+//!    either case) the guarded clients resolve and check every destination
+//!    they would hand to the proxy, refusing one that does not resolve,
+//!    since the connect-time resolver never sees a proxied destination
+//!    (#5459; `services::env_proxy_guard`).
+//! 4. Egress NetworkPolicy at the cluster layer is a defense-in-depth
 //!    follow-up tracked separately.
 //!
 //! # Residual gaps
@@ -23,6 +28,11 @@
 //! time and a private IP at fetch time is not caught by string-based
 //! validation. Mitigation requires a custom DNS resolver or pinning the
 //! resolved IP via `reqwest`'s `resolve_to_addrs`. Tracked as a follow-up.
+//!
+//! Proxied destinations: a proxy resolves the destination name itself, so
+//! the check in layer 3 cannot bind the proxy to the address it saw. An
+//! answer that changes between that check and the proxy's own lookup is
+//! for the proxy's destination policy to refuse.
 
 use crate::error::{AppError, Result};
 
@@ -76,6 +86,10 @@ const BLOCKED_HOSTS: &[&str] = &[
 pub(crate) enum BlockReason {
     Hostname(String),
     Ip(std::net::IpAddr),
+    /// A host name that did not resolve, where an unresolvable destination
+    /// is refused rather than left to connect time (a proxied destination,
+    /// #5459).
+    Unresolved(String),
 }
 
 impl BlockReason {
@@ -84,6 +98,7 @@ impl BlockReason {
         match self {
             BlockReason::Hostname(_) => "hostname",
             BlockReason::Ip(_) => "ip",
+            BlockReason::Unresolved(_) => "unresolved",
         }
     }
 }
@@ -109,7 +124,9 @@ impl BlockReason {
 /// curate explicitly; widening it is an opt-in action, not a per-surface
 /// relaxation. For SSO this is the preferred, narrowest knob: scope it to
 /// the IdP host/CIDR (e.g. `AK_SSRF_ALLOW_PRIVATE_CIDRS=10.10.0.8/32`)
-/// rather than enabling the blanket `SSO_ALLOW_PRIVATE_IPS` toggle.
+/// rather than enabling the blanket `SSO_ALLOW_PRIVATE_IPS` toggle. For the
+/// webhook and SSO contexts a set blanket toggle is honoured even when the
+/// list is also configured (#4428, #4474); see [`private_ip_allowed_by`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundUrlContext {
     /// Remote-proxy / upstream fetch path.
@@ -137,6 +154,17 @@ pub enum OutboundUrlContext {
 }
 
 impl OutboundUrlContext {
+    /// The `surface` label of `ak_ssrf_blocks_total` for this trust class
+    /// (#4676).
+    pub(crate) fn ssrf_surface(self) -> &'static str {
+        match self {
+            OutboundUrlContext::Upstream => "upstream",
+            OutboundUrlContext::Webhook => "webhook",
+            OutboundUrlContext::SsoDiscovery => "sso",
+            OutboundUrlContext::TrustedInternal => "internal",
+        }
+    }
+
     /// Name of the env var that, when set to a truthy value, exempts
     /// RFC1918 / IPv6 unique-local addresses for this context.
     fn env_var(self) -> &'static str {
@@ -196,26 +224,10 @@ pub fn validate_outbound_webhook_url(url_str: &str, label: &str) -> Result<()> {
 ///
 /// When a request is blocked because the target resolved to a private /
 /// internal address, the returned error names the config knobs the
-/// operator can use, so the failure is actionable instead of opaque.
+/// operator can use, so the failure is actionable instead of opaque (see
+/// [`blocked_ip_message`]).
 pub fn validate_outbound_sso_url(url_str: &str, label: &str) -> Result<()> {
-    match validate_outbound_url_with(url_str, label, OutboundUrlContext::SsoDiscovery) {
-        Ok(()) => Ok(()),
-        // Only the private/internal-IP block is operator-fixable via an
-        // allowlist knob; surface guidance for it. Hostname blocks (cloud
-        // metadata service names) and loopback are deliberate hard-blocks
-        // and must not advertise a bypass.
-        Err(AppError::Validation(msg)) if msg.contains("private/internal network") => {
-            Err(AppError::Validation(format!(
-                "{msg}. The identity provider resolves to a private/internal \
-                 address. If this IdP is trusted, allow it by setting \
-                 AK_SSRF_ALLOW_PRIVATE_CIDRS to the IdP host/CIDR (preferred, \
-                 e.g. AK_SSRF_ALLOW_PRIVATE_CIDRS=10.10.0.8/32) or \
-                 SSO_ALLOW_PRIVATE_IPS=true to allow all private IPs for SSO. \
-                 Cloud metadata, loopback and link-local addresses stay blocked."
-            )))
-        }
-        Err(other) => Err(other),
-    }
+    validate_outbound_url_with(url_str, label, OutboundUrlContext::SsoDiscovery)
 }
 
 /// Validate an **operator-configured, trusted internal endpoint** URL
@@ -273,8 +285,12 @@ pub fn validate_outbound_ldap_url(url_str: &str, label: &str) -> Result<()> {
     }
 
     if let Some(reason) = is_blocked_host_str(host, OutboundUrlContext::Upstream) {
-        record_block(label, &reason);
-        return Err(block_reason_to_error(label, reason));
+        record_block(label, &reason, "ldap");
+        return Err(block_reason_to_error(
+            label,
+            reason,
+            OutboundUrlContext::Upstream,
+        ));
     }
 
     Ok(())
@@ -357,8 +373,8 @@ fn validate_outbound_url_with(url_str: &str, label: &str, ctx: OutboundUrlContex
     }
 
     if let Some(reason) = is_blocked_url_in(&parsed, ctx) {
-        record_block(label, &reason);
-        return Err(block_reason_to_error(label, reason));
+        record_block(label, &reason, ssrf_surface(ctx, label));
+        return Err(block_reason_to_error(label, reason, ctx));
     }
 
     Ok(())
@@ -368,16 +384,51 @@ fn validate_outbound_url_with(url_str: &str, label: &str, ctx: OutboundUrlContex
 /// the standard message wording. Shared by [`validate_outbound_url_with`]
 /// and [`validate_outbound_ldap_url`] so the host/IP messages stay
 /// identical across surfaces.
-fn block_reason_to_error(label: &str, reason: BlockReason) -> AppError {
+fn block_reason_to_error(label: &str, reason: BlockReason, ctx: OutboundUrlContext) -> AppError {
     match reason {
         BlockReason::Hostname(host) => {
             AppError::Validation(format!("{} host '{}' is not allowed", label, host))
         }
-        BlockReason::Ip(ip) => AppError::Validation(format!(
-            "{} IP '{}' is not allowed (private/internal network)",
-            label, ip
-        )),
+        BlockReason::Ip(ip) => AppError::Validation(blocked_ip_message(label, ip, ctx)),
+        BlockReason::Unresolved(host) => {
+            AppError::Validation(format!("{} host '{}' could not be resolved", label, host))
+        }
     }
+}
+
+/// User-facing refusal for a blocked IP. When the address is one an
+/// operator can admit (RFC1918, CGNAT, IPv6 unique-local) the message names
+/// the setting that admits it, so an LDAP server, IdP or upstream on a
+/// private network is a configuration step rather than a dead end (#4638).
+/// Cloud-metadata, loopback, link-local and unspecified addresses can never
+/// be admitted, so their refusal advertises nothing.
+fn blocked_ip_message(label: &str, ip: std::net::IpAddr, ctx: OutboundUrlContext) -> String {
+    let base = format!("{label} IP '{ip}' is not allowed (private/internal network)");
+    // TrustedInternal refuses only the hard-blocked addresses.
+    if is_blocked_ip_in(ip, OutboundUrlContext::TrustedInternal) {
+        return base;
+    }
+    let toggle = match ctx {
+        OutboundUrlContext::Webhook | OutboundUrlContext::SsoDiscovery => {
+            format!(
+                ", or set {}=true to allow every private address",
+                ctx.env_var()
+            )
+        }
+        OutboundUrlContext::Upstream | OutboundUrlContext::TrustedInternal => String::new(),
+    };
+    format!(
+        "{base}. If this target is trusted, add it to AK_SSRF_ALLOW_PRIVATE_CIDRS \
+         (comma-separated CIDRs or IPs, e.g. AK_SSRF_ALLOW_PRIVATE_CIDRS={ip}){toggle}. \
+         Cloud metadata, loopback and link-local addresses stay blocked"
+    )
+}
+
+/// Refusal for a resolved address in the upstream context (the LDAP
+/// connectivity probe), worded like the write-time validator so the same
+/// setting is named on both paths (#4638).
+pub fn blocked_resolved_ip_error(label: &str, ip: std::net::IpAddr) -> AppError {
+    AppError::Validation(blocked_ip_message(label, ip, OutboundUrlContext::Upstream))
 }
 
 /// Decide whether a parsed URL targets a blocked address. Used by the
@@ -425,20 +476,28 @@ fn is_blocked_url_in(url: &reqwest::Url, ctx: OutboundUrlContext) -> Option<Bloc
     is_blocked_host_str(host, ctx)
 }
 
-/// Decide whether a host string (a DNS name or an IP literal, possibly
-/// bracketed for IPv6 like `[::1]`) targets a blocked address for the
-/// given context. Factored out of [`is_blocked_url_in`] so the
-/// `BLOCKED_HOSTS` list, literal-IP rules, and hostname-resolution step
-/// live in one place and are shared by [`validate_outbound_ldap_url`]
-/// (which cannot reuse the http(s)-only [`validate_outbound_url`]).
-fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReason> {
+/// The part of a host check that needs no DNS: the `BLOCKED_HOSTS` names
+/// and IP literals. Shared by the validation-time check
+/// ([`is_blocked_host_str`]) and the environment-proxy destination check
+/// (`services::env_proxy_guard`, #5459), which resolves asynchronously.
+pub(crate) enum HostVerdict {
+    /// Refused without a lookup.
+    Blocked(BlockReason),
+    /// An allowed IP literal: nothing to resolve.
+    Allowed,
+    /// A DNS name (lowercased, trailing dot removed) whose addresses decide.
+    Resolve(String),
+}
+
+/// See [`HostVerdict`]. `host` may be a bracketed IPv6 literal (`[::1]`).
+pub(crate) fn host_verdict(host: &str, ctx: OutboundUrlContext) -> HostVerdict {
     let host_lower = host.to_lowercase();
     // Strip a trailing dot so `localhost.` is treated like `localhost`.
     let host_normalized = host_lower.trim_end_matches('.');
 
     for blocked in BLOCKED_HOSTS {
         if host_normalized == *blocked || host_normalized.ends_with(&format!(".{}", blocked)) {
-            return Some(BlockReason::Hostname(host.to_string()));
+            return HostVerdict::Blocked(BlockReason::Hostname(host.to_string()));
         }
     }
 
@@ -449,13 +508,49 @@ fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReaso
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     if let Ok(ip) = bare_host.parse::<std::net::IpAddr>() {
-        if is_blocked_ip_in(ip, ctx) {
-            return Some(BlockReason::Ip(ip));
-        }
         // An IP literal carries no DNS resolution step, so once the IP
         // itself is cleared there is nothing more to check.
-        return None;
+        return match first_blocked_ip([ip], ctx) {
+            Some(reason) => HostVerdict::Blocked(reason),
+            None => HostVerdict::Allowed,
+        };
     }
+    HostVerdict::Resolve(host_normalized.to_string())
+}
+
+/// The first of `ips` the policy for `ctx` refuses, as a [`BlockReason`].
+pub(crate) fn first_blocked_ip(
+    ips: impl IntoIterator<Item = std::net::IpAddr>,
+    ctx: OutboundUrlContext,
+) -> Option<BlockReason> {
+    ips.into_iter()
+        .find(|ip| is_blocked_ip_in(*ip, ctx))
+        .map(BlockReason::Ip)
+}
+
+/// Decide whether a host string (a DNS name or an IP literal, possibly
+/// bracketed for IPv6 like `[::1]`) targets a blocked address for the
+/// given context. Factored out of [`is_blocked_url_in`] so the
+/// `BLOCKED_HOSTS` list, literal-IP rules, and hostname-resolution step
+/// live in one place and are shared by [`validate_outbound_ldap_url`]
+/// (which cannot reuse the http(s)-only [`validate_outbound_url`]).
+fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReason> {
+    is_blocked_host_str_with(host, ctx, false)
+}
+
+/// [`is_blocked_host_str`], refusing a DNS name that does not resolve when
+/// `fail_closed` (a destination that will be handed to a proxy, which
+/// resolves it on its own, #5459).
+fn is_blocked_host_str_with(
+    host: &str,
+    ctx: OutboundUrlContext,
+    fail_closed: bool,
+) -> Option<BlockReason> {
+    let name = match host_verdict(host, ctx) {
+        HostVerdict::Blocked(reason) => return Some(reason),
+        HostVerdict::Allowed => return None,
+        HostVerdict::Resolve(name) => name,
+    };
 
     // The host is a DNS name, not an IP literal. The string-based checks
     // above (BLOCKED_HOSTS) only catch known service names, so an
@@ -472,16 +567,29 @@ fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReaso
     // the resolved address into the request (reqwest `resolve_to_addrs`)
     // is the follow-up that closes the TOCTOU window.
     use std::net::ToSocketAddrs;
-    if let Ok(addrs) = (host_normalized, 0u16).to_socket_addrs() {
-        for addr in addrs {
-            let ip = addr.ip();
-            if is_blocked_ip_in(ip, ctx) {
-                return Some(BlockReason::Ip(ip));
+    match (name.as_str(), 0u16).to_socket_addrs() {
+        Ok(addrs) => {
+            let ips: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
+            if fail_closed && ips.is_empty() {
+                return Some(BlockReason::Unresolved(host.to_string()));
             }
+            first_blocked_ip(ips, ctx)
         }
+        Err(_) if fail_closed => Some(BlockReason::Unresolved(host.to_string())),
+        // A direct request resolves again at connect time, through the
+        // SSRF resolver, so an unresolvable name fails there.
+        Err(_) => None,
     }
+}
 
-    None
+/// [`is_blocked_url`] in any trust class, refusing a host name that does
+/// not resolve: for a destination that is about to be handed to a proxy
+/// (#5459).
+pub(crate) fn is_blocked_url_fail_closed(
+    url: &reqwest::Url,
+    ctx: OutboundUrlContext,
+) -> Option<BlockReason> {
+    is_blocked_host_str_with(url.host_str()?, ctx, true)
 }
 
 /// Return true when an IP must not be contacted from server-side requests.
@@ -517,9 +625,12 @@ fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReaso
 ///   silently relax the other.
 /// - `AK_SSRF_ALLOW_PRIVATE_CIDRS=10.0.0.0/8,192.168.7.0/24` — more
 ///   precise: only the listed CIDRs are exempted, and this allowlist
-///   applies to **both** contexts. Same metadata / loopback hard-blocks
-///   apply. Wins over the blanket toggle if both are set (allowlist is
-///   strictly more restrictive).
+///   applies to **every** context. Same metadata / loopback hard-blocks
+///   apply. For the upstream context it wins over the blanket toggle if
+///   both are set (allowlist is strictly more restrictive). For the webhook
+///   and SSO contexts the two are additive: `WEBHOOK_ALLOW_PRIVATE_IPS` /
+///   `SSO_ALLOW_PRIVATE_IPS` still admit every private address when a CIDR
+///   list is also set (#4428, #4474), see [`private_ip_allowed_by`].
 ///   `UPSTREAM_PRIVATE_IP_ALLOWLIST` is accepted as a backward-compatible
 ///   alias; if both are set, `AK_SSRF_ALLOW_PRIVATE_CIDRS` takes
 ///   precedence.
@@ -622,6 +733,18 @@ fn is_blocked_ipv6(v6: std::net::Ipv6Addr, ctx: OutboundUrlContext) -> bool {
         // Honor the same allowlist as IPv4 private addresses.
         return !private_ip_allowed(std::net::IpAddr::V6(v6), ctx);
     }
+    // The NAT64 well-known prefix `64:ff9b::/96` (RFC 6052) embeds an IPv4
+    // address in its last 32 bits, which a NAT64 gateway translates to: it
+    // obeys the IPv4 rules. The local-use prefix `64:ff9b:1::/48` (RFC 8215)
+    // carries site-chosen translations, so it is treated as private.
+    if segs[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        let [.., hi, lo] = segs;
+        let v4 = std::net::Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
+        return is_blocked_ipv4(v4, ctx);
+    }
+    if segs[..3] == [0x64, 0xff9b, 1] {
+        return !private_ip_allowed(std::net::IpAddr::V6(v6), ctx);
+    }
     // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d)
     // forms must obey the IPv4 rules so attackers cannot bypass them
     // by writing the v4 address inside a v6 literal.
@@ -638,17 +761,8 @@ fn is_blocked_ipv6(v6: std::net::Ipv6Addr, ctx: OutboundUrlContext) -> bool {
 /// allowlist for the given context. Returns false (i.e. block) by
 /// default. Order:
 ///
-/// 1. If `AK_SSRF_ALLOW_PRIVATE_CIDRS` (or its backward-compatible
-///    alias `UPSTREAM_PRIVATE_IP_ALLOWLIST`) is set, only IPs inside
-///    one of those CIDRs are exempted. The blanket toggle is ignored.
-///    If both are set, `AK_SSRF_ALLOW_PRIVATE_CIDRS` wins so the
-///    canonical name is the operator's source of truth. The allowlist
-///    applies to both contexts.
-/// 2. Otherwise, the per-context blanket toggle is consulted:
-///    `UPSTREAM_ALLOW_PRIVATE_IPS=true` for the upstream/remote-proxy
-///    path, `WEBHOOK_ALLOW_PRIVATE_IPS=true` for the webhook path.
-///    Issue #1435 split these so relaxing one does not silently relax
-///    the other.
+/// The environment is read here and the decision itself is
+/// [`private_ip_allowed_by`], which documents the precedence.
 ///
 /// Metadata IPs and loopback are checked separately and are never
 /// reachable through this path (see `is_hard_blocked_ipv4`).
@@ -663,10 +777,50 @@ fn private_ip_allowed(ip: std::net::IpAddr, ctx: OutboundUrlContext) -> bool {
     if matches!(ctx, OutboundUrlContext::TrustedInternal) {
         return true;
     }
-    if let Some(list) = private_cidr_allowlist_value() {
-        return cidr_list_contains(&list, ip);
+    private_ip_allowed_by(
+        ip,
+        ctx,
+        private_cidr_allowlist_value().as_deref(),
+        allow_private_ips_enabled(ctx),
+    )
+}
+
+/// Pure precedence rule behind [`private_ip_allowed`], given the shared
+/// CIDR allowlist (`AK_SSRF_ALLOW_PRIVATE_CIDRS`, or its backward-compatible
+/// alias `UPSTREAM_PRIVATE_IP_ALLOWLIST`; the canonical name wins when both
+/// are set) and whether the context's blanket toggle is on:
+///
+/// * **Webhook (#4428) and SSO (#4474)**: the two knobs are ADDITIVE. An
+///   address is allowed when the context's toggle (`WEBHOOK_ALLOW_PRIVATE_IPS`
+///   / `SSO_ALLOW_PRIVATE_IPS`) is on, or when it lies in the shared CIDR
+///   list. The CIDR list exists to narrow the attacker-influenceable upstream
+///   surface; before these fixes configuring it for that purpose silently
+///   switched off an explicit webhook or SSO toggle, so a private webhook
+///   receiver or IdP outside the listed CIDRs was refused. Both surfaces take
+///   admin-configured targets only (webhook create is admin-only, #2321 G4;
+///   the IdP is server/admin configuration), so an explicit toggle is
+///   honoured as written.
+/// * **Upstream**: unchanged. A configured CIDR list is authoritative and
+///   `UPSTREAM_ALLOW_PRIVATE_IPS` is ignored (the list is strictly more
+///   restrictive, and upstream URLs are client-influenced); with no list the
+///   toggle decides. The toggles stay split per surface (#1435 / #1891) so
+///   relaxing one never relaxes another.
+fn private_ip_allowed_by(
+    ip: std::net::IpAddr,
+    ctx: OutboundUrlContext,
+    cidr_list: Option<&str>,
+    toggle_enabled: bool,
+) -> bool {
+    if matches!(
+        ctx,
+        OutboundUrlContext::Webhook | OutboundUrlContext::SsoDiscovery
+    ) {
+        return toggle_enabled || cidr_list.is_some_and(|list| cidr_list_contains(list, ip));
     }
-    allow_private_ips_enabled(ctx)
+    match cidr_list {
+        Some(list) => cidr_list_contains(list, ip),
+        None => toggle_enabled,
+    }
 }
 
 /// Read the configured private-CIDR allowlist, preferring the canonical
@@ -808,9 +962,23 @@ fn ipv6_in_prefix(net: std::net::Ipv6Addr, ip: std::net::Ipv6Addr, prefix: u8) -
     (u128::from(net) & mask) == (u128::from(ip) & mask)
 }
 
-fn record_block(label: &str, reason: &BlockReason) {
+/// The `surface` label of `ak_ssrf_blocks_total` for one validation (#4676):
+/// the plugin and peer endpoints validate in the upstream trust class but are
+/// separate attack surfaces, so they are told apart by their field label;
+/// everything else is the trust class itself.
+fn ssrf_surface(ctx: OutboundUrlContext, label: &str) -> &'static str {
+    if label.starts_with("Plugin ") {
+        "plugin"
+    } else if label.starts_with("Peer ") {
+        "peer"
+    } else {
+        ctx.ssrf_surface()
+    }
+}
+
+fn record_block(label: &str, reason: &BlockReason, surface: &'static str) {
     let detail = match reason {
-        BlockReason::Hostname(host) => host.clone(),
+        BlockReason::Hostname(host) | BlockReason::Unresolved(host) => host.clone(),
         BlockReason::Ip(ip) => ip.to_string(),
     };
     tracing::warn!(
@@ -821,19 +989,25 @@ fn record_block(label: &str, reason: &BlockReason) {
         "outbound URL blocked"
     );
     crate::services::metrics_service::record_outbound_url_blocked(reason.metric_label(), label);
+    crate::services::metrics_service::record_ssrf_block(surface);
 }
+
+/// Tests that mutate the process-wide private-address settings
+/// (`AK_SSRF_ALLOW_PRIVATE_CIDRS`, the per-context toggles) serialize on this
+/// lock, wherever they live: `cargo test` runs tests in parallel threads, so
+/// without it an env-mutating test can flip state under another test.
+#[cfg(test)]
+pub(crate) static OUTBOUND_POLICY_ENV_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Tests that mutate process-wide env vars (the private-IP allowlist
-    /// toggles) must serialize to avoid racing parallel test threads.
-    /// `cargo test` runs tests in parallel; without this lock, an
-    /// env-var-mutating test can flip state under another test's nose.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// See [`OUTBOUND_POLICY_ENV_LOCK`]. These tests are synchronous, so they
+    /// take it with `blocking_lock`.
+    static ENV_LOCK: &tokio::sync::Mutex<()> = &OUTBOUND_POLICY_ENV_LOCK;
 
     /// Helper: assert that `validate_outbound_url(url, ...)` rejects with
     /// an error whose message contains both `label_part` (proving the
@@ -1352,7 +1526,7 @@ mod tests {
     /// Take the env lock and snapshot any allowlist-related vars so the
     /// test restores them on drop. Pattern matches `test_cgnat_block_when_opted_in`.
     struct AllowlistGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
         prev_allow: Option<String>,
         prev_webhook: Option<String>,
         prev_sso: Option<String>,
@@ -1362,7 +1536,7 @@ mod tests {
 
     impl AllowlistGuard {
         fn new() -> Self {
-            let lock = ENV_LOCK.lock().unwrap();
+            let lock = ENV_LOCK.blocking_lock();
             let g = Self {
                 _lock: lock,
                 prev_allow: std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").ok(),
@@ -1891,6 +2065,101 @@ mod tests {
         assert!(validate_outbound_url("http://10.0.0.1/upstream", "Upstream URL").is_err());
     }
 
+    /// #4428: the precedence rule itself, without the environment. For the
+    /// webhook context the blanket toggle and the shared CIDR list are
+    /// additive; for upstream and SSO a configured list stays authoritative.
+    #[test]
+    fn test_private_ip_allowed_by_precedence_per_context() {
+        let inside: std::net::IpAddr = "10.244.0.5".parse().unwrap();
+        let outside: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let list = Some("10.244.0.0/16");
+        // Webhook (#4428) and SSO (#4474): toggle on admits everything
+        // private, list or no list; toggle off falls back to the list.
+        for ctx in [
+            OutboundUrlContext::Webhook,
+            OutboundUrlContext::SsoDiscovery,
+        ] {
+            assert!(private_ip_allowed_by(outside, ctx, list, true), "{ctx:?}");
+            assert!(private_ip_allowed_by(inside, ctx, list, true), "{ctx:?}");
+            assert!(private_ip_allowed_by(outside, ctx, None, true), "{ctx:?}");
+            assert!(private_ip_allowed_by(inside, ctx, list, false), "{ctx:?}");
+            assert!(!private_ip_allowed_by(outside, ctx, list, false), "{ctx:?}");
+            assert!(!private_ip_allowed_by(outside, ctx, None, false), "{ctx:?}");
+        }
+        // Upstream: the list wins over the toggle.
+        let up = OutboundUrlContext::Upstream;
+        assert!(!private_ip_allowed_by(outside, up, list, true));
+        assert!(private_ip_allowed_by(inside, up, list, true));
+        assert!(private_ip_allowed_by(inside, up, list, false));
+        assert!(private_ip_allowed_by(outside, up, None, true));
+        assert!(!private_ip_allowed_by(outside, up, None, false));
+    }
+
+    /// End to end through the environment for a context whose toggle is
+    /// additive to `AK_SSRF_ALLOW_PRIVATE_CIDRS`: with the list set, the
+    /// context's `toggle` must still admit a private target OUTSIDE the
+    /// listed CIDRs, in whichever order the two were configured, at both
+    /// validation and connect time, while metadata stays blocked and the
+    /// upstream validator keeps the list authoritative.
+    fn assert_toggle_additive_to_cidr_list(
+        toggle: &str,
+        validate: fn(&str, &str) -> Result<()>,
+        connect_blocked: fn(std::net::IpAddr) -> bool,
+    ) {
+        let list = ("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.244.0.0/16");
+        for order in [[list, (toggle, "true")], [(toggle, "true"), list]] {
+            let _g = AllowlistGuard::new();
+            for (k, v) in order {
+                std::env::set_var(k, v);
+            }
+            assert!(
+                validate("http://10.0.0.1/x", "Target URL").is_ok(),
+                "{toggle} must admit a target outside the CIDR list ({order:?})"
+            );
+            assert!(
+                validate("http://10.244.0.5/x", "Target URL").is_ok(),
+                "a target inside the CIDR list stays allowed ({order:?})"
+            );
+            assert!(
+                !connect_blocked("10.0.0.1".parse().unwrap()),
+                "the connect-time check must agree with validation ({order:?})"
+            );
+            assert!(
+                validate("http://169.254.169.254/x", "Target URL").is_err(),
+                "metadata stays hard-blocked ({order:?})"
+            );
+            assert!(
+                validate_outbound_url("http://10.0.0.1/upstream", "Upstream URL").is_err(),
+                "upstream keeps the CIDR list authoritative ({order:?})"
+            );
+        }
+    }
+
+    /// #4428: `WEBHOOK_ALLOW_PRIVATE_IPS` is additive to the CIDR list.
+    #[test]
+    fn test_webhook_toggle_is_additive_to_named_cidr_allowlist() {
+        assert_toggle_additive_to_cidr_list(
+            "WEBHOOK_ALLOW_PRIVATE_IPS",
+            validate_outbound_webhook_url,
+            is_blocked_resolved_ip_webhook,
+        );
+    }
+
+    /// #4474: `SSO_ALLOW_PRIVATE_IPS` is additive to the CIDR list, and it
+    /// still does not relax the webhook surface.
+    #[test]
+    fn test_sso_toggle_is_additive_to_named_cidr_allowlist() {
+        assert_toggle_additive_to_cidr_list(
+            "SSO_ALLOW_PRIVATE_IPS",
+            validate_outbound_sso_url,
+            is_blocked_resolved_ip_sso,
+        );
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.244.0.0/16");
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "true");
+        assert!(validate_outbound_webhook_url("http://10.0.0.1/hook", "Webhook URL").is_err());
+    }
+
     #[test]
     fn test_webhook_allow_private_ips_enabled_helper() {
         // Boot-time helper used by main.rs to log the security posture.
@@ -2197,5 +2466,129 @@ mod tests {
         assert!(is_blocked_resolved_ip("::1".parse().unwrap()));
         // A public IP passes.
         assert!(!is_blocked_resolved_ip("93.184.216.34".parse().unwrap()));
+    }
+
+    // -----------------------------------------------------------------------
+    // #4638: an operator whose LDAP server (or any other outbound target)
+    // lives on a private network must be told which setting admits it. The
+    // allowlist itself is AK_SSRF_ALLOW_PRIVATE_CIDRS (shared by every
+    // surface); the refusal must name it, and must NOT advertise it for a
+    // cloud-metadata / loopback / link-local address it can never admit.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ldap_private_ip_refusal_names_allowlist_setting_4638() {
+        let _g = AllowlistGuard::new();
+        let err = validate_outbound_ldap_url("ldap://10.10.10.10:389", "LDAP server URL")
+            .expect_err("private LDAP IP must be refused by default");
+        let msg = err.to_string();
+        assert!(msg.contains("private/internal network"), "msg: {msg}");
+        assert!(
+            msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
+            "refusal must name the allowlist setting, got: {msg}"
+        );
+
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.10.10.0/24");
+        assert!(
+            validate_outbound_ldap_url("ldap://10.10.10.10:389", "LDAP server URL").is_ok(),
+            "listed CIDR must admit the LDAP server"
+        );
+    }
+
+    #[test]
+    fn test_metadata_refusal_does_not_advertise_allowlist_4638() {
+        let _g = AllowlistGuard::new();
+        // Even with the containing range listed, metadata stays refused and
+        // the message must not suggest a setting that cannot admit it.
+        std::env::set_var(
+            "AK_SSRF_ALLOW_PRIVATE_CIDRS",
+            "169.254.0.0/16,100.64.0.0/10,192.0.0.0/24,fd00::/8",
+        );
+        for url in [
+            "ldap://169.254.169.254:389",
+            "ldap://[::ffff:169.254.169.254]:389",
+            "ldap://100.100.100.200",
+            "ldap://192.0.0.192",
+            "ldap://[fd00:ec2::254]",
+            "ldaps://127.0.0.1:636",
+        ] {
+            let msg = validate_outbound_ldap_url(url, "LDAP server URL")
+                .expect_err(&format!("{url} must stay refused"))
+                .to_string();
+            assert!(msg.contains("private/internal network"), "{url}: {msg}");
+            assert!(!msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"), "{url}: {msg}");
+        }
+        for (res, what) in [
+            (
+                validate_outbound_url("http://169.254.169.254/", "Test URL"),
+                "upstream",
+            ),
+            (
+                validate_outbound_sso_url("http://169.254.169.254/", "OIDC issuer URL"),
+                "sso",
+            ),
+        ] {
+            let msg = res.expect_err(what).to_string();
+            assert!(
+                !msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
+                "{what}: {msg}"
+            );
+            assert!(!msg.contains("SSO_ALLOW_PRIVATE_IPS"), "{what}: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_private_refusal_names_context_settings_4638() {
+        let _g = AllowlistGuard::new();
+        let upstream = validate_outbound_url("http://10.1.2.3/", "Remote URL")
+            .expect_err("upstream private refused")
+            .to_string();
+        assert!(
+            upstream.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
+            "{upstream}"
+        );
+        let webhook = validate_outbound_webhook_url("http://10.1.2.3/", "Webhook URL")
+            .expect_err("webhook private refused")
+            .to_string();
+        assert!(webhook.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"), "{webhook}");
+        assert!(webhook.contains("WEBHOOK_ALLOW_PRIVATE_IPS"), "{webhook}");
+        let sso = validate_outbound_sso_url("http://10.1.2.3/", "OIDC issuer URL")
+            .expect_err("sso private refused")
+            .to_string();
+        assert!(sso.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"), "{sso}");
+        assert!(sso.contains("SSO_ALLOW_PRIVATE_IPS"), "{sso}");
+        // The hint is given once, not stacked by the SSO wrapper.
+        assert_eq!(sso.matches("SSO_ALLOW_PRIVATE_IPS").count(), 1, "{sso}");
+    }
+
+    /// #4676: every SSRF refusal is counted in `ak_ssrf_blocks_total` under
+    /// the bounded surface that asked. Cloud metadata is hard-blocked in every
+    /// trust class, so no env toggle can change the outcome here.
+    #[test]
+    fn test_ssrf_blocks_are_counted_by_surface_4676() {
+        use crate::services::metrics_service::capture_counters;
+        let metadata = "http://169.254.169.254/latest/meta-data/";
+        let ((), counted) = capture_counters(|| {
+            assert!(validate_outbound_url(metadata, "Upstream URL").is_err());
+            assert!(validate_outbound_url(metadata, "Cargo upstream download URL").is_err());
+            assert!(validate_outbound_webhook_url(metadata, "Webhook URL").is_err());
+            assert!(validate_outbound_sso_url(metadata, "OIDC token endpoint").is_err());
+            assert!(validate_outbound_internal_url(metadata, "Scanner adapter URL").is_err());
+            assert!(validate_outbound_url(metadata, "Plugin callback URL").is_err());
+            assert!(validate_outbound_url(metadata, "Peer endpoint URL").is_err());
+            assert!(validate_outbound_ldap_url("ldap://169.254.169.254:389", "LDAP URL").is_err());
+            // Allowed and malformed URLs are not SSRF blocks.
+            assert!(validate_outbound_url("https://example.com/", "Upstream URL").is_ok());
+            assert!(validate_outbound_url("ftp://example.com/", "Upstream URL").is_err());
+        });
+        let get = |surface: &str| counted.get("ak_ssrf_blocks_total", &[("surface", surface)]);
+        assert_eq!(get("upstream"), 2);
+        assert_eq!(get("webhook"), 1);
+        assert_eq!(get("sso"), 1);
+        assert_eq!(get("internal"), 1);
+        assert_eq!(get("plugin"), 1);
+        assert_eq!(get("peer"), 1);
+        assert_eq!(get("ldap"), 1);
+        assert_eq!(counted.get("ak_ssrf_blocks_total", &[]), 8);
     }
 }

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -9,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,6 +19,12 @@ import (
 // Harbor report shape.
 type Scanner struct {
 	cfg *Config
+	// dbMu guards the local vulnerability DB directory (<CacheDir>/db) against
+	// PUT /api/v1/vulndb. Every trivy scan holds the read lock for the whole
+	// invocation; the import takes the write lock only for the swap (two
+	// renames), after the upload has been received and verified. See
+	// importVulnDB for why the whole invocation is covered.
+	dbMu sync.RWMutex
 }
 
 // NewScanner constructs a Scanner bound to cfg.
@@ -70,14 +79,54 @@ func (s *Scanner) buildArgs(imageRef string) []string {
 	if s.cfg.Insecure {
 		args = append(args, "--insecure")
 	}
-	if s.cfg.SkipDBUpdate {
-		args = append(args, "--skip-db-update")
-	}
+	args = append(args, s.cfg.dbUpdateArgs()...)
 	if s.cfg.DBRepository != "" {
 		args = append(args, "--db-repository", s.cfg.DBRepository)
 	}
+	args = append(args, s.cfg.clientArgs()...)
 	args = append(args, imageRef)
 	return args
+}
+
+// dbUpdateArgs returns the DB-update and offline flags shared by image and
+// filesystem scans: --skip-db-update when DB updates are off (always in
+// offline mode), and in offline mode (#5287) --skip-java-db-update and
+// --offline-scan so no scan contacts a DB registry, the Java DB registry or
+// any other network API.
+func (c *Config) dbUpdateArgs() []string {
+	var args []string
+	if c.SkipDBUpdate || c.Offline {
+		args = append(args, "--skip-db-update")
+	}
+	if c.Offline {
+		args = append(args, "--skip-java-db-update", "--offline-scan")
+	}
+	return args
+}
+
+// clientArgs returns the flags shared by every scan invocation for the
+// client/server settings: `--server` when a trivy server is configured, and the
+// cache-partition `--skip-dirs` entry when a partition is configured.
+func (c *Config) clientArgs() []string {
+	var args []string
+	if c.TrivyServer != "" {
+		args = append(args, "--server", c.TrivyServer)
+	}
+	if c.CachePartition != "" {
+		args = append(args, "--skip-dirs", cachePartitionDir(c.CachePartition))
+	}
+	return args
+}
+
+// cachePartitionDir maps a cache partition to the `--skip-dirs` pattern that
+// carries it. trivy folds the skip-dirs list into every analysis cache key, so
+// distinct partitions yield disjoint keys. The pattern is a hash, so it is
+// glob-safe whatever the partition string contains, and it names a directory
+// no real image or workspace has; if one ever did, only that directory of that
+// scan would be skipped.
+func cachePartitionDir(partition string) string {
+	sum := sha256.Sum256([]byte(partition))
+	return "/.scanner-cache-partition-" + hex.EncodeToString(sum[:8])
 }
 
 // registryToken extracts the bare token from a "Bearer <token>" authorization
@@ -286,7 +335,8 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	localDB, err := s.runLocked(cmd)
+	if err != nil {
 		return nil, fmt.Errorf("trivy scan failed for %s: %v: %s", imageRef, err, strings.TrimSpace(stderr.String()))
 	}
 
@@ -305,8 +355,31 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 		return nil, fmt.Errorf("failed to parse trivy output for %s: %w", imageRef, err)
 	}
 
+	db, err := s.vulnDBInfo(trivyReport.Trivy, localDB)
+	if err != nil {
+		return nil, fmt.Errorf("trivy scan for %s: %w", imageRef, err)
+	}
 	scanner := HarborScanner{Name: "Trivy", Version: s.cfg.ScannerVersion}
-	return mapTrivyToHarbor(&trivyReport, scanner), nil
+	report := mapTrivyToHarbor(&trivyReport, scanner)
+	report.VulnerabilityDB = db
+	return report, nil
+}
+
+// vulnDBInfo returns the trivy DB provenance of a finished scan (#3014).
+//
+// Client mode: taken from the report's own Trivy.Server block, which also
+// re-verifies per scan that the server had a DB and ran the bundled release;
+// a failed check is returned as an error and fails the scan closed.
+//
+// Standalone: local, the cache's db/metadata.json as read by runLocked right
+// after the scan, still under the DB read lock (so it names the DB the scan
+// ran against even when an import swaps it in just after). Best-effort: nil
+// when the read failed (logged by runLocked).
+func (s *Scanner) vulnDBInfo(info trivyReportInfo, local *VulnDBInfo) (*VulnDBInfo, error) {
+	if s.cfg.TrivyServer != "" {
+		return clientModeProvenance(info, s.cfg.ClientVersion)
+	}
+	return local, nil
 }
 
 // fsSeverity is the severity filter for filesystem scans. It mirrors the
@@ -321,7 +394,7 @@ const fsSeverity = "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
 // `--list-all-pkgs` is load-bearing: the backend's SBOM package inventory
 // (#903) reads the Packages blocks it adds to the native JSON report.
 func (s *Scanner) buildFsArgs(dir string) []string {
-	return []string{
+	args := []string{
 		"filesystem",
 		"--format", "json",
 		"--list-all-pkgs",
@@ -329,16 +402,19 @@ func (s *Scanner) buildFsArgs(dir string) []string {
 		"--timeout", s.cfg.FsScanTimeout.String(),
 		"--cache-dir", s.cfg.CacheDir,
 		"--quiet",
-		dir,
 	}
+	args = append(args, s.cfg.dbUpdateArgs()...)
+	args = append(args, s.cfg.clientArgs()...)
+	return append(args, dir)
 }
 
 // ScanFilesystem runs `trivy filesystem` over an untarred workspace dir and
-// returns trivy's NATIVE JSON report plus its stderr text. The stderr is
+// returns trivy's NATIVE JSON report, the DB provenance (see vulnDBInfo) and
+// trivy's stderr text. The stderr is
 // returned even on success so the backend can classify partial scans (#1153).
 // Fail-closed like Scan: a non-zero exit, an exit-0 DB failure, or unparseable
 // output is an error (the job fails and the report endpoint 500s).
-func (s *Scanner) ScanFilesystem(ctx context.Context, dir string) (json.RawMessage, string, error) {
+func (s *Scanner) ScanFilesystem(ctx context.Context, dir string) (json.RawMessage, *VulnDBInfo, string, error) {
 	// Leave headroom over trivy's own --timeout so trivy's descriptive timeout
 	// error wins over a blunt context kill.
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.FsScanTimeout+30*time.Second)
@@ -349,21 +425,56 @@ func (s *Scanner) ScanFilesystem(ctx context.Context, dir string) (json.RawMessa
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
-		return nil, stderr.String(), fmt.Errorf("trivy filesystem scan failed: %v: %s", err, strings.TrimSpace(stderr.String()))
+	localDB, err := s.runLocked(cmd)
+	if err != nil {
+		return nil, nil, stderr.String(), fmt.Errorf("trivy filesystem scan failed: %v: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
 	// Exit-0 DB-failure detection: same fail-closed marker check the image
 	// path uses, so a missing/rejected vuln DB never yields a false clean.
 	if trivyOutputIndicatesDBFailure(stderr.String()) {
-		return nil, stderr.String(), fmt.Errorf("trivy filesystem scan reported a vulnerability-DB failure: %s", strings.TrimSpace(stderr.String()))
+		return nil, nil, stderr.String(), fmt.Errorf("trivy filesystem scan reported a vulnerability-DB failure: %s", strings.TrimSpace(stderr.String()))
 	}
 
 	raw := []byte(stdout.String())
 	if !json.Valid(raw) {
-		return nil, stderr.String(), fmt.Errorf("trivy filesystem output is not valid JSON")
+		return nil, nil, stderr.String(), fmt.Errorf("trivy filesystem output is not valid JSON")
 	}
-	return json.RawMessage(raw), stderr.String(), nil
+	// The report is passed through verbatim; only its Trivy block is read,
+	// for the client-mode server check and the DB provenance.
+	var peek struct {
+		Trivy trivyReportInfo `json:"Trivy"`
+	}
+	if err := json.Unmarshal(raw, &peek); err != nil {
+		return nil, nil, stderr.String(), fmt.Errorf("trivy filesystem output: %w", err)
+	}
+	db, err := s.vulnDBInfo(peek.Trivy, localDB)
+	if err != nil {
+		return nil, nil, stderr.String(), fmt.Errorf("trivy filesystem scan: %w", err)
+	}
+	return json.RawMessage(raw), db, stderr.String(), nil
+}
+
+// runLocked runs a trivy scan under the DB read lock, so a vulnerability-DB
+// import never swaps <CacheDir>/db while trivy is opening, reading or (with DB
+// updates on) refreshing it. In standalone mode it also reads the local DB
+// provenance (#3014) after a successful run, before releasing the lock;
+// in client mode it returns nil (the provenance comes from the report).
+func (s *Scanner) runLocked(cmd *exec.Cmd) (*VulnDBInfo, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+	if s.cfg.TrivyServer != "" {
+		return nil, nil
+	}
+	db, err := ReadVulnDBInfo(s.cfg.CacheDir)
+	if err != nil {
+		log.Printf("trivy DB provenance unavailable: %v", err)
+		return nil, nil
+	}
+	return db, nil
 }
 
 // ProbeVersion runs `trivy --version` and extracts the semantic version string

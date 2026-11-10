@@ -6,17 +6,35 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "format_handlers",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "format_key",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "format_handlers",
+            "name": "format_key"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "plugin_id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "format_handlers",
+            "name": "plugin_id"
+          }
+        }
       },
       {
         "ordinal": 3,
@@ -31,42 +49,90 @@
               ]
             }
           }
+        },
+        "origin": {
+          "Table": {
+            "table": "format_handlers",
+            "name": "handler_type"
+          }
         }
       },
       {
         "ordinal": 4,
         "name": "display_name",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "format_handlers",
+            "name": "display_name"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "description",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "format_handlers",
+            "name": "description"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "extensions",
-        "type_info": "TextArray"
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "format_handlers",
+            "name": "extensions"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "is_enabled",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "format_handlers",
+            "name": "is_enabled"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "priority",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "format_handlers",
+            "name": "priority"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "format_handlers",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "updated_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "format_handlers",
+            "name": "updated_at"
+          }
+        }
       }
     ],
     "parameters": {

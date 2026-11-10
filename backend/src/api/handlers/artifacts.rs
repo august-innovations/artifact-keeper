@@ -233,6 +233,7 @@ pub async fn get_artifact(
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
     check_artifact_visibility(&auth, id, &state.db, "read").await?;
+    require_mcp_servable(&state, &auth, id).await?;
 
     let download_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
@@ -247,6 +248,15 @@ pub async fn get_artifact(
             .fetch_optional(&state.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // #1758: the latest successful promotion, same contract as the listing.
+    let last_promotion = crate::api::handlers::last_promotion::fetch_last_promotions(
+        &state.db,
+        &[id],
+        auth.as_ref(),
+    )
+    .await
+    .remove(&id);
 
     Ok(Json(ArtifactResponse {
         id: artifact.id,
@@ -284,7 +294,8 @@ pub async fn get_artifact(
         // than failing the request.
         origin: artifact
             .origin
-            .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::from_json(&v)),
+            .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::for_response(&v)),
+        last_promotion,
     }))
 }
 
@@ -315,7 +326,53 @@ async fn require_existing_visible_artifact(
         return Err(AppError::NotFound("Artifact not found".to_string()));
     }
 
-    check_artifact_visibility(auth, id, &state.db, "read").await
+    check_artifact_visibility(auth, id, &state.db, "read").await?;
+    require_mcp_servable(state, auth, id).await
+}
+
+/// The MCP serve decision on the by-id routes (#5253): an MCP server version
+/// (or a bundle of one) that readers are not served now is "Artifact not
+/// found" for a caller who does not hold the repository, as on the registry
+/// surface ([`super::mcp::GenericArtifactGate`]). Other formats pass.
+pub(crate) async fn require_mcp_servable(
+    state: &SharedState,
+    auth: &Option<AuthExtension>,
+    id: Uuid,
+) -> Result<()> {
+    if mcp_servable(state, auth.as_ref(), id).await? {
+        Ok(())
+    } else {
+        Err(AppError::NotFound("Artifact not found".to_string()))
+    }
+}
+
+/// Whether artifact `id` passes the MCP serve decision for `auth`
+/// ([`require_mcp_servable`]): `true` for any artifact outside an MCP
+/// registry (and for an id that names no artifact, which the caller answers
+/// as missing itself), and for a repository holder. The routes that answer a
+/// missing artifact with their own body (a `404` with another message, or an
+/// empty listing) give that same answer when this is `false`, so a held
+/// version cannot be told from a missing one.
+pub(crate) async fn mcp_servable(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    id: Uuid,
+) -> Result<bool> {
+    let row: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT a.repository_id, a.path FROM artifacts a \
+         JOIN repositories r ON r.id = a.repository_id \
+         WHERE a.id = $1 AND r.format = 'mcp'",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let Some((repo_id, path)) = row else {
+        return Ok(true);
+    };
+    Ok(super::mcp::GenericArtifactGate::new(state, auth)
+        .visible(repo_id, &path)
+        .await)
 }
 
 /// Get artifact metadata by artifact ID
@@ -336,8 +393,11 @@ pub async fn get_artifact_metadata(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<ArtifactMetadataResponse>> {
+    base: crate::api::extractors::RequestBaseUrl,
+) -> Result<axum::response::Response> {
     require_existing_visible_artifact(&state, &auth, id).await?;
+    // #5452: an MCP server version's `server` is its served (pinned) form.
+    let served = super::mcp::served_server_json(&state.db, id, base.as_str()).await?;
 
     let metadata = sqlx::query!(
         r#"
@@ -352,12 +412,23 @@ pub async fn get_artifact_metadata(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact metadata not found".to_string()))?;
 
-    Ok(Json(ArtifactMetadataResponse {
-        artifact_id: metadata.artifact_id,
-        format: metadata.format,
-        metadata: metadata.metadata,
-        properties: metadata.properties,
-    }))
+    let embeds_mcp = served.is_some();
+    let mut response =
+        axum::response::IntoResponse::into_response(Json(ArtifactMetadataResponse {
+            artifact_id: metadata.artifact_id,
+            format: metadata.format,
+            metadata: super::mcp::with_served_server(metadata.metadata, served),
+            properties: metadata.properties,
+        }));
+    if embeds_mcp {
+        // The embedded server.json follows the request's base URL and the
+        // serve decision of this read (#5452).
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    Ok(response)
 }
 
 /// Get artifact download statistics
@@ -452,6 +523,7 @@ mod tests {
             quarantine_status: "not_quarantined".to_string(),
             quarantine_until: None,
             origin: None,
+            last_promotion: None,
         }
     }
 

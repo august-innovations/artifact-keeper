@@ -356,9 +356,19 @@ fn record_flush_lost(kind: &'static str, lost: usize) {
 /// INSERT first (the fast path); if Postgres rejects it, retries each row
 /// individually so only genuinely bad rows are lost. Returns the number of
 /// rows that could not be persisted.
+///
+/// Every persisted row is one served download, so this is also where
+/// `ak_artifact_downloads_total` is counted (#4642): each INSERT reports the
+/// rows it wrote per `(repository key, format)` and those counts move the
+/// counter. Counting here rather than on the byte plane keeps the hot path
+/// free of any lookup, and keeps the counter equal to the
+/// `download_statistics` rows (a `HEAD`, which writes no row, never counts).
 async fn flush_stats_with_fallback(db: &PgPool, stats: Vec<DownloadStatsEvent>) -> usize {
     match insert_stats_batch(db, &stats).await {
-        Ok(()) => 0,
+        Ok(counts) => {
+            record_download_counts(&counts);
+            0
+        }
         Err(batch_err) => {
             warn!(
                 rows = stats.len(),
@@ -367,9 +377,12 @@ async fn flush_stats_with_fallback(db: &PgPool, stats: Vec<DownloadStatsEvent>) 
             );
             let mut lost = 0usize;
             for s in &stats {
-                if let Err(e) = insert_stat_row(db, s).await {
-                    warn!(artifact_id = %s.artifact_id, error = %e, "failed to record download statistics (row dropped)");
-                    lost += 1;
+                match insert_stats_batch(db, std::slice::from_ref(s)).await {
+                    Ok(counts) => record_download_counts(&counts),
+                    Err(e) => {
+                        warn!(artifact_id = %s.artifact_id, error = %e, "failed to record download statistics (row dropped)");
+                        lost += 1;
+                    }
                 }
             }
             lost
@@ -377,17 +390,38 @@ async fn flush_stats_with_fallback(db: &PgPool, stats: Vec<DownloadStatsEvent>) 
     }
 }
 
+/// Rows a stats INSERT wrote, per `(repository key, format)`.
+type DownloadCounts = Vec<(String, String, i64)>;
+
+/// Move `ak_artifact_downloads_total` by the rows a flush persisted (#4642).
+fn record_download_counts(counts: &DownloadCounts) {
+    for (repo_key, format, rows) in counts {
+        crate::services::metrics_service::record_artifact_downloads(
+            repo_key,
+            format,
+            u64::try_from(*rows).unwrap_or(0),
+        );
+    }
+}
+
 /// Batched multi-row `download_statistics` INSERT via parallel-array UNNEST —
 /// the same shape as `webhook_producer`'s `BATCH_INSERT_DELIVERIES_SQL`.
 /// Runtime (non-macro) query, matching the single-row INSERT this replaces, so
-/// no offline `.sqlx` prepare is needed.
+/// no offline `.sqlx` prepare is needed. The per-row fallback calls it with a
+/// one-element slice.
+///
+/// Returns the inserted rows grouped by their artifact's repository key and
+/// format, in the same round-trip, for the download counter.
 ///
 /// `user_agent` is re-clamped to the column width here (defense-in-depth:
 /// [`DownloadContext`] already clamps at capture, but events can be built from
 /// synthesized contexts) so no oversized string can ever fail the statement.
 ///
 /// [`DownloadContext`]: crate::api::middleware::download_telemetry::DownloadContext
-async fn insert_stats_batch(db: &PgPool, stats: &[DownloadStatsEvent]) -> sqlx::Result<()> {
+async fn insert_stats_batch(
+    db: &PgPool,
+    stats: &[DownloadStatsEvent],
+) -> sqlx::Result<DownloadCounts> {
     let mut artifact_ids: Vec<Uuid> = Vec::with_capacity(stats.len());
     let mut user_ids: Vec<Option<Uuid>> = Vec::with_capacity(stats.len());
     let mut ip_addresses: Vec<Option<&str>> = Vec::with_capacity(stats.len());
@@ -398,36 +432,27 @@ async fn insert_stats_batch(db: &PgPool, stats: &[DownloadStatsEvent]) -> sqlx::
         ip_addresses.push(s.ip_address.as_deref());
         user_agents.push(s.user_agent.clone().map(clamp_user_agent));
     }
-    sqlx::query(
+    sqlx::query_as(
         r#"
-        INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent)
-        SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::text[])
-            AS t(artifact_id, user_id, ip_address, user_agent)
+        WITH inserted AS (
+            INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent)
+            SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::text[])
+                AS t(artifact_id, user_id, ip_address, user_agent)
+            RETURNING artifact_id
+        )
+        SELECT r.key, r.format::text, COUNT(*)::int8
+        FROM inserted i
+        JOIN artifacts a ON a.id = i.artifact_id
+        JOIN repositories r ON r.id = a.repository_id
+        GROUP BY r.key, r.format
         "#,
     )
     .bind(artifact_ids)
     .bind(user_ids)
     .bind(ip_addresses)
     .bind(user_agents)
-    .execute(db)
-    .await?;
-    Ok(())
-}
-
-/// Single-row stats INSERT — the pre-batching statement, used as the per-row
-/// fallback when a batch is rejected.
-async fn insert_stat_row(db: &PgPool, s: &DownloadStatsEvent) -> sqlx::Result<()> {
-    sqlx::query(
-        "INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent) \
-         VALUES ($1, $2, $3, $4)",
-    )
-    .bind(s.artifact_id)
-    .bind(s.user_id)
-    .bind(s.ip_address.as_deref())
-    .bind(s.user_agent.clone().map(clamp_user_agent))
-    .execute(db)
-    .await?;
-    Ok(())
+    .fetch_all(db)
+    .await
 }
 
 #[cfg(ak_test_shard = "services-1")]
@@ -724,6 +749,70 @@ mod tests {
                 .await
                 .expect("count rows");
         assert_eq!(rows, 3, "every innocent co-batched row must persist");
+    }
+
+    /// #4642: `ak_artifact_downloads_total` was defined but never recorded.
+    /// Flushing download events must move it by the rows persisted, labelled
+    /// by the artifact's repository key and format, on the batched path and on
+    /// the per-row fallback alike (where the poison row is not counted).
+    #[test]
+    fn test_flush_counts_artifact_downloads_4642() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use metrics_util::debugging::DebugValue;
+        let event = |artifact_id| DownloadStatsEvent {
+            artifact_id,
+            user_id: None,
+            ip_address: None,
+            user_agent: Some("metrics/1.0".to_string()),
+        };
+        let (keys, captured) = tdh::capture_metrics(|| async {
+            let pool = tdh::try_pool().await?;
+            let batched = seed_flush_artifact(&pool, "com/acme/metered-1.0.jar").await;
+            let fallback = seed_flush_artifact(&pool, "com/acme/metered-2.0.jar").await;
+            // Batched path: two downloads of one artifact.
+            let lost = flush_stats_with_fallback(&pool, vec![event(batched), event(batched)]).await;
+            assert_eq!(lost, 0);
+            // Fallback path: an FK-violating row fails the batch; the three
+            // innocent rows persist one by one and the poison row is lost.
+            let lost = flush_stats_with_fallback(
+                &pool,
+                vec![
+                    event(fallback),
+                    event(fallback),
+                    event(Uuid::new_v4()),
+                    event(fallback),
+                ],
+            )
+            .await;
+            assert_eq!(lost, 1);
+            let mut keys = Vec::new();
+            for id in [batched, fallback] {
+                let key: String = sqlx::query_scalar(
+                    "SELECT r.key FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
+                     WHERE a.id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("repository key");
+                keys.push(key);
+            }
+            Some(keys)
+        });
+        let Some(keys) = keys else {
+            return;
+        };
+        for (key, expected) in keys.iter().zip([2u64, 3]) {
+            assert_eq!(
+                tdh::captured_metric(
+                    &captured,
+                    "ak_artifact_downloads_total",
+                    &[("repository", key), ("format", "maven")],
+                ),
+                Some(&DebugValue::Counter(expected)),
+                "downloads of {key} must be counted (#4642); captured: {captured:?}"
+            );
+        }
     }
 
     /// Finding 2 re-verify at the worker level: `flush_batch` counts rows

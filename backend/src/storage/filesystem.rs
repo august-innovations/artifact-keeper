@@ -19,36 +19,39 @@ use crate::error::{AppError, Result};
 const STREAM_CHUNK_SIZE: usize = 256 * 1024;
 
 #[cfg(unix)]
-async fn sync_parent_directory(path: &Path) -> Result<()> {
+/// Errors name the storage `key`, not the absolute directory: the message is
+/// recorded on the storage span and logged at INFO (#3954).
+async fn sync_parent_directory(path: &Path, key: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         let dir = fs::File::open(parent).await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to open parent directory {} for sync: {}",
-                parent.display(),
-                e
-            ))
+            crate::storage::failure::io_storage_error(
+                &e,
+                format!(
+                    "Failed to open parent directory of '{}' for sync: {}",
+                    key, e
+                ),
+            )
         })?;
         dir.sync_all().await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to sync parent directory {}: {}",
-                parent.display(),
-                e
-            ))
+            crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to sync parent directory of '{}': {}", key, e),
+            )
         })?;
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-async fn sync_parent_directory(_path: &Path) -> Result<()> {
+async fn sync_parent_directory(_path: &Path, _key: &str) -> Result<()> {
     Ok(())
 }
 
-fn temp_path_for_dest(dest: &Path, id: Uuid) -> Result<PathBuf> {
+fn temp_path_for_dest(dest: &Path, key: &str, id: Uuid) -> Result<PathBuf> {
     let parent = dest.parent().ok_or_else(|| {
         AppError::Storage(format!(
-            "Destination path {} has no parent directory",
-            dest.display()
+            "Destination path for '{}' has no parent directory",
+            key
         ))
     })?;
     Ok(parent.join(format!(".tmp.{id}")))
@@ -172,9 +175,73 @@ impl FilesystemStorage {
     }
 }
 
+/// Whether `name` is an atomic-write staging file of this backend: `.tmp.<uuid>`
+/// ([`temp_path_for_dest`]) or `<name>.tmp.<uuid>` (`put`), with the UUID in the
+/// hyphenated form both write. Any other name holding `.tmp.`, such as a Maven
+/// `x.tmp.jar`, is a real object (#5168).
+fn is_atomic_write_staging_name(name: &str) -> bool {
+    name.rsplit_once(".tmp.").is_some_and(|(_, suffix)| {
+        Uuid::try_parse(suffix).is_ok_and(|id| id.hyphenated().to_string() == suffix)
+    })
+}
+
+/// Blocking directory walk behind [`FilesystemStorage::list_keys`]: every
+/// regular file under `dir` as `{prefix}/{relative path}`, skipping atomic-write
+/// temp files. A missing directory is an empty namespace.
+fn list_files_under(dir: &Path, prefix: &str) -> Result<Vec<super::ListedKey>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut keys = Vec::new();
+    for entry in walkdir::WalkDir::new(dir).follow_links(false) {
+        let entry = entry.map_err(|e| AppError::Storage(format!("filesystem listing: {e}")))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy();
+        if is_atomic_write_staging_name(&name) {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(dir) else {
+            continue;
+        };
+        let rel = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let last_modified = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(chrono::DateTime::<chrono::Utc>::from);
+        keys.push(super::ListedKey {
+            key: format!("{prefix}/{rel}"),
+            last_modified,
+        });
+    }
+    keys.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(keys)
+}
+
 #[async_trait]
 impl StorageBackend for FilesystemStorage {
-    #[tracing::instrument(skip(self, content), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put"))]
+    /// Walk the directory a multi-component key under `prefix` maps to,
+    /// returning `prefix`-relative keys. In-flight atomic-write temp files
+    /// (`*.tmp.<uuid>`, see `put_stream`) are not objects and are skipped.
+    async fn list_keys(&self, prefix: &str) -> Result<Option<Vec<super::ListedKey>>> {
+        let prefix = prefix.trim_matches('/').to_string();
+        if prefix.is_empty() {
+            return Ok(None);
+        }
+        let dir = self.root_for(&prefix).join(&prefix);
+        let keys = tokio::task::spawn_blocking(move || list_files_under(&dir, &prefix))
+            .await
+            .map_err(|e| AppError::Storage(format!("filesystem listing task failed: {e}")))??;
+        Ok(Some(keys))
+    }
+
+    #[tracing::instrument(err(Display, level = "info"), skip(self, content), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let path = self.key_to_path(key);
 
@@ -205,6 +272,15 @@ impl StorageBackend for FilesystemStorage {
             let _ = fs::remove_file(&temp_path).await;
             return Err(e.into());
         }
+        // #4646: `tokio::fs::File::write_all` returns once the last chunk is
+        // handed to a background write, and `sync_all` drains that write but
+        // parks its error instead of returning it. `flush` is what surfaces
+        // it; without it a failed final write (ENOSPC, EIO, EFBIG) left a
+        // truncated temp file that was renamed into place as if complete.
+        if let Err(e) = file.flush().await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
         if let Err(e) = file.sync_all().await {
             let _ = fs::remove_file(&temp_path).await;
             return Err(e.into());
@@ -219,7 +295,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get"))]
     async fn get(&self, key: &str) -> Result<Bytes> {
         let path = self.key_to_path(key);
         let content = fs::read(&path).await.map_err(|e| {
@@ -234,19 +310,22 @@ impl StorageBackend for FilesystemStorage {
             if e.kind() == std::io::ErrorKind::NotFound {
                 AppError::NotFound(format!("Storage key not found: {}", key))
             } else {
-                AppError::Storage(format!("Failed to read {}: {}", key, e))
+                crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to read {}: {}", key, e),
+                )
             }
         })?;
         Ok(Bytes::from(content))
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "exists"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let path = self.key_to_path(key);
         Ok(path.exists())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "delete"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "delete"))]
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.key_to_path(key);
         fs::remove_file(&path).await.map_err(|e| {
@@ -256,27 +335,33 @@ impl StorageBackend for FilesystemStorage {
             if e.kind() == std::io::ErrorKind::NotFound {
                 AppError::NotFound(format!("Storage key not found: {}", key))
             } else {
-                AppError::Storage(format!("Failed to delete {}: {}", key, e))
+                crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to delete {}: {}", key, e),
+                )
             }
         })?;
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "copy"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "copy"))]
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         let source_path = self.key_to_path(source);
         let dest_path = self.key_to_path(dest);
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let temp_path = temp_path_for_dest(&dest_path, Uuid::new_v4())?;
+        let temp_path = temp_path_for_dest(&dest_path, dest, Uuid::new_v4())?;
 
         if let Err(e) = fs::copy(&source_path, &temp_path).await {
             remove_temp_file_best_effort(&temp_path, "filesystem copy failed").await;
             return Err(if e.kind() == std::io::ErrorKind::NotFound {
                 AppError::NotFound(format!("Storage key not found: {}", source))
             } else {
-                AppError::Storage(format!("Failed to copy {} to {}: {}", source, dest, e))
+                crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to copy {} to {}: {}", source, dest, e),
+                )
             });
         }
 
@@ -284,33 +369,92 @@ impl StorageBackend for FilesystemStorage {
             Ok(file) => file,
             Err(e) => {
                 remove_temp_file_best_effort(&temp_path, "filesystem copy temp open failed").await;
-                return Err(AppError::Storage(format!(
-                    "Failed to open copied temp file for {}: {}",
-                    dest, e
-                )));
+                return Err(crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to open copied temp file for {}: {}", dest, e),
+                ));
             }
         };
         if let Err(e) = file.sync_all().await {
             remove_temp_file_best_effort(&temp_path, "filesystem copy temp sync failed").await;
-            return Err(AppError::Storage(format!(
-                "Failed to sync copied temp file for {}: {}",
-                dest, e
-            )));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to sync copied temp file for {}: {}", dest, e),
+            ));
         }
         drop(file);
 
         if let Err(e) = fs::rename(&temp_path, &dest_path).await {
             remove_temp_file_best_effort(&temp_path, "filesystem copy temp promote failed").await;
-            return Err(AppError::Storage(format!(
-                "Failed to promote copied temp file to {}: {}",
-                dest, e
-            )));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to promote copied temp file to {}: {}", dest, e),
+            ));
         }
-        sync_parent_directory(&dest_path).await?;
+        sync_parent_directory(&dest_path, dest).await?;
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put_file"))]
+    /// Rename instead of copying, so the cost does not grow with the object
+    /// (#5133). Whenever the rename route fails for any reason but a missing
+    /// source (`EXDEV` across mounts, or whatever a network or FUSE filesystem
+    /// refuses), this falls back to [`Self::copy`], which worked there before and
+    /// leaves the source for the caller to delete.
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "promote"))]
+    async fn promote(&self, source: &str, dest: &str) -> Result<()> {
+        let source_path = self.key_to_path(source);
+        let dest_path = self.key_to_path(dest);
+
+        // The name is about to be published, so its bytes must be durable first.
+        // `put_stream` has already synced them, which makes this cheap there.
+        let source_synced = async {
+            let file = fs::File::open(&source_path).await?;
+            file.sync_all().await
+        }
+        .await;
+        let moved = match source_synced {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AppError::NotFound(format!(
+                    "Storage key not found: {}",
+                    source
+                )));
+            }
+            Err(e) => Err(e),
+            Ok(()) => {
+                if let Some(parent) = dest_path.parent() {
+                    fs::create_dir_all(parent).await?;
+                }
+                fs::rename(&source_path, &dest_path).await
+            }
+        };
+        if let Err(e) = moved {
+            // `copy` reports a source that vanished in the meantime as `NotFound`.
+            tracing::debug!(source, dest, error = %e, "Rename unavailable; promoting by copy");
+            return self.copy(source, dest).await;
+        }
+
+        // Both directory entries changed. The destination has to be durable
+        // before the caller commits a row naming it; the source so that a
+        // crash cannot bring back an object whose journal row is then cleared.
+        sync_parent_directory(&dest_path, dest).await?;
+        sync_parent_directory(&source_path, source).await
+    }
+
+    async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+        match fs::metadata(self.key_to_path(key)).await {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::NotFound(format!(
+                "Storage key not found: {}",
+                key
+            ))),
+            Err(e) => Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to read metadata of {}: {}", key, e),
+            )),
+        }
+    }
+
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put_file"))]
     async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
         let dest = self.key_to_path(key);
         if let Some(parent) = dest.parent() {
@@ -324,14 +468,14 @@ impl StorageBackend for FilesystemStorage {
         // two concurrent writers of the same key raced on truncate/write so a
         // reader could observe torn bytes. Staging makes the visible `dest`
         // flip atomically from absent/old bytes to complete bytes.
-        let temp_path = temp_path_for_dest(&dest, Uuid::new_v4())?;
+        let temp_path = temp_path_for_dest(&dest, key, Uuid::new_v4())?;
 
         if let Err(e) = fs::copy(path, &temp_path).await {
             remove_temp_file_best_effort(&temp_path, "filesystem put_file copy failed").await;
-            return Err(AppError::Storage(format!(
-                "Failed to copy file to {}: {}",
-                key, e
-            )));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to copy file to {}: {}", key, e),
+            ));
         }
 
         let file = match fs::OpenOptions::new().read(true).open(&temp_path).await {
@@ -339,36 +483,36 @@ impl StorageBackend for FilesystemStorage {
             Err(e) => {
                 remove_temp_file_best_effort(&temp_path, "filesystem put_file temp open failed")
                     .await;
-                return Err(AppError::Storage(format!(
-                    "Failed to open copied temp file for {}: {}",
-                    key, e
-                )));
+                return Err(crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to open copied temp file for {}: {}", key, e),
+                ));
             }
         };
         if let Err(e) = file.sync_all().await {
             remove_temp_file_best_effort(&temp_path, "filesystem put_file temp sync failed").await;
-            return Err(AppError::Storage(format!(
-                "Failed to sync copied temp file for {}: {}",
-                key, e
-            )));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to sync copied temp file for {}: {}", key, e),
+            ));
         }
         drop(file);
 
         if let Err(e) = fs::rename(&temp_path, &dest).await {
             remove_temp_file_best_effort(&temp_path, "filesystem put_file temp promote failed")
                 .await;
-            return Err(AppError::Storage(format!(
-                "Failed to promote copied temp file to {}: {}",
-                key, e
-            )));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to promote copied temp file to {}: {}", key, e),
+            ));
         }
-        sync_parent_directory(&dest).await?;
+        sync_parent_directory(&dest, key).await?;
         Ok(())
     }
 
     // The span covers GET initiation (time-to-first-byte); the body transfer
     // happens later as the caller polls the returned stream.
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get_stream"))]
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let path = self.key_to_path(key);
         let file = fs::File::open(&path).await.map_err(|e| {
@@ -379,7 +523,10 @@ impl StorageBackend for FilesystemStorage {
             if e.kind() == std::io::ErrorKind::NotFound {
                 AppError::NotFound(format!("Storage key not found: {}", key))
             } else {
-                AppError::Storage(format!("Failed to open {}: {}", key, e))
+                crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to open {}: {}", key, e),
+                )
             }
         })?;
 
@@ -387,13 +534,16 @@ impl StorageBackend for FilesystemStorage {
         let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_SIZE);
 
         // Map tokio io errors to our Result type
-        let mapped = stream
-            .map(|result| result.map_err(|e| AppError::Storage(format!("Read error: {}", e))));
+        let mapped = stream.map(|result| {
+            result.map_err(|e| {
+                crate::storage::failure::io_storage_error(&e, format!("Read error: {}", e))
+            })
+        });
 
         Ok(Box::pin(mapped))
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get_range"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get_range"))]
     async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -404,23 +554,28 @@ impl StorageBackend for FilesystemStorage {
             if e.kind() == std::io::ErrorKind::NotFound {
                 AppError::NotFound(format!("Storage key not found: {}", key))
             } else {
-                AppError::Storage(format!("Failed to open {}: {}", key, e))
+                crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to open {}: {}", key, e),
+                )
             }
         })?;
 
-        file.seek(SeekFrom::Start(offset))
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to seek {}: {}", key, e)))?;
+        file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+            crate::storage::failure::io_storage_error(&e, format!("Failed to seek {}: {}", key, e))
+        })?;
 
         let mut remaining = length;
         let mut out = Vec::with_capacity(length);
 
         while remaining > 0 {
             let mut buf = vec![0u8; remaining.min(STREAM_CHUNK_SIZE)];
-            let read = file
-                .read(&mut buf)
-                .await
-                .map_err(|e| AppError::Storage(format!("Failed to read {}: {}", key, e)))?;
+            let read = file.read(&mut buf).await.map_err(|e| {
+                crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to read {}: {}", key, e),
+                )
+            })?;
             if read == 0 {
                 break;
             }
@@ -432,7 +587,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(Bytes::from(out))
     }
 
-    #[tracing::instrument(skip(self, stream), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, stream), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put_stream"))]
     async fn put_stream(
         &self,
         key: &str,
@@ -445,10 +600,13 @@ impl StorageBackend for FilesystemStorage {
 
         // Write to a temp file in the same directory so rename is atomic
         // (same filesystem guarantees atomic rename on POSIX).
-        let temp_path = temp_path_for_dest(&dest, Uuid::new_v4())?;
-        let mut file = fs::File::create(&temp_path)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to create temp file: {}", e)))?;
+        let temp_path = temp_path_for_dest(&dest, key, Uuid::new_v4())?;
+        let mut file = fs::File::create(&temp_path).await.map_err(|e| {
+            crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to create temp file: {}", e),
+            )
+        })?;
 
         let mut hasher = Sha256::new();
         let mut total: u64 = 0;
@@ -462,7 +620,10 @@ impl StorageBackend for FilesystemStorage {
                     if let Err(e) = file.write_all(&data).await {
                         remove_temp_file_best_effort(&temp_path, "filesystem stream write failed")
                             .await;
-                        return Err(AppError::Storage(format!("Write error: {}", e)));
+                        return Err(crate::storage::failure::io_storage_error(
+                            &e,
+                            format!("Write error: {}", e),
+                        ));
                     }
                 }
                 Err(e) => {
@@ -472,19 +633,36 @@ impl StorageBackend for FilesystemStorage {
             }
         }
 
-        // Flush and sync to disk before renaming
+        // Flush and sync to disk before renaming. The explicit `flush` is
+        // load-bearing (#4646): tokio's `sync_all` drains the in-flight final
+        // write but swallows its error, so a failed last write would otherwise
+        // publish a truncated object while this returns the checksum and
+        // length of the full stream.
+        if let Err(e) = file.flush().await {
+            remove_temp_file_best_effort(&temp_path, "filesystem stream flush failed").await;
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Write error: {}", e),
+            ));
+        }
         if let Err(e) = file.sync_all().await {
             remove_temp_file_best_effort(&temp_path, "filesystem stream sync failed").await;
-            return Err(AppError::Storage(format!("Sync error: {}", e)));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Sync error: {}", e),
+            ));
         }
         drop(file);
 
         // Atomic rename
         if let Err(e) = fs::rename(&temp_path, &dest).await {
             remove_temp_file_best_effort(&temp_path, "filesystem stream promote failed").await;
-            return Err(AppError::Storage(format!("Rename error: {}", e)));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Rename error: {}", e),
+            ));
         }
-        sync_parent_directory(&dest).await?;
+        sync_parent_directory(&dest, key).await?;
 
         Ok(PutStreamResult {
             checksum_sha256: format!("{:x}", hasher.finalize()),
@@ -497,6 +675,216 @@ impl StorageBackend for FilesystemStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5133: promoting moves the staged object: same inode, source gone.
+    ///
+    /// FAILS ON MAIN's copy path: a new inode, with the source still there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn promote_renames_instead_of_copying_5133() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(dir.path());
+        storage
+            .put("oci-uploads/staged", Bytes::from_static(b"layer"))
+            .await
+            .unwrap();
+        let inode = std::fs::metadata(dir.path().join("oci-uploads/staged"))
+            .unwrap()
+            .ino();
+
+        storage
+            .promote("oci-uploads/staged", "oci-blobs/sha256/ab/layer")
+            .await
+            .unwrap();
+
+        assert!(!storage.exists("oci-uploads/staged").await.unwrap());
+        assert_eq!(
+            storage
+                .get("oci-blobs/sha256/ab/layer")
+                .await
+                .unwrap()
+                .as_ref(),
+            b"layer"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("oci-blobs/sha256/ab/layer"))
+                .unwrap()
+                .ino(),
+            inode
+        );
+    }
+
+    /// #5133: a promote onto an existing object replaces it atomically, the way
+    /// a re-push of a content-addressed key does.
+    #[tokio::test]
+    async fn promote_replaces_an_existing_destination_5133() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(dir.path());
+        storage
+            .put("staged", Bytes::from_static(b"new"))
+            .await
+            .unwrap();
+        storage
+            .put("blob", Bytes::from_static(b"old"))
+            .await
+            .unwrap();
+
+        storage.promote("staged", "blob").await.unwrap();
+
+        assert_eq!(storage.get("blob").await.unwrap().as_ref(), b"new");
+        assert!(!storage.exists("staged").await.unwrap());
+    }
+
+    /// #5133: a missing source is `NotFound`, as `copy` reports it, and creates
+    /// no destination.
+    #[tokio::test]
+    async fn promote_of_a_missing_source_is_not_found_5133() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(dir.path());
+
+        let err = storage.promote("missing", "dir/blob").await.unwrap_err();
+
+        assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
+        assert!(!storage.exists("dir/blob").await.unwrap());
+    }
+
+    /// #5133: a rename refused for another reason, as a network or FUSE filesystem
+    /// can do, still promotes by copy, leaving the source for the caller to delete.
+    /// A read-only source directory makes the rename fail while the copy works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn promote_falls_back_to_copy_when_rename_is_refused_5133() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(dir.path());
+        storage
+            .put("locked/staged", Bytes::from_static(b"layer"))
+            .await
+            .unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Permission bits do not bind root, so the rename would simply succeed.
+        let enforced = std::fs::File::create(locked.join("probe")).is_err();
+
+        let result = storage.promote("locked/staged", "blobs/layer").await;
+        let source_kept = storage.exists("locked/staged").await.unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        result.unwrap();
+        assert_eq!(storage.get("blobs/layer").await.unwrap().as_ref(), b"layer");
+        if enforced {
+            assert!(source_kept, "a copy leaves the source for the caller");
+        }
+    }
+
+    /// #5133: the stored size comes from metadata, and a missing key says so.
+    #[tokio::test]
+    async fn stored_size_reports_length_and_not_found_5133() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(dir.path());
+        storage
+            .put("obj", Bytes::from_static(b"12345"))
+            .await
+            .unwrap();
+
+        assert_eq!(storage.stored_size("obj").await.unwrap(), Some(5));
+        assert!(matches!(
+            storage.stored_size("missing").await,
+            Err(AppError::NotFound(_))
+        ));
+    }
+
+    /// #5133: staging and blob directories can sit on different mounts, where a
+    /// rename fails with EXDEV. That falls back to a copy, not an error.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn promote_across_filesystems_falls_back_to_copy_5133() {
+        let Ok(other_fs) = tempfile::TempDir::new_in("/dev/shm") else {
+            return;
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        if same_device(dir.path(), other_fs.path()) {
+            return;
+        }
+        std::os::unix::fs::symlink(other_fs.path(), dir.path().join("elsewhere")).unwrap();
+        let storage = FilesystemStorage::new(dir.path());
+        storage
+            .put("staged", Bytes::from_static(b"layer"))
+            .await
+            .unwrap();
+
+        storage.promote("staged", "elsewhere/blob").await.unwrap();
+
+        assert_eq!(
+            std::fs::read(other_fs.path().join("blob")).unwrap(),
+            b"layer"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn same_device(a: &Path, b: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(a).unwrap().dev() == std::fs::metadata(b).unwrap().dev()
+    }
+
+    /// #3954: storage spans record a failed operation (`err` on the
+    /// `#[tracing::instrument]`), which `tracing-opentelemetry` turns into an
+    /// error span status. The event is INFO, not ERROR, so a routine NotFound
+    /// (a proxy-cache miss) does not become an error log line, and is not
+    /// below INFO, so the status still lands under a `RUST_LOG=info` filter.
+    #[tokio::test]
+    async fn test_failed_operation_records_err_on_the_storage_span() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct ErrEvents(Arc<Mutex<Vec<(String, tracing::Level)>>>);
+        struct HasError(bool);
+        impl tracing::field::Visit for HasError {
+            fn record_debug(&mut self, f: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                self.0 |= f.name() == "error";
+            }
+        }
+        impl<S> tracing_subscriber::Layer<S> for ErrEvents
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut has_error = HasError(false);
+                event.record(&mut has_error);
+                if let (true, Some(span)) = (has_error.0, ctx.event_span(event)) {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((span.name().to_string(), *event.metadata().level()));
+                }
+            }
+        }
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+        let events = ErrEvents::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(events.clone()));
+
+        let err = StorageBackend::get(&storage, "no-such-key").await;
+        assert!(matches!(err, Err(AppError::NotFound(_))));
+        assert!(StorageBackend::exists(&storage, "no-such-key")
+            .await
+            .is_ok());
+
+        let recorded = events.0.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![("get".to_string(), tracing::Level::INFO)],
+            "exactly the failed get must record its error on its own span"
+        );
+    }
 
     /// #3517: `put_file` must stage and rename, never copy in place.
     ///
@@ -597,9 +985,93 @@ mod tests {
     }
 
     #[test]
+    fn test_temp_path_error_names_the_key_not_the_path() {
+        // #3954: the message is recorded on the storage span at INFO.
+        let err = temp_path_for_dest(Path::new("/"), "my-key", Uuid::nil())
+            .expect_err("the root has no parent");
+        let msg = err.to_string();
+        assert!(msg.contains("'my-key'"), "got: {msg}");
+        assert!(!msg.contains("path /"), "got: {msg}");
+    }
+
+    /// #5168: only the exact staging suffix marks a staging file.
+    #[test]
+    fn test_is_atomic_write_staging_name_5168() {
+        let id = "01234567-89ab-cdef-0123-456789abcdef";
+        for staging in [format!(".tmp.{id}"), format!("x-1.0.jar.tmp.{id}")] {
+            assert!(is_atomic_write_staging_name(&staging), "{staging}");
+        }
+        for object in [
+            "x.tmp.jar".to_string(),
+            "x-1.0.tmp.jar.sha1".to_string(),
+            ".tmp.".to_string(),
+            "x.tmp.".to_string(),
+            "x.tmp".to_string(),
+            format!("x.tmp.{id}.jar"),
+            format!("x.tmp.{id}.tmp.jar"),
+            // Not the form `Uuid`'s Display writes.
+            format!("x.tmp.{}", id.replace('-', "")),
+            format!("x.tmp.{}", id.to_uppercase()),
+            format!("x.tmp.{{{id}}}"),
+            format!("x.tmp.urn:uuid:{id}"),
+        ] {
+            assert!(!is_atomic_write_staging_name(&object), "{object}");
+        }
+    }
+
+    /// #5168: the listing behind reindex finds an object whose name merely
+    /// holds `.tmp.`, and still hides the files both atomic writers stage.
+    #[tokio::test]
+    async fn test_list_keys_skips_only_atomic_write_staging_files_5168() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+        let dir_key = "maven/com/acme/x/1.0";
+        storage
+            .put(
+                &format!("{dir_key}/x-1.0.tmp.jar"),
+                Bytes::from_static(b"real object"),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                &format!("{dir_key}/x-1.0.jar"),
+                Bytes::from_static(b"plain object"),
+            )
+            .await
+            .unwrap();
+        let dir = storage.key_to_path(&format!("{dir_key}/x-1.0.jar"));
+        let dir = dir.parent().unwrap();
+        let dest = dir.join("y-1.0.jar");
+        let id = Uuid::new_v4();
+        let staged = temp_path_for_dest(&dest, "k", id).unwrap();
+        std::fs::write(&staged, b"in flight").unwrap();
+        let mut put_staged = dest.as_os_str().to_os_string();
+        put_staged.push(format!(".tmp.{id}"));
+        std::fs::write(&put_staged, b"in flight").unwrap();
+
+        let listed: Vec<String> = storage
+            .list_keys("maven/com")
+            .await
+            .unwrap()
+            .expect("the filesystem backend lists")
+            .into_iter()
+            .map(|l| l.key)
+            .collect();
+
+        assert_eq!(
+            listed,
+            vec![
+                format!("{dir_key}/x-1.0.jar"),
+                format!("{dir_key}/x-1.0.tmp.jar"),
+            ]
+        );
+    }
+
+    #[test]
     fn test_temp_path_for_dest_uses_short_sibling_name() {
         let dest = PathBuf::from(format!("/data/aa/{}", "a".repeat(240)));
-        let temp = temp_path_for_dest(&dest, Uuid::nil()).expect("temp path");
+        let temp = temp_path_for_dest(&dest, "k", Uuid::nil()).expect("temp path");
 
         assert_eq!(temp.parent(), dest.parent());
         let file_name = temp
@@ -1345,6 +1817,91 @@ mod tests {
         match storage.get("lifecycle-key").await.unwrap_err() {
             AppError::NotFound(_) => {}
             other => panic!("post-delete get must be NotFound, got {:?}", other),
+        }
+    }
+
+    /// Cap this process's file size with `RLIMIT_FSIZE` (SIGXFSZ ignored, so an
+    /// over-limit `write(2)` fails with `EFBIG` instead of killing the process)
+    /// for the duration of `body`. The limit is process-wide, so this only runs
+    /// under cargo-nextest, which gives every test its own process; under
+    /// `cargo test` it would fail unrelated tests writing files concurrently.
+    async fn with_file_size_limit<F, Fut>(limit: u64, body: F) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        if std::env::var_os("NEXTEST_RUN_ID").is_none() {
+            eprintln!("skipping RLIMIT_FSIZE test outside cargo-nextest");
+            return false;
+        }
+        let mut old = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: plain libc calls on stack-owned, initialised structs.
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut old), 0);
+            let new = libc::rlimit {
+                rlim_cur: limit as libc::rlim_t,
+                rlim_max: old.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &new), 0);
+        }
+        body().await;
+        // SAFETY: as above; restores the limit read before the test.
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_FSIZE, &old);
+        }
+        true
+    }
+
+    /// #4646: a write that fails on the LAST buffered `tokio::fs::File` write
+    /// (here EFBIG; in production ENOSPC/EIO on the scratch volume) must fail
+    /// `put_stream`. tokio's `sync_all` drains the in-flight write but parks
+    /// its error instead of returning it, so without an explicit `flush` the
+    /// truncated temp file was renamed into place and `put_stream` returned
+    /// Ok with the checksum and length of the bytes it was *given*. An OCI
+    /// PATCH part stored that way is later concatenated short and the upload
+    /// fails with DIGEST_INVALID on a digest that matches nothing sent.
+    #[tokio::test]
+    async fn put_stream_fails_when_final_buffered_write_fails() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        let ran = with_file_size_limit(4096, || async {
+            let data = Bytes::from(vec![0x5a_u8; 64 * 1024]);
+            let stream: BoxStream<'static, Result<Bytes>> =
+                Box::pin(futures::stream::iter(vec![Ok(data)]));
+            let result = storage.put_stream("oci-uploads/part", stream).await;
+            assert!(
+                result.is_err(),
+                "put_stream must surface the failed final write, got {:?}",
+                result.map(|r| r.bytes_written)
+            );
+        })
+        .await;
+        if ran {
+            assert!(
+                !storage.exists("oci-uploads/part").await.unwrap(),
+                "a failed put_stream must not publish a truncated object"
+            );
+        }
+    }
+
+    /// #4646: the same lost-final-write hole in buffered `put`.
+    #[tokio::test]
+    async fn put_fails_when_final_buffered_write_fails() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        let ran = with_file_size_limit(4096, || async {
+            let result = storage
+                .put("blob", Bytes::from(vec![0x5a_u8; 64 * 1024]))
+                .await;
+            assert!(result.is_err(), "put must surface the failed final write");
+        })
+        .await;
+        if ran {
+            assert!(!storage.exists("blob").await.unwrap());
         }
     }
 }

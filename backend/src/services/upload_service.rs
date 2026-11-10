@@ -24,10 +24,12 @@
 //! crashed, or its purge failed), so nothing depends on the request that
 //! created the bytes surviving.
 
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -172,6 +174,17 @@ pub fn staged_chunk_key(session_id: Uuid, chunk_index: i32) -> String {
     format!("{}/{chunk_index:08}", staging_prefix(session_id))
 }
 
+/// Content type a session records when its creator names none.
+pub const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// Storage key of the single object a streamed completion assembles the staged
+/// chunks into (#3916). It lives in the session's staging namespace, distinct
+/// from every [`staged_chunk_key`], so the normal purge (and its reaper
+/// backstop) reclaims it along with the chunks.
+pub fn staged_assembly_key(session_id: Uuid) -> String {
+    format!("{}/assembled", staging_prefix(session_id))
+}
+
 fn storage_err(e: impl std::fmt::Display) -> UploadError {
     UploadError::Storage(e.to_string())
 }
@@ -279,6 +292,17 @@ const MIN_CHUNK_SIZE: i64 = 1_048_576; // 1 MB
 const MAX_CHUNK_SIZE: i64 = 268_435_456; // 256 MB
 const DEFAULT_CHUNK_SIZE: i32 = 8_388_608; // 8 MB
 pub const COMMIT_LEASE_TTL_SECS: f64 = 6.0 * 3600.0;
+/// Completion-lease lifetime for the `Prefer: respond-async` path (#5002).
+///
+/// The background commit is tracked only in this replica's task. If that
+/// replica restarts, the session stays `committing` until its lease lapses,
+/// and the client polls/cannot re-issue completion until then. Six hours is a
+/// reasonable bound for an in-request commit guarded by a live renewal loop,
+/// but far too long when the guard is a detached task: a crash would strand
+/// the client for the rest of the day. Ten minutes keeps the same crash
+/// recovery contract as other cluster work while still covering a large
+/// package finalize (the renewal loop extends it while the task runs).
+pub const ASYNC_COMMIT_LEASE_TTL_SECS: f64 = 10.0 * 60.0;
 
 // ---------------------------------------------------------------------------
 // Service
@@ -337,7 +361,7 @@ impl UploadService {
         }
 
         let total_chunks = ((p.total_size + chunk_size as i64 - 1) / chunk_size as i64) as i32;
-        let content_type = p.content_type.unwrap_or("application/octet-stream");
+        let content_type = p.content_type.unwrap_or(DEFAULT_CONTENT_TYPE);
         let artifact_name = normalize_optional_metadata(p.artifact_name);
         let artifact_version = normalize_optional_metadata(p.artifact_version);
         let artifact_metadata_format = normalize_optional_metadata(p.artifact_metadata_format);
@@ -740,6 +764,21 @@ impl UploadService {
         session_id: Uuid,
         user_id: Uuid,
     ) -> Result<UploadSession, UploadError> {
+        Self::complete_session_with_lease(db, session_id, user_id, COMMIT_LEASE_TTL_SECS).await
+    }
+
+    /// [`Self::complete_session`] with an explicit completion-lease lifetime.
+    ///
+    /// The async (`Prefer: respond-async`) path uses the shorter
+    /// [`ASYNC_COMMIT_LEASE_TTL_SECS`] so a replica restart does not strand the
+    /// client behind the six-hour in-request lease; the renewal loop extends
+    /// the lease with the same TTL while the detached commit is alive.
+    pub async fn complete_session_with_lease(
+        db: &PgPool,
+        session_id: Uuid,
+        user_id: Uuid,
+        lease_ttl_secs: f64,
+    ) -> Result<UploadSession, UploadError> {
         // Pre-read for ownership and precise error mapping.
         let session = Self::get_session(db, session_id, Some(user_id)).await?;
 
@@ -773,7 +812,7 @@ impl UploadService {
         .bind(session_id)
         .bind(user_id)
         .bind(Uuid::new_v4())
-        .bind(COMMIT_LEASE_TTL_SECS)
+        .bind(lease_ttl_secs)
         .fetch_optional(db)
         .await?;
 
@@ -844,6 +883,66 @@ impl UploadService {
         }
     }
 
+    /// Reassemble a committing session's staged chunks **on the repository's
+    /// backend** instead of a local scratch file (#3916) and verify the result.
+    ///
+    /// The chunks are streamed, in order, into
+    /// [`staged_assembly_key`] through the backend's native `put_stream`
+    /// (S3 multipart / GCS resumable / Azure block blob), so no replica needs
+    /// local disk proportional to the artifact. The assembled object's byte
+    /// count and SHA-256 are checked against the session just as the local
+    /// [`Self::assemble_for_commit`] path checks its file; a mismatch deletes
+    /// the staging object and settles the lease exactly like the local path
+    /// (checksum mismatch is terminal, anything else retryable).
+    ///
+    /// The returned key is a staging object the caller promotes with
+    /// `StorageBackend::copy` and then deletes. Leaving it behind is safe: the
+    /// session purge (and the hourly reaper) removes it with the chunks.
+    pub async fn assemble_for_commit_on_backend(
+        db: &PgPool,
+        storage: &Arc<dyn StorageBackend>,
+        session: &UploadSession,
+    ) -> Result<String, UploadError> {
+        match assemble_staged_chunks_on_backend(storage, session).await {
+            Ok(key) => Ok(key),
+            Err(e) => Err(Self::settle_assembly_failure(db, session, e).await),
+        }
+    }
+
+    /// Verify a committing session's staged chunks without writing anything,
+    /// for a completion whose content-addressed object already exists.
+    ///
+    /// Streams the chunks once and checks the total size and SHA-256, so a
+    /// deduplicated completion still refuses corrupt staged bytes (the local
+    /// path verifies while assembling even when it will skip the write).
+    pub async fn verify_for_commit(
+        db: &PgPool,
+        storage: &Arc<dyn StorageBackend>,
+        session: &UploadSession,
+    ) -> Result<(), UploadError> {
+        match verify_staged_chunks(storage, session).await {
+            Ok(()) => Ok(()),
+            Err(e) => Err(Self::settle_assembly_failure(db, session, e).await),
+        }
+    }
+
+    /// Settle a completion lease after an assembly/verification failure: a
+    /// checksum mismatch means the staged bytes are wrong and the session is
+    /// terminal; a size mismatch or transient storage failure is retryable, so
+    /// the lease is released and the client can re-issue the completion.
+    async fn settle_assembly_failure(
+        db: &PgPool,
+        session: &UploadSession,
+        e: UploadError,
+    ) -> UploadError {
+        if matches!(e, UploadError::ChecksumMismatch { .. }) {
+            Self::fail_committing(db, session, &e.to_string()).await;
+        } else {
+            Self::release_commit_lease(db, session).await;
+        }
+        e
+    }
+
     /// Delete a session's staged chunk objects and record the purge (#3922).
     ///
     /// Idempotent: a chunk that is already gone counts as deleted, so two
@@ -908,22 +1007,27 @@ impl UploadService {
         db: PgPool,
         session: &UploadSession,
     ) -> crate::services::cluster_work::RenewalGuard {
+        Self::spawn_commit_lease_renewal_for(db, session, COMMIT_LEASE_TTL_SECS)
+    }
+
+    /// [`Self::spawn_commit_lease_renewal`] with an explicit TTL, so the async
+    /// completion path renews with the same shorter lease it claimed.
+    pub fn spawn_commit_lease_renewal_for(
+        db: PgPool,
+        session: &UploadSession,
+        ttl_secs: f64,
+    ) -> crate::services::cluster_work::RenewalGuard {
         let session_id = session.id;
         let state_token = session.state_token;
         crate::services::cluster_work::spawn_renewal_loop(
             format!("upload session commit {session_id}"),
-            COMMIT_LEASE_TTL_SECS,
+            ttl_secs,
             move || {
                 let db = db.clone();
                 async move {
-                    Self::renew_commit_lease_by_token(
-                        &db,
-                        session_id,
-                        state_token,
-                        COMMIT_LEASE_TTL_SECS,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())
+                    Self::renew_commit_lease_by_token(&db, session_id, state_token, ttl_secs)
+                        .await
+                        .map_err(|e| e.to_string())
                 }
             },
         )
@@ -1346,7 +1450,106 @@ async fn assemble_staged_chunks(
     Ok(assembled)
 }
 
-/// Delete a session's staged chunk objects; an already-missing one is fine.
+/// Stream every staged chunk, in order, from the repository's backend: the
+/// bytes [`assemble_staged_chunks`] would have written to a local scratch file,
+/// without the file (#3916).
+pub fn staged_chunk_stream(
+    storage: Arc<dyn StorageBackend>,
+    session_id: Uuid,
+    total_chunks: i32,
+) -> BoxStream<'static, crate::error::Result<bytes::Bytes>> {
+    use futures::TryStreamExt;
+
+    futures::stream::iter(0..total_chunks)
+        .then(move |index| {
+            let storage = storage.clone();
+            async move {
+                storage
+                    .get_stream(&staged_chunk_key(session_id, index))
+                    .await
+            }
+        })
+        .try_flatten()
+        .boxed()
+}
+
+/// Reassemble the staged chunks into one object on the backend through its
+/// native `put_stream`, then verify the byte count and SHA-256 against the
+/// session. On any verification failure the staging object is deleted so the
+/// bad bytes never survive; the caller settles the lease.
+async fn assemble_staged_chunks_on_backend(
+    storage: &Arc<dyn StorageBackend>,
+    session: &UploadSession,
+) -> Result<String, UploadError> {
+    let key = staged_assembly_key(session.id);
+    let stream = staged_chunk_stream(storage.clone(), session.id, session.total_chunks);
+
+    let put = match storage.put_stream(&key, stream).await {
+        Ok(put) => put,
+        Err(e) => {
+            // A backend that aborts its own multipart/block upload leaves
+            // nothing behind; deleting is a belt-and-braces no-op otherwise.
+            let _ = storage.delete(&key).await;
+            return Err(storage_err(e));
+        }
+    };
+
+    if put.bytes_written != session.total_size as u64 {
+        let _ = storage.delete(&key).await;
+        return Err(UploadError::SizeMismatch {
+            expected: session.total_size,
+            actual: i64::try_from(put.bytes_written).unwrap_or(i64::MAX),
+        });
+    }
+    if !put
+        .checksum_sha256
+        .eq_ignore_ascii_case(&session.checksum_sha256)
+    {
+        let _ = storage.delete(&key).await;
+        return Err(UploadError::ChecksumMismatch {
+            expected: session.checksum_sha256.clone(),
+            actual: put.checksum_sha256,
+        });
+    }
+
+    Ok(key)
+}
+
+/// Verify a session's staged chunks by streaming them once, without writing
+/// them anywhere: the read-only counterpart of
+/// [`assemble_staged_chunks_on_backend`] for a deduplicated completion.
+async fn verify_staged_chunks(
+    storage: &Arc<dyn StorageBackend>,
+    session: &UploadSession,
+) -> Result<(), UploadError> {
+    let mut stream = staged_chunk_stream(storage.clone(), session.id, session.total_chunks);
+    let mut hasher = Sha256::new();
+    let mut size: i64 = 0;
+
+    while let Some(block) = stream.next().await {
+        let block = block.map_err(storage_err)?;
+        hasher.update(&block);
+        size = size.saturating_add(block.len() as i64);
+    }
+
+    if size != session.total_size {
+        return Err(UploadError::SizeMismatch {
+            expected: session.total_size,
+            actual: size,
+        });
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != session.checksum_sha256 {
+        return Err(UploadError::ChecksumMismatch {
+            expected: session.checksum_sha256.clone(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// Delete a session's staged chunk objects and any streamed assembly object; an
+/// already-missing key is fine.
 async fn delete_staged_chunk_objects(
     storage: &dyn StorageBackend,
     session_id: Uuid,
@@ -1361,7 +1564,13 @@ async fn delete_staged_chunk_objects(
             Err(e) => return Err(storage_err(e)),
         }
     }
-    Ok(())
+    // A streamed completion may have left its single assembled object behind
+    // (a crash between staging and promotion, or a failed copy). It shares the
+    // session's staging namespace, so the same purge reclaims it (#3916).
+    match storage.delete(&staged_assembly_key(session_id)).await {
+        Ok(()) | Err(crate::error::AppError::NotFound(_)) => Ok(()),
+        Err(e) => Err(storage_err(e)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2866,6 +3075,58 @@ mod tests {
         teardown_lease_fixture(&f).await;
     }
 
+    /// The async completion path can claim a shorter lease than the six-hour
+    /// in-request lease, so a replica restart only strands the client for the
+    /// short TTL (#5002).
+    #[tokio::test]
+    async fn complete_session_with_lease_uses_the_requested_short_ttl() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+
+        let session = UploadService::complete_session_with_lease(
+            &f.pool,
+            f.session_id,
+            f.user_id,
+            ASYNC_COMMIT_LEASE_TTL_SECS,
+        )
+        .await
+        .expect("claim with the async lease");
+        assert_eq!(session.status, "committing");
+
+        let (_, _, expires) = session_claim_state(&f.pool, f.session_id).await;
+        let remaining = expires
+            .expect("lease expiry")
+            .signed_duration_since(chrono::Utc::now())
+            .num_seconds();
+        assert!(
+            remaining <= ASYNC_COMMIT_LEASE_TTL_SECS as i64,
+            "async lease must not use the six-hour default, remaining {remaining}s"
+        );
+        assert!(
+            remaining > 0,
+            "async lease must still be live, remaining {remaining}s"
+        );
+
+        // Renewal uses the same short TTL, not the six-hour default.
+        assert!(
+            UploadService::renew_commit_lease(&f.pool, &session, ASYNC_COMMIT_LEASE_TTL_SECS)
+                .await
+                .expect("renew query ok")
+        );
+        let (_, _, renewed) = session_claim_state(&f.pool, f.session_id).await;
+        let renewed_remaining = renewed
+            .expect("renewed expiry")
+            .signed_duration_since(chrono::Utc::now())
+            .num_seconds();
+        assert!(
+            renewed_remaining <= ASYNC_COMMIT_LEASE_TTL_SECS as i64,
+            "renewal must extend with the short TTL, remaining {renewed_remaining}s"
+        );
+
+        teardown_lease_fixture(&f).await;
+    }
+
     /// A live committer can renew before another complete request reclaims
     /// the session; once a newer token owns the session, the stale token is
     /// fenced out of renewal.
@@ -3838,5 +4099,229 @@ mod tests {
             .bind(session_id)
             .execute(&pool)
             .await;
+    }
+}
+
+/// Live checks of the on-backend chunk assembly (#3916) against a real
+/// S3-compatible store, Azure Blob or GCS endpoint (MinIO, Azurite and
+/// fake-gcs-server locally). Ignored by default; pick the backend with
+/// `AK_STREAMED_ASSEMBLY_LIVE=s3|azure|gcs` and that backend's usual
+/// `S3_*`, `AZURE_STORAGE_*` or `GCS_*` variables, e.g.
+///
+///   AK_STREAMED_ASSEMBLY_LIVE=s3 S3_BUCKET=ak-test S3_REGION=us-east-1 \
+///   S3_ENDPOINT=http://127.0.0.1:39000 S3_ACCESS_KEY_ID=... \
+///   S3_SECRET_ACCESS_KEY=... cargo test streamed_assembly_live -- --ignored
+#[cfg(test)]
+mod streamed_assembly_live {
+    use super::*;
+    use bytes::Bytes;
+
+    async fn live_backend() -> Option<Arc<dyn StorageBackend>> {
+        let kind = std::env::var("AK_STREAMED_ASSEMBLY_LIVE").ok()?;
+        let backend: Arc<dyn StorageBackend> = match kind.as_str() {
+            "s3" => Arc::new(
+                crate::storage::s3::S3Backend::new(
+                    crate::storage::s3::S3Config::from_env().expect("S3Config::from_env"),
+                )
+                .await
+                .expect("S3Backend::new"),
+            ),
+            "azure" => Arc::new(
+                crate::storage::azure::AzureBackend::new(
+                    crate::storage::azure::AzureConfig::from_env().expect("AzureConfig::from_env"),
+                )
+                .await
+                .expect("AzureBackend::new"),
+            ),
+            "gcs" => Arc::new(
+                crate::storage::gcs::GcsBackend::new(
+                    crate::storage::gcs::GcsConfig::from_env().expect("GcsConfig::from_env"),
+                )
+                .await
+                .expect("GcsBackend::new"),
+            ),
+            other => panic!("unknown AK_STREAMED_ASSEMBLY_LIVE backend {other:?}"),
+        };
+        Some(backend)
+    }
+
+    fn session(id: Uuid, total_size: i64, total_chunks: i32, checksum: String) -> UploadSession {
+        let now = chrono::Utc::now();
+        UploadSession {
+            id,
+            user_id: Uuid::nil(),
+            repository_id: Uuid::nil(),
+            repository_key: "live".into(),
+            artifact_path: "live/streamed.bin".into(),
+            artifact_name: None,
+            artifact_version: None,
+            artifact_metadata_format: None,
+            artifact_metadata: None,
+            artifact_metadata_properties: None,
+            package_description: None,
+            package_metadata: None,
+            is_replication: false,
+            content_type: "application/octet-stream".into(),
+            total_size,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            total_chunks,
+            completed_chunks: total_chunks,
+            bytes_received: total_size,
+            checksum_sha256: checksum,
+            temp_file_path: String::new(),
+            status: "committing".into(),
+            error_message: None,
+            state_token: None,
+            committing_expires_at: None,
+            staged_in_storage: true,
+            staging_purged_at: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: now,
+        }
+    }
+
+    /// Four 10 MiB chunks plus a short tail (~40 MiB): several S3 multipart
+    /// parts, more than one 32 MiB GCS resumable request and several Azure
+    /// blocks. Each chunk carries distinct bytes so a reordered or dropped
+    /// chunk changes the digest.
+    fn chunks() -> Vec<Bytes> {
+        let mut out: Vec<Bytes> = (0..4u8)
+            .map(|i| {
+                Bytes::from(
+                    (0..10 * 1024 * 1024)
+                        .map(|n: usize| (n as u8).wrapping_mul(31).wrapping_add(i))
+                        .collect::<Vec<u8>>(),
+                )
+            })
+            .collect();
+        out.push(Bytes::from_static(b"tail of the streamed assembly"));
+        out
+    }
+
+    async fn read_digest(storage: &Arc<dyn StorageBackend>, key: &str) -> (i64, String) {
+        let mut stream = storage.get_stream(key).await.expect("get_stream");
+        let mut digest = Sha256::new();
+        let mut len = 0i64;
+        while let Some(block) = stream.next().await {
+            let block = block.expect("read block");
+            digest.update(&block);
+            len += block.len() as i64;
+        }
+        (len, format!("{:x}", digest.finalize()))
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn streamed_assembly_live_roundtrip_and_failures() {
+        let Some(storage) = live_backend().await else {
+            println!("Skipping: set AK_STREAMED_ASSEMBLY_LIVE=s3|azure|gcs to run");
+            return;
+        };
+        assert!(
+            storage.supports_streamed_assembly(),
+            "every object-store backend must advertise streamed assembly"
+        );
+
+        let parts = chunks();
+        let mut hasher = Sha256::new();
+        let mut total = 0i64;
+        for part in &parts {
+            hasher.update(part);
+            total += part.len() as i64;
+        }
+        let checksum = format!("{:x}", hasher.finalize());
+        let id = Uuid::new_v4();
+        for (index, part) in parts.iter().enumerate() {
+            storage
+                .put(&staged_chunk_key(id, index as i32), part.clone())
+                .await
+                .expect("stage chunk");
+        }
+        let good = session(id, total, parts.len() as i32, checksum.clone());
+
+        // Happy path: assemble on the backend and verify; the staging object
+        // must hold exactly the staged bytes.
+        let staged = assemble_staged_chunks_on_backend(&storage, &good)
+            .await
+            .expect("assemble on backend");
+        assert_eq!(staged, staged_assembly_key(id));
+        assert_eq!(
+            read_digest(&storage, &staged).await,
+            (total, checksum.clone())
+        );
+
+        // Promote with copy and read the final key back. Azurite does not
+        // serve Put Blob From URL, so `AK_STREAMED_ASSEMBLY_LIVE_SKIP_COPY=1`
+        // skips this step there (the copy primitive predates #3916).
+        let final_key = format!("live-3916/{}", checksum);
+        let copy_checked =
+            std::env::var("AK_STREAMED_ASSEMBLY_LIVE_SKIP_COPY").as_deref() != Ok("1");
+        if copy_checked {
+            storage
+                .copy(&staged, &final_key)
+                .await
+                .expect("promote by copy");
+            assert_eq!(
+                read_digest(&storage, &final_key).await,
+                (total, checksum.clone()),
+                "final object holds the exact staged bytes"
+            );
+        }
+        verify_staged_chunks(&storage, &good)
+            .await
+            .expect("read-only verification of good chunks");
+
+        // A wrong declared digest: refused, and the staging object is gone.
+        storage.delete(&staged).await.expect("drop staging object");
+        let wrong_digest = session(id, total, parts.len() as i32, "0".repeat(64));
+        let err = assemble_staged_chunks_on_backend(&storage, &wrong_digest)
+            .await
+            .expect_err("checksum mismatch must fail");
+        assert!(matches!(err, UploadError::ChecksumMismatch { .. }), "{err}");
+        assert!(
+            !storage.exists(&staged_assembly_key(id)).await.unwrap(),
+            "a failed assembly must not leave its staging object"
+        );
+        let err = verify_staged_chunks(&storage, &wrong_digest)
+            .await
+            .expect_err("read-only verification must fail too");
+        assert!(matches!(err, UploadError::ChecksumMismatch { .. }), "{err}");
+
+        // A wrong declared size: refused as a size mismatch, nothing left.
+        let wrong_size = session(id, total + 1, parts.len() as i32, checksum.clone());
+        let err = assemble_staged_chunks_on_backend(&storage, &wrong_size)
+            .await
+            .expect_err("size mismatch must fail");
+        assert!(matches!(err, UploadError::SizeMismatch { .. }), "{err}");
+        assert!(!storage.exists(&staged_assembly_key(id)).await.unwrap());
+
+        // A missing chunk: a storage error (retryable), nothing left.
+        storage
+            .delete(&staged_chunk_key(id, 2))
+            .await
+            .expect("drop a chunk");
+        let err = assemble_staged_chunks_on_backend(&storage, &good)
+            .await
+            .expect_err("missing chunk must fail");
+        assert!(matches!(err, UploadError::Storage(_)), "{err}");
+        assert!(!storage.exists(&staged_assembly_key(id)).await.unwrap());
+
+        // The purge reclaims every chunk and any assembled object.
+        storage
+            .put(&staged_assembly_key(id), Bytes::from_static(b"leftover"))
+            .await
+            .expect("simulate a leftover assembly");
+        delete_staged_chunk_objects(storage.as_ref(), id, parts.len() as i32)
+            .await
+            .expect("purge");
+        for index in 0..parts.len() as i32 {
+            assert!(!storage.exists(&staged_chunk_key(id, index)).await.unwrap());
+        }
+        assert!(!storage.exists(&staged_assembly_key(id)).await.unwrap());
+        if copy_checked {
+            storage.delete(&final_key).await.expect("cleanup final");
+        }
+        println!("#3916 live streamed assembly OK ({total} bytes)");
     }
 }

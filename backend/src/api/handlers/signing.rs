@@ -14,9 +14,17 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::repository::RepositoryFormat;
-use crate::models::signing_key::{RepositorySigningConfig, SigningKeyPublic};
+use crate::models::signing_key::{
+    RepositorySigningConfig, SigningKeyPublic, SigningKeyTrustAttestation,
+};
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::repository_service::RepositoryService;
-use crate::services::signing_service::{normalize_key_type, CreateKeyRequest, SigningService};
+use crate::services::signing_service::{
+    normalize_key_type, validate_key_spec, CreateKeyRequest, SigningKeyTrustChallenge,
+    SigningService, VerifyTrustAttestationRequest,
+};
 
 /// Create signing key management routes.
 pub fn router() -> Router<SharedState> {
@@ -27,6 +35,18 @@ pub fn router() -> Router<SharedState> {
         .route("/keys/:key_id/revoke", post(revoke_key))
         .route("/keys/:key_id/rotate", post(rotate_key))
         .route("/keys/:key_id/public", get(get_public_key))
+        .route(
+            "/keys/:key_id/trust-attestation",
+            get(get_key_trust_attestation),
+        )
+        .route(
+            "/keys/:key_id/trust-attestation/challenge",
+            get(get_key_trust_attestation_challenge),
+        )
+        .route(
+            "/keys/:key_id/trust-attestation/verify",
+            post(verify_key_trust_attestation),
+        )
         // Repository signing config
         .route(
             "/repositories/:repo_id/config",
@@ -53,8 +73,14 @@ pub struct ListKeysQuery {
 pub struct CreateKeyPayload {
     pub repository_id: Option<Uuid>,
     pub name: String,
-    pub key_type: Option<String>,  // default "rsa"
-    pub algorithm: Option<String>, // default "rsa4096"
+    /// Key family: `gpg` (OpenPGP; required for Debian/RPM metadata signing)
+    /// or `rsa` (X.509 keypair for raw-RSA formats such as Alpine and Conda).
+    /// `rsa2048`/`rsa4096` are accepted as aliases for `rsa`. `ed25519` is
+    /// rejected; use `gpg` with `algorithm=ed25519`. Default: `rsa`.
+    pub key_type: Option<String>,
+    /// `rsa2048`, `rsa4096`, or `ed25519` (with `key_type=gpg` only).
+    /// Default: `rsa4096`, or the `key_type` alias when that names a size.
+    pub algorithm: Option<String>,
     pub uid_name: Option<String>,
     pub uid_email: Option<String>,
 }
@@ -81,6 +107,23 @@ pub struct SigningConfigResponse {
     pub sign_packages: bool,
     pub require_signatures: bool,
     pub key: Option<SigningKeyPublic>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrustAttestationChallengeResponse {
+    pub signing_key_id: Uuid,
+    pub payload: String,
+    pub key_public_key_armored: String,
+    pub key_fingerprint: Option<String>,
+    pub key_type: String,
+    pub algorithm: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct VerifyTrustAttestationPayload {
+    pub issuer_name: Option<String>,
+    pub issuer_public_key_armored: String,
+    pub signature_armored: String,
 }
 
 // --- Handlers ---
@@ -183,6 +226,9 @@ async fn create_key(
 ///   `algorithm`, the variant is used as the algorithm so the requested key
 ///   size is honored.
 /// - Defaults (`rsa` / `rsa4096`) are preserved when fields are omitted.
+/// - The pair must be one the service can generate (`validate_key_spec`):
+///   `gpg` + `ed25519` is an Ed25519 OpenPGP key (#1326); `ed25519` as a
+///   key_type is refused rather than silently producing an RSA key.
 fn resolve_key_type_and_algorithm(
     key_type: Option<String>,
     algorithm: Option<String>,
@@ -198,6 +244,7 @@ fn resolve_key_type_and_algorithm(
             "rsa4096".to_string()
         }
     });
+    validate_key_spec(&family, &algorithm).map_err(AppError::Validation)?;
     Ok((family, algorithm))
 }
 
@@ -205,9 +252,9 @@ fn resolve_key_type_and_algorithm(
 /// signing, at key-creation (config) time rather than at anonymous request time
 /// (#2651).
 ///
-/// Debian (`InRelease`/`Release.gpg`) and RPM (`repomd.xml.asc`) metadata is
-/// signed with OpenPGP (`SigningService::sign_openpgp_*`), which can only load a
-/// `key_type='gpg'` key. An `rsa`/`ed25519` key holds PKCS#8 RSA material that
+/// Debian (`InRelease`/`Release.gpg`), RPM (`repomd.xml.asc`) and pacman
+/// (`{repo}.db.sig`) metadata is signed with OpenPGP
+/// (`SigningService::sign_openpgp_*`), which can only load a `key_type='gpg'` key. An `rsa`/`ed25519` key holds PKCS#8 RSA material that
 /// the OpenPGP path can never parse, so such a key lets the repository boot
 /// green and then fail every `apt`/`dnf` metadata poll — a fail-open config
 /// trap. This turns that latent request-time failure into an actionable 400 at
@@ -221,16 +268,32 @@ fn validate_key_type_for_repo_format(
     format: &RepositoryFormat,
     key_type: &str,
 ) -> std::result::Result<(), String> {
-    let requires_openpgp = matches!(format, RepositoryFormat::Debian | RepositoryFormat::Rpm);
+    let requires_openpgp = matches!(
+        format,
+        RepositoryFormat::Debian | RepositoryFormat::Rpm | RepositoryFormat::Pacman
+    );
     if requires_openpgp && key_type != "gpg" {
         return Err(format!(
             "key_type='{key_type}' cannot sign {format:?} repository metadata. \
-             Debian/RPM metadata (InRelease, Release.gpg, repomd.xml.asc) is OpenPGP-signed \
+             Debian/RPM/pacman metadata (InRelease, Release.gpg, repomd.xml.asc, {{repo}}.db.sig) \
+             is OpenPGP-signed \
              and requires a signing key with key_type='gpg'. Supported key_type for this \
              repository format: gpg."
         ));
     }
     Ok(())
+}
+
+/// The key a signing config update must prove capable, if any: one the request
+/// names, or the bound one when the request turns metadata signing on. Any other
+/// update on a repository that already has an incapable key bound goes through,
+/// so an operator can always turn signing off.
+fn key_needing_capability_check(
+    requested_key: Option<Uuid>,
+    requested_sign_metadata: Option<bool>,
+    current_key: Option<Uuid>,
+) -> Option<Uuid> {
+    requested_key.or(current_key.filter(|_| requested_sign_metadata == Some(true)))
 }
 
 /// Get a signing key by ID.
@@ -309,11 +372,29 @@ async fn revoke_key(
 ) -> Result<Json<serde_json::Value>> {
     require_signing_admin(&auth)?;
     let svc = signing_service(&state);
+    let key = svc.get_key(key_id).await?;
     svc.revoke_key(key_id, Some(auth.user_id)).await?;
+    audit_signing_key(
+        &state,
+        &auth,
+        AuditAction::SigningKeyRevoked,
+        &key,
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(serde_json::json!({"revoked": true})))
 }
 
 /// Rotate a signing key — generates new key, deactivates old one.
+///
+/// The successor keeps the old key's type and algorithm and takes over the
+/// repository's signing config. For an OpenPGP (`gpg`) key the old key keeps
+/// co-signing Debian/RPM metadata, and is still served from `gpg-key.asc` /
+/// `repomd.xml.key`, for `SIGNING_KEY_ROTATION_OVERLAP_SECS` (default 14 days)
+/// so clients that only trust it keep working while the new key rolls out.
+/// **If you are rotating because the old key is compromised, revoke the old
+/// key (`POST /keys/{key_id}/revoke`) right after rotating**: that ends its
+/// overlap immediately.
 #[utoipa::path(
     post,
     path = "/keys/{key_id}/rotate",
@@ -336,7 +417,19 @@ async fn rotate_key(
 ) -> Result<Json<SigningKeyPublic>> {
     require_signing_admin(&auth)?;
     let svc = signing_service(&state);
+    let old_key = svc.get_key(key_id).await?;
     let new_key = svc.rotate_key(key_id, Some(auth.user_id)).await?;
+    audit_signing_key(
+        &state,
+        &auth,
+        AuditAction::SigningKeyRotated,
+        &old_key,
+        serde_json::json!({
+            "new_key_id": new_key.id,
+            "new_fingerprint": new_key.fingerprint,
+        }),
+    )
+    .await;
     Ok(Json(new_key))
 }
 
@@ -362,6 +455,120 @@ async fn get_public_key(
     let svc = signing_service(&state);
     let key = svc.get_key(key_id).await?;
     Ok(key.public_key_pem)
+}
+
+/// Get the stored trust attestation for a signing key, if any.
+#[utoipa::path(
+    get,
+    path = "/keys/{key_id}/trust-attestation",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID")
+    ),
+    responses(
+        (status = 200, description = "Stored trust attestation, or null", body = Option<SigningKeyTrustAttestation>),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_key_trust_attestation(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(key_id): Path<Uuid>,
+) -> Result<Json<Option<SigningKeyTrustAttestation>>> {
+    let svc = signing_service(&state);
+    let _ = svc.get_key(key_id).await?;
+    let attestation = svc.get_trust_attestation(key_id).await?;
+    Ok(Json(attestation))
+}
+
+/// Challenge payload an external issuer key must sign.
+#[utoipa::path(
+    get,
+    path = "/keys/{key_id}/trust-attestation/challenge",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID")
+    ),
+    responses(
+        (status = 200, description = "Attestation challenge", body = TrustAttestationChallengeResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_key_trust_attestation_challenge(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(key_id): Path<Uuid>,
+) -> Result<Json<TrustAttestationChallengeResponse>> {
+    let svc = signing_service(&state);
+    let challenge: SigningKeyTrustChallenge = svc.get_trust_attestation_challenge(key_id).await?;
+    Ok(Json(TrustAttestationChallengeResponse {
+        signing_key_id: challenge.signing_key_id,
+        payload: challenge.payload,
+        key_public_key_armored: challenge.key_public_key_armored,
+        key_fingerprint: challenge.key_fingerprint,
+        key_type: challenge.key_type,
+        algorithm: challenge.algorithm,
+    }))
+}
+
+/// Verify a detached OpenPGP signature over the challenge payload and store it.
+///
+/// Success means the signature is cryptographically valid (`signature_valid`),
+/// not that the issuer is a pinned trust anchor (#2462).
+#[utoipa::path(
+    post,
+    path = "/keys/{key_id}/trust-attestation/verify",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    request_body = VerifyTrustAttestationPayload,
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID")
+    ),
+    responses(
+        (status = 200, description = "Stored attestation", body = SigningKeyTrustAttestation),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "A different issuer already attested this key", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn verify_key_trust_attestation(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(key_id): Path<Uuid>,
+    Json(payload): Json<VerifyTrustAttestationPayload>,
+) -> Result<Json<SigningKeyTrustAttestation>> {
+    require_signing_admin(&auth)?;
+    let svc = signing_service(&state);
+    let key = svc.get_key(key_id).await?;
+    let attestation = svc
+        .verify_and_store_trust_attestation(VerifyTrustAttestationRequest {
+            signing_key_id: key_id,
+            issuer_name: payload.issuer_name,
+            issuer_public_key_armored: payload.issuer_public_key_armored,
+            signature_armored: payload.signature_armored,
+            created_by: Some(auth.user_id),
+        })
+        .await?;
+    audit_signing_key(
+        &state,
+        &auth,
+        AuditAction::SigningKeyTrustAttested,
+        &key,
+        serde_json::json!({
+            "issuer_fingerprint": attestation.issuer_fingerprint,
+            "issuer_name": attestation.issuer_name,
+            "verification_status": attestation.verification_status,
+        }),
+    )
+    .await;
+    Ok(Json(attestation))
 }
 
 /// Get signing configuration for a repository.
@@ -425,8 +632,9 @@ async fn get_repo_signing_config(
     request_body = UpdateSigningConfigPayload,
     responses(
         (status = 200, description = "Updated signing configuration", body = RepositorySigningConfig),
+        (status = 400, description = "The key cannot sign this repository's metadata", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
-        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository or signing key not found", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -442,6 +650,19 @@ async fn update_repo_signing_config(
     // Get existing config to merge with updates
     let existing = svc.get_signing_config(repo_id).await?;
     let (cur_key, cur_meta, cur_pkg, cur_req) = signing_config_fields(existing.as_ref());
+
+    // #5198: the same refusal as key creation (#2651), which a global key or one
+    // made before that check never met.
+    if let Some(key_id) =
+        key_needing_capability_check(payload.signing_key_id, payload.sign_metadata, cur_key)
+    {
+        let repo = RepositoryService::new(state.db.clone())
+            .get_by_id(repo_id)
+            .await?;
+        let key = svc.get_key(key_id).await?;
+        validate_key_type_for_repo_format(&repo.format, &key.key_type)
+            .map_err(AppError::Validation)?;
+    }
 
     let config = svc
         .update_signing_config(
@@ -483,6 +704,7 @@ async fn get_repo_public_key(
 
 fn signing_service(state: &SharedState) -> SigningService {
     SigningService::new(state.db.clone(), &state.config.jwt_secret)
+        .with_rotation_overlap(state.config.signing_key_rotation_overlap_secs)
 }
 
 /// Response from a deliberate per-artifact signing action (#2535).
@@ -519,7 +741,7 @@ pub struct SignArtifactResponse {
         (status = 200, description = "Artifact signed; attestation recorded", body = SignArtifactResponse),
         (status = 403, description = "Admin privilege required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Artifact not found or not eligible for signing", body = crate::api::openapi::ErrorResponse),
-        (status = 409, description = "Repository has no active signing key/config", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Repository cannot sign artifacts: no signing config, no active key, or sign_packages disabled", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -553,18 +775,27 @@ async fn sign_artifact(
     let location = crate::storage::StorageLocation { backend, path };
     let storage = state.storage_for_repo(&location)?;
     let content = storage.get(&storage_key).await.map_err(|e| {
-        AppError::NotFound(format!("Artifact content unavailable for signing: {e}"))
+        // An outage or full store keeps its own status (#5649); any other
+        // failure is "not available", without the storage error's text,
+        // which names keys and backends and can carry the class marker.
+        if e.storage_failure().is_some() {
+            return e;
+        }
+        tracing::warn!(error = %e, storage_key = %storage_key, "artifact content unavailable for signing");
+        AppError::NotFound("Artifact content unavailable for signing".to_string())
     })?;
 
-    let signed = signing_service(&state)
+    let svc = signing_service(&state);
+    let Some(signed) = svc
         .sign_artifact_content(repository_id, artifact_id, &content, Some(auth.user_id))
         .await?
-        .ok_or_else(|| {
-            AppError::Conflict(
-                "Repository has no active signing key or signing config; configure one before signing artifacts"
-                    .to_string(),
-            )
-        })?;
+    else {
+        // Name the missing setting rather than a generic "no key or config" (#5208).
+        return Err(AppError::Conflict(
+            svc.content_signing_unavailable_reason(repository_id)
+                .await?,
+        ));
+    };
 
     Ok(Json(SignArtifactResponse {
         artifact_id,
@@ -572,6 +803,37 @@ async fn sign_artifact(
         algorithm: signed.algorithm,
         signature_sha256: signed.signature_sha256,
     }))
+}
+
+/// Record a signing-key rotation or revocation (#4710), best-effort, against
+/// the key acted on. Identifies the key (id, name, type, algorithm,
+/// fingerprint, repository); never key material, public or private.
+async fn audit_signing_key(
+    state: &SharedState,
+    auth: &AuthExtension,
+    action: AuditAction,
+    key: &SigningKeyPublic,
+    extra: serde_json::Value,
+) {
+    let mut details = serde_json::json!({
+        "key_id": key.id,
+        "name": key.name,
+        "key_type": key.key_type,
+        "algorithm": key.algorithm,
+        "fingerprint": key.fingerprint,
+        "repository_id": key.repository_id,
+    });
+    if let (Some(map), serde_json::Value::Object(extra)) = (details.as_object_mut(), extra) {
+        map.extend(extra);
+    }
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(action, ResourceType::SigningKey, auth)
+            .resource(key.id)
+            .resource_name(key.name.clone())
+            .details(details),
+    )
+    .await;
 }
 
 /// Admin gate shared by the signing-key/repo-config mutation handlers.
@@ -610,6 +872,9 @@ fn signing_config_fields(
         revoke_key,
         rotate_key,
         get_public_key,
+        get_key_trust_attestation,
+        get_key_trust_attestation_challenge,
+        verify_key_trust_attestation,
         get_repo_signing_config,
         update_repo_signing_config,
         get_repo_public_key,
@@ -621,6 +886,9 @@ fn signing_config_fields(
         UpdateSigningConfigPayload,
         KeyListResponse,
         SigningConfigResponse,
+        TrustAttestationChallengeResponse,
+        VerifyTrustAttestationPayload,
+        SigningKeyTrustAttestation,
         SignArtifactResponse,
     ))
 )]
@@ -682,10 +950,17 @@ mod tests {
     }
 
     #[test]
+    fn test_pacman_requires_gpg_key_type() {
+        // `{repo}.db.sig` is a detached OpenPGP signature (#3343).
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Pacman, "rsa").is_err());
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Pacman, "gpg").is_ok());
+    }
+
+    #[test]
     fn test_debian_rejects_ed25519_key_type() {
-        // ed25519 is not an OpenPGP key either (and is not even generated as a
-        // real ed25519 key — it falls through to RSA keygen), so it also cannot
-        // satisfy the Debian/RPM OpenPGP metadata path.
+        // A legacy key_type='ed25519' row holds RSA material (new ones are
+        // refused, #1326), so it cannot satisfy the Debian/RPM OpenPGP
+        // metadata path. An Ed25519 OpenPGP key is key_type='gpg'.
         assert!(validate_key_type_for_repo_format(&RepositoryFormat::Debian, "ed25519").is_err());
     }
 
@@ -843,6 +1118,7 @@ mod tests {
             "rotate_key",
             "update_repo_signing_config",
             "sign_artifact",
+            "verify_key_trust_attestation",
         ] {
             assert!(
                 signing_handler_body(name).contains("require_signing_admin"),
@@ -1056,10 +1332,32 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_ed25519_key_type_preserved() {
-        let (key_type, _) =
-            resolve_key_type_and_algorithm(Some("ed25519".to_string()), None).unwrap();
-        assert_eq!(key_type, "ed25519");
+    fn test_resolve_ed25519_key_type_is_rejected() {
+        // key_type='ed25519' used to fall through to RSA keygen and store an
+        // RSA keypair labelled ed25519 (#1326). It is now a clean 400 that
+        // points at the real Ed25519 option.
+        let err = resolve_key_type_and_algorithm(Some("ed25519".to_string()), None).unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("key_type='gpg'"), "{msg}"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_gpg_ed25519_pair_accepted() {
+        let (key_type, algorithm) =
+            resolve_key_type_and_algorithm(Some("gpg".to_string()), Some("ed25519".to_string()))
+                .unwrap();
+        assert_eq!(key_type, "gpg");
+        assert_eq!(algorithm, "ed25519");
+    }
+
+    #[test]
+    fn test_resolve_rsa_family_rejects_ed25519_algorithm() {
+        let err =
+            resolve_key_type_and_algorithm(Some("rsa".to_string()), Some("ed25519".to_string()))
+                .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
     }
 
     #[test]
@@ -1454,5 +1752,359 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, member).await;
         tdh::cleanup_user(&pool, outsider).await;
+    }
+
+    /// #4710: rotating and revoking a signing key each write one audit row
+    /// naming the admin and the key (id, algorithm, fingerprint), never key
+    /// material.
+    #[tokio::test]
+    async fn test_rotate_and_revoke_are_audited() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let mut admin = admin_jwt();
+        admin.user_id = user_id;
+        let sdir = std::env::temp_dir().join(format!("sk4710-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+        let payload = CreateKeyPayload {
+            repository_id: Some(repo_id),
+            name: format!("k4710-{}", &Uuid::new_v4().to_string()[..8]),
+            key_type: Some("rsa".to_string()),
+            algorithm: Some("rsa2048".to_string()),
+            uid_name: None,
+            uid_email: None,
+        };
+        let created = create_key(
+            State(state.clone()),
+            Extension(admin.clone()),
+            Json(payload),
+        )
+        .await
+        .expect("create key")
+        .0;
+
+        let rotated = rotate_key(
+            State(state.clone()),
+            Extension(admin.clone()),
+            Path(created.id),
+        )
+        .await
+        .expect("rotate key")
+        .0;
+        let revoked = revoke_key(State(state.clone()), Extension(admin), Path(rotated.id)).await;
+        let rotate_row = tdh::audit_row_eventually(&pool, created.id, "SIGNING_KEY_ROTATED").await;
+        let revoke_row = tdh::audit_row_eventually(&pool, rotated.id, "SIGNING_KEY_REVOKED").await;
+
+        for sql in [
+            "DELETE FROM repository_signing_config WHERE repository_id = $1",
+            "DELETE FROM signing_keys WHERE repository_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(repo_id).execute(&pool).await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(revoked.is_ok(), "revoke must succeed: {revoked:?}");
+        assert_eq!(rotate_row.user_id, Some(user_id));
+        assert_eq!(rotate_row.resource_type, "signing_key");
+        assert_eq!(rotate_row.details["key_id"], created.id.to_string());
+        assert_eq!(rotate_row.details["new_key_id"], rotated.id.to_string());
+        assert_eq!(rotate_row.details["algorithm"], created.algorithm.as_str());
+        assert_eq!(revoke_row.user_id, Some(user_id));
+        assert_eq!(revoke_row.details["key_id"], rotated.id.to_string());
+        assert_eq!(
+            revoke_row.details["fingerprint"],
+            json_or_null(&rotated.fingerprint)
+        );
+        for row in [&rotate_row, &revoke_row] {
+            let text = row.details.to_string();
+            assert!(
+                !text.contains("BEGIN"),
+                "a signing-key audit row must not carry key material: {text}"
+            );
+        }
+    }
+
+    /// #4282: verifying a trust attestation through the handler stores it,
+    /// writes one SIGNING_KEY_TRUST_ATTESTED audit row naming the admin and
+    /// the issuer fingerprint, and refuses an over-long issuer name with a
+    /// validation error instead of a database error.
+    #[tokio::test]
+    async fn test_verify_trust_attestation_is_audited() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let mut admin = admin_jwt();
+        admin.user_id = user_id;
+        let sdir = std::env::temp_dir().join(format!("sk4282-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+        let svc = signing_service(&state);
+        let mk = |name: &str| CreateKeyRequest {
+            repository_id: Some(repo_id),
+            name: format!("{name}-{}", &Uuid::new_v4().to_string()[..8]),
+            key_type: "gpg".to_string(),
+            algorithm: "rsa2048".to_string(),
+            uid_name: Some("AK 4282".to_string()),
+            uid_email: None,
+            created_by: None,
+        };
+        let target = svc
+            .create_key(mk("k4282-target"))
+            .await
+            .expect("target key");
+        let issuer = svc
+            .create_key(mk("k4282-issuer"))
+            .await
+            .expect("issuer key");
+        let issuer_full: crate::models::signing_key::SigningKey =
+            sqlx::query_as("SELECT * FROM signing_keys WHERE id = $1")
+                .bind(issuer.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load issuer key");
+        let challenge = svc
+            .get_trust_attestation_challenge(target.id)
+            .await
+            .expect("challenge");
+        let signature = svc
+            .sign_openpgp_detached_with_key(&issuer_full, challenge.payload.as_bytes())
+            .await
+            .expect("issuer signature");
+
+        let too_long = verify_key_trust_attestation(
+            State(state.clone()),
+            Extension(admin.clone()),
+            Path(target.id),
+            Json(VerifyTrustAttestationPayload {
+                issuer_name: Some("x".repeat(256)),
+                issuer_public_key_armored: issuer.public_key_pem.clone(),
+                signature_armored: signature.clone(),
+            }),
+        )
+        .await;
+        let stored = verify_key_trust_attestation(
+            State(state.clone()),
+            Extension(admin),
+            Path(target.id),
+            Json(VerifyTrustAttestationPayload {
+                issuer_name: Some("offline-root".to_string()),
+                issuer_public_key_armored: issuer.public_key_pem.clone(),
+                signature_armored: signature,
+            }),
+        )
+        .await;
+        let row = tdh::audit_row_eventually(&pool, target.id, "SIGNING_KEY_TRUST_ATTESTED").await;
+
+        for sql in [
+            "DELETE FROM repository_signing_config WHERE repository_id = $1",
+            "DELETE FROM signing_keys WHERE repository_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(repo_id).execute(&pool).await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(
+            matches!(too_long, Err(AppError::Validation(_))),
+            "an over-long issuer_name is a validation error: {too_long:?}"
+        );
+        let stored = stored.expect("verify attestation").0;
+        assert_eq!(stored.verification_status, "signature_valid");
+        assert_eq!(row.user_id, Some(user_id));
+        assert_eq!(row.resource_type, "signing_key");
+        assert_eq!(row.details["key_id"], target.id.to_string());
+        assert_eq!(
+            row.details["issuer_fingerprint"],
+            stored.issuer_fingerprint.as_str()
+        );
+        assert_eq!(row.details["issuer_name"], "offline-root");
+        assert!(
+            !row.details.to_string().contains("BEGIN"),
+            "the attestation audit row must not carry key material"
+        );
+    }
+
+    fn json_or_null(value: &Option<String>) -> serde_json::Value {
+        value
+            .as_deref()
+            .map_or(serde_json::Value::Null, serde_json::Value::from)
+    }
+}
+
+/// #5198: the config route is the other way a key reaches a repository, so it
+/// refuses what key creation refuses (#2651), while leaving an operator able to
+/// turn signing off on a repository that already has such a key bound.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod config_route_key_capability_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::signing_service::{SigningService, ED25519_ALGORITHM};
+    use axum::body::Bytes;
+    use axum::http::StatusCode;
+
+    async fn new_key(f: &tdh::Fixture, key_type: &str) -> Uuid {
+        let (key_type_owned, algorithm) = match key_type {
+            "gpg" => ("gpg".to_string(), ED25519_ALGORITHM.to_string()),
+            other => (other.to_string(), "rsa2048".to_string()),
+        };
+        SigningService::new(f.pool.clone(), &f.state.config.jwt_secret)
+            .create_key(CreateKeyRequest {
+                repository_id: None,
+                name: format!("cfg-5198-{}", Uuid::new_v4()),
+                key_type: key_type_owned,
+                algorithm,
+                uid_name: None,
+                uid_email: None,
+                created_by: None,
+            })
+            .await
+            .expect("create signing key")
+            .id
+    }
+
+    async fn post_config(
+        f: &tdh::Fixture,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let app = tdh::router_with_auth_ext(
+            super::router(),
+            f.state.clone(),
+            tdh::admin_auth(f.user_id, &f.username),
+        );
+        let (status, body) = tdh::send(
+            app,
+            tdh::post(
+                format!("/repositories/{}/config", f.repo_id),
+                "application/json",
+                Bytes::from(body.to_string()),
+            ),
+        )
+        .await;
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn bound_key(f: &tdh::Fixture) -> Option<Uuid> {
+        sqlx::query_scalar(
+            "SELECT signing_key_id FROM repository_signing_config WHERE repository_id = $1",
+        )
+        .bind(f.repo_id)
+        .fetch_optional(&f.pool)
+        .await
+        .expect("read binding")
+        .flatten()
+    }
+
+    async fn delete_keys(f: &tdh::Fixture, keys: &[Uuid]) {
+        sqlx::query("DELETE FROM repository_signing_config WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("delete signing config");
+        sqlx::query("DELETE FROM signing_keys WHERE id = ANY($1)")
+            .bind(keys)
+            .execute(&f.pool)
+            .await
+            .expect("delete signing keys");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_non_openpgp_key_on_every_openpgp_format_5198() {
+        for format in ["debian", "rpm", "pacman"] {
+            let Some(f) = tdh::Fixture::setup("local", format).await else {
+                return;
+            };
+            let rsa = new_key(&f, "rsa").await;
+            let (status, body) = post_config(
+                &f,
+                serde_json::json!({"signing_key_id": rsa, "sign_metadata": true}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{format}: {body}");
+            assert!(
+                body.to_string().contains("key_type='gpg'"),
+                "{format}: the refusal must name the key type that works: {body}"
+            );
+            assert_eq!(bound_key(&f).await, None, "{format}: nothing was bound");
+
+            let gpg = new_key(&f, "gpg").await;
+            let (status, body) = post_config(
+                &f,
+                serde_json::json!({"signing_key_id": gpg, "sign_metadata": true}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{format}: {body}");
+            assert_eq!(bound_key(&f).await, Some(gpg), "{format}");
+
+            delete_keys(&f, &[rsa, gpg]).await;
+            f.teardown().await;
+        }
+    }
+
+    /// A format whose signatures are not OpenPGP keeps accepting an rsa key.
+    #[tokio::test]
+    async fn still_accepts_an_rsa_key_on_a_format_that_can_use_it_5198() {
+        let Some(f) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let rsa = new_key(&f, "rsa").await;
+        let (status, body) = post_config(
+            &f,
+            serde_json::json!({"signing_key_id": rsa, "sign_metadata": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(bound_key(&f).await, Some(rsa));
+        delete_keys(&f, &[rsa]).await;
+        f.teardown().await;
+    }
+
+    /// An existing bad binding must not lock the operator out: signing can be
+    /// turned off and other flags changed, but it cannot be turned back on, and
+    /// the same key cannot be named again.
+    #[tokio::test]
+    async fn existing_rsa_binding_can_be_switched_off_but_not_on_5198() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let rsa = new_key(&f, "rsa").await;
+        let svc = SigningService::new(f.pool.clone(), &f.state.config.jwt_secret);
+        svc.update_signing_config(f.repo_id, Some(rsa), true, false, false)
+            .await
+            .expect("seed a binding from before the route's check");
+
+        let (status, body) = post_config(&f, serde_json::json!({"sign_metadata": false})).await;
+        assert_eq!(status, StatusCode::OK, "switching off: {body}");
+        let (status, body) =
+            post_config(&f, serde_json::json!({"require_signatures": false})).await;
+        assert_eq!(status, StatusCode::OK, "unrelated flag: {body}");
+
+        let (status, body) = post_config(&f, serde_json::json!({"sign_metadata": true})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "switching on: {body}");
+        let (status, body) = post_config(&f, serde_json::json!({"signing_key_id": rsa})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "naming it again: {body}");
+
+        delete_keys(&f, &[rsa]).await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_key_is_not_found_5198() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let (status, body) =
+            post_config(&f, serde_json::json!({"signing_key_id": Uuid::new_v4()})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        f.teardown().await;
     }
 }

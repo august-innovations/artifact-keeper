@@ -37,32 +37,71 @@
 # Deleting a release line needs the same toggle for the same reason: the
 # `deletion` rule has no bypass actor either.
 #
+# THE MATCHING TEST-SUITE BRANCH (#4372)
+# --------------------------------------
+# The Release Gate is artifact-keeper-test's release-gate.yml@main, and every
+# one of its jobs runs scripts/switch-tests-ref.sh (artifact-keeper-test#420):
+# if that repository has a `release/X.Y.x` for the candidate's version, the
+# suite runs from it, otherwise from main. Without the branch a maintenance
+# candidate is gated by main's suite, which keeps gaining companion tests for
+# features the line never gets -- that is what failed ten suites on the
+# v1.10.2 candidate (#4350). So a line is created in BOTH repositories, the
+# test branch at the suite commit that certified the line's first release:
+#
+#   --tests-from-run <id>  the successful Release Candidate run that certified
+#                          v<X.Y>.0; the commit is the release-gate.yml sha
+#                          GitHub recorded for that run (`referenced_workflows`)
+#   --tests-sha <sha>      that commit, given directly (40 hex)
+#
+# The commit must be on artifact-keeper-test's main. artifact-keeper-test has
+# no ruleset on `release/*`, so this is a plain ref creation, outside the
+# toggle window, and nothing needs dispatching: the gate reads the branch when
+# a candidate runs. It is idempotent: a test branch that already exists is
+# left where it is (backported companion tests are cherry-picked onto it,
+# artifact-keeper-test#424, so its tip legitimately moves), and re-running the
+# script for a line whose backend branch already exists only creates the test
+# branch -- which is how a failed test-branch creation is retried, and how an
+# older line gets one.
+#
 # Runs locally, on a workstation, by a human admin -- so the messages here are
 # plain text, not `::error` workflow annotations.
 #
-# Usage:  create-release-line.sh [--dry-run] <X.Y> [<sha>]
+# Usage:  create-release-line.sh [--dry-run] [--tests-from-run <id> | --tests-sha <sha>] <X.Y> [<sha>]
 #
 # Env:
-#   RELEASE_LINE_REPO     owner/repo   (default artifact-keeper/artifact-keeper)
-#   RELEASE_LINE_RULESET  ruleset id   (default 20038606)
+#   RELEASE_LINE_REPO        owner/repo   (default artifact-keeper/artifact-keeper)
+#   RELEASE_LINE_RULESET     ruleset id   (default 20038606)
+#   RELEASE_LINE_TESTS_REPO  owner/repo   (default artifact-keeper/artifact-keeper-test)
 #
 # Exit codes: 0 created (or dry run passed), 1 refused / failed.
 set -euo pipefail
 
 REPO="${RELEASE_LINE_REPO:-artifact-keeper/artifact-keeper}"
 RULESET="${RELEASE_LINE_RULESET:-20038606}"
+TESTS_REPO="${RELEASE_LINE_TESTS_REPO:-artifact-keeper/artifact-keeper-test}"
 DRY_RUN=0
+TESTS_RUN=""
+TESTS_SHA=""
 RELAXED_SECONDS=0
 
 usage() {
   cat <<USAGE
-usage: $(basename "$0") [--dry-run] <X.Y> [<sha>]
+usage: $(basename "$0") [--dry-run] [--tests-from-run <id> | --tests-sha <sha>] <X.Y> [<sha>]
 
 Creates refs/heads/release/<X.Y>.x at <sha> (default: the commit tagged
 v<X.Y>.0) by putting ruleset ${RULESET} into 'evaluate' for the length of one
-API call and back to 'active' from a trap.
+API call and back to 'active' from a trap, then creates the matching
+release/<X.Y>.x in ${TESTS_REPO} at the suite commit that certified v<X.Y>.0.
 
-  --dry-run   run every check and print the plan; change nothing
+  --dry-run               run every check and print the plan; change nothing
+  --tests-from-run <id>   the successful Release Candidate run that certified
+                          v<X.Y>.0; the test branch starts at the release-gate
+                          commit that run used
+  --tests-sha <sha>       the test-suite commit, given directly (40 hex)
+
+One of the two --tests-* options is required unless ${TESTS_REPO} already has
+the branch. If release/<X.Y>.x already exists here, only the test branch is
+created.
 USAGE
 }
 
@@ -75,6 +114,12 @@ args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
+    --tests-from-run)
+      [[ $# -ge 2 ]] || die "--tests-from-run needs a run id."
+      TESTS_RUN="$2"; shift 2 ;;
+    --tests-sha)
+      [[ $# -ge 2 ]] || die "--tests-sha needs a commit sha."
+      TESTS_SHA="$2"; shift 2 ;;
     -h | --help) usage; exit 0 ;;
     -*) usage >&2; die "unknown option '$1'." ;;
     *) args+=("$1"); shift ;;
@@ -86,6 +131,10 @@ if [[ ${#args[@]} -lt 1 || ${#args[@]} -gt 2 ]]; then
 fi
 LINE="${args[0]}"
 SHA="${args[1]:-}"
+[[ -z "$TESTS_RUN" || -z "$TESTS_SHA" ]] \
+  || die "pass --tests-from-run or --tests-sha, not both."
+[[ -z "$TESTS_RUN" || "$TESTS_RUN" =~ ^[1-9][0-9]*$ ]] \
+  || die "--tests-from-run takes a numeric run id (got '${TESTS_RUN}')."
 
 # The branch name is the ruleset's include pattern, not a free choice. The
 # pattern was narrowed to `refs/heads/release/[0-9]*.[0-9]*.x` so working
@@ -109,53 +158,147 @@ git fetch --quiet --tags origin \
   || die "'git fetch origin' failed; refusing to reason about a stale origin/main."
 
 # 3. The line must not already exist. Re-running is not free: the second POST
-#    fails, but only after the ruleset has already been relaxed.
+#    fails, but only after the ruleset has already been relaxed. The one
+#    exception is a run that names a test-suite commit: that only creates the
+#    test branch (retrying a failed one, or giving an older line one), and
+#    never touches the ruleset.
+BACKEND_EXISTS=0
 if git ls-remote --exit-code --heads origin "refs/heads/${BRANCH}" > /dev/null 2>&1; then
-  die "${BRANCH} already exists; an existing line needs no toggle (RELEASING.md, 'Patch releases from a release/X.Y.x branch')."
+  [[ -n "$TESTS_RUN$TESTS_SHA" ]] \
+    || die "${BRANCH} already exists; an existing line needs no toggle (RELEASING.md, 'Patch releases from a release/X.Y.x branch'). To give it a ${TESTS_REPO} branch, re-run with --tests-from-run or --tests-sha."
+  BACKEND_EXISTS=1
 fi
 
-# 4. The commit. Default to the tag that opened the line: that is what a cut
-#    actually wants, and a hand-typed sha is where this goes wrong.
-TAG="v${LINE}.0"
-TAG_NOTE=""
-if [[ -z "$SHA" ]]; then
-  SHA="$(git rev-parse --verify --quiet "refs/tags/${TAG}^{commit}" || true)"
-  [[ -n "$SHA" ]] \
-    || die "there is no tag ${TAG}, so there is no default commit; pass the full 40-character sha explicitly."
-  TAG_NOTE=", tagged ${TAG}"
+VERSION=""
+if [[ $BACKEND_EXISTS -eq 0 ]]; then
+  # 4. The commit. Default to the tag that opened the line: that is what a cut
+  #    actually wants, and a hand-typed sha is where this goes wrong.
+  TAG="v${LINE}.0"
+  TAG_NOTE=""
+  if [[ -z "$SHA" ]]; then
+    SHA="$(git rev-parse --verify --quiet "refs/tags/${TAG}^{commit}" || true)"
+    [[ -n "$SHA" ]] \
+      || die "there is no tag ${TAG}, so there is no default commit; pass the full 40-character sha explicitly."
+    TAG_NOTE=", tagged ${TAG}"
+  fi
+  [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] \
+    || die "'${SHA}' is not a full 40-character commit sha. Abbreviations and ref names are refused; the sha is what the audit line records."
+  git rev-parse --verify --quiet "${SHA}^{commit}" > /dev/null \
+    || die "${SHA} is not a commit in this clone."
+
+  # 5. Reachable from main. The release line's whole premise is that its content
+  #    came through main -- 'Verify commits trace back to main' enforces it for
+  #    every later commit, and nothing enforces it for the root one but this.
+  git merge-base --is-ancestor "$SHA" origin/main \
+    || die "${SHA} is not reachable from origin/main. A release line starts at a commit that is on main."
+
+  # 6. ...and the version at that commit must belong to THIS line, or the branch
+  #    name and `resolve-certified-ref.sh`'s derivation from Cargo.toml disagree
+  #    from the first commit onwards.
+  cargo_toml="$(git show "${SHA}:Cargo.toml" 2> /dev/null)" || die "${SHA} has no Cargo.toml."
+  VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' <<< "$cargo_toml" | head -1)"
+  [[ "$VERSION" == "${LINE}."* ]] \
+    || die "Cargo.toml at ${SHA} says version '${VERSION:-<none>}', which is not on the ${LINE} line."
 fi
-[[ "$SHA" =~ ^[0-9a-f]{40}$ ]] \
-  || die "'${SHA}' is not a full 40-character commit sha. Abbreviations and ref names are refused; the sha is what the audit line records."
-git rev-parse --verify --quiet "${SHA}^{commit}" > /dev/null \
-  || die "${SHA} is not a commit in this clone."
 
-# 5. Reachable from main. The release line's whole premise is that its content
-#    came through main -- 'Verify commits trace back to main' enforces it for
-#    every later commit, and nothing enforces it for the root one but this.
-git merge-base --is-ancestor "$SHA" origin/main \
-  || die "${SHA} is not reachable from origin/main. A release line starts at a commit that is on main."
-
-# 6. ...and the version at that commit must belong to THIS line, or the branch
-#    name and `resolve-certified-ref.sh`'s derivation from Cargo.toml disagree
-#    from the first commit onwards.
-cargo_toml="$(git show "${SHA}:Cargo.toml" 2> /dev/null)" || die "${SHA} has no Cargo.toml."
-VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' <<< "$cargo_toml" | head -1)"
-[[ "$VERSION" == "${LINE}."* ]] \
-  || die "Cargo.toml at ${SHA} says version '${VERSION:-<none>}', which is not on the ${LINE} line."
+# 7. The test-suite branch (#4372). Resolved and checked here, before
+#    anything is relaxed, like everything above.
+tests_push="$(gh api "repos/${TESTS_REPO}" --jq '.permissions.push' 2> /dev/null || true)"
+[[ "$tests_push" == "true" ]] \
+  || die "gh must be able to push to ${TESTS_REPO} (.permissions.push = '${tests_push:-<unreadable>}')."
+# On a 404, gh still prints the error body to stdout, so the exit status and
+# the shape of the answer are what decide, not whether anything was printed.
+TESTS_EXISTING="$(gh api "repos/${TESTS_REPO}/branches/${BRANCH//\//%2F}" --jq '.commit.sha' 2> /dev/null)" \
+  || TESTS_EXISTING=""
+[[ -z "$TESTS_EXISTING" || "$TESTS_EXISTING" =~ ^[0-9a-f]{40}$ ]] \
+  || die "could not read ${BRANCH} in ${TESTS_REPO} (got '${TESTS_EXISTING}')."
+TESTS_NOTE=""
+if [[ -n "$TESTS_RUN" ]]; then
+  run_info="$(gh api "repos/${REPO}/actions/runs/${TESTS_RUN}" \
+    --jq '[.name, .conclusion, ([.referenced_workflows[]? | select(.path | startswith("'"${TESTS_REPO}"'/.github/workflows/release-gate.yml@")) | .sha] | first // "")] | join(" ")' \
+    2> /dev/null)" || die "could not read run ${TESTS_RUN} of ${REPO}."
+  read -r -a run_fields <<< "$run_info"
+  # name is "Release Candidate": two words, then conclusion, then the sha.
+  [[ "${run_fields[0]:-} ${run_fields[1]:-}" == "Release Candidate" ]] \
+    || die "run ${TESTS_RUN} is not a Release Candidate run ('${run_info}')."
+  [[ "${run_fields[2]:-}" == "success" ]] \
+    || die "run ${TESTS_RUN} concluded '${run_fields[2]:-<none>}', not success: it certified nothing."
+  TESTS_SHA="${run_fields[3]:-}"
+  [[ -n "$TESTS_SHA" ]] \
+    || die "run ${TESTS_RUN} records no ${TESTS_REPO} release-gate.yml commit; pass --tests-sha instead."
+  TESTS_NOTE=", the release-gate.yml commit of Release Candidate run ${TESTS_RUN}"
+fi
+if [[ -n "$TESTS_SHA" ]]; then
+  [[ "$TESTS_SHA" =~ ^[0-9a-f]{40}$ ]] \
+    || die "test-suite commit '${TESTS_SHA}' is not a full 40-character sha."
+  # compare main...<sha>: 'behind' or 'identical' means <sha> is on main.
+  tests_rel="$(gh api "repos/${TESTS_REPO}/compare/main...${TESTS_SHA}" --jq '.status' 2> /dev/null || true)"
+  [[ "$tests_rel" == "behind" || "$tests_rel" == "identical" ]] \
+    || die "${TESTS_SHA} is not on ${TESTS_REPO} main (compare status '${tests_rel:-<unreadable>}')."
+elif [[ -z "$TESTS_EXISTING" ]]; then
+  die "${TESTS_REPO} has no ${BRANCH}; pass --tests-from-run <the Release Candidate run that certified v${LINE}.0> or --tests-sha <40-hex>, so the line's candidates are not gated by main's suite (#4372)."
+fi
+if [[ -n "$TESTS_EXISTING" ]]; then
+  TESTS_PLAN="exists at ${TESTS_EXISTING}; left as is"
+  [[ -z "$TESTS_SHA" || "$TESTS_SHA" == "$TESTS_EXISTING" ]] \
+    || TESTS_PLAN+=" (not moved to ${TESTS_SHA}: its tip carries cherry-picked companion tests, artifact-keeper-test#424)"
+else
+  TESTS_PLAN="create at ${TESTS_SHA}${TESTS_NOTE}"
+fi
 
 WHO="$(gh api user --jq '.login' 2> /dev/null || echo '<unknown>')"
 STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-cat <<PLAN
+if [[ $BACKEND_EXISTS -eq 1 ]]; then
+  cat <<PLAN
+== create release line ==
+repo:    ${REPO}
+branch:  refs/heads/${BRANCH} (exists; not touched, ruleset not toggled)
+tests:   ${TESTS_REPO} refs/heads/${BRANCH}: ${TESTS_PLAN}
+by:      ${WHO} at ${STARTED}
+PLAN
+else
+  cat <<PLAN
 == create release line ==
 repo:    ${REPO}
 branch:  refs/heads/${BRANCH}
 sha:     ${SHA} (version ${VERSION}${TAG_NOTE})
 ruleset: ${RULESET} -> evaluate, create the ref, -> active
+tests:   ${TESTS_REPO} refs/heads/${BRANCH}: ${TESTS_PLAN}
 by:      ${WHO} at ${STARTED}
 PLAN
+fi
 
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "--dry-run: every precondition passed and nothing was changed."
+  exit 0
+fi
+
+# Outside the toggle window: artifact-keeper-test has no ruleset on release/*.
+# Verified afterwards rather than assumed, like the backend ref.
+TESTS_AUDIT=""
+create_tests_branch() {
+  if [[ -n "$TESTS_EXISTING" ]]; then
+    TESTS_AUDIT="\`${TESTS_REPO}\` \`refs/heads/${BRANCH}\` already existed at \`${TESTS_EXISTING}\`; left as is."
+    return 0
+  fi
+  gh api -X POST "repos/${TESTS_REPO}/git/refs" -f "ref=refs/heads/${BRANCH}" -f "sha=${TESTS_SHA}" > /dev/null \
+    || die "could not create ${BRANCH} in ${TESTS_REPO}. Re-run this script with the same arguments: the backend line now exists, so it only creates the test branch."
+  local got
+  got="$(gh api "repos/${TESTS_REPO}/branches/${BRANCH//\//%2F}" --jq '.commit.sha' 2> /dev/null)" || got=""
+  [[ "$got" == "$TESTS_SHA" ]] \
+    || die "${TESTS_REPO} refs/heads/${BRANCH} points at '${got:-<missing>}', not ${TESTS_SHA}."
+  TESTS_AUDIT="Created \`${TESTS_REPO}\` \`refs/heads/${BRANCH}\` at \`${TESTS_SHA}\`${TESTS_NOTE}."
+}
+
+if [[ $BACKEND_EXISTS -eq 1 ]]; then
+  create_tests_branch
+  cat <<AUDIT
+
+== audit summary -- paste into the issue that asked for the line ==
+\`refs/heads/${BRANCH}\` already existed in ${REPO}; the ruleset was not touched.
+${TESTS_AUDIT}
+Actor: ${WHO}. At: ${STARTED} UTC.
+AUDIT
   exit 0
 fi
 
@@ -220,6 +363,8 @@ remote_sha="$(git ls-remote origin "refs/heads/${BRANCH}" | awk '{print $1}')"
 [[ "$remote_sha" == "$SHA" ]] \
   || die "refs/heads/${BRANCH} points at '${remote_sha:-<missing>}', not ${SHA}."
 
+create_tests_branch
+
 cat <<AUDIT
 
 == audit summary -- paste into the release PR, or the issue that asked for the line ==
@@ -229,4 +374,5 @@ Ruleset ${RULESET} was in \`evaluate\` for ${RELAXED_SECONDS}s and is \`active\`
 before/after JSON identical apart from enforcement and updated_at
 (${BEFORE}, ${AFTER}).
 Branch reports rules: ${rules}.
+${TESTS_AUDIT}
 AUDIT

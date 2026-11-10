@@ -5,8 +5,9 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
-    http::HeaderMap,
+    async_trait,
+    extract::{ConnectInfo, FromRequestParts, Path, Query, State},
+    http::{request::Parts, HeaderMap},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
@@ -18,7 +19,10 @@ use uuid::Uuid;
 // #3713: the crate's `Json` rather than `axum::Json`, so a body this module
 // refuses (a NUL in `code` included) is the 400 VALIDATION_ERROR envelope
 // every other handler emits, not axum's 422 plain text (#1368).
-use crate::api::extractors::{request_scheme_is_https, trusted_external_url, Json, RequestBaseUrl};
+use crate::api::extractors::{
+    forwarded_headers_trusted, request_base_url_from_request, request_base_url_ignoring_forwarded,
+    request_scheme_is_https, trusted_external_url, Json,
+};
 use crate::api::handlers::auth::set_auth_cookies;
 use crate::api::validation::validate_outbound_sso_url;
 
@@ -33,6 +37,7 @@ use crate::services::auth_config_service::SamlConfigRow;
 use crate::services::auth_config_service::SsoProviderInfo;
 use crate::services::auth_service::{AuthService, FederatedCredentials};
 use crate::services::http_client::{read_json_capped, MAX_OIDC_RESPONSE_BYTES};
+use crate::services::metrics_service::AuthFailureReason;
 use crate::services::oidc_service::resolve_federated_email;
 use crate::services::saml_service::SamlService;
 
@@ -79,6 +84,17 @@ async fn audit_federated_login(
         entry = entry.actor_name(name);
     }
     audit_fire_and_forget(state.db.clone(), entry).await;
+}
+
+/// Count a rejected OIDC, SAML or LDAP sign-in in `ak_auth_failures_total`
+/// (#4676): only credential and policy refusals, `expired` when the
+/// validator said so, never an IdP outage.
+fn record_sso_auth_failure(err: &AppError, fallback: AuthFailureReason) {
+    crate::services::metrics_service::record_auth_failure_for_error(
+        crate::services::metrics_service::AuthFailureSurface::Sso,
+        err,
+        fallback,
+    );
 }
 
 /// Re-validate an OIDC endpoint URL against the outbound-URL SSRF guard
@@ -171,6 +187,10 @@ async fn fetch_oidc_discovery(issuer_url: &str) -> Result<serde_json::Value> {
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Failed to fetch OIDC discovery: {e}")))?;
+    let discovery_response =
+        crate::services::http_client::require_idp_success(discovery_response, "OIDC discovery")
+            .await
+            .map_err(AppError::Internal)?;
     read_json_capped(discovery_response, MAX_OIDC_RESPONSE_BYTES)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to parse OIDC discovery: {e}")))
@@ -226,7 +246,7 @@ pub async fn oidc_login(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(query): Query<OidcLoginQuery>,
-    base_url: RequestBaseUrl,
+    base_url: OidcBaseUrl,
 ) -> Result<Redirect> {
     // 0. Validate the optional prompt before any session/state is created so
     //    a rejected request leaves nothing behind.
@@ -265,13 +285,16 @@ pub async fn oidc_login(
     // 4. Build redirect_uri from attribute_mapping, falling back to an
     //    externally visible absolute URL derived from the request.
     let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &id, base_url.as_str());
+    if let Some(hint) = insecure_redirect_uri_hint(
+        &redirect_uri,
+        &row.attribute_mapping,
+        trusted_external_url().is_some(),
+    ) {
+        tracing::warn!(provider = %row.name, "{hint}");
+    }
 
     // 5. Build authorization URL
-    let scope = if row.scopes.is_empty() {
-        "openid profile email".to_string()
-    } else {
-        row.scopes.join(" ")
-    };
+    let scope = oidc_request_scope(&row.scopes);
 
     let mut auth_url = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}",
@@ -300,6 +323,36 @@ pub async fn oidc_login(
     }
 
     Ok(Redirect::temporary(&auth_url))
+}
+
+/// The space-separated `scope` sent on both the authorization request and the
+/// token request, so the two always agree (#4699).
+pub(crate) fn oidc_request_scope(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        "openid profile email".to_string()
+    } else {
+        scopes.join(" ")
+    }
+}
+
+/// The error for a token response that carries no `id_token` (#4699): a 502
+/// naming the provider, plus the IdP's own OAuth `error` code when it sent
+/// one, so an operator can tell an IdP-side misconfiguration from a backend
+/// fault. Only the short `error` code is echoed, never the response body.
+pub(crate) fn missing_id_token_error(
+    provider_name: &str,
+    token_response: &serde_json::Value,
+) -> AppError {
+    let idp_error = token_response["error"]
+        .as_str()
+        .map(|code| code.chars().take(64).collect::<String>())
+        .map(|code| format!(" (IdP error: {code})"))
+        .unwrap_or_default();
+    AppError::OidcNoIdToken(format!(
+        "OIDC provider '{provider_name}' returned no id_token from its token endpoint{idp_error}. \
+         Check that the provider's scopes include 'openid' and that the IdP application \
+         is allowed to issue ID tokens."
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +527,7 @@ async fn finish_silent_denied(state: &SharedState, sso_state: Option<&str>) -> R
         (status = 307, description = "Redirect to frontend with exchange code, or to /callback?silent_denied=1 when a prompt=none probe found no IdP session"),
         (status = 400, description = "Invalid callback parameters", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "IdP error or invalid/expired SSO state", body = crate::api::openapi::ErrorResponse),
+        (status = 502, description = "The IdP's token response carried no id_token (code OIDC_NO_ID_TOKEN)", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn oidc_callback(
@@ -481,7 +535,7 @@ pub async fn oidc_callback(
     Path(id): Path<Uuid>,
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
-    base_url: RequestBaseUrl,
+    base_url: OidcBaseUrl,
 ) -> Result<Response> {
     let client_is_https = request_scheme_is_https(&headers);
     // Resolve parameter shape BEFORE hitting the session store. Empty state or
@@ -502,11 +556,13 @@ pub async fn oidc_callback(
     // /oidc/{B}/callback so the PKCE code_verifier and code travel to
     // provider B's token endpoint. We derive provider_id from the session
     // (the authoritative side) and reject if the URL path disagrees.
-    let session = AuthConfigService::validate_sso_session(&state.db, &sso_state).await?;
+    let session = AuthConfigService::validate_sso_session(&state.db, &sso_state)
+        .await
+        .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
     if session.provider_id != id {
-        return Err(AppError::Authentication(
-            "SSO state does not match provider".to_string(),
-        ));
+        let err = AppError::Authentication("SSO state does not match provider".to_string());
+        record_sso_auth_failure(&err, AuthFailureReason::InvalidToken);
+        return Err(err);
     }
     oidc_callback_inner(
         state,
@@ -530,7 +586,7 @@ pub async fn oidc_callback_generic(
     State(state): State<SharedState>,
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
-    base_url: RequestBaseUrl,
+    base_url: OidcBaseUrl,
 ) -> Result<Response> {
     let client_is_https = request_scheme_is_https(&headers);
     // Resolve parameter shape BEFORE hitting the session store. See
@@ -543,7 +599,9 @@ pub async fn oidc_callback_generic(
     };
 
     // Validate SSO session and resolve the provider from the stored state
-    let session = AuthConfigService::validate_sso_session(&state.db, &sso_state).await?;
+    let session = AuthConfigService::validate_sso_session(&state.db, &sso_state)
+        .await
+        .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
     oidc_callback_inner(
         state,
         session.provider_id,
@@ -564,7 +622,7 @@ async fn oidc_callback_inner(
     authorization_code: String,
     session_nonce: Option<String>,
     pkce_code_verifier: Option<String>,
-    base_url: RequestBaseUrl,
+    base_url: OidcBaseUrl,
     client_is_https: bool,
 ) -> Result<Response> {
     // 1. Get decrypted OIDC config
@@ -585,12 +643,18 @@ async fn oidc_callback_inner(
         resolve_oidc_redirect_uri(&row.attribute_mapping, &provider_id, base_url.as_str());
 
     // 4. Exchange authorization code for tokens (with PKCE verifier when present).
+    //    `scope` repeats the authorization request's scopes: Microsoft Entra's
+    //    v2 token endpoint returns an id_token only when the token request
+    //    itself carries `openid` (#4699). RFC 6749 permits it here and other
+    //    IdPs ignore it.
+    let scope = oidc_request_scope(&row.scopes);
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "authorization_code"),
         ("code", &authorization_code),
         ("redirect_uri", &redirect_uri),
         ("client_id", &row.client_id),
         ("client_secret", &client_secret),
+        ("scope", &scope),
     ];
     if let Some(verifier) = pkce_code_verifier.as_deref() {
         form.push(("code_verifier", verifier));
@@ -601,14 +665,16 @@ async fn oidc_callback_inner(
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Token exchange failed: {e}")))?;
-    let token_response: serde_json::Value =
-        read_json_capped(token_exchange_response, MAX_OIDC_RESPONSE_BYTES)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to parse token response: {e}")))?;
+    let token_response: serde_json::Value = crate::services::http_client::read_idp_token_response(
+        token_exchange_response,
+        "OIDC token endpoint",
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("Failed to parse token response: {e}")))?;
 
     let id_token = token_response["id_token"]
         .as_str()
-        .ok_or_else(|| AppError::Internal("Token response missing id_token".into()))?;
+        .ok_or_else(|| missing_id_token_error(&row.name, &token_response))?;
 
     // Capture the access_token for a later userinfo group fetch (#2831). GitLab
     // delivers only DIRECT memberships in the id_token; the effective set incl.
@@ -626,7 +692,8 @@ async fn oidc_callback_inner(
         session_nonce.as_deref(),
         row.allow_legacy_rsa_keys,
     )
-    .await?;
+    .await
+    .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
 
     // 6. Extract user claims (using attribute_mapping overrides when configured)
     let attr = &row.attribute_mapping;
@@ -725,6 +792,7 @@ async fn oidc_callback_inner(
     {
         Ok(result) => result,
         Err(e) => {
+            record_sso_auth_failure(&e, AuthFailureReason::Scope);
             audit_federated_login(
                 &state,
                 AuditAction::LoginFailed,
@@ -843,6 +911,7 @@ pub async fn ldap_login(
     let ldap_user = match ldap_svc.authenticate(&req.username, &req.password).await {
         Ok(u) => u,
         Err(e) => {
+            record_sso_auth_failure(&e, AuthFailureReason::BadPassword);
             audit_federated_login(
                 &state,
                 AuditAction::LoginFailed,
@@ -880,6 +949,21 @@ pub async fn ldap_login(
         )
         .await?;
 
+    // #3830: remember which provider this user authenticated through, so the
+    // periodic directory reconcile re-reads them with this provider's base,
+    // filter and service account rather than guessing from the DN.
+    // Non-fatal: login still succeeds if the write fails.
+    if let Err(e) =
+        crate::services::ldap_sync_service::record_ldap_provider(&state.db, user.id, id).await
+    {
+        tracing::warn!(
+            user_id = %user.id,
+            provider_id = %id,
+            error = %e,
+            "Failed to record the LDAP provider for this user; login still succeeds"
+        );
+    }
+
     // Issue #2468: when group sync is configured (group_base_dn and/or
     // group_filter set), reflect the user's LDAP/AD groups as Artifact
     // Keeper group memberships through the shared external-group
@@ -913,19 +997,22 @@ pub async fn ldap_login(
     )
     .await;
 
+    // `expires_in` is the access token's real lifetime
+    // (JWT_ACCESS_TOKEN_EXPIRY_MINUTES), as `POST /auth/login` reports it
+    // (#4648); it was missing here and the cookie assumed one hour.
     let body = serde_json::json!({
         "access_token": tokens.access_token,
         "refresh_token": tokens.refresh_token,
         "token_type": "Bearer",
+        "expires_in": tokens.expires_in,
     });
 
-    // Default expires_in for LDAP tokens (1 hour = 3600 seconds)
     let mut response = Json(body).into_response();
     set_auth_cookies(
         response.headers_mut(),
         &tokens.access_token,
         &tokens.refresh_token,
-        3600,
+        tokens.expires_in,
         client_is_https,
     );
     Ok(response)
@@ -1129,6 +1216,7 @@ pub async fn saml_acs(
     let saml_user = match saml_svc.authenticate(&form.saml_response).await {
         Ok(u) => u,
         Err(e) => {
+            record_sso_auth_failure(&e, AuthFailureReason::InvalidToken);
             audit_federated_login(
                 &state,
                 AuditAction::LoginFailed,
@@ -1234,6 +1322,25 @@ struct ExchangeCodeResponse {
     access_token: String,
     refresh_token: String,
     token_type: String,
+    /// Seconds until `access_token` expires (#4648). Login sessions are
+    /// short-lived (`JWT_ACCESS_TOKEN_EXPIRY_MINUTES`, 30 by default);
+    /// automation should mint an API token instead.
+    expires_in: u64,
+}
+
+/// Seconds left before `access_token` expires, read from its `exp` claim
+/// (#4648). The exchange code stores only the token strings, and the token
+/// was minted at callback time, so the remaining lifetime is what a client
+/// should schedule against. A token without a readable `exp` (never minted
+/// by this backend) reports `fallback_secs`.
+pub(crate) fn access_token_expires_in(access_token: &str, now: i64, fallback_secs: u64) -> u64 {
+    // Unverified read of a token this backend minted moments ago, used only
+    // to report its remaining lifetime; it authorises nothing.
+    jsonwebtoken::dangerous::insecure_decode::<serde_json::Value>(access_token)
+        .ok()
+        .and_then(|data| data.claims["exp"].as_i64())
+        .map(|exp| exp.saturating_sub(now).max(0) as u64)
+        .unwrap_or(fallback_secs)
 }
 
 /// Exchange a short-lived code for access and refresh tokens
@@ -1254,22 +1361,28 @@ pub async fn exchange_code(
     Json(req): Json<ExchangeCodeRequest>,
 ) -> Result<Response> {
     let client_is_https = request_scheme_is_https(&headers);
-    let (access_token, refresh_token) =
-        AuthConfigService::exchange_code(&state.db, &req.code).await?;
+    let (access_token, refresh_token) = AuthConfigService::exchange_code(&state.db, &req.code)
+        .await
+        .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
 
+    let expires_in = access_token_expires_in(
+        &access_token,
+        chrono::Utc::now().timestamp(),
+        (state.config.jwt_access_token_expiry_minutes.max(0) as u64) * 60,
+    );
     let body = ExchangeCodeResponse {
         access_token: access_token.clone(),
         refresh_token: refresh_token.clone(),
         token_type: "Bearer".to_string(),
+        expires_in,
     };
 
-    // Default expires_in for SSO tokens (1 hour = 3600 seconds)
     let mut response = Json(body).into_response();
     set_auth_cookies(
         response.headers_mut(),
         &access_token,
         &refresh_token,
-        3600,
+        expires_in,
         client_is_https,
     );
     Ok(response)
@@ -1344,6 +1457,81 @@ pub(crate) fn build_sso_callback_redirect(
         client_is_https,
     );
     Ok(response)
+}
+
+/// The externally visible base URL the OIDC `redirect_uri` is built from
+/// (#4143).
+///
+/// `AK_EXTERNAL_URL` wins when set. Otherwise `X-Forwarded-Proto` /
+/// `X-Forwarded-Host` are honoured only when [`forwarded_headers_trusted`]
+/// accepts the TCP peer against `RATE_LIMIT_TRUSTED_PROXY_CIDRS`; from any
+/// other peer they are ignored, so a client cannot steer the `redirect_uri`
+/// the backend sends to the IdP.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OidcBaseUrl(pub String);
+
+impl OidcBaseUrl {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Pure core of [`OidcBaseUrl`]: see its docs.
+pub(crate) fn oidc_base_url(
+    headers: &HeaderMap,
+    uri: Option<&axum::http::Uri>,
+    peer: Option<std::net::IpAddr>,
+    trusted_proxies: &[crate::api::middleware::rate_limit::CidrRange],
+) -> String {
+    if forwarded_headers_trusted(peer, trusted_proxies) {
+        request_base_url_from_request(headers, uri)
+    } else {
+        request_base_url_ignoring_forwarded(headers, uri)
+    }
+}
+
+#[async_trait]
+impl FromRequestParts<SharedState> for OidcBaseUrl {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &SharedState,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip());
+        Ok(Self(oidc_base_url(
+            &parts.headers,
+            Some(&parts.uri),
+            peer,
+            &state.config.rate_limit_trusted_proxy_cidrs,
+        )))
+    }
+}
+
+/// The operator hint for a plain-`http://` OIDC `redirect_uri` (#4143), or
+/// `None` when the URI is `https://` or was pinned explicitly. An IdP that
+/// registered the `https://` callback (Microsoft Entra rejects the mismatch
+/// with AADSTS50011) fails the login, and the usual cause is a TLS-terminating
+/// proxy that does not send `X-Forwarded-Proto: https` with no
+/// `AK_EXTERNAL_URL` set.
+pub(crate) fn insecure_redirect_uri_hint(
+    redirect_uri: &str,
+    attribute_mapping: &serde_json::Value,
+    external_url_configured: bool,
+) -> Option<String> {
+    let pinned = attribute_mapping.get("redirect_uri").is_some();
+    if pinned || external_url_configured || !redirect_uri.starts_with("http://") {
+        return None;
+    }
+    Some(format!(
+        "OIDC redirect_uri {redirect_uri} was derived from the request and is plain http. \
+         If users reach Artifact Keeper over HTTPS, set AK_EXTERNAL_URL to the public \
+         https:// base URL, or have the reverse proxy send X-Forwarded-Proto: https \
+         (and list it in RATE_LIMIT_TRUSTED_PROXY_CIDRS when that is set)."
+    ))
 }
 
 /// Resolve the redirect URI from OIDC attribute_mapping, falling back to an
@@ -1651,13 +1839,13 @@ pub(crate) fn federated_group_name_rejection(name: &str) -> Option<GroupNameReje
 /// only that group rather than aborting the whole sync transaction (#2835).
 const GROUP_SYNC_SAVEPOINT: &str = "federated_group_sync";
 
-/// Upsert one federated group and ensure the user's membership in it.
+/// Find or create a federated group inside one provider namespace.
 ///
-/// Returns the group id, or `None` when the name collides with a group outside
-/// this provider's namespace (the #2759 ownership refusal).
-async fn sync_one_federated_group(
+/// Returns the group id, or `None` when the name is already owned by a local
+/// group or by a different federated source/provider. The ownership guard is
+/// shared by normal login synchronization and admin pre-provisioning.
+pub(crate) async fn ensure_federated_group(
     conn: &mut sqlx::PgConnection,
-    user_id: Uuid,
     provider_id: Uuid,
     source: &str,
     name: &str,
@@ -1676,9 +1864,7 @@ async fn sync_one_federated_group(
     // is already tagged with this same source + provider id. A collision
     // with an operator-managed group (NULL external_source — the
     // NULL = $3 comparison is never true) or with a group owned by a
-    // different source/provider returns no row, and membership is
-    // refused by the caller instead of silently attaching the federated
-    // user to a same-named — potentially privileged — local group.
+    // different source/provider returns no row.
     let group_id: Option<(Uuid,)> = sqlx::query_as(
         r#"
             INSERT INTO groups (name, description, external_source, external_provider_id)
@@ -1701,7 +1887,22 @@ async fn sync_one_federated_group(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let Some((group_id,)) = group_id else {
+    Ok(group_id.map(|(group_id,)| group_id))
+}
+
+/// Upsert one federated group and ensure the user's membership in it.
+///
+/// Returns the group id, or `None` when the name collides with a group outside
+/// this provider's namespace (the #2759 ownership refusal).
+async fn sync_one_federated_group(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    provider_id: Uuid,
+    source: &str,
+    name: &str,
+) -> Result<Option<Uuid>> {
+    let group_id = ensure_federated_group(&mut *conn, provider_id, source, name).await?;
+    let Some(group_id) = group_id else {
         return Ok(None);
     };
 
@@ -2102,6 +2303,10 @@ async fn validate_id_token(
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Failed to fetch JWKS: {e}")))?;
+    let jwks_response =
+        crate::services::http_client::require_idp_success(jwks_response, "OIDC JWKS endpoint")
+            .await
+            .map_err(AppError::Internal)?;
     let jwks: serde_json::Value = read_json_capped(jwks_response, MAX_OIDC_RESPONSE_BYTES)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to parse JWKS: {e}")))?;
@@ -2376,6 +2581,42 @@ mod tests {
     // -----------------------------------------------------------------------
     // decode_jwt_payload
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_oidc_request_scope_defaults_and_joins() {
+        assert_eq!(oidc_request_scope(&[]), "openid profile email");
+        let scopes = vec!["openid".to_string(), "offline_access".to_string()];
+        assert_eq!(oidc_request_scope(&scopes), "openid offline_access");
+    }
+
+    #[test]
+    fn test_missing_id_token_error_names_provider_and_idp_error() {
+        let err = missing_id_token_error(
+            "Entra",
+            &serde_json::json!({"error": "invalid_scope", "error_description": "secret detail"}),
+        );
+        assert!(matches!(err, AppError::OidcNoIdToken(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("'Entra'"), "{msg}");
+        assert!(msg.contains("id_token"), "{msg}");
+        assert!(msg.contains("IdP error: invalid_scope"), "{msg}");
+        assert!(!msg.contains("secret detail"), "{msg}");
+
+        let plain = missing_id_token_error("Entra", &serde_json::json!({"access_token": "x"}));
+        assert!(!plain.to_string().contains("IdP error"));
+    }
+
+    #[test]
+    fn test_access_token_expires_in_reads_exp() {
+        let token = make_jwt(&serde_json::json!({ "sub": "u", "exp": 10_001_800 }));
+        assert_eq!(access_token_expires_in(&token, 10_000_000, 60), 1800);
+        // Already expired: zero, never a wrapped huge value.
+        assert_eq!(access_token_expires_in(&token, 10_009_999, 60), 0);
+        // No readable exp: the configured lifetime.
+        assert_eq!(access_token_expires_in("not-a-jwt", 0, 1800), 1800);
+        let no_exp = make_jwt(&serde_json::json!({ "sub": "u" }));
+        assert_eq!(access_token_expires_in(&no_exp, 0, 1800), 1800);
+    }
 
     #[test]
     fn test_decode_jwt_payload_valid() {
@@ -2898,8 +3139,10 @@ mod tests {
             access_token: "at_123".to_string(),
             refresh_token: "rt_456".to_string(),
             token_type: "Bearer".to_string(),
+            expires_in: 1800,
         };
         let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["expires_in"], 1800);
         assert_eq!(json["access_token"], "at_123");
         assert_eq!(json["refresh_token"], "rt_456");
         assert_eq!(json["token_type"], "Bearer");
@@ -3120,6 +3363,68 @@ mod tests {
             resolve_oidc_redirect_uri(&attr, &id, "https://external.example.com"),
             "https://external.example.com/api/v1/auth/sso/oidc/callback"
         );
+    }
+
+    fn forwarded_https_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "backend:8080".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "ak.example.com".parse().unwrap());
+        headers
+    }
+
+    fn proxy_cidrs() -> Vec<crate::api::middleware::rate_limit::CidrRange> {
+        vec![crate::api::middleware::rate_limit::CidrRange::parse("10.0.0.0/8").unwrap()]
+    }
+
+    #[test]
+    fn test_oidc_base_url_honours_forwarded_headers_from_trusted_proxy() {
+        let peer = Some("10.1.2.3".parse().unwrap());
+        assert_eq!(
+            oidc_base_url(&forwarded_https_headers(), None, peer, &proxy_cidrs()),
+            "https://ak.example.com"
+        );
+    }
+
+    #[test]
+    fn test_oidc_base_url_ignores_forwarded_headers_from_untrusted_peer() {
+        let headers = forwarded_https_headers();
+        let outside = Some("203.0.113.9".parse().unwrap());
+        assert_eq!(
+            oidc_base_url(&headers, None, outside, &proxy_cidrs()),
+            "http://backend:8080"
+        );
+        // No ConnectInfo: no peer to vouch for, so untrusted too.
+        assert_eq!(
+            oidc_base_url(&headers, None, None, &proxy_cidrs()),
+            "http://backend:8080"
+        );
+    }
+
+    #[test]
+    fn test_oidc_base_url_empty_proxy_list_keeps_accept_all() {
+        let outside = Some("203.0.113.9".parse().unwrap());
+        assert_eq!(
+            oidc_base_url(&forwarded_https_headers(), None, outside, &[]),
+            "https://ak.example.com"
+        );
+    }
+
+    #[test]
+    fn test_insecure_redirect_uri_hint() {
+        let empty = serde_json::json!({});
+        let hint = insecure_redirect_uri_hint(
+            "http://ak.example.com/api/v1/auth/sso/oidc/callback",
+            &empty,
+            false,
+        )
+        .expect("plain http derived from the request gets a hint");
+        assert!(hint.contains("AK_EXTERNAL_URL"), "{hint}");
+        assert!(hint.contains("X-Forwarded-Proto"), "{hint}");
+        assert!(insecure_redirect_uri_hint("https://ak.example.com/cb", &empty, false).is_none());
+        assert!(insecure_redirect_uri_hint("http://ak.example.com/cb", &empty, true).is_none());
+        let pinned = serde_json::json!({ "redirect_uri": "http://ak.example.com/cb" });
+        assert!(insecure_redirect_uri_hint("http://ak.example.com/cb", &pinned, false).is_none());
     }
 
     #[test]
@@ -3799,6 +4104,62 @@ mod tests {
     /// the handler and before the pool checkout. Router-level and DB-backed
     /// (no-op without `DATABASE_URL`) because the counterfactual *is* the
     /// query: with the hook removed this answers 500.
+    /// #4676: a rejected SSO step is counted in
+    /// `ak_auth_failures_total{surface="sso"}`: an unknown exchange code and
+    /// an unknown callback `state` are `invalid_token`. A request refused as
+    /// malformed (a NUL in the code) is not an auth failure.
+    #[test]
+    fn rejected_sso_steps_are_counted_4676() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::metrics_service::capture_counters_async;
+        let (ran, counted) = capture_counters_async(|| async {
+            let Some(pool) = tdh::try_pool().await else {
+                return false;
+            };
+            let dir = std::env::temp_dir().join(format!("ph-4676-{}", uuid::Uuid::new_v4()));
+            let state = tdh::build_state(pool, dir.to_string_lossy().as_ref());
+            let app = tdh::router_anon(super::router(), state);
+            let exchange = |body: String| {
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/exchange")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            };
+            let (status, _) = tdh::send(
+                app.clone(),
+                exchange(format!("{{\"code\":\"ph-4676-{}\"}}", uuid::Uuid::new_v4())),
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+            let (status, _) =
+                tdh::send(app.clone(), exchange("{\"code\":\"a\\u0000b\"}".into())).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+            let callback = axum::http::Request::builder()
+                .uri(format!(
+                    "/oidc/callback?code=c&state=ph-4676-{}",
+                    uuid::Uuid::new_v4()
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let (status, _) = tdh::send(app, callback).await;
+            assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+            true
+        });
+        if !ran {
+            return;
+        }
+        assert_eq!(
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", "sso"), ("reason", "invalid_token")]
+            ),
+            2
+        );
+        assert_eq!(counted.get("ak_auth_failures_total", &[]), 2);
+    }
+
     #[tokio::test]
     async fn exchange_code_rejects_a_nul_in_code_before_the_query() {
         use crate::api::handlers::test_db_helpers as tdh;

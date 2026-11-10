@@ -46,6 +46,9 @@ pub enum WebhookSecretError {
     #[error("AK_WEBHOOK_SECRET_KEY is not configured")]
     KeyMissing,
 
+    #[error("{0}")]
+    KeyFile(String),
+
     #[error("AK_WEBHOOK_SECRET_KEY is not valid base64: {0}")]
     KeyNotBase64(String),
 
@@ -103,7 +106,9 @@ impl<E: base64::Engine> _Decoder for E {
 
 /// Load the 32-byte key from the environment, decoding base64 or base64url.
 fn load_key() -> Result<[u8; 32]> {
-    let raw = std::env::var(ENV_KEY).map_err(|_| WebhookSecretError::KeyMissing)?;
+    let raw = crate::config::secret_or_env(ENV_KEY)
+        .map_err(WebhookSecretError::KeyFile)?
+        .ok_or(WebhookSecretError::KeyMissing)?;
     let trimmed = raw.trim();
     let bytes = decode_key_material(trimmed).map_err(WebhookSecretError::KeyNotBase64)?;
     if bytes.len() != 32 {
@@ -145,15 +150,25 @@ pub fn generate_secret() -> String {
 /// Returns nonce-prefixed AES-256-GCM ciphertext. Callers should persist
 /// this directly into the `secret_encrypted` `bytea` column.
 pub fn encrypt_secret(plaintext: &str) -> Result<Vec<u8>> {
-    let enc = encryptor()?;
-    Ok(enc.encrypt(plaintext.as_bytes()))
+    encrypt_bytes(plaintext.as_bytes())
 }
 
 /// Decrypt a previously stored webhook secret.
 pub fn decrypt_secret(ciphertext: &[u8]) -> Result<String> {
+    String::from_utf8(decrypt_bytes(ciphertext)?).map_err(|_| WebhookSecretError::NotUtf8)
+}
+
+/// Encrypt arbitrary key material (e.g. the instance Ed25519 webhook
+/// signing seed, #921) with the same key and layout as [`encrypt_secret`].
+pub fn encrypt_bytes(plaintext: &[u8]) -> Result<Vec<u8>> {
     let enc = encryptor()?;
-    let plaintext = enc.decrypt(ciphertext)?;
-    String::from_utf8(plaintext).map_err(|_| WebhookSecretError::NotUtf8)
+    Ok(enc.encrypt(plaintext))
+}
+
+/// Inverse of [`encrypt_bytes`].
+pub fn decrypt_bytes(ciphertext: &[u8]) -> Result<Vec<u8>> {
+    let enc = encryptor()?;
+    Ok(enc.decrypt(ciphertext)?)
 }
 
 /// Compute a stable, non-reversible identifier suitable for surfacing in
@@ -226,6 +241,20 @@ mod tests {
         assert_ne!(s1, s2);
         // base64url of 24 bytes (no padding) is 32 chars.
         assert_eq!(s1.len(), SECRET_PREFIX.len() + 32);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_bytes_roundtrip_non_utf8() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_test_key();
+        let seed = [0xFFu8, 0x00, 0x80, 0x7F];
+        let ct = encrypt_bytes(&seed).expect("encrypt");
+        assert_eq!(decrypt_bytes(&ct).expect("decrypt"), seed.to_vec());
+        // The string API refuses the same ciphertext as non-UTF-8.
+        assert!(matches!(
+            decrypt_secret(&ct),
+            Err(WebhookSecretError::NotUtf8)
+        ));
     }
 
     #[test]
@@ -313,6 +342,42 @@ mod tests {
         }
         let res = encrypt_secret("x");
         assert!(matches!(res, Err(WebhookSecretError::KeyMissing)));
+    }
+
+    #[test]
+    fn test_key_read_from_file_4142() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let key = B64.encode([7u8; 32]);
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(&mut file.as_file(), format!("{key}\n").as_bytes())
+            .expect("write key file");
+        unsafe {
+            std::env::remove_var(ENV_KEY);
+            std::env::set_var(
+                format!("{ENV_KEY}_FILE"),
+                file.path().to_str().expect("utf-8 path"),
+            );
+        }
+        let plaintext = "whsec_from_file";
+        let ct = encrypt_secret(plaintext).expect("encrypt with file key");
+        assert_eq!(decrypt_secret(&ct).expect("decrypt"), plaintext);
+        unsafe {
+            std::env::remove_var(format!("{ENV_KEY}_FILE"));
+        }
+    }
+
+    #[test]
+    fn test_unreadable_key_file_yields_key_file_error_4142() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var(ENV_KEY);
+            std::env::set_var(format!("{ENV_KEY}_FILE"), "/nonexistent/webhook-key-4142");
+        }
+        let res = encrypt_secret("x");
+        assert!(matches!(res, Err(WebhookSecretError::KeyFile(_))));
+        unsafe {
+            std::env::remove_var(format!("{ENV_KEY}_FILE"));
+        }
     }
 
     #[test]

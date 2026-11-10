@@ -6,32 +6,68 @@
       {
         "ordinal": 0,
         "name": "password_hash",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "password_hash"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "totp_secret",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "totp_secret"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "totp_enabled",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "totp_enabled"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "username",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "username"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "is_admin",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "is_admin"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "is_service_account",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "is_service_account"
+          }
+        }
       },
       {
         "ordinal": 6,
@@ -48,6 +84,12 @@
                 "ci"
               ]
             }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "auth_provider"
           }
         }
       }

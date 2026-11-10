@@ -8,6 +8,13 @@ license.workspace = true
 name = "artifact-keeper"
 path = "src/main.rs"
 
+# The isolated MCP introspection worker (#5253). A separate binary so the
+# server process never links the probe or the sandbox runner; it talks to the
+# backend over its HTTP API only. Not built into the backend image.
+[[bin]]
+name = "ak-mcp-introspector"
+path = "src/bin/mcp_introspector/main.rs"
+
 [features]
 vendored-openssl = ["openssl/vendored"]
 jemalloc = ["dep:tikv-jemallocator"]
@@ -38,13 +45,22 @@ tokio.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
+# The HTTP accept loop in `api::serve` builds hyper connections itself so it
+# can set an HTTP/1 header-read timeout, which `axum::serve` cannot (#4665).
+# Both are already in the tree through axum.
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+# `client-proxy`: the guarded outbound clients read the environment proxy
+# with the same matcher reqwest uses, so they can check each proxied
+# destination before handing it to the proxy (#5459). reqwest already
+# compiles it in.
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio", "client-proxy"] }
 
 # Database
 sqlx.workspace = true
 
 # Serialization
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 
 # Authentication
 jsonwebtoken.workspace = true
@@ -66,6 +82,7 @@ object_store.workspace = true
 
 # HTTP types (presigned URL methods)
 http.workspace = true
+http-body.workspace = true
 http-body-util.workspace = true
 
 # TLS (explicit provider selection for rustls 0.23+)
@@ -85,6 +102,7 @@ tracing-opentelemetry.workspace = true
 # Metrics
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+metrics-util.workspace = true
 
 # Error handling
 thiserror.workspace = true
@@ -129,12 +147,14 @@ rand08 = { package = "rand", version = "0.8" }
 pgp = "0.14.2"
 
 # Format parsing
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 flate2 = "1.0"
 tar = "0.4"
 xz2 = "0.1"
 mime_guess = "2.0"
-zip = "8.5"
+zip = "9.0"
+# Strict SemVer 2.0 parsing and precedence for agent plugin versions (#5251).
+semver = "1"
 toml = "1.1"
 serde_yaml = "0.9"
 regex = "1.11"
@@ -149,8 +169,8 @@ rmp-serde = "1.3"
 # networking module is not needed (we stream from in-memory upload bytes), and
 # its `.tar.bz2` reader is single-stream, so the multi-stream v1 path stays on
 # our own reader (#4067).
-rattler_conda_types = { version = "0.53", default-features = false }
-rattler_package_streaming = { version = "0.27", default-features = false }
+rattler_conda_types = { version = "0.58", default-features = false }
+rattler_package_streaming = { version = "0.27.16", default-features = false }
 
 # WASM runtime
 wasmtime.workspace = true
@@ -231,6 +251,11 @@ x509-cert = { version = "0.2", features = ["pem"] }
 # internally for exactly this payload in its (private, feature-gated) cosign
 # path — matching its encoding byte-for-byte is the whole point.
 serde_json_canonicalizer = "0.3"
+# The protobuf types behind `sigstore::bundle::Bundle`, pinned to the exact
+# version `sigstore` 0.14.0 already resolves. Used only to serialize a bundle's
+# DSSE envelope with the crate's own serializer, so the Rekor `envelopeHash`
+# comparison (#4082) hashes the very bytes `verify_digest` hashes.
+sigstore_protobuf_specs = "=0.5.2"
 
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
@@ -240,21 +265,30 @@ tikv-jemalloc-sys = { version = "0.6", optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 
+# setrlimit(2) on the `unsquashfs` child that unpacks an ISO's rootfs image
+# (#1966, services/iso_rootfs). Already in the tree transitively.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 tonic-prost-build.workspace = true
 prost-build.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
-axum-test = "19"
+# setrlimit(RLIMIT_FSIZE) in the filesystem storage tests, to make a write
+# fail on demand (#4646). Already in the tree transitively.
+libc = "0.2"
+axum-test = "21"
 wiremock = "0.6"
-metrics-util = "0.20"
+metrics-util = { workspace = true, features = ["debugging"] }
+opentelemetry_sdk = { workspace = true, features = ["testing", "experimental_metrics_custom_reader"] }
 # Mint self-signed / non-Fulcio leaf certificates for the attestation red-team
 # suite (#2955 Stage 4, rows 3 and 8 — the Stage-1 fixtures were missing them).
 rcgen = "0.14"
 # Serve the CI OIDC e2e mock issuer over TLS (`ci_oidc_exchange_e2e_tests`):
 # the exchange refuses a non-https issuer, and axum 0.7's `serve` is plain TCP.
-# Both are already in the tree transitively; `ring`, not the default aws-lc-rs,
-# matches the provider the backend's own rustls is built with.
+# Both are already in the tree transitively (hyper-util is also a normal
+# dependency); `ring`, not the default aws-lc-rs, matches the provider the
+# backend's own rustls is built with.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }

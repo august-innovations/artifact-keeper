@@ -74,7 +74,7 @@ const MAX_NO_PROXY_LEN: usize = 4096;
 ///
 /// | mode | behaviour |
 /// |------|-----------|
-/// | [`Inherit`](EgressProxyMode::Inherit) | Use the process-wide `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment, i.e. whatever the deployment already does. The default, and the state of every repository that predates this feature. |
+/// | [`Inherit`](EgressProxyMode::Inherit) | Use the process-wide `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` environment (either case), i.e. whatever the deployment already does. A destination it would proxy is resolved and checked against the outbound address policy first (#5459). The default, and the state of every repository that predates this feature. |
 /// | [`Direct`](EgressProxyMode::Direct) | Bypass the environment proxy entirely and connect straight out. Answers the other half of #2811 ("certain repos require a proxy, others do not") for a deployment whose *global* posture is proxied. |
 /// | [`Explicit`](EgressProxyMode::Explicit) | Use this repository's own proxy URL and `no_proxy` list. The environment proxy variables are **ignored**, not merged. |
 ///
@@ -424,7 +424,22 @@ pub fn validate_no_proxy(no_proxy: &str) -> Result<()> {
 ///
 /// [`http_client::base_client_builder`]: crate::services::http_client::base_client_builder
 pub fn build_repo_client(config: &EgressProxyConfig) -> Result<reqwest::Client> {
-    let mut builder = crate::services::http_client::base_client_builder();
+    repo_client_builder(config)?
+        .build()
+        .map_err(|e| AppError::Internal(format!("Failed to build egress-proxy HTTP client: {e}")))
+}
+
+/// The [`reqwest::ClientBuilder`] behind [`build_repo_client`], for a caller
+/// that adds its own settings (a client-wide timeout) before building.
+pub fn repo_client_builder(config: &EgressProxyConfig) -> Result<reqwest::ClientBuilder> {
+    // `direct` and `explicit` replace the environment proxy, so they start
+    // from a builder that never installs it (or its destination check).
+    let mut builder = match config.mode {
+        EgressProxyMode::Inherit => crate::services::http_client::base_client_builder(),
+        EgressProxyMode::Direct | EgressProxyMode::Explicit => {
+            crate::services::http_client::base_client_builder_without_env_proxy()
+        }
+    };
 
     match config.mode {
         EgressProxyMode::Inherit => {
@@ -482,9 +497,7 @@ pub fn build_repo_client(config: &EgressProxyConfig) -> Result<reqwest::Client> 
         }
     }
 
-    builder
-        .build()
-        .map_err(|e| AppError::Internal(format!("Failed to build egress-proxy HTTP client: {e}")))
+    Ok(builder)
 }
 
 /// Re-apply the destination SSRF check that routing through a proxy would

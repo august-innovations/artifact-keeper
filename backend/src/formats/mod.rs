@@ -1,5 +1,6 @@
 //! Package format handlers.
 
+pub mod agent_plugins;
 pub mod alpine;
 pub mod ansible;
 pub mod bazel;
@@ -22,12 +23,14 @@ pub mod incus;
 pub mod jetbrains_plugins;
 pub mod maven;
 pub mod maven_version;
+pub mod mcp;
 pub mod mlmodel;
 pub mod npm;
 pub mod nuget;
 pub mod oci;
 pub mod opkg;
 pub mod p2;
+pub mod pacman;
 pub mod protobuf;
 pub mod r#pub;
 pub mod puppet;
@@ -141,6 +144,9 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "bazel" => Some(Box::new(bazel::BazelHandler::new())),
         "protobuf" => Some(Box::new(protobuf::ProtobufHandler::new())),
         "incus" | "lxc" => Some(Box::new(incus::IncusHandler::new())),
+        "pacman" => Some(Box::new(pacman::PacmanHandler::new())),
+        "agentplugins" => Some(Box::new(agent_plugins::AgentPluginsHandler::new())),
+        "mcp" => Some(Box::new(mcp::McpHandler::new())),
         _ => None,
     }
 }
@@ -205,6 +211,9 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         RepositoryFormat::Bazel => Box::new(bazel::BazelHandler::new()),
         RepositoryFormat::Protobuf => Box::new(protobuf::ProtobufHandler::new()),
         RepositoryFormat::Incus | RepositoryFormat::Lxc => Box::new(incus::IncusHandler::new()),
+        RepositoryFormat::Pacman => Box::new(pacman::PacmanHandler::new()),
+        RepositoryFormat::AgentPlugins => Box::new(agent_plugins::AgentPluginsHandler::new()),
+        RepositoryFormat::Mcp => Box::new(mcp::McpHandler::new()),
     }
 }
 
@@ -269,6 +278,114 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
     handlers
 }
 
+/// Core handler keys whose Remote/Virtual download path enforces the inline
+/// scan-on-proxy gate (#4099): the handler routes its proxied package bytes
+/// through `proxy_helpers::serve_scanned_proxy_file` (Cargo, Conda, Maven,
+/// npm, NuGet, PyPI, sbt, VS Code; the `maven` key also serves `gradle`
+/// repositories, and `nuget` serves `chocolatey` and `powershell`) or,
+/// for OCI manifests, straight through `proxy_helpers::gate_proxy_scan_serve`.
+///
+/// `GET /api/v1/formats` reports these as `scan_on_proxy: "enforced"`; every
+/// other core handler stores the flag and serves unscanned (`"accepted"`).
+/// The `scan_on_proxy_capability_matches_the_gate` test in `proxy_helpers`
+/// reads every format handler's source and fails when a handler reaches the
+/// gate without being listed here, or is listed without reaching it, so the
+/// capability cannot drift from the router. Adopting the gate in a new format
+/// adds its key here, and a row to the coverage table in
+/// `docs/security/scan-on-proxy.md` (#4114), which
+/// `scan_on_proxy_coverage_doc_matches_the_capability` keeps in step.
+///
+/// `enforced` is a per-FORMAT capability: the format's proxy path runs the
+/// shared gate. Whether that gate blocks or only records is a per-REPOSITORY
+/// choice (`scan_configs.proxy_scan_action`: `fail_open` / `fail_closed` /
+/// `record_only`, #3645) read from `GET/PUT /repositories/{key}/security`, so
+/// the formats API carries no mode indicator: under `record_only` an
+/// `enforced` format still scans and records every pull, and serves it.
+///
+/// It is also per handler, not per file type. Maven/sbt scan every proxied
+/// file except an allowlist of non-package files (POMs, `.xml` metadata,
+/// Gradle `.module`, checksums, signatures, and `-sources`/`-javadoc` jars,
+/// skipped by name). Only `.jar`/`.war`/`.ear` carry an identity pin, and
+/// `.aar`, `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar` and `.zip` are a known gap:
+/// they are scanned as raw files, not unpacked (#4100). NuGet scans every
+/// proxied flat-container and V2 package file except the `.nuspec` manifest
+/// (#4102). Conda scans `.conda` and `.tar.bz2` package downloads; the
+/// channel indexes (repodata in every encoding, channeldata, shards) are not
+/// gated, and a `.sigs` sidecar follows its package's stored verdict (#4585).
+/// `conda` and `conda_native` are two handler keys served by the one conda
+/// route, so both are listed. Go (module `.zip`), RubyGems (`.gem`) and
+/// Composer (dist archives) scan every file on their package download route
+/// (#4103, #4104, #4105); RubyGems is graded as the gem the request names
+/// (its pin), Go and Composer on the archive's contents, since the scanner
+/// has no pin for them (see `api::handlers::proxy_scan_archive`). Pub scans
+/// package archives (#4107), graded as the package their `pubspec.yaml`
+/// declares; Conan scans the `.tgz` recipe and package archives (#4108),
+/// graded on their contents, and streams the text files. CocoaPods pod
+/// archives and Swift source archives (#4109, #4110) are graded on their
+/// contents: the bundled scanner has no advisory data for either ecosystem.
+pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &[
+    "alpine",       // #4113
+    "cargo",        // #4101
+    "cocoapods",    // #4109
+    "composer",     // #4105
+    "conan",        // #4108
+    "conda",        // #4585
+    "conda_native", // #4585 (the same conda route)
+    "debian",       // #4111
+    "go",           // #4103
+    "maven",        // #4100 (also serves gradle)
+    "nuget",        // #4102 (also serves chocolatey and powershell)
+    "pub",          // #4107
+    "rpm",          // #4112
+    "rubygems",     // #4104
+    "sbt",          // #4100
+    "swift",        // #4110
+    "npm",
+    "oci",
+    "pypi",
+    "vscode",
+];
+
+/// Every repository type, in the order the API lists them.
+pub const ALL_REPO_TYPES: &[&str] = &["local", "staging", "remote", "virtual"];
+
+/// The repository types (`repo_type` values) a repository of format handler
+/// `handler_key` may be created as. Agent Plugins repositories are hosted
+/// only (#5251); every other format, MCP registries included (#5253),
+/// supports all four. `GET /api/v1/formats` advertises this as
+/// `repository_types`, and repository creation enforces it.
+pub fn supported_repo_types(handler_key: &str) -> &'static [&'static str] {
+    match handler_key {
+        "agentplugins" => &["local", "staging", "remote"],
+        _ => ALL_REPO_TYPES,
+    }
+}
+
+/// Does the core handler `handler_key` enforce scan-on-proxy (#4099)?
+pub fn handler_enforces_scan_on_proxy(handler_key: &str) -> bool {
+    SCAN_ON_PROXY_ENFORCED_HANDLERS.contains(&handler_key)
+}
+
+/// Does a repository of `format` run the scan-on-proxy gate on its proxied
+/// downloads? The per-repository-format form of
+/// [`handler_enforces_scan_on_proxy`], aliases resolved through
+/// [`RepositoryFormat::handler_key`]. Everything that has to agree with the
+/// gate asks this: the generic download route's refusal (#4442) and the
+/// dashboard's `policy_violations_blocked` count (#4582), which must not call
+/// a verdict blocked on a format that serves it anyway.
+pub fn format_enforces_scan_on_proxy(format: &RepositoryFormat) -> bool {
+    handler_enforces_scan_on_proxy(format.handler_key())
+}
+
+/// [`format_enforces_scan_on_proxy`] for a `repository_format` database label
+/// (`"conda"`, `"docker"`, ...). An unknown label is not enforced.
+pub fn format_key_enforces_scan_on_proxy(format_key: &str) -> bool {
+    RepositoryFormat::ALL
+        .iter()
+        .find(|f| f.as_key() == format_key)
+        .is_some_and(format_enforces_scan_on_proxy)
+}
+
 /// Presentation metadata for a core handler key.
 ///
 /// Deliberately total: an unrecognised key falls back to the key itself rather
@@ -326,7 +443,8 @@ fn core_handler_metadata(
             &[".vsix"],
         ),
         "jetbrains" => ("JetBrains Plugins", "JetBrains IDE plugins", &[".zip"]),
-        "huggingface" => ("Hugging Face", "Hugging Face models and datasets", &[]),
+        "agentplugins" => ("Agent Plugins", "AI coding-agent plugin bundles", &[".zip"]),
+        "huggingface" => ("Hugging Face", "Hugging Face Hub models", &[]),
         "mlmodel" => ("ML Models", "Machine-learning model artifacts", &[]),
         "cran" => ("CRAN", "R packages", &[".tar.gz"]),
         "vagrant" => ("Vagrant", "Vagrant boxes", &[".box"]),
@@ -335,6 +453,16 @@ fn core_handler_metadata(
         "bazel" => ("Bazel", "Bazel modules and rulesets", &[".tar.gz"]),
         "protobuf" => ("Protobuf", "Protocol Buffer schema registry", &[".proto"]),
         "incus" => ("Incus/LXC", "Incus and LXC container images", &[".tar.xz"]),
+        "pacman" => (
+            "Pacman",
+            "Arch Linux pacman packages",
+            &[".pkg.tar.zst", ".pkg.tar.xz"],
+        ),
+        "mcp" => (
+            "MCP Registry",
+            "Model Context Protocol server registry (server.json, registry API v0.1)",
+            &[".json"],
+        ),
         // Total fallback -- see the doc comment. A format that reaches this
         // arm is still listed, it just shows its raw key as the display name.
         other => (other, "Compiled-in format handler", &[]),
@@ -437,10 +565,35 @@ static CARGO_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
     publish_time_resolver: true,
 };
 
+static MAVEN_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
+    canonical: RepositoryFormat::Maven,
+    label: "maven",
+    // A released Maven coordinate is immutable: Maven Central refuses a
+    // redeploy of a release, resolvers cache releases forever, and checksum
+    // sidecars pin the bytes. `-SNAPSHOT` versions are rebuilt by design and
+    // are not age-gated at all (`services::age_gate_maven`).
+    immutable_coordinates: true,
+    // The upstream `Last-Modified` of each version's POM, stamped by the
+    // repository manager at deploy time (#4702; `services::age_gate_maven`).
+    publish_time_resolver: true,
+};
+
 /// Look up the age-gate capability spec for a repository format, collapsing
 /// protocol aliases (yarn/pnpm speak npm; poetry speaks PyPI) onto the
 /// canonical format that owns their policy. `None` means the format has no
 /// age-gate support; the config endpoint rejects attempts to enable it.
+static MCP_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
+    canonical: RepositoryFormat::Mcp,
+    label: "mcp",
+    // A server version is write-once in AK: a Remote MCP registry never
+    // overwrites an ingested `name@version` (changed upstream bytes raise a
+    // content-drift hold instead), so a first sighting binds to fixed content.
+    immutable_coordinates: true,
+    // The upstream `publishedAt` is the upstream registry's claim; the gate
+    // trusts this instance's own clock (`first_seen`) only (#5253).
+    publish_time_resolver: false,
+};
+
 pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormatSpec> {
     match format {
         RepositoryFormat::Npm | RepositoryFormat::Yarn | RepositoryFormat::Pnpm => {
@@ -452,6 +605,13 @@ pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormat
         RepositoryFormat::Go => Some(&GO_AGE_GATE_SPEC),
         RepositoryFormat::Vscode => Some(&VSCODE_AGE_GATE_SPEC),
         RepositoryFormat::Cargo => Some(&CARGO_AGE_GATE_SPEC),
+        // Gradle repositories speak the Maven layout through the same
+        // handler. sbt has its own handler with no age-gate seam, so it stays
+        // out (an entry without enforcement would accept a gate it ignores).
+        RepositoryFormat::Maven | RepositoryFormat::Gradle => Some(&MAVEN_AGE_GATE_SPEC),
+        // Remote MCP registries gate server versions in the `/v0.1` read path
+        // (`services::mcp_curation`), not a download handler.
+        RepositoryFormat::Mcp => Some(&MCP_AGE_GATE_SPEC),
         _ => None,
     }
 }

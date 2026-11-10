@@ -77,8 +77,8 @@ use artifact_keeper_backend::services::auth_config_service::{
 };
 
 use common::sso_support::{
-    allow_private_sso_ip, audit_row_eventually, build_state, ensure_sso_encryption_key,
-    non_loopback_bind_ip, sso_app, try_pool,
+    allow_private_sso_ip, audit_row_eventually, build_state, build_state_with_config,
+    ensure_sso_encryption_key, non_loopback_bind_ip, sso_app, test_config, try_pool,
 };
 
 // ===========================================================================
@@ -244,6 +244,9 @@ struct ProviderOpts {
     attr_extra: Value,
     map_groups_to_groups: bool,
     auto_create_users: bool,
+    /// Pin `attribute_mapping.redirect_uri`. Off only for the cases that
+    /// assert the request-derived redirect_uri (#4143).
+    pin_redirect_uri: bool,
 }
 
 impl Default for ProviderOpts {
@@ -252,6 +255,7 @@ impl Default for ProviderOpts {
             attr_extra: json!({}),
             map_groups_to_groups: false,
             auto_create_users: true,
+            pin_redirect_uri: true,
         }
     }
 }
@@ -266,9 +270,13 @@ async fn create_provider_with(pool: &PgPool, idp: &MockIdp, opts: ProviderOpts) 
     // Pin a fixed redirect_uri so we can assert it on the login redirect
     // without relying on request Host headers, then merge any case-specific
     // claim overrides on top.
-    let mut attr = json!({
-        "redirect_uri": "https://ak.example.test/api/v1/auth/sso/oidc/callback"
-    });
+    let mut attr = if opts.pin_redirect_uri {
+        json!({
+            "redirect_uri": "https://ak.example.test/api/v1/auth/sso/oidc/callback"
+        })
+    } else {
+        json!({})
+    };
     if let (Value::Object(base), Value::Object(more)) = (&mut attr, opts.attr_extra) {
         base.extend(more);
     }
@@ -1265,5 +1273,273 @@ async fn test_oidc_generic_callback_login_required_redirects_silent_denied() {
         .expect("Location");
     assert_eq!(location, "/callback?silent_denied=1");
 
+    delete_provider(&pool, provider_id).await;
+}
+
+// ===========================================================================
+// Token request carries `scope` (#4699)
+// ===========================================================================
+
+/// The form fields the backend POSTed to the mock token endpoint (the last
+/// token request received).
+async fn last_token_request_form(idp: &MockIdp) -> HashMap<String, String> {
+    let requests = idp
+        .server
+        .received_requests()
+        .await
+        .expect("wiremock request recording is on");
+    let token_req = requests
+        .iter()
+        .rev()
+        .find(|r| r.url.path() == "/token")
+        .expect("backend POSTed to the token endpoint");
+    url::form_urlencoded::parse(&token_req.body)
+        .into_owned()
+        .collect()
+}
+
+/// #4699: Microsoft Entra's v2 token endpoint returns an `id_token` only when
+/// the token request itself carries the `openid` scope, so the code exchange
+/// must repeat the provider's configured scopes (RFC 6749 permits `scope` on
+/// the token request). Before the fix the form had no `scope` field at all.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+async fn test_oidc_token_request_sends_configured_scopes() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+
+    let (sso_state, nonce) = login_state_nonce(&pool, provider_id).await;
+    idp.mount_token_endpoint(&nonce, json!({ "sub": "oidc-sub-4699-scope" }))
+        .await;
+
+    let resp = do_callback_state(&pool, provider_id, &sso_state).await;
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+
+    let form = last_token_request_form(&idp).await;
+    assert_eq!(
+        form.get("scope").map(String::as_str),
+        Some("openid profile email"),
+        "token request must repeat the configured scopes, got form {form:?}"
+    );
+    assert_eq!(
+        form.get("grant_type").map(String::as_str),
+        Some("authorization_code")
+    );
+
+    delete_user_by_sub(&pool, "oidc-sub-4699-scope").await;
+    delete_provider(&pool, provider_id).await;
+}
+
+/// #4699: a token response without `id_token` is an IdP-side problem. It must
+/// surface as a 502 that names the provider and says the IdP returned no
+/// id_token, not as an opaque 500 `INTERNAL_ERROR`.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test exempt — buffering a small JSON error body in a test assertion is not an artifact path (#1608)
+async fn test_oidc_token_response_without_id_token_is_502_naming_provider() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+    let provider_name: String = sqlx::query_scalar("SELECT name FROM oidc_configs WHERE id = $1")
+        .bind(provider_id)
+        .fetch_one(&pool)
+        .await
+        .expect("provider name");
+
+    let (sso_state, _nonce) = login_state_nonce(&pool, provider_id).await;
+    Mock::given(method("POST"))
+        .and(wm_path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "mock-access-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        })))
+        .mount(&idp.server)
+        .await;
+
+    let resp = do_callback_state(&pool, provider_id, &sso_state).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let body: Value = serde_json::from_slice(&body).expect("json error body");
+    assert_eq!(body["code"], "OIDC_NO_ID_TOKEN", "body: {body}");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&provider_name) && message.contains("id_token"),
+        "message must name the provider and the missing id_token: {message}"
+    );
+
+    delete_provider(&pool, provider_id).await;
+}
+
+// ===========================================================================
+// Request-derived redirect_uri behind a reverse proxy (#4143)
+// ===========================================================================
+
+/// Drive `GET /oidc/{id}/login` as if the TCP peer were `peer`, with the
+/// headers a TLS-terminating proxy sets, and return the `redirect_uri` sent
+/// to the IdP.
+async fn login_redirect_uri_from_peer(
+    state: SharedState,
+    provider_id: Uuid,
+    peer: std::net::SocketAddr,
+) -> String {
+    let mut req = Request::builder()
+        .method("GET")
+        .uri(format!("/oidc/{provider_id}/login"))
+        .header("host", "backend.internal:8080")
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-host", "ak.example.test")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
+    let resp = sso_app(state).oneshot(req).await.expect("login oneshot");
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let query = location.split_once('?').map(|(_, q)| q).unwrap_or("");
+    url_decode_query(query)
+        .remove("redirect_uri")
+        .expect("redirect_uri on the authorize URL")
+}
+
+/// #4143: with `RATE_LIMIT_TRUSTED_PROXY_CIDRS` set, `X-Forwarded-Proto` /
+/// `X-Forwarded-Host` decide the OIDC `redirect_uri` only when the TCP peer is
+/// one of those proxies. Behind a trusted proxy that sets
+/// `X-Forwarded-Proto: https` the redirect_uri is `https://`; the same headers
+/// from an untrusted peer are ignored (before the fix they were believed from
+/// any peer, so a client could steer the redirect_uri sent to the IdP).
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+async fn test_oidc_redirect_uri_forwarded_headers_only_from_trusted_proxy() {
+    if std::env::var("AK_EXTERNAL_URL").is_ok() {
+        // AK_EXTERNAL_URL overrides every request-derived base URL.
+        return;
+    }
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider_with(
+        &pool,
+        &idp,
+        ProviderOpts {
+            pin_redirect_uri: false,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut cfg = test_config();
+    cfg.rate_limit_trusted_proxy_cidrs = vec![
+        artifact_keeper_backend::api::middleware::rate_limit::CidrRange::parse("10.0.0.0/8")
+            .unwrap(),
+    ];
+    let state = build_state_with_config(pool.clone(), cfg);
+
+    let trusted = login_redirect_uri_from_peer(
+        state.clone(),
+        provider_id,
+        "10.20.30.40:51000".parse().unwrap(),
+    )
+    .await;
+    assert_eq!(
+        trusted, "https://ak.example.test/api/v1/auth/sso/oidc/callback",
+        "a trusted proxy's X-Forwarded-Proto/Host must decide the redirect_uri"
+    );
+
+    let untrusted =
+        login_redirect_uri_from_peer(state, provider_id, "203.0.113.7:51000".parse().unwrap())
+            .await;
+    assert_eq!(
+        untrusted, "http://backend.internal:8080/api/v1/auth/sso/oidc/callback",
+        "forwarding headers from an untrusted peer must be ignored"
+    );
+
+    delete_provider(&pool, provider_id).await;
+}
+
+// ===========================================================================
+// SSO session lifetime is reported to the client (#4648)
+// ===========================================================================
+
+/// #4648: login sessions are short-lived, so every login response must say
+/// how long the access token lives. `POST /auth/login` already returns
+/// `expires_in`; the SSO exchange (`POST /sso/exchange`, which hands the
+/// browser its OIDC/SAML session) did not. It must report the configured
+/// `JWT_ACCESS_TOKEN_EXPIRY_MINUTES`, here set to a non-default 45.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test exempt — buffering a small JSON body in a test assertion is not an artifact path (#1608)
+async fn test_sso_exchange_reports_configured_expires_in() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+    let (sso_state, nonce) = login_state_nonce(&pool, provider_id).await;
+    let external_id = format!("oidc-sub-4648-{}", Uuid::new_v4().as_simple());
+    idp.mount_token_endpoint(&nonce, json!({ "sub": external_id }))
+        .await;
+
+    let mut cfg = test_config();
+    cfg.jwt_access_token_expiry_minutes = 45;
+    let state = build_state_with_config(pool.clone(), cfg);
+
+    let resp = do_callback(
+        state.clone(),
+        provider_id,
+        &format!(
+            "code=mock-auth-code&state={}",
+            urlencoding::encode(&sso_state)
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let code = url_decode_query(location.split_once('?').map(|(_, q)| q).unwrap_or(""))
+        .remove("code")
+        .expect("exchange code on the frontend redirect");
+
+    let resp = sso_app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/exchange")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "code": code }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("exchange oneshot");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let body: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(body["token_type"], "Bearer");
+    let expires_in = body["expires_in"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("exchange response must carry expires_in: {body}"));
+    assert!(
+        (45 * 60 - 10..=45 * 60).contains(&expires_in),
+        "expires_in must be the configured 45-minute lifetime, got {expires_in}"
+    );
+
+    delete_user_by_sub(&pool, &external_id).await;
     delete_provider(&pool, provider_id).await;
 }

@@ -410,7 +410,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut w = zip::ZipWriter::new(&mut cursor);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             w.start_file("vendor/pkg/composer.json", opts).unwrap();
             w.write_all(body).unwrap();

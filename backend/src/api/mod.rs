@@ -7,6 +7,7 @@ pub mod handlers;
 pub mod middleware;
 pub mod openapi;
 pub mod routes;
+pub mod serve;
 pub mod validation;
 
 use crate::config::Config;
@@ -176,6 +177,13 @@ pub type SignedReleaseCacheIndex = Arc<RwLock<HashMap<(String, String), Vec<Stri
 /// still bounding worst-case memory if the cache ever grows pathologically.
 pub const SIGNED_RELEASE_CACHE_MAX_ENTRIES: usize = 1024;
 
+/// Username of the built-in bootstrap admin account (#4634).
+///
+/// The first-run setup gate, `admin.password` and the SQL that provisions and
+/// re-checks them all refer to this one account, so a pending password change
+/// on any other admin must not arm, hold or re-arm the gate.
+pub const BUILTIN_ADMIN_USERNAME: &str = "admin";
+
 /// Application state shared across handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -226,6 +234,10 @@ pub struct AppState {
     /// In-process cache of finished PyPI simple-project pages. Always
     /// present; a TTL of `0` makes the handler skip it.
     pub pypi_simple_cache: Arc<PypiSimpleCache>,
+    /// Live state of this replica's npm upstream change-feed consumer
+    /// (#3069): written by the `FeedConsumer` (`main.rs` hands it this
+    /// handle), read by `GET /api/v1/admin/npm/upstream-feed/status`.
+    pub upstream_feed_status: Arc<crate::services::upstream_feed::FeedStatus>,
     /// In-process cache of signed APT `InRelease` / `Release.gpg` payloads,
     /// keyed by `SHA-256(unsigned Release || key fingerprint)`. Avoids
     /// re-signing on every `apt update` poll (#1236).
@@ -249,6 +261,11 @@ pub struct AppState {
     /// extra concurrent login starves the blocking-thread pool and the rest
     /// of the API degrades along with it (#991, #1088).
     pub auth_semaphore: Option<Arc<Semaphore>>,
+    /// Runtime guest-access setting (#867): env pin, else the
+    /// `system_settings` row, else the default; cached with a short TTL,
+    /// refreshed with the written value on write, closed when unreadable. Every consumer of "is anonymous access allowed"
+    /// asks this instead of `config.guest_access_enabled`.
+    pub guest_access_policy: Arc<crate::services::guest_access_policy::GuestAccessPolicy>,
 }
 
 /// Build an auth-concurrency semaphore from a config value, or `None` when
@@ -259,6 +276,20 @@ fn build_auth_semaphore(max: usize) -> Option<Arc<Semaphore>> {
     } else {
         Some(Arc::new(Semaphore::new(max)))
     }
+}
+
+/// The runtime guest-access handle every `AppState` constructor installs
+/// (#867): env pin and default from `config`, stored value from `db`.
+fn build_guest_access_policy(
+    db: &PgPool,
+    config: &Config,
+) -> Arc<crate::services::guest_access_policy::GuestAccessPolicy> {
+    Arc::new(
+        crate::services::guest_access_policy::GuestAccessPolicy::from_config(
+            Some(db.clone()),
+            config,
+        ),
+    )
 }
 
 impl AppState {
@@ -288,6 +319,7 @@ impl AppState {
             std::time::Duration::from_secs(config.pypi_simple_cache_ttl_secs),
             config.pypi_simple_cache_max_bytes,
         ));
+        let guest_access_policy = build_guest_access_policy(&db, &config);
         Self {
             config,
             db,
@@ -312,10 +344,12 @@ impl AppState {
             npm_packument_cache,
             npm_attestation_cache,
             pypi_simple_cache,
+            upstream_feed_status: Arc::default(),
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
+            guest_access_policy,
         }
     }
 
@@ -342,6 +376,7 @@ impl AppState {
             std::time::Duration::from_secs(config.pypi_simple_cache_ttl_secs),
             config.pypi_simple_cache_max_bytes,
         ));
+        let guest_access_policy = build_guest_access_policy(&db, &config);
         Self {
             config,
             db,
@@ -366,10 +401,12 @@ impl AppState {
             npm_packument_cache,
             npm_attestation_cache,
             pypi_simple_cache,
+            upstream_feed_status: Arc::default(),
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
+            guest_access_policy,
         }
     }
 
@@ -388,6 +425,12 @@ impl AppState {
     /// back to `true` at runtime, so after the first confirmation no further
     /// queries are issued.
     ///
+    /// Only the built-in `admin` account counts (#4634), the same account
+    /// `provision_admin_user` arms the gate for at boot. Any other admin with a
+    /// pending change would keep every replica locked after `admin` had
+    /// already rotated its password, and it is still forced to rotate at its
+    /// own login by the per-user 428 in the auth middleware.
+    ///
     /// Only an **active** admin counts (#3723): local login filters on
     /// `is_active`, so a deactivated built-in admin can never complete the
     /// change-password flow, and gating on it would lock the instance with
@@ -404,7 +447,8 @@ impl AppState {
         }
         match sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM users \
-             WHERE is_admin = true AND must_change_password = true AND is_active = true)",
+             WHERE username = 'admin' AND is_admin = true AND external_id IS NULL \
+               AND must_change_password = true AND is_active = true)",
         )
         .fetch_one(&self.db)
         .await
@@ -442,7 +486,8 @@ impl AppState {
     }
 
     /// Convenience for handlers that return `Result<..., Response>`.
-    /// Resolves storage and maps errors to a 500 plain-text response.
+    /// Resolves storage and maps errors to a 500 plain-text response, except a
+    /// backend skipped at startup, which keeps its 503 (#4530).
     #[allow(clippy::result_large_err)]
     pub fn storage_for_repo_or_500(
         &self,
@@ -450,6 +495,11 @@ impl AppState {
     ) -> Result<Arc<dyn StorageBackend>, Response> {
         self.storage_for_repo(location).map_err(|e| {
             tracing::error!("Storage backend resolution failed: {}", e);
+            // A backend skipped at startup is a 503 naming it (#4530), not a
+            // bare 500.
+            if matches!(e, crate::error::AppError::ServiceUnavailable(_)) {
+                return e.into_response();
+            }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage operation failed",
@@ -553,24 +603,68 @@ impl AppState {
 
 pub type SharedState = Arc<AppState>;
 
-/// Redact sensitive query-string parameters from a URI path for safe logging.
+/// Query parameter names whose value is a credential and must never reach a
+/// log line, compared case-insensitively after percent-decoding the key.
 ///
-/// Parameters named `token`, `key`, `api_key`, `password`, or `secret`
-/// (case-insensitive) have their values replaced with `[REDACTED]`.
+/// - `token`, `key`, `api_key`, `password`, `secret`: the original set (#544).
+/// - `ticket`: the single-use download ticket (`?ticket=`) the auth
+///   middleware accepts in place of a header (#4675).
+/// - `access_token`, `refresh_token`, `id_token`, `client_secret`, `code`:
+///   OAuth2 / OCI `/v2/token` style credentials and the OIDC authorization
+///   code on the SSO callback, should a client put them in the URL (#4675).
+/// - `x-amz-signature`, `x-amz-credential`, `x-amz-security-token`,
+///   `x-goog-signature`, `x-goog-credential`, `signature`, `sig`:
+///   presigned-URL signatures and session tokens (S3, GCS, CloudFront,
+///   Azure SAS) (#4675).
+const SENSITIVE_QUERY_PARAMS: &[&str] = &[
+    "token",
+    "key",
+    "api_key",
+    "password",
+    "secret",
+    "ticket",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "client_secret",
+    "code",
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+    "x-goog-signature",
+    "x-goog-credential",
+    "signature",
+    "sig",
+];
+
+/// Whether a raw (possibly percent-encoded) query key names a credential.
+/// The key is decoded first so `%74icket=` or `access%5Ftoken=` is caught
+/// the same as the plain spelling.
+fn is_sensitive_query_key(raw_key: &str) -> bool {
+    let decoded = urlencoding::decode(&raw_key.replace('+', " "))
+        .map(|k| k.into_owned())
+        .unwrap_or_else(|_| raw_key.to_string());
+    let k = decoded.trim().to_ascii_lowercase();
+    SENSITIVE_QUERY_PARAMS.contains(&k.as_str())
+}
+
+/// Redact credentials from a request path and query string for safe logging.
+///
+/// Query parameters named in [`SENSITIVE_QUERY_PARAMS`] (case-insensitive,
+/// percent-decoded) have their values replaced with `[REDACTED]` (#544,
+/// #4675). This is what the `http_request` span records as `uri`.
+///
+/// The path is passed through [`redact_token_path_segment`], which hides the
+/// bearer token the two conda token-channel layouts carry in the path itself.
 pub fn redact_sensitive_params(path: &str, query: Option<&str>) -> String {
+    let path = redact_token_path_segment(path);
     match query {
         Some(q) => {
             let redacted: String = q
                 .split('&')
                 .map(|pair| {
                     if let Some((key, _)) = pair.split_once('=') {
-                        let k = key.to_lowercase();
-                        if k == "token"
-                            || k == "key"
-                            || k == "api_key"
-                            || k == "password"
-                            || k == "secret"
-                        {
+                        if is_sensitive_query_key(key) {
                             return format!("{}=[REDACTED]", key);
                         }
                     }
@@ -580,8 +674,58 @@ pub fn redact_sensitive_params(path: &str, query: Option<&str>) -> String {
                 .join("&");
             format!("{}?{}", path, redacted)
         }
-        None => path.to_string(),
+        None => path.into_owned(),
     }
+}
+
+/// Replace the token segment of a conda token-channel path with `[REDACTED]`.
+///
+/// Two layouts put a bearer token in the path rather than a header:
+///
+/// - `/conda/t/<TOKEN>/<repo_key>/...` (conda's `.condarc` token channel)
+/// - `/t/<TOKEN>/conda/<repo_key>/...` (rattler / pixi `--conda-token`)
+///
+/// Only a path that STARTS with one of those prefixes is touched; a `/t/`
+/// deeper in the path (a repository or package path that happens to contain
+/// one) is left alone. Leading slashes are skipped the same way
+/// `extract_conda_url_token` skips them, so `//conda/t/<TOKEN>/...` is
+/// redacted too. Under `/conda/t/` the segment is only treated as a token when
+/// more path follows it, so `/conda/t/channeldata.json` (a repository whose
+/// key is literally `t`) stays readable, matching what the auth middleware
+/// accepts as a credential. Everything around the token is kept verbatim.
+pub fn redact_token_path_segment(path: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+
+    let trimmed = path.trim_start_matches('/');
+    let lead = &path[..path.len() - trimmed.len()];
+    let (prefix, rest) = if let Some(rest) = trimmed.strip_prefix("t/") {
+        ("t/", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("agentplugins/t/") {
+        // #5251: as for conda, the segment is a token whenever anything
+        // follows it (`/agentplugins/t/<TOKEN>/plugins` and `.../plugins/`
+        // included); `/agentplugins/t/<doc>` is a route of a repository `t`.
+        if !rest.contains('/') {
+            return Cow::Borrowed(path);
+        }
+        ("agentplugins/t/", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("conda/t/") {
+        // A token channel needs a path after the token; without one the
+        // segment is a route under a repository named `t`.
+        if !rest.contains('/') {
+            return Cow::Borrowed(path);
+        }
+        ("conda/t/", rest)
+    } else {
+        return Cow::Borrowed(path);
+    };
+    let (token, tail) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    if token.is_empty() {
+        return Cow::Borrowed(path);
+    }
+    Cow::Owned(format!("{lead}{prefix}[REDACTED]{tail}"))
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -902,6 +1046,186 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_redact_download_ticket_param() {
+        // #4675: the single-use download ticket must not reach the log plane.
+        let result = redact_sensitive_params(
+            "/api/v1/repositories/r/download/pkg.tgz",
+            Some("ticket=0123456789abcdef0123456789abcdef"),
+        );
+        assert_eq!(
+            result,
+            "/api/v1/repositories/r/download/pkg.tgz?ticket=[REDACTED]"
+        );
+        let result = redact_sensitive_params(
+            "/terraform/v1/providers/x/y/1.0.0/download/linux/amd64",
+            Some("foo=1&TICKET=abc&bar=2"),
+        );
+        assert_eq!(
+            result,
+            "/terraform/v1/providers/x/y/1.0.0/download/linux/amd64?foo=1&TICKET=[REDACTED]&bar=2"
+        );
+    }
+
+    #[test]
+    fn test_redact_percent_encoded_ticket_key() {
+        let result = redact_sensitive_params("/d", Some("%74icket=abc&x=1"));
+        assert_eq!(result, "/d?%74icket=[REDACTED]&x=1");
+    }
+
+    #[test]
+    fn test_redact_oauth_token_query_params() {
+        // OCI `/v2/token` and OAuth2-style credentials carried in the URL.
+        let result = redact_sensitive_params(
+            "/v2/token",
+            Some(
+                "service=artifact-keeper&scope=repository:a/b:pull&account=bob\
+                 &refresh_token=rt&access_token=at&id_token=it&client_secret=cs",
+            ),
+        );
+        assert_eq!(
+            result,
+            "/v2/token?service=artifact-keeper&scope=repository:a/b:pull&account=bob\
+             &refresh_token=[REDACTED]&access_token=[REDACTED]&id_token=[REDACTED]\
+             &client_secret=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_redact_oidc_callback_code() {
+        let result = redact_sensitive_params(
+            "/api/v1/auth/sso/oidc/abc/callback",
+            Some("code=authcode123&state=s1"),
+        );
+        assert_eq!(
+            result,
+            "/api/v1/auth/sso/oidc/abc/callback?code=[REDACTED]&state=s1"
+        );
+    }
+
+    #[test]
+    fn test_redact_presigned_style_params() {
+        let result = redact_sensitive_params(
+            "/blob",
+            Some(
+                "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA%2F20260101\
+                 &X-Amz-Signature=deadbeef&X-Amz-Security-Token=st&sig=azsig\
+                 &Signature=cfsig&X-Goog-Signature=gsig&Expires=1",
+            ),
+        );
+        assert_eq!(
+            result,
+            "/blob?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=[REDACTED]\
+             &X-Amz-Signature=[REDACTED]&X-Amz-Security-Token=[REDACTED]&sig=[REDACTED]\
+             &Signature=[REDACTED]&X-Goog-Signature=[REDACTED]&Expires=1"
+        );
+    }
+
+    #[test]
+    fn test_redact_uri_without_secrets_unchanged() {
+        let q = "q=ticket&page=2&sort=name&tickets=3&codec=h264&signed=true&key_id=k";
+        assert_eq!(
+            redact_sensitive_params("/api/v1/search", Some(q)),
+            format!("/api/v1/search?{q}")
+        );
+        assert_eq!(
+            redact_sensitive_params("/api/v1/repositories/r/download/ticket", None),
+            "/api/v1/repositories/r/download/ticket"
+        );
+        // A bare key with no value has nothing to hide.
+        assert_eq!(redact_sensitive_params("/d", Some("ticket")), "/d?ticket");
+    }
+
+    #[test]
+    fn test_redact_conda_token_channel_path() {
+        let result =
+            redact_sensitive_params("/conda/t/ak_secret123/my-repo/noarch/repodata.json", None);
+        assert_eq!(result, "/conda/t/[REDACTED]/my-repo/noarch/repodata.json");
+    }
+
+    #[test]
+    fn test_redact_rattler_token_path() {
+        let result = redact_sensitive_params(
+            "/t/ak_secret123/conda/my-repo/linux-64/pkg-1.0-0.conda",
+            None,
+        );
+        assert_eq!(
+            result,
+            "/t/[REDACTED]/conda/my-repo/linux-64/pkg-1.0-0.conda"
+        );
+    }
+
+    #[test]
+    fn test_redact_token_path_with_sensitive_query() {
+        let result = redact_sensitive_params(
+            "/t/ak_secret123/conda/my-repo/noarch/repodata.json",
+            Some("token=abc&x=1"),
+        );
+        assert_eq!(
+            result,
+            "/t/[REDACTED]/conda/my-repo/noarch/repodata.json?token=[REDACTED]&x=1"
+        );
+    }
+
+    #[test]
+    fn test_redact_token_path_extra_leading_slashes() {
+        let result = redact_sensitive_params(
+            "/agentplugins/t/ak_secret123/plugins/claude-marketplace.json",
+            None,
+        );
+        assert_eq!(
+            result,
+            "/agentplugins/t/[REDACTED]/plugins/claude-marketplace.json"
+        );
+        let result = redact_sensitive_params("/agentplugins/t/marketplace.json", None);
+        assert_eq!(result, "/agentplugins/t/marketplace.json");
+        for (raw, redacted) in [
+            (
+                "/agentplugins/t/ak_secret123/plugins",
+                "/agentplugins/t/[REDACTED]/plugins",
+            ),
+            (
+                "/agentplugins/t/ak_secret123/plugins/",
+                "/agentplugins/t/[REDACTED]/plugins/",
+            ),
+            (
+                "/agentplugins/t/ak_secret123/",
+                "/agentplugins/t/[REDACTED]/",
+            ),
+        ] {
+            assert_eq!(redact_sensitive_params(raw, None), redacted, "{raw}");
+        }
+        let result = redact_sensitive_params("//conda/t/ak_secret123/my-repo/", None);
+        assert_eq!(result, "//conda/t/[REDACTED]/my-repo/");
+    }
+
+    #[test]
+    fn test_redact_token_path_nested_t_untouched() {
+        for path in [
+            "/conda/my-repo/t/noarch/repodata.json",
+            "/npm/some-repo/t/x",
+            "/api/v1/repositories/t/artifacts",
+            "/maven/repo/org/t/1.0/t-1.0.jar",
+        ] {
+            assert_eq!(redact_sensitive_params(path, None), path);
+        }
+    }
+
+    #[test]
+    fn test_redact_token_path_repo_named_t_untouched() {
+        // `/conda/t/<doc>` with nothing after is the plain route for a
+        // repository whose key is `t`, not a token channel.
+        for path in ["/conda/t/channeldata.json", "/conda/t/upload", "/conda/t"] {
+            assert_eq!(redact_sensitive_params(path, None), path);
+        }
+    }
+
+    #[test]
+    fn test_redact_token_path_empty_token_untouched() {
+        assert_eq!(redact_sensitive_params("/t//conda/x", None), "/t//conda/x");
+        assert_eq!(redact_sensitive_params("/t/", None), "/t/");
+    }
+
     // -----------------------------------------------------------------------
     // Auth-concurrency semaphore (perf bundle #991/#1088)
     // -----------------------------------------------------------------------
@@ -937,5 +1261,49 @@ mod tests {
         }
         // Permit returned to the pool after drop, the next acquire must succeed.
         assert!(sem.clone().try_acquire_owned().is_ok());
+    }
+
+    /// #4530: `storage_for_repo_or_500` keeps the 503 of a backend skipped at
+    /// startup (naming it, without the configuration error) and still maps
+    /// every other resolution failure to the historic plain 500.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // STREAMING-EXEMPT: test reads a small, bounded error body
+    async fn storage_for_repo_or_500_keeps_skipped_backend_503_4530() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let dir = std::env::temp_dir().join(format!("skip-4530-{}", Uuid::new_v4()));
+        let mut state = tdh::build_state(tdh::lazy_pool(), dir.to_str().unwrap());
+        let mut registry =
+            StorageRegistry::new(std::collections::HashMap::new(), "filesystem".to_string());
+        registry.record_skipped_backend("s3", "S3_PUBLIC_ENDPOINT=\"ftp://internal.example\"");
+        Arc::get_mut(&mut state)
+            .expect("fresh state has one owner")
+            .storage_registry = Arc::new(registry);
+
+        let skipped = state
+            .storage_for_repo_or_500(&StorageLocation {
+                backend: "s3".to_string(),
+                path: "repo/x".to_string(),
+            })
+            .err()
+            .expect("a skipped backend must not resolve");
+        assert_eq!(skipped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(skipped.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("'s3'"), "names the backend: {body}");
+        assert!(
+            !body.contains("internal.example"),
+            "does not carry the configuration error: {body}"
+        );
+
+        let unknown = state
+            .storage_for_repo_or_500(&StorageLocation {
+                backend: "azure".to_string(),
+                path: "repo/x".to_string(),
+            })
+            .err()
+            .expect("an unconfigured backend must not resolve");
+        assert_eq!(unknown.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

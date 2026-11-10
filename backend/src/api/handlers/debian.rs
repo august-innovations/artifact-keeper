@@ -16,6 +16,8 @@
 //!   GET  /debian/{repo_key}/pool/{component}/*path                                  - Download .deb
 //!   PUT  /debian/{repo_key}/pool/{component}/*path                                  - Upload .deb
 //!   POST /debian/{repo_key}/upload                                                  - Upload .deb (raw body)
+//!   GET  /debian/{repo_key}/{InRelease,Release,Release.gpg,Packages*}                - Flat repository (#4619)
+//!   GET  /debian/{repo_key}/{dir}/*path                                             - Flat repository suite dir / package
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -38,7 +40,7 @@ use sqlx::PgPool;
 use tracing::info;
 use xz2::read::XzDecoder;
 
-use crate::api::handlers::error_helpers::require_signing_key;
+use crate::api::handlers::error_helpers::{require_openpgp_capable_key, require_signing_key};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::{SharedState, SignedReleaseCacheEntry, SIGNED_RELEASE_CACHE_MAX_ENTRIES};
@@ -56,10 +58,12 @@ use crate::services::package_analysis_service::{
 use crate::services::package_service::PackageService;
 use crate::services::proxy_service::{ProxyService, DEFAULT_DISTS_INDEX_TTL_SECS};
 use crate::services::signing_service::{
-    signed_cache_entry_is_fresh, signed_cache_max_age, SigningService,
+    openpgp_public_keyring, signed_cache_entry_is_fresh, signed_cache_max_age,
+    signer_set_fingerprint, SigningService,
 };
+use crate::storage::StorageBackend;
 
-const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
+pub(crate) const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
 
 // ---------------------------------------------------------------------------
 // Router
@@ -98,6 +102,12 @@ pub fn router() -> Router<SharedState> {
         )
         // Alternative upload endpoint
         .route("/:repo_key/upload", post(upload_raw))
+        // Flat repositories (#4619, `deb <uri> /`): release documents,
+        // indices and packages addressed relative to the repository root.
+        // The static `dists`/`pool`/`upload`/`gpg-key.asc` segments above
+        // take precedence over these parameters.
+        .route("/:repo_key/:flat", get(flat_root_file))
+        .route("/:repo_key/:flat/*flat_rest", get(flat_nested_file))
 }
 
 // ---------------------------------------------------------------------------
@@ -777,6 +787,21 @@ fn package_matches_requested_arch(package_arch: &str, requested_arch: &str) -> b
     } else {
         package_arch == requested_arch || package_arch == "all"
     }
+}
+
+/// The `Packages` index text for `component`/`arch`, exactly as
+/// `dists/<dist>/<component>/binary-<arch>/Packages` serves it.
+#[cfg(test)]
+pub(crate) async fn render_packages_index(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    component: &str,
+    arch: &str,
+) -> Result<String, StatusCode> {
+    let entries = fetch_package_entries(db, repo_id, component, arch)
+        .await
+        .map_err(|r| r.status())?;
+    Ok(build_packages_text(&entries))
 }
 
 /// Fetch all package entries for a given repo, component, and architecture.
@@ -1616,14 +1641,36 @@ async fn load_release_checksums(
     upstream_url: &str,
     distribution: &str,
 ) -> Option<HashMap<String, (String, u64)>> {
+    load_release_checksums_at(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &format!("dists/{distribution}"),
+        distribution,
+    )
+    .await
+}
+
+/// [`load_release_checksums`] for a release document in `release_dir`
+/// (`dists/<suite>` for the suite layout, the suite directory of a flat
+/// repository, #4619), revalidated under `epoch_distribution`'s release epoch.
+async fn load_release_checksums_at(
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    release_dir: &str,
+    epoch_distribution: &str,
+) -> Option<HashMap<String, (String, u64)>> {
     let pseudo_repo = proxy_helpers::build_remote_repo(repo_id, repo_key, upstream_url);
     for name in ["InRelease", "Release"] {
-        let path = format!("dists/{}/{}", distribution, name);
+        let path = flat_release_path(release_dir, name);
         if let Ok((bytes, _ct, _changed)) = proxy
             .fetch_dists_with_revalidation(
                 &pseudo_repo,
                 &path,
-                distribution,
+                epoch_distribution,
                 DEFAULT_DISTS_INDEX_TTL_SECS,
             )
             .await
@@ -1658,7 +1705,28 @@ async fn enforce_dists_integrity(
     else {
         return Ok(());
     };
-    if verify_index_against_release(&table, dist_relative_path, content)
+    reject_unverified_index(
+        proxy,
+        repo_key,
+        upstream_path,
+        &table,
+        dist_relative_path,
+        content,
+    )
+    .await
+}
+
+/// Shared Tier A verdict: on a checksum/size mismatch against the signed
+/// `Release` table, evict the cached `upstream_path` and answer 502.
+async fn reject_unverified_index(
+    proxy: &ProxyService,
+    repo_key: &str,
+    upstream_path: &str,
+    table: &HashMap<String, (String, u64)>,
+    release_relative_path: &str,
+    content: &[u8],
+) -> Result<(), Response> {
+    if verify_index_against_release(table, release_relative_path, content)
         == IndexVerification::Mismatch
     {
         // Evict the poisoned entry so a later read cannot serve it.
@@ -1725,7 +1793,8 @@ fn decompress_packages_index(cache_path: &str, bytes: &[u8]) -> Option<String> {
     if cache_path.ends_with(".gz") {
         read_index_capped(GzDecoder::new(bytes))
     } else if cache_path.ends_with(".xz") {
-        read_index_capped(XzDecoder::new(bytes))
+        // Multi-stream: Ubuntu's release pockets publish two concatenated streams.
+        read_index_capped(XzDecoder::new_multi_decoder(bytes))
     } else {
         Some(String::from_utf8_lossy(bytes).into_owned())
     }
@@ -1757,42 +1826,454 @@ fn read_index_capped<R: Read>(reader: R) -> Option<String> {
 /// (#2561), which sheds the request with a retryable 503 before any upstream
 /// fetch or cache write — the resolve fails cleanly, no partial state.
 async fn resolve_pool_expected_checksum(
+    db: &PgPool,
     proxy: &ProxyService,
+    repo_id: uuid::Uuid,
     repo_key: &str,
     component: &str,
     artifact_path: &str,
 ) -> crate::error::Result<Option<String>> {
-    let Some(filename) = artifact_path.rsplit('/').next() else {
-        return Ok(None);
-    };
-    let Ok((_, _, arch)) = DebianHandler::parse_deb_filename(filename) else {
-        return Ok(None);
-    };
-    for cache_path in proxy.list_cached_paths(repo_key).await {
-        if !is_matching_packages_index(&cache_path, component, &arch) {
-            continue;
+    Ok(
+        resolve_pool_index_entry(db, proxy, repo_id, repo_key, component, artifact_path)
+            .await?
+            .map(|(sha, _)| sha),
+    )
+}
+
+/// The distribution a cached Packages index path belongs to:
+/// `dists/{distribution}/{component}/binary-{arch}/Packages*` (a nested
+/// distribution such as `bookworm/updates` included).
+fn packages_index_distribution(cache_path: &str, component: &str) -> Option<String> {
+    let rest = cache_path.strip_prefix("dists/")?;
+    let at = rest.find(&format!("/{component}/binary-"))?;
+    let distribution = &rest[..at];
+    (!distribution.is_empty()).then(|| distribution.to_string())
+}
+
+/// A cached Packages index to look a pool file up in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexCandidate {
+    /// Where it is cached.
+    cache_path: String,
+    /// The path it is decoded as (its compression suffix).
+    name: String,
+    /// The SHA-256 the suite's `Release` names it by (#5695). When set, the
+    /// cached bytes are read only if they hash to it.
+    sha256: Option<String>,
+    /// The release that same `Release` names (#5695): read from the text the
+    /// digest was checked against, never re-read after the check.
+    release: Option<crate::services::scanner_service::OsRelease>,
+}
+
+/// What a cached Packages index records for a pool file.
+struct PoolIndexEntry {
+    /// The file's SHA-256.
+    sha256: String,
+    /// The index's distribution.
+    distribution: String,
+    /// The release of the `Release` the index was checked against.
+    release: Option<crate::services::scanner_service::OsRelease>,
+}
+
+impl IndexCandidate {
+    /// An index trusted as cached (the client-path Tier B resolver).
+    fn unchecked(cache_path: String) -> Self {
+        Self {
+            name: cache_path.clone(),
+            cache_path,
+            sha256: None,
+            release: None,
         }
-        let Ok(Some((bytes, _, _))) = proxy
-            .get_cached_artifact_by_path(repo_key, &cache_path)
-            .await
-        else {
+    }
+}
+
+/// The cached Packages index, at `cache_path` and decoded as `name` says, that
+/// lists `artifact_path`: its SHA-256 for the file and its distribution.
+async fn pool_entry_in_indexes(
+    proxy: &ProxyService,
+    repo_key: &str,
+    (component, artifact_path): (&str, &str),
+    indexes: impl IntoIterator<Item = IndexCandidate>,
+    ignore_expiry: bool,
+) -> crate::error::Result<Option<PoolIndexEntry>> {
+    for IndexCandidate {
+        cache_path,
+        name,
+        sha256,
+        release,
+    } in indexes
+    {
+        let cached = if ignore_expiry {
+            proxy
+                .get_cached_artifact_by_path_ignoring_expiry(repo_key, &cache_path)
+                .await
+        } else {
+            proxy
+                .get_cached_artifact_by_path(repo_key, &cache_path)
+                .await
+        };
+        let Ok(Some(proxy_helpers::CachedBody { content: bytes, .. })) = cached else {
             continue;
         };
+        // A `by-hash/` entry says what it must hash to, and so does an index
+        // the suite's `Release` names (#5695): bytes that are not the ones
+        // named decide nothing, however they got into the cache.
+        let actual = crate::services::storage_service::StorageService::calculate_hash(&bytes);
+        let mismatch = |want: &str| !actual.eq_ignore_ascii_case(want);
+        if by_hash_sha256(&cache_path).is_some_and(mismatch)
+            || sha256.as_deref().is_some_and(mismatch)
+        {
+            continue;
+        }
         // #2561: permit-scoped decode on this serve path (each cached index
         // inflates up to the 128 MiB budget), fast-fail 503 on saturation; the
         // permit is released before the next cache read.
         let Some(text) = crate::util::bounded_archive::with_ingest_extraction(|| {
-            decompress_packages_index(&cache_path, &bytes)
+            decompress_packages_index(&name, &bytes)
         })?
         else {
             continue;
         };
         let map = crate::formats::debian::parse_packages_index(&text);
-        if let Some(sha) = resolve_pool_deb_checksum(&map, artifact_path) {
-            return Ok(Some(sha));
+        if let Some(sha256) = resolve_pool_deb_checksum(&map, artifact_path) {
+            let distribution =
+                packages_index_distribution(&cache_path, component).unwrap_or_default();
+            return Ok(Some(PoolIndexEntry {
+                sha256,
+                distribution,
+                release,
+            }));
         }
     }
     Ok(None)
+}
+
+/// [`resolve_pool_expected_checksum`] plus the distribution of the cached
+/// Packages index that lists the file.
+async fn resolve_pool_index_entry(
+    db: &PgPool,
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    component: &str,
+    artifact_path: &str,
+) -> crate::error::Result<Option<(String, String)>> {
+    let Some(arch) = pool_file_arch(artifact_path) else {
+        return Ok(None);
+    };
+    let indexes = cached_dists_paths(db, proxy, repo_id, repo_key)
+        .await
+        .into_iter()
+        .filter(|path| is_matching_packages_index(path, component, &arch))
+        .map(IndexCandidate::unchecked);
+    Ok(
+        pool_entry_in_indexes(proxy, repo_key, (component, artifact_path), indexes, false)
+            .await?
+            .map(|entry| (entry.sha256, entry.distribution)),
+    )
+}
+
+/// The architecture a pool file's name names.
+fn pool_file_arch(artifact_path: &str) -> Option<String> {
+    let filename = artifact_path.rsplit('/').next()?;
+    let (_, _, arch) = DebianHandler::parse_deb_filename(filename).ok()?;
+    Some(arch)
+}
+
+/// The suite directories (`dists/bookworm`) with a cached release document.
+fn cached_suite_dirs(cached_paths: &[String]) -> Vec<&str> {
+    let mut dirs: Vec<&str> = cached_paths
+        .iter()
+        .filter_map(|path| {
+            let (dir, leaf) = path.rsplit_once('/')?;
+            (dir.starts_with("dists/") && matches!(leaf, "InRelease" | "Release")).then_some(dir)
+        })
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    dirs
+}
+
+/// The component whose indexes list a pool file: `pool/{component}/...`, or
+/// `pool/updates/{component}/...` in the Debian security archive, whose index
+/// is still `dists/{suite}/{component}`.
+fn pool_file_index_component(artifact_path: &str) -> Option<&str> {
+    let mut segments = artifact_path.strip_prefix("pool/")?.split('/');
+    match segments.next()? {
+        "updates" => segments.next(),
+        component => Some(component),
+    }
+}
+
+/// Whether an index of `index_arch` can list a file of `file_arch`. An `_all`
+/// package is listed in every architecture's index, the only ones apt fetches
+/// (`No-Support-for-Architecture-all: Packages`).
+fn index_arch_lists(index_arch: &str, file_arch: &str) -> bool {
+    file_arch == "all" || index_arch == file_arch
+}
+
+/// A Packages index for a pool file that a suite's `Release` table names.
+struct NamedPackagesIndex {
+    /// The table's path, `main/binary-amd64/Packages.xz`.
+    path: String,
+    /// `main/binary-amd64`.
+    dir: String,
+    sha256: String,
+}
+
+impl NamedPackagesIndex {
+    /// Where apt fetches it when the `Release` says `Acquire-By-Hash: yes`.
+    fn by_hash_path(&self, suite_dir: &str) -> String {
+        format!("{suite_dir}/{}/by-hash/SHA256/{}", self.dir, self.sha256)
+    }
+}
+
+/// The Packages indexes a `Release` table names for `component` and `arch`, by
+/// path. Only these are read under `by-hash/`, which keeps every earlier index,
+/// immutable and cached for years: decoding all of them per pull would grow
+/// without bound.
+fn release_packages_indexes(
+    release_text: &str,
+    component: &str,
+    arch: &str,
+) -> Vec<NamedPackagesIndex> {
+    let prefix = format!("{component}/binary-");
+    let mut named: Vec<NamedPackagesIndex> =
+        crate::formats::debian::parse_release_checksums(release_text)
+            .into_iter()
+            .filter_map(|(path, (sha256, _))| {
+                let (index_arch, leaf) = path.strip_prefix(&prefix)?.split_once('/')?;
+                let is_index = matches!(leaf, "Packages" | "Packages.gz" | "Packages.xz");
+                (is_index && index_arch_lists(index_arch, arch)).then(|| NamedPackagesIndex {
+                    dir: format!("{prefix}{index_arch}"),
+                    path: path.clone(),
+                    sha256,
+                })
+            })
+            .collect();
+    named.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    named
+}
+
+/// Fetch the one index a pull needs of those a suite's `Release` names: the
+/// first architecture's, smallest encoding first, by hash when the archive
+/// serves it that way. `None` unless the bytes are the ones the `Release`
+/// names. Cached like a client's fetch, so this happens once per index, but
+/// only once verified (#5695): bytes the `Release` does not name are never
+/// committed to the proxy cache, and a cached copy that no longer matches is
+/// evicted and fetched again.
+async fn fetch_named_packages_index(
+    proxy: &ProxyService,
+    repo: &crate::models::repository::Repository,
+    suite_dir: &str,
+    release_text: &str,
+    named: &[NamedPackagesIndex],
+) -> Option<IndexCandidate> {
+    let dir = &named.first()?.dir;
+    let index = [".xz", ".gz", ""].iter().find_map(|encoding| {
+        let path = format!("{dir}/Packages{encoding}");
+        named.iter().find(|n| n.path == path)
+    })?;
+    let by_hash = release_text
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("Acquire-By-Hash: yes"));
+    let cache_path = if by_hash {
+        index.by_hash_path(suite_dir)
+    } else {
+        format!("{suite_dir}/{}", index.path)
+    };
+    let want = index.sha256.clone();
+    let check: Box<crate::services::proxy_service::CachedBodyCheck> =
+        Box::new(move |bytes: Bytes, _encoding: Option<String>| {
+            let matches = crate::services::storage_service::StorageService::calculate_hash(&bytes)
+                .eq_ignore_ascii_case(&want);
+            Box::pin(async move { matches })
+        });
+    let body = proxy
+        .fetch_artifact_with_cache_path_capped_checked(
+            repo,
+            &cache_path,
+            &cache_path,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            &*check,
+        )
+        .await
+        .ok()?;
+    // A fresh body that fails the check is returned uncached: still refuse it.
+    let actual = crate::services::storage_service::StorageService::calculate_hash(&body.content);
+    actual
+        .eq_ignore_ascii_case(&index.sha256)
+        .then(|| IndexCandidate {
+            cache_path,
+            name: index.path.clone(),
+            sha256: Some(index.sha256.clone()),
+            release: crate::api::handlers::proxy_scan_archive::os_release_from_apt_release(
+                release_text,
+            ),
+        })
+}
+
+/// [`is_matching_packages_index`], with an `_all` file in any architecture's.
+fn is_gated_packages_index(cache_path: &str, component: &str, arch: &str) -> bool {
+    if arch != "all" {
+        return is_matching_packages_index(cache_path, component, arch);
+    }
+    let leaf = cache_path.rsplit('/').next().unwrap_or("");
+    cache_path.starts_with("dists/")
+        && cache_path.contains(&format!("/{component}/binary-"))
+        && matches!(leaf, "Packages" | "Packages.gz" | "Packages.xz")
+}
+
+/// The scan gate's [`resolve_pool_index_entry`] (#5170), which finds the suite
+/// the way a real client's traffic leaves it findable: under `by-hash/`, where
+/// apt fetches an index, for an `_all` file in any architecture's index, and
+/// past the short cache TTL (a pool file is immutable, so an expired index that
+/// lists it is still right about it). A client whose lists are current fetches
+/// no index at all, so a suite whose `Release` is cached and whose index is not
+/// has the index the `Release` names fetched, verified against that `Release`.
+/// The file's SHA-256 and the release named by the very `Release` text its
+/// index was checked against (#5695).
+async fn resolve_gated_pool_index_entry(
+    db: &PgPool,
+    proxy: &ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    component: &str,
+    artifact_path: &str,
+) -> crate::error::Result<Option<(String, Option<crate::services::scanner_service::OsRelease>)>> {
+    let Some(arch) = pool_file_arch(artifact_path) else {
+        return Ok(None);
+    };
+    let component = pool_file_index_component(artifact_path).unwrap_or(component);
+    let target = (component, artifact_path);
+    let cached_paths = cached_dists_paths(db, proxy, repo_id, repo_key).await;
+    let cached_set: std::collections::HashSet<&str> =
+        cached_paths.iter().map(String::as_str).collect();
+    let mut releases = HashMap::new();
+    let mut indexes: Vec<IndexCandidate> = Vec::new();
+    for path in cached_paths
+        .iter()
+        .filter(|path| is_gated_packages_index(path, component, &arch))
+    {
+        if let Some(index) =
+            release_checked_index(proxy, repo_key, component, path, &mut releases).await
+        {
+            indexes.push(index);
+        }
+    }
+    let mut without_an_index = Vec::new();
+    for dir in cached_suite_dirs(&cached_paths) {
+        let Some(text) = cached_apt_release_text(proxy, repo_key, dir).await else {
+            continue;
+        };
+        let named = release_packages_indexes(&text, component, &arch);
+        let suite_release =
+            crate::api::handlers::proxy_scan_archive::os_release_from_apt_release(&text);
+        let by_hash: Vec<IndexCandidate> = named
+            .iter()
+            .map(|index| IndexCandidate {
+                cache_path: index.by_hash_path(dir),
+                name: index.path.clone(),
+                sha256: Some(index.sha256.clone()),
+                release: suite_release.clone(),
+            })
+            .filter(|index| cached_set.contains(index.cache_path.as_str()))
+            .collect();
+        let suite_prefix = format!("{dir}/");
+        // Worth a fetch only if listing the file would name a release: a
+        // derivative's `Release` names none the scanner grades.
+        if suite_release.is_some()
+            && by_hash.is_empty()
+            && !indexes
+                .iter()
+                .any(|index| index.cache_path.starts_with(&suite_prefix))
+        {
+            without_an_index.push((dir, text, named));
+        }
+        indexes.extend(by_hash);
+    }
+    if let Some(entry) = pool_entry_in_indexes(proxy, repo_key, target, indexes, true).await? {
+        return Ok(Some((entry.sha256, entry.release)));
+    }
+    let repo = proxy_helpers::build_remote_repo_with_format(
+        repo_id,
+        repo_key,
+        upstream_url,
+        RepositoryFormat::Debian,
+    );
+    for (dir, text, named) in without_an_index {
+        let Some(index) = fetch_named_packages_index(proxy, &repo, dir, &text, &named).await else {
+            continue;
+        };
+        if let Some(entry) = pool_entry_in_indexes(proxy, repo_key, target, [index], true).await? {
+            return Ok(Some((entry.sha256, entry.release)));
+        }
+    }
+    Ok(None)
+}
+
+/// A suite `Release`'s SHA256 table (path -> (digest, size)) and the release
+/// it names, both read from one cached `Release` text.
+type CheckedRelease = (
+    HashMap<String, (String, u64)>,
+    Option<crate::services::scanner_service::OsRelease>,
+);
+
+/// A cached `Packages` index at `cache_path` as the gate may read it (#5695):
+/// held to the digest its own suite's cached `Release` names it by, so bytes
+/// cached before they were checked, or an index a later `Release` no longer
+/// names, never decide a pull, and carrying the release that same `Release`
+/// text names. `None` when that `Release` carries no SHA256 table (every
+/// Debian and Ubuntu `Release` does), a table that does not name the index,
+/// or one that names other bytes than those cached. A suite whose `Release`
+/// is not cached has nothing to check the index against, and the index names
+/// no release for the file.
+async fn release_checked_index(
+    proxy: &ProxyService,
+    repo_key: &str,
+    component: &str,
+    cache_path: &str,
+    releases: &mut HashMap<String, Option<CheckedRelease>>,
+) -> Option<IndexCandidate> {
+    let unchecked = IndexCandidate::unchecked(cache_path.to_string());
+    let Some(distribution) = packages_index_distribution(cache_path, component) else {
+        return Some(unchecked);
+    };
+    let dir = format!("dists/{distribution}");
+    if !releases.contains_key(&dir) {
+        let release = cached_apt_release_text(proxy, repo_key, &dir)
+            .await
+            .map(|text| {
+                (
+                    crate::formats::debian::parse_release_checksums(&text),
+                    crate::api::handlers::proxy_scan_archive::os_release_from_apt_release(&text),
+                )
+            });
+        releases.insert(dir.clone(), release);
+    }
+    let Some((table, release)) = releases.get(&dir).and_then(Option::as_ref) else {
+        return Some(unchecked);
+    };
+    let release_relative = cache_path.strip_prefix(&format!("{dir}/"))?;
+    // An empty table names nothing, so nothing here is vouched for.
+    let (sha256, _) = table.get(release_relative)?;
+    // Checked here as well as when it is read, so a suite whose only cached
+    // index is not the one named counts as having none, and has the named
+    // one fetched (which evicts the stale copy).
+    let cached = proxy
+        .get_cached_artifact_by_path_ignoring_expiry(repo_key, cache_path)
+        .await
+        .ok()
+        .flatten()?;
+    if !crate::services::storage_service::StorageService::calculate_hash(&cached.content)
+        .eq_ignore_ascii_case(sha256)
+    {
+        return None;
+    }
+    Some(IndexCandidate {
+        sha256: Some(sha256.clone()),
+        release: release.clone(),
+        ..unchecked
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1940,6 +2421,41 @@ async fn require_active_signing_key(
     repo_id: uuid::Uuid,
 ) -> Result<SigningKey, Response> {
     require_signing_key(signing_svc.get_active_key_for_repo(repo_id).await)
+}
+
+/// Resolve the keys that sign a repository's `Release` (#1329): the active key
+/// (404 when none, as above) followed by any rotation predecessor still in its
+/// overlap window, plus the signer-set fingerprint for the signed-Release cache
+/// key. Outside an overlap window that is just the active key and its
+/// fingerprint, so the cache keys are unchanged.
+///
+/// A key that can never produce OpenPGP (`key_type=rsa`, the default) is a 409
+/// with a WARN (#5198), as on RPM. These routes are anonymous, so a 500 would
+/// let any client drive ERROR logs and 500-rate alerts over an operator's config
+/// mistake. `route` names the requested file in that WARN.
+async fn release_signers(
+    signing_svc: &SigningService,
+    repo_id: uuid::Uuid,
+    route: &'static str,
+) -> Result<(Vec<SigningKey>, String), Response> {
+    let key = require_active_signing_key(signing_svc, repo_id).await?;
+    let key = require_openpgp_capable_key(key).inspect_err(|_resp| {
+        tracing::warn!(
+            repo_id = %repo_id,
+            route,
+            "Debian signed metadata requested but the repository's active signing key cannot \
+             produce an OpenPGP signature (requires key_type='gpg')",
+        );
+    })?;
+    let signers = signing_svc.openpgp_signers(key).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::internal_err_message("Failed to resolve signing keys", &e),
+        )
+            .into_response()
+    })?;
+    let fingerprint = signer_set_fingerprint(&signers);
+    Ok((signers, fingerprint))
 }
 
 /// Apply a Virtual repo member's own P2 dist/component/architecture filter to
@@ -2267,10 +2783,16 @@ async fn release_file(
     if let Some(base) = repo_remote_upstream(&repo) {
         let filter = load_debian_filter(&state.db, repo.id).await?;
         gate_debian_dists(&filter, base, &distribution, "Release")?;
+        refuse_dists_on_flat_repository(&filter, &repo, &repo_key)?;
     }
-    proxy
+    // #4619: a failure against an upstream that turns out to be a flat
+    // repository answers with the flat sources line instead.
+    if let Err(resp) = proxy
         .dists_detecting_change("Release", "text/plain; charset=utf-8", &repo)
-        .await?;
+        .await
+    {
+        return Err(suggest_flat_layout_on_failure(&state, &repo, &repo_key, resp).await);
+    }
 
     let (release, _) = local_release_content(&state, &repo_key, &distribution).await?;
 
@@ -2297,10 +2819,16 @@ async fn in_release_file(
     if let Some(base) = repo_remote_upstream(&repo) {
         let filter = load_debian_filter(&state.db, repo.id).await?;
         gate_debian_dists(&filter, base, &distribution, "InRelease")?;
+        refuse_dists_on_flat_repository(&filter, &repo, &repo_key)?;
     }
-    proxy
+    // #4619: a failure against an upstream that turns out to be a flat
+    // repository answers with the flat sources line instead.
+    if let Err(resp) = proxy
         .dists_detecting_change("InRelease", "text/plain; charset=utf-8", &repo)
-        .await?;
+        .await
+    {
+        return Err(suggest_flat_layout_on_failure(&state, &repo, &repo_key, resp).await);
+    }
 
     let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
 
@@ -2310,16 +2838,15 @@ async fn in_release_file(
     // none is configured and (b) include the fingerprint in the cache key.
     // The previous `.unwrap_or(release)` fallback silently served unsigned
     // bytes, which is a security footgun (#1236 review).
-    let key = require_active_signing_key(&signing_svc, repo.id).await?;
-    let fingerprint = key.fingerprint.as_deref().unwrap_or("unknown");
+    let (signers, fingerprint) = release_signers(&signing_svc, repo.id, "InRelease").await?;
     let cache_key =
-        signed_release_cache_key(SignedReleaseVariant::InRelease, &release, fingerprint);
+        signed_release_cache_key(SignedReleaseVariant::InRelease, &release, &fingerprint);
 
     let body = if let Some(cached) = signed_release_cache_get(&state, &cache_key).await {
         cached
     } else {
         let armored = signing_svc
-            .sign_openpgp_cleartext_with_key(&key, &release)
+            .sign_openpgp_cleartext_with_keys(&signers, &release)
             .await
             .map_err(|e| {
                 (
@@ -2330,7 +2857,7 @@ async fn in_release_file(
             })?;
         // Best-effort `last_used_at` stamp; we don't fail the request if the
         // audit update errors (the sign already succeeded).
-        let _ = signing_svc.mark_key_used(key.id).await;
+        let _ = signing_svc.mark_key_used(signers[0].id).await;
         let bytes = Bytes::from(armored.into_bytes());
         signed_release_cache_put(&state, &repo_key, &distribution, cache_key, bytes.clone()).await;
         bytes
@@ -2360,6 +2887,7 @@ async fn release_gpg(
     if let Some(base) = repo_remote_upstream(&repo) {
         let filter = load_debian_filter(&state.db, repo.id).await?;
         gate_debian_dists(&filter, base, &distribution, "Release.gpg")?;
+        refuse_dists_on_flat_repository(&filter, &repo, &repo_key)?;
     }
     // Release.gpg is the detached signature of Release. We do not need
     // revalidation here because the matching Release fetch (called
@@ -2372,16 +2900,15 @@ async fn release_gpg(
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret)
         .with_signature_expiry(state.config.signature_expiry_seconds);
-    let key = require_active_signing_key(&signing_svc, repo.id).await?;
-    let fingerprint = key.fingerprint.as_deref().unwrap_or("unknown");
+    let (signers, fingerprint) = release_signers(&signing_svc, repo.id, "Release.gpg").await?;
     let cache_key =
-        signed_release_cache_key(SignedReleaseVariant::ReleaseGpg, &release, fingerprint);
+        signed_release_cache_key(SignedReleaseVariant::ReleaseGpg, &release, &fingerprint);
 
     let body = if let Some(cached) = signed_release_cache_get(&state, &cache_key).await {
         cached
     } else {
         let armored = signing_svc
-            .sign_openpgp_detached_with_key(&key, release.as_bytes())
+            .sign_openpgp_detached_with_keys(&signers, release.as_bytes())
             .await
             .map_err(|e| {
                 (
@@ -2390,7 +2917,7 @@ async fn release_gpg(
                 )
                     .into_response()
             })?;
-        let _ = signing_svc.mark_key_used(key.id).await;
+        let _ = signing_svc.mark_key_used(signers[0].id).await;
         let bytes = Bytes::from(armored.into_bytes());
         signed_release_cache_put(&state, &repo_key, &distribution, cache_key, bytes.clone()).await;
         bytes
@@ -2415,29 +2942,25 @@ async fn gpg_key_asc(
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
-    let public_key = signing_svc
-        .get_repo_public_key(repo.id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::internal_err_message("Failed to retrieve public key", &e),
-            )
-                .into_response()
-        })?;
-
-    match public_key {
-        Some(pem) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/pgp-keys")
-            .body(Body::from(pem))
-            .unwrap()),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            "No signing key configured for this repository",
+    // #1329: during a rotation overlap window this is a keyring holding the
+    // new and the previous key, matching the dual-signed InRelease. #5198: any
+    // other key type holds an X.509 SPKI PEM, which is not what this route's
+    // `application/pgp-keys` claims and which `apt` cannot use, so it gets the
+    // same 409 as InRelease rather than a 200 with those bytes.
+    let (signers, _) = release_signers(&signing_svc, repo.id, "gpg-key.asc").await?;
+    let keyring = openpgp_public_keyring(&signers).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::internal_err_message("Failed to retrieve public key", &e),
         )
-            .into_response()),
-    }
+            .into_response()
+    })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/pgp-keys")
+        .body(Body::from(keyring))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -2638,6 +3161,7 @@ async fn dists_dispatch(
         if let Some(base) = repo_remote_upstream(&repo) {
             let filter = load_debian_filter(&state.0.db, repo.id).await?;
             gate_debian_dists(&filter, base, &distribution, &dists_path)?;
+            refuse_dists_on_flat_repository(&filter, &repo, &repo_key)?;
         }
 
         let path = Path((repo_key, distribution, req.component, req.binary_arch));
@@ -2665,6 +3189,11 @@ async fn dists_proxy_catchall(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+    // #4365 item 3, as on the pool route.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[&distribution, &dists_path],
+    )?;
 
     // #2460 P2: pre-fetch allowlist gate for catch-all dists metadata
     // (i18n/Translation, Sources, dep11, Contents, ...), gating on the exact
@@ -2677,6 +3206,7 @@ async fn dists_proxy_catchall(
     if let Some(base) = repo_remote_upstream(&repo) {
         let filter = load_debian_filter(&state.db, repo.id).await?;
         gate_debian_dists(&filter, base, &distribution, &dists_path)?;
+        refuse_dists_on_flat_repository(&filter, &repo, &repo_key)?;
         if let Some(proxy) = state.proxy_service.as_deref() {
             enforce_by_hash_arch(
                 proxy,
@@ -2692,6 +3222,25 @@ async fn dists_proxy_catchall(
     }
 
     let upstream_path = format!("dists/{}/{}", distribution, dists_path);
+
+    // #4111: a binary package under `dists/` (#3596) goes through the gate
+    // when the repository, or a Virtual's member, scans on proxy.
+    if dists_path_is_package_content(&dists_path) {
+        if let Some(served) = serve_scanned_deb_download(
+            &state,
+            auth.as_ref(),
+            &repo,
+            DebPackageRoute::Dists {
+                distribution: &distribution,
+                dists_path: &dists_path,
+            },
+            &ctx,
+        )
+        .await?
+        {
+            return served;
+        }
+    }
 
     // Virtual repos: walk Remote members in priority order so a Virtual
     // APT repo can serve i18n / Translation / dep11 / Sources etc. just
@@ -2756,6 +3305,7 @@ async fn dists_proxy_catchall(
             &upstream_path,
             DEBIAN_BINARY_CONTENT_TYPE,
             RepositoryFormat::Debian,
+            ctx.is_head,
         )
         .await?;
         // #3446: count the proxied package. `upstream_path` is also the
@@ -2857,6 +3407,620 @@ fn xz_compress(data: &[u8]) -> Result<Vec<u8>, io::Error> {
 }
 
 // ---------------------------------------------------------------------------
+// Flat repositories (#4619): `deb <uri> /`
+//
+// A flat repository has no `dists/<suite>/` tree: `InRelease`, `Release`,
+// `Release.gpg` and `Packages{,.gz,.xz}` sit at the URI apt is given (or under
+// an exact-path suite directory, `deb <uri> sub/`), and each package is
+// fetched from `<uri>/<Filename>`. pkgs.k8s.io and the openSUSE Build Service
+// publish this way, so a remote that only spoke `dists/<suite>` could not
+// mirror them: `GET /debian/<repo>/InRelease` was a 404 and
+// `/dists/stable/InRelease` a 502 (the CDN 403s a `dists/` path).
+//
+// The flat routes give these upstreams the same treatment as the suite layout:
+// the upstream `InRelease`/`Release`/`Release.gpg` are served byte-for-byte
+// (apt keeps verifying against the publisher's key), the release documents
+// revalidate on the 5-minute TTL with conditional requests and drive the
+// release epoch that lazily invalidates the indices next to them, every index
+// is checked against the signed `Release` before it is served (#2459 Tier A),
+// and a package is cached only when its body matches the SHA-256 the cached
+// `Packages` records for it (Tier B).
+//
+// Which layout a repository speaks is the client's choice, made in its
+// sources line, so no probe decides it up front. `debian.flat_repository =
+// true` declares the repository flat explicitly: its `dists/` routes then
+// answer 404 with the sources line to use instead of contacting upstream.
+// Left false (the default), both layouts are served, and a `dists/` request
+// that fails against an upstream which turns out to be flat answers 404 with
+// the same hint. Either decision is logged once per repository.
+// ---------------------------------------------------------------------------
+
+/// Pseudo distribution under which a flat repository's release epoch (#1147)
+/// is recorded. A flat upstream has no `dists/` tree, so this cannot collide
+/// with a real suite's epoch sidecar.
+const FLAT_EPOCH_DISTRIBUTION: &str = "__flat__";
+
+/// What a flat-layout request names. Anything else is refused before the
+/// upstream is contacted, so the flat routes do not turn the remote into a
+/// general-purpose proxy of the upstream host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlatRequestKind {
+    /// `InRelease` or `Release`: revalidated, drives the release epoch.
+    ReleaseDocument,
+    /// `Release.gpg`: the detached signature, served as fetched.
+    ReleaseSignature,
+    /// An index apt reads from a flat repository (`Packages*`, `Sources*`,
+    /// `Translation-*`, or a `by-hash/` entry): verified against `Release`.
+    Index,
+    /// A binary package (`.deb`, `.udeb`, `.ddeb`): streamed, Tier B gated.
+    Package,
+}
+
+/// Classify a (normalised) flat-layout path, or `None` for a path that is not
+/// part of an APT flat repository.
+fn classify_flat_path(path: &str) -> Option<FlatRequestKind> {
+    if path.is_empty() || path.starts_with("dists/") {
+        return None;
+    }
+    if by_hash_sha256(path).is_some() {
+        return Some(FlatRequestKind::Index);
+    }
+    let leaf = path.rsplit('/').next().unwrap_or(path);
+    match leaf {
+        "InRelease" | "Release" => return Some(FlatRequestKind::ReleaseDocument),
+        "Release.gpg" => return Some(FlatRequestKind::ReleaseSignature),
+        _ => {}
+    }
+    if dists_path_is_package_content(path) {
+        return Some(FlatRequestKind::Package);
+    }
+    let base = strip_index_compression_suffix(leaf);
+    let base = base.strip_suffix(".lzma").unwrap_or(base);
+    if base == "Packages" || base == "Sources" || base.starts_with("Translation-") {
+        return Some(FlatRequestKind::Index);
+    }
+    None
+}
+
+/// The exact-path suite directory a flat index or release document belongs
+/// to: `""` for `deb <uri> /`, `sub` for `deb <uri> sub/`. A `by-hash/` entry
+/// belongs to the directory holding the `by-hash` tree.
+fn flat_suite_dir(path: &str) -> &str {
+    if let Some(idx) = path.find("by-hash/") {
+        return path[..idx].trim_end_matches('/');
+    }
+    match path.rfind('/') {
+        Some(i) => &path[..i],
+        None => "",
+    }
+}
+
+/// `path` relative to its suite directory: the name the suite's signed
+/// `Release` lists it under.
+fn flat_release_relative<'p>(path: &'p str, suite_dir: &str) -> &'p str {
+    if suite_dir.is_empty() {
+        return path;
+    }
+    path.strip_prefix(suite_dir)
+        .map(|rest| rest.trim_start_matches('/'))
+        .unwrap_or(path)
+}
+
+/// The path of a release document in a flat suite directory.
+fn flat_release_path(suite_dir: &str, name: &str) -> String {
+    if suite_dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{suite_dir}/{name}")
+    }
+}
+
+/// Gate a flat-layout request on the repository's #2460 filter and return the
+/// reqwest-normalised path that will be fetched, with its kind.
+///
+/// A flat repository has no distribution or component. Its suite is `/` in
+/// apt's terms, so a distribution allowlist that does not name `/` (or `*`)
+/// keeps it out, and the component allowlist has nothing to apply to. A
+/// package is gated on the architecture in its filename, failing closed under
+/// an architecture allowlist when the filename does not yield one, exactly as
+/// the `pool/` route does.
+#[allow(clippy::result_large_err)]
+fn gate_flat_request(
+    filter: &DebianRepositoryConfig,
+    base_url: &str,
+    raw_path: &str,
+) -> Result<(String, FlatRequestKind), Response> {
+    let path = normalized_debian_relpath(base_url, raw_path, filter.allow_encoded_separators)?;
+    let kind = classify_flat_path(&path).ok_or_else(|| debian_filter_denied("path", &path))?;
+    debian_filter_decision(filter, Some("/"), None, None)?;
+    if kind == FlatRequestKind::Package && !filter.architectures.is_empty() {
+        let filename = path.rsplit('/').next().unwrap_or(&path);
+        let decoded = decode_to_fixpoint(filename).unwrap_or_else(|| filename.to_string());
+        match parse_deb_filename(&decoded).map(|d| d.arch) {
+            Some(arch) => debian_filter_decision(filter, None, None, Some(&arch))?,
+            None => return Err(debian_filter_denied("architecture", filename)),
+        }
+    }
+    Ok((path, kind))
+}
+
+/// Repositories whose layout decision has already been logged by this
+/// process, keyed by (repository, decision).
+fn flat_layout_logged(
+) -> &'static std::sync::Mutex<std::collections::HashSet<(uuid::Uuid, &'static str)>> {
+    static LOGGED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(uuid::Uuid, &'static str)>>,
+    > = std::sync::OnceLock::new();
+    LOGGED.get_or_init(Default::default)
+}
+
+/// Whether `decision` is logged for the first time for this repository.
+fn first_flat_layout_decision(repo_id: uuid::Uuid, decision: &'static str) -> bool {
+    flat_layout_logged()
+        .lock()
+        .map(|mut seen| seen.insert((repo_id, decision)))
+        .unwrap_or(false)
+}
+
+/// Why a repository is answering in the flat layout, for the decision log.
+fn flat_layout_reason(filter: &DebianRepositoryConfig) -> &'static str {
+    if filter.flat_repository {
+        "configured: debian.flat_repository = true"
+    } else {
+        "auto-detected: apt requested the flat (exact-path suite) layout"
+    }
+}
+
+/// The 404 body that tells an operator which sources line a flat upstream
+/// needs.
+fn flat_layout_hint(repo_key: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "Repository '{repo_key}' mirrors a flat APT repository (no dists/ tree). \
+             Use the flat sources form, e.g. \
+             `deb [signed-by=<publisher key>] <base URL>/debian/{repo_key}/ /`"
+        ),
+    )
+        .into_response()
+}
+
+/// `debian.flat_repository = true`: refuse a `dists/` request before any
+/// upstream fetch, with the sources line to use instead.
+#[allow(clippy::result_large_err)]
+fn refuse_dists_on_flat_repository(
+    filter: &DebianRepositoryConfig,
+    repo: &RepoInfo,
+    repo_key: &str,
+) -> Result<(), Response> {
+    if !filter.flat_repository {
+        return Ok(());
+    }
+    if first_flat_layout_decision(repo.id, "dists-refused") {
+        tracing::info!(
+            repo_key = %repo_key,
+            "debian remote is configured flat (debian.flat_repository = true); \
+             answering dists/ requests with 404 and the flat sources line (#4619)"
+        );
+    }
+    Err(flat_layout_hint(repo_key))
+}
+
+/// Auto-detection for a `dists/` release request that failed upstream: when
+/// the upstream serves a flat repository at its root instead, log that
+/// decision and answer 404 with the flat sources line rather than the bare
+/// 404/502. Any other response, including a success, is returned unchanged.
+async fn suggest_flat_layout_on_failure(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    response: Response,
+) -> Response {
+    let status = response.status();
+    if repo.repo_type != RepositoryType::Remote
+        || !(status == StatusCode::NOT_FOUND || status == StatusCode::BAD_GATEWAY)
+    {
+        return response;
+    }
+    let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) else {
+        return response;
+    };
+    let pseudo_repo = proxy_helpers::build_remote_repo(repo.id, repo_key, upstream_url);
+    for name in ["InRelease", "Release"] {
+        if proxy
+            .fetch_dists_with_revalidation(
+                &pseudo_repo,
+                name,
+                FLAT_EPOCH_DISTRIBUTION,
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
+            .await
+            .is_ok()
+        {
+            if first_flat_layout_decision(repo.id, "dists-on-flat-upstream") {
+                tracing::warn!(
+                    repo_key = %repo_key,
+                    upstream = %crate::services::proxy_service::redact_url_for_diagnostics(upstream_url),
+                    "debian remote: upstream has no dists/<suite> tree but serves a flat \
+                     repository ({name} at its root); apt must use the flat sources form \
+                     `deb <url>/debian/{repo_key}/ /` (#4619)"
+                );
+            }
+            return flat_layout_hint(repo_key);
+        }
+    }
+    response
+}
+
+/// Tier A for a flat index: verify `content` against the SHA-256 table of the
+/// signed `Release` in the index's suite directory and, on a mismatch, evict
+/// the cached copy and answer 502. Best-effort like the suite layout: no
+/// loadable `Release` (or a path it does not list) serves the fetch unchanged.
+async fn enforce_flat_integrity(
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    content: &[u8],
+) -> Result<(), Response> {
+    let suite_dir = flat_suite_dir(path);
+    let Some(table) = load_release_checksums_at(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        suite_dir,
+        FLAT_EPOCH_DISTRIBUTION,
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    reject_unverified_index(
+        proxy,
+        repo_key,
+        path,
+        &table,
+        flat_release_relative(path, suite_dir),
+        content,
+    )
+    .await
+}
+
+/// The cached flat `Packages` indices that can describe `package_path`: the
+/// ones in the repository root and in each directory above the package (the
+/// `Filename:` of a flat index is relative to the repository URI, and the
+/// index normally sits at or above the package).
+fn flat_packages_index_candidates(package_path: &str) -> Vec<String> {
+    let mut dirs = vec![String::new()];
+    let mut prefix = String::new();
+    let mut segments: Vec<&str> = package_path.split('/').collect();
+    segments.pop();
+    for seg in segments {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(seg);
+        dirs.push(prefix.clone());
+    }
+    let mut out = Vec::with_capacity(dirs.len() * 3);
+    for dir in &dirs {
+        for leaf in ["Packages", "Packages.gz", "Packages.xz"] {
+            out.push(flat_release_path(dir, leaf));
+        }
+    }
+    out
+}
+
+/// Tier B for a flat package: the SHA-256 a cached flat `Packages` index
+/// records for `package_path`, or `None` when no cached index covers it (the
+/// download then keeps the Content-Length-gated cache commit, as for `pool/`).
+async fn resolve_flat_expected_checksum(
+    proxy: &ProxyService,
+    repo_key: &str,
+    package_path: &str,
+) -> crate::error::Result<Option<String>> {
+    let dotted = format!("./{package_path}");
+    for cache_path in flat_packages_index_candidates(package_path) {
+        let Ok(Some(proxy_helpers::CachedBody { content: bytes, .. })) = proxy
+            .get_cached_artifact_by_path(repo_key, &cache_path)
+            .await
+        else {
+            continue;
+        };
+        // #2561: permit-scoped decode, same as the pool resolver.
+        let Some(text) = crate::util::bounded_archive::with_ingest_extraction(|| {
+            decompress_packages_index(&cache_path, &bytes)
+        })?
+        else {
+            continue;
+        };
+        let map = crate::formats::debian::parse_packages_index(&text);
+        if let Some(sha) = resolve_pool_deb_checksum(&map, package_path)
+            .or_else(|| resolve_pool_deb_checksum(&map, &dotted))
+        {
+            return Ok(Some(sha));
+        }
+    }
+    Ok(None)
+}
+
+/// Default Content-Type for a flat-layout response.
+fn flat_content_type(kind: FlatRequestKind, path: &str) -> String {
+    match kind {
+        FlatRequestKind::ReleaseDocument => "text/plain; charset=utf-8".to_string(),
+        FlatRequestKind::ReleaseSignature => "application/pgp-signature".to_string(),
+        FlatRequestKind::Package => DEBIAN_BINARY_CONTENT_TYPE.to_string(),
+        FlatRequestKind::Index => content_type_for_dists_path(path),
+    }
+}
+
+/// `GET /debian/{repo_key}/{file}`: a file at the root of a flat repository.
+async fn flat_root_file(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, file)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    flat_dispatch(&state, auth.as_ref(), &repo_key, &file, &ctx).await
+}
+
+/// `GET /debian/{repo_key}/{dir}/{*rest}`: a file below the root of a flat
+/// repository (an exact-path suite's indices, or a package such as
+/// `amd64/kubectl_1.34.0-1.1_amd64.deb`).
+async fn flat_nested_file(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, dir, rest)): Path<(String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let path = format!("{dir}/{rest}");
+    flat_dispatch(&state, auth.as_ref(), &repo_key, &path, &ctx).await
+}
+
+async fn flat_dispatch(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+    raw_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let repo = resolve_debian_repo(&state.db, repo_key).await?;
+    // #4365 item 3: the flat path is the upstream path and the proxy-cache
+    // key of a proxying repository (hosted ones answer 404 below anyway).
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[raw_path],
+    )?;
+    if repo.repo_type == RepositoryType::Remote {
+        flat_remote(state, &repo, repo_key, raw_path, ctx).await
+    } else if repo.repo_type == RepositoryType::Virtual {
+        flat_virtual(state, auth, &repo, raw_path, ctx).await
+    } else {
+        // A hosted repository publishes the suite layout only.
+        Err((StatusCode::NOT_FOUND, "Not found").into_response())
+    }
+}
+
+async fn flat_remote(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    raw_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, state.proxy_service.as_deref())
+    else {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    };
+    let filter = load_debian_filter(&state.db, repo.id).await?;
+    let (path, kind) = gate_flat_request(&filter, upstream_url, raw_path)?;
+    if first_flat_layout_decision(repo.id, "flat-served") {
+        tracing::info!(
+            repo_key = %repo_key,
+            reason = flat_layout_reason(&filter),
+            "debian remote: serving the flat repository layout (#4619)"
+        );
+    }
+    let (content, upstream_ct) = match kind {
+        FlatRequestKind::Package => {
+            // #4111: scan-on-proxy for the flat layout's packages.
+            // A Remote needs no caller authorization for its own upstream.
+            if let Some(served) = serve_scanned_deb_download(
+                state,
+                None,
+                repo,
+                DebPackageRoute::Flat {
+                    path: &path,
+                    raw_path,
+                },
+                ctx,
+            )
+            .await?
+            {
+                return served;
+            }
+            let expected = resolve_flat_expected_checksum(proxy, repo_key, &path)
+                .await
+                .map_err(|e| e.into_response())?;
+            let result = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
+                proxy,
+                repo.id,
+                repo_key,
+                upstream_url,
+                &path,
+                &path,
+                expected,
+                RepositoryFormat::Debian,
+                ctx.is_head,
+            )
+            .await?;
+            proxy_helpers::record_proxy_download(state, repo.id, repo_key, &path, ctx).await;
+            return proxy_helpers::stream_fetch_result(result, DEBIAN_BINARY_CONTENT_TYPE, None);
+        }
+        FlatRequestKind::ReleaseDocument => {
+            let pseudo_repo = proxy_helpers::build_remote_repo(repo.id, repo_key, upstream_url);
+            let _budget_permit = proxy_helpers::proxy_metadata_budget()
+                .reserve(proxy_helpers::LARGE_METADATA_MAX_BYTES)
+                .await;
+            let (content, ct, changed) = proxy
+                .fetch_dists_with_revalidation(
+                    &pseudo_repo,
+                    &path,
+                    FLAT_EPOCH_DISTRIBUTION,
+                    DEFAULT_DISTS_INDEX_TTL_SECS,
+                )
+                .await
+                .map_err(map_proxy_err)?;
+            if changed {
+                signed_release_cache_invalidate(state, repo_key, FLAT_EPOCH_DISTRIBUTION).await;
+            }
+            (content, ct)
+        }
+        FlatRequestKind::ReleaseSignature | FlatRequestKind::Index => {
+            maybe_invalidate_by_epoch(proxy, repo_key, FLAT_EPOCH_DISTRIBUTION, &path).await;
+            let proxy_repo = proxy_helpers::build_remote_repo_with_format(
+                repo.id,
+                repo_key,
+                upstream_url,
+                RepositoryFormat::Debian,
+            );
+            // #2684: buffered index, bounded by the shared metadata budget.
+            let _budget_permit = proxy_helpers::proxy_metadata_budget()
+                .reserve(proxy_helpers::LARGE_METADATA_MAX_BYTES)
+                .await;
+            let (content, ct) = proxy
+                .fetch_artifact_capped(&proxy_repo, &path, proxy_helpers::LARGE_METADATA_MAX_BYTES)
+                .await
+                .map_err(map_proxy_err)?;
+            if kind == FlatRequestKind::Index {
+                enforce_flat_integrity(proxy, repo.id, repo_key, upstream_url, &path, &content)
+                    .await?;
+            }
+            (content, ct)
+        }
+    };
+    Ok(build_dists_response(
+        content,
+        upstream_ct,
+        &flat_content_type(kind, &path),
+    ))
+}
+
+/// A virtual repository answers a flat request from its Remote members in
+/// priority order, each gated on its own filter (#2727) and narrowed to the
+/// members the caller may read (#3323), like the suite layout.
+async fn flat_virtual(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    raw_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    };
+    let mut allowed = Vec::new();
+    for member in members {
+        let Some(base) = remote_member_upstream(&member) else {
+            continue;
+        };
+        let Ok(filter) = load_debian_filter(&state.db, member.id).await else {
+            continue;
+        };
+        if let Ok((path, kind)) = gate_flat_request(&filter, base, raw_path) {
+            allowed.push((member, path, kind));
+        }
+    }
+    let Some((_, path, kind)) = allowed.first().cloned() else {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    };
+
+    if kind == FlatRequestKind::Package {
+        // #4111: scan-on-proxy over the members whose own allowlist admits
+        // the path (the walk asks each member again).
+        if let Some(served) = serve_scanned_deb_download(
+            state,
+            auth,
+            repo,
+            DebPackageRoute::Flat {
+                path: &path,
+                raw_path,
+            },
+            ctx,
+        )
+        .await?
+        {
+            return served;
+        }
+        let members = allowed.into_iter().map(|(m, _, _)| m).collect();
+        let result = proxy_helpers::resolve_virtual_download_from_members(
+            members,
+            Some(proxy),
+            &path,
+            Some(ctx),
+            |_member_id, _location| async {
+                Err((StatusCode::NOT_FOUND, "Not found").into_response())
+            },
+        )
+        .await?;
+        let filename = path.rsplit('/').next().unwrap_or(&path).to_string();
+        return proxy_helpers::stream_fetch_result(
+            result,
+            DEBIAN_BINARY_CONTENT_TYPE,
+            Some(&filename),
+        );
+    }
+
+    let mut first_err: Option<Response> = None;
+    for (member, path, kind) in &allowed {
+        let Some(upstream_url) = remote_member_upstream(member) else {
+            continue;
+        };
+        let fetched = if *kind == FlatRequestKind::ReleaseDocument {
+            let pseudo_repo =
+                proxy_helpers::build_remote_repo(member.id, &member.key, upstream_url);
+            proxy
+                .fetch_dists_with_revalidation(
+                    &pseudo_repo,
+                    path,
+                    FLAT_EPOCH_DISTRIBUTION,
+                    DEFAULT_DISTS_INDEX_TTL_SECS,
+                )
+                .await
+                .map(|(content, ct, _changed)| (content, ct))
+        } else {
+            maybe_invalidate_by_epoch(proxy, &member.key, FLAT_EPOCH_DISTRIBUTION, path).await;
+            let proxy_repo = proxy_helpers::build_remote_repo_with_format(
+                member.id,
+                &member.key,
+                upstream_url,
+                RepositoryFormat::Debian,
+            );
+            proxy
+                .fetch_artifact_capped(&proxy_repo, path, proxy_helpers::LARGE_METADATA_MAX_BYTES)
+                .await
+        };
+        match fetched {
+            Ok((content, ct)) => {
+                return Ok(build_dists_response(
+                    content,
+                    ct,
+                    &flat_content_type(*kind, path),
+                ));
+            }
+            Err(crate::error::AppError::NotFound(_)) => continue,
+            Err(e) => {
+                first_err.get_or_insert(map_proxy_err(e));
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| (StatusCode::NOT_FOUND, "Not found").into_response()))
+}
+
+// ---------------------------------------------------------------------------
 // GET /debian/{repo_key}/pool/{component}/*path -- Download .deb
 // ---------------------------------------------------------------------------
 
@@ -2867,6 +4031,13 @@ async fn pool_download(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+    // #4365 item 3: on a proxying repository the component and path are the
+    // upstream path and the proxy-cache key, so an ambiguous one is a 400
+    // before anything is fetched, scanned or not.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[&component, &path],
+    )?;
 
     // #2460 P2: pre-fetch allowlist gate for pool downloads, gating on the
     // reqwest-normalised path. Gates the component and the architecture (derived
@@ -2899,6 +4070,22 @@ async fn pool_download(
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
+            // #4111: scan-on-proxy, Remote and Virtual. `None` when the file
+            // is not gated or nothing scans: the paths below are untouched.
+            if let Some(served) = serve_scanned_deb_download(
+                &state,
+                auth.as_ref(),
+                &repo,
+                DebPackageRoute::Pool {
+                    component: &component,
+                    path: &path,
+                },
+                &ctx,
+            )
+            .await?
+            {
+                return served;
+            }
             if repo.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
@@ -2919,7 +4106,9 @@ async fn pool_download(
                     // never buffered (#1608). `None` (no covering Packages
                     // index cached) preserves the prior cache behaviour.
                     let expected_checksum = resolve_pool_expected_checksum(
+                        &state.db,
                         proxy,
+                        repo.id,
                         &repo_key,
                         &component,
                         &artifact_path,
@@ -2935,6 +4124,7 @@ async fn pool_download(
                         &upstream_path,
                         expected_checksum,
                         RepositoryFormat::Debian,
+                        ctx.is_head,
                     )
                     .await?;
                     // #3446: count the proxied `.deb`. `upstream_path` is also
@@ -2971,13 +4161,13 @@ async fn pool_download(
                 // #3178: authorize the member set against the CALLER before any
                 // format-specific filtering, so a member this caller could not
                 // read directly can never reach the byte resolver.
-                let members = proxy_helpers::authorize_virtual_members(
+                let members = proxy_helpers::try_authorize_virtual_members(
                     &state.db,
                     auth.as_ref(),
                     repo.id,
                     members,
                 )
-                .await;
+                .await?;
                 let mut allowed_members = Vec::with_capacity(members.len());
                 for member in members {
                     match remote_member_upstream(&member) {
@@ -3005,6 +4195,7 @@ async fn pool_download(
                     allowed_members,
                     state.proxy_service.as_deref(),
                     &upstream_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -3068,7 +4259,397 @@ async fn pool_download(
         .unwrap())
 }
 
-struct DebianPackageUpload {
+// ---------------------------------------------------------------------------
+// Scan-on-proxy (#4111)
+// ---------------------------------------------------------------------------
+
+/// Pool files that describe a source package rather than being one
+/// (`.dsc`, `.buildinfo`, `.changes`): signed text documents, streamed
+/// unscanned like the Maven POM control. Every other file under `pool/` is
+/// gated: a binary package is graded as itself, and anything else (a source
+/// tarball) is not a package the scanner can grade as one, so it is
+/// inconclusive.
+const DEB_POOL_METADATA_SUFFIXES: &[&str] = &[".dsc", ".buildinfo", ".changes"];
+
+/// The `(cache_key, scannable)` decision for a Debian package path (#4365
+/// item 1): `pool/` files except [`DEB_POOL_METADATA_SUFFIXES`], and the
+/// binary packages a `dists/` or flat layout serves.
+fn deb_serve_key(upstream_path: &str) -> crate::services::proxy_service::ProxyServeKey {
+    let in_pool = upstream_path.trim_start_matches('/').starts_with("pool/");
+    crate::services::proxy_service::proxy_serve_key(upstream_path, |file| {
+        if in_pool {
+            !DEB_POOL_METADATA_SUFFIXES.iter().any(|s| file.ends_with(s))
+        } else {
+            dists_path_is_package_content(file)
+        }
+    })
+}
+
+/// Which route a Debian package file is served on, which decides how a
+/// member's allowlist, `Packages` digest and release are looked up.
+#[derive(Clone, Copy)]
+enum DebPackageRoute<'a> {
+    /// `pool/{component}/{path}`.
+    Pool { component: &'a str, path: &'a str },
+    /// `dists/{distribution}/{dists_path}` (a vendor layout that keeps the
+    /// binaries next to their index, #3596).
+    Dists {
+        distribution: &'a str,
+        dists_path: &'a str,
+    },
+    /// A flat repository's package path, as `gate_flat_request` normalised
+    /// it, and the raw request path each member's allowlist is asked about.
+    Flat { path: &'a str, raw_path: &'a str },
+}
+
+impl DebPackageRoute<'_> {
+    fn upstream_path(&self) -> String {
+        match self {
+            DebPackageRoute::Pool { component, path } => format!("pool/{component}/{path}"),
+            DebPackageRoute::Dists {
+                distribution,
+                dists_path,
+            } => format!("dists/{distribution}/{dists_path}"),
+            DebPackageRoute::Flat { path, .. } => path.to_string(),
+        }
+    }
+}
+
+/// The Debian half of the generic gate (#4111): a `.deb` must be the
+/// package, version and architecture its file name names, and is graded as
+/// that package of `release` through the synthetic installed system the
+/// scanner writes.
+struct DebPackage {
+    /// The release the remote's own metadata names for this file; when
+    /// `None`, a stable-update or backport version (`+deb12u1`) still names
+    /// one.
+    release: Option<crate::services::scanner_service::OsRelease>,
+    /// The SHA-256 the cached `Packages` index records (#2459 Tier B).
+    expected_sha256: Option<String>,
+}
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for DebPackage {
+    const LABEL: &'static str = "debian package";
+    const CONTENT_TYPE: &'static str = DEBIAN_BINARY_CONTENT_TYPE;
+
+    fn requested(&self) -> String {
+        "the package file name's package, version and architecture".to_string()
+    }
+
+    fn identity(
+        &self,
+        filename: &str,
+        bytes: &Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        deb_identity(filename, bytes, self.release.clone())
+    }
+
+    fn expected_sha256(&self) -> Option<&str> {
+        self.expected_sha256.as_deref()
+    }
+}
+
+/// What a proxied `.deb` says about itself (#4111): its own `control` must
+/// name the package, version (the file name carries no epoch) and
+/// architecture of the requested file name. It is then pinned as that
+/// package of the release the remote names, or the release its version names
+/// (`+deb12u1`, `~bpo12+1`); with neither, it is not graded as anything. When
+/// both name a Debian release and they differ (#5170), neither is trusted.
+fn deb_identity(
+    filename: &str,
+    bytes: &Bytes,
+    release: Option<crate::services::scanner_service::OsRelease>,
+) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+    use crate::api::handlers::proxy_scan_archive::{
+        deb_source_name, debian_marker_contradicting, debian_release_from_version,
+        os_package_identity, read_deb_control, strip_version_epoch, ArchiveIdentity,
+    };
+    let Ok((name, version, arch)) = DebianHandler::parse_deb_filename(filename) else {
+        return ArchiveIdentity::Unreadable(format!("{filename} is not a binary package"));
+    };
+    let control = match read_deb_control(bytes) {
+        Ok(control) => control,
+        Err(e) => return ArchiveIdentity::Unreadable(e),
+    };
+    if control.package != name
+        || strip_version_epoch(&control.version) != version
+        || control.architecture != arch
+    {
+        return ArchiveIdentity::Disagrees(format!(
+            "control declares {} {} {}",
+            control.package, control.version, control.architecture
+        ));
+    }
+    if let Some(named) = &release {
+        if let Some(marker) = debian_marker_contradicting(&control.version, named) {
+            return ArchiveIdentity::Disagrees(format!(
+                "version {} names Debian {marker}, its suite names {}",
+                control.version,
+                named.label()
+            ));
+        }
+    }
+    let release = release.or_else(|| debian_release_from_version(&control.version));
+    os_package_identity(
+        crate::services::scanner_service::ComponentEcosystem::Debian,
+        &control.package,
+        &control.version,
+        &control.architecture,
+        control.source.as_deref().and_then(deb_source_name),
+        release,
+    )
+}
+
+/// The text of the `InRelease` or `Release` cached under `dir`, expired or not:
+/// the release it names does not change when its short TTL runs out.
+async fn cached_apt_release_text(
+    proxy: &ProxyService,
+    repo_key: &str,
+    dir: &str,
+) -> Option<String> {
+    for leaf in ["InRelease", "Release"] {
+        let path = flat_release_path(dir, leaf);
+        if let Ok(Some(body)) = proxy
+            .get_cached_artifact_by_path_ignoring_expiry(repo_key, &path)
+            .await
+        {
+            if let Ok(text) = String::from_utf8(body.content.to_vec()) {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+/// The release a cached `Release` / `InRelease` under `dir` names, if one is
+/// cached and names a release the scanner grades.
+async fn cached_apt_release(
+    proxy: &ProxyService,
+    repo_key: &str,
+    dir: &str,
+) -> Option<crate::services::scanner_service::OsRelease> {
+    let text = cached_apt_release_text(proxy, repo_key, dir).await?;
+    crate::api::handlers::proxy_scan_archive::os_release_from_apt_release(&text)
+}
+
+/// The cached proxy paths under `dists/`, from the catalog when it has rows.
+async fn cached_dists_paths(
+    db: &PgPool,
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+) -> Vec<String> {
+    if crate::services::proxy_catalog::has_rows(db, repo_id)
+        .await
+        .unwrap_or(false)
+    {
+        crate::services::proxy_catalog::paths_under_prefixes(
+            db,
+            repo_id,
+            &["dists/".to_string()],
+            i64::MAX,
+        )
+        .await
+        .unwrap_or_default()
+    } else {
+        proxy.list_cached_paths(repo_key).await
+    }
+}
+
+/// The `Packages` digest and the release one Remote (a Virtual's member, or
+/// the repository itself) serves a package file under (#4111). The release is
+/// only ever the one the file's own suite names (#5170): another suite's would
+/// grade the file against a release it may not belong to, so `None` leaves
+/// [`deb_identity`] with the version's marker, else inconclusive.
+async fn deb_member_digest_and_release(
+    state: &SharedState,
+    proxy: &ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    route: DebPackageRoute<'_>,
+) -> Result<
+    (
+        Option<String>,
+        Option<crate::services::scanner_service::OsRelease>,
+    ),
+    Response,
+> {
+    let (expected, release) = match route {
+        DebPackageRoute::Pool { component, .. } => {
+            let artifact_path = route.upstream_path();
+            match resolve_gated_pool_index_entry(
+                &state.db,
+                proxy,
+                (repo_id, repo_key, upstream_url),
+                component,
+                &artifact_path,
+            )
+            .await
+            .map_err(IntoResponse::into_response)?
+            {
+                Some((sha, release)) => (Some(sha), release),
+                None => (None, None),
+            }
+        }
+        DebPackageRoute::Dists { distribution, .. } => (
+            None,
+            cached_apt_release(proxy, repo_key, &format!("dists/{distribution}")).await,
+        ),
+        DebPackageRoute::Flat { path, .. } => {
+            let expected = resolve_flat_expected_checksum(proxy, repo_key, path)
+                .await
+                .map_err(IntoResponse::into_response)?;
+            // The nearest directory above the package with a cached flat
+            // `Release`, as `flat_packages_index_candidates` walks them.
+            let mut release = None;
+            let mut dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+            loop {
+                if let Some(found) = cached_apt_release(proxy, repo_key, dir).await {
+                    release = Some(found);
+                    break;
+                }
+                if dir.is_empty() {
+                    break;
+                }
+                dir = dir.rsplit_once('/').map_or("", |(d, _)| d);
+            }
+            (expected, release)
+        }
+    };
+    Ok((expected, release))
+}
+
+/// Inline scan-and-block for one Debian package file from one Remote
+/// repository (#4111).
+#[allow(clippy::too_many_arguments)]
+async fn serve_scanned_deb(
+    state: &SharedState,
+    proxy: &ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    cache_key: &str,
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    kind: DebPackage,
+    disposition: Option<&str>,
+) -> Result<Response, Response> {
+    let filename = cache_key.rsplit('/').next().unwrap_or(cache_key);
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: RepositoryFormat::Debian,
+        source_path: cache_key,
+        cache_path: cache_key,
+        filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+        proxy,
+        kind,
+        disposition,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The scan-on-proxy arms of a Debian package download, Remote and Virtual
+/// (#4111): `Ok(None)` for a file the gate does not see, or when nothing
+/// scans, so the caller keeps its untouched streaming path. A Virtual's
+/// Remote members are narrowed by their own allowlists first (#2727), as the
+/// unscanned walk narrows them.
+async fn serve_scanned_deb_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    route: DebPackageRoute<'_>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Result<Response, Response>>, Response> {
+    use crate::api::handlers::proxy_scan_archive::{LocalLookup, ScannedRoute};
+    let upstream_path = route.upstream_path();
+    let serve_key = deb_serve_key(&upstream_path);
+    if !serve_key.scannable {
+        return Ok(None);
+    }
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    let cache_key = serve_key.cache_key.as_str();
+    let filename = cache_key.rsplit('/').next().unwrap_or(cache_key);
+    let scanned_route = ScannedRoute {
+        upstream_path: cache_key,
+        lookup: LocalLookup::ExactPath(&upstream_path),
+        default_content_type: DEBIAN_BINARY_CONTENT_TYPE,
+        virtual_disposition: Some(filename),
+    };
+    let keep = |member: &crate::models::repository::Repository| {
+        let member = member.clone();
+        async move {
+            let Some(base) = remote_member_upstream(&member) else {
+                // Hosted members serve hosted content the proxy allowlist
+                // does not apply to; a flat walk has Remote members only.
+                return !matches!(route, DebPackageRoute::Flat { .. });
+            };
+            let Ok(filter) = load_debian_filter(&state.db, member.id).await else {
+                return false;
+            };
+            match route {
+                DebPackageRoute::Pool { component, path } => {
+                    gate_debian_pool(&filter, base, component, path).is_ok()
+                }
+                DebPackageRoute::Dists {
+                    distribution,
+                    dists_path,
+                } => {
+                    virtual_member_dists_allowed(
+                        state,
+                        proxy,
+                        &member,
+                        base,
+                        distribution,
+                        dists_path,
+                    )
+                    .await
+                }
+                DebPackageRoute::Flat { raw_path, .. } => {
+                    gate_flat_request(&filter, base, raw_path).is_ok()
+                }
+            }
+        }
+    };
+    let scanned = |(id, key, upstream): crate::api::handlers::proxy_scan_archive::ScannedRemote,
+                   policy: proxy_helpers::MemberScanPolicy,
+                   disposition: Option<String>| async move {
+        let (expected_sha256, release) =
+            deb_member_digest_and_release(state, proxy, (id, &key, &upstream), route).await?;
+        serve_scanned_deb(
+            state,
+            proxy,
+            (id, &key, &upstream),
+            cache_key,
+            policy,
+            ctx,
+            DebPackage {
+                release,
+                expected_sha256,
+            },
+            disposition.as_deref(),
+        )
+        .await
+    };
+    crate::api::handlers::proxy_scan_archive::serve_scanned_package_download_over(
+        state,
+        auth,
+        repo,
+        scanned_route,
+        false,
+        ctx,
+        keep,
+        scanned,
+    )
+    .await
+}
+
+pub(crate) struct DebianPackageUpload {
     artifact_path: String,
     component: String,
     deb_info: DebInfo,
@@ -3082,21 +4663,26 @@ fn prepare_debian_upload(
     path: &str,
     body: &[u8],
 ) -> Result<DebianPackageUpload, Response> {
+    parse_debian_upload(component, path, body)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message).into_response())
+}
+
+/// Parse and validate a `.deb` destined for `pool/<component>/<path>`: the
+/// file name must be `{name}_{version}_{arch}.deb`, the control file must be
+/// readable, and its Package/Version/Architecture must match the file name.
+/// Every failure is a client error, returned as its message. `body` only
+/// needs to reach the end of the `control.tar` member.
+fn parse_debian_upload(
+    component: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<DebianPackageUpload, String> {
     let filename = path.rsplit('/').next().unwrap_or(path);
     let deb_info = parse_deb_filename(filename).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Invalid Debian package filename. Expected {name}_{version}_{arch}.deb",
-        )
-            .into_response()
+        "Invalid Debian package filename. Expected {name}_{version}_{arch}.deb".to_string()
     })?;
-    let control = DebianHandler::extract_control(body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid Debian package metadata: {}", e),
-        )
-            .into_response()
-    })?;
+    let control = DebianHandler::extract_control(body)
+        .map_err(|e| format!("Invalid Debian package metadata: {}", e))?;
     validate_debian_control_matches_filename(&deb_info, &control)?;
 
     let artifact_path = format!("pool/{}/{}", component, path);
@@ -3117,40 +4703,25 @@ fn prepare_debian_upload(
     })
 }
 
-#[allow(clippy::result_large_err)]
 fn validate_debian_control_matches_filename(
     deb_info: &DebInfo,
     control: &DebControl,
-) -> Result<(), Response> {
+) -> Result<(), String> {
+    let mismatch = |field: &str, from_name: &str, from_control: &str| {
+        format!("{field} mismatch: filename says '{from_name}' but control says '{from_control}'")
+    };
     if control.package != deb_info.name {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Package name mismatch: filename says '{}' but control says '{}'",
-                deb_info.name, control.package
-            ),
-        )
-            .into_response());
+        return Err(mismatch("Package name", &deb_info.name, &control.package));
     }
     if control.version != deb_info.version {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Version mismatch: filename says '{}' but control says '{}'",
-                deb_info.version, control.version
-            ),
-        )
-            .into_response());
+        return Err(mismatch("Version", &deb_info.version, &control.version));
     }
     if control.architecture != deb_info.arch {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Architecture mismatch: filename says '{}' but control says '{}'",
-                deb_info.arch, control.architecture
-            ),
-        )
-            .into_response());
+        return Err(mismatch(
+            "Architecture",
+            &deb_info.arch,
+            &control.architecture,
+        ));
     }
     Ok(())
 }
@@ -3254,24 +4825,100 @@ async fn persist_debian_upload(
             DEBIAN_BINARY_CONTENT_TYPE,
             body,
             user_id,
-            enqueue_sync_tasks,
+            // #4889: queue after the control document is written below, not
+            // before it.
+            false,
         )
         .await
         .map_err(|e| e.into_response())?;
 
+    record_debian_package(
+        state,
+        &artifact_service,
+        repo.id,
+        artifact.id,
+        artifact.size_bytes,
+        &artifact.checksum_sha256,
+        upload,
+        &analysis_body,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
+
+    if enqueue_sync_tasks {
+        super::queue_push_sync_tasks_now(
+            &state.db,
+            repo.id,
+            artifact.id,
+            &upload.artifact_path,
+            artifact.size_bytes,
+        )
+        .await;
+    }
+
+    Ok(artifact)
+}
+
+/// Everything a Debian upload records once its `artifacts` row exists: the
+/// `artifact_metadata` control document (which `Packages` renders from), the
+/// maintainer-script analysis (#4033), the package catalog row, and the
+/// repository's `updated_at` bump. Shared by the native upload routes and the
+/// generic chunked completion (#1846, via [`StagedDebianPackage::parts`]), so
+/// a `.deb` gets the same records whichever way it arrived. `deb_head` must reach the end of the
+/// `control.tar` member. Only the metadata write is fatal; the rest is
+/// best-effort, as on the native path (see [`record_debian_package_extras`],
+/// which the migration importer calls after writing the control document in
+/// its own transaction, #4657).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_debian_package(
+    state: &SharedState,
+    artifact_service: &ArtifactService,
+    repo_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    size_bytes: i64,
+    checksum_sha256: &str,
+    upload: &DebianPackageUpload,
+    deb_head: &[u8],
+) -> crate::error::Result<()> {
     artifact_service
         .set_metadata(
-            artifact.id,
+            artifact_id,
             "debian",
             upload.metadata.clone(),
             serde_json::json!({}),
         )
-        .await
-        .map_err(|e| e.into_response())?;
+        .await?;
 
+    record_debian_package_extras(
+        &state.db,
+        repo_id,
+        artifact_id,
+        size_bytes,
+        checksum_sha256,
+        upload,
+        deb_head,
+    )
+    .await;
+    Ok(())
+}
+
+/// The best-effort part of [`record_debian_package`]: maintainer-script
+/// analysis, the package catalog row and the repository `updated_at` bump.
+/// The migration importer (#4657) writes the control document inside its own
+/// transaction and calls this once it commits, so a migrated `.deb` ends up
+/// with exactly the records a native upload has.
+pub(crate) async fn record_debian_package_extras(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    size_bytes: i64,
+    checksum_sha256: &str,
+    upload: &DebianPackageUpload,
+    deb_head: &[u8],
+) {
     // `preinst`/`postinst`/`prerm`/`postrm` run as root on `apt install`
     // (#4033). Best-effort: the artifact row is already committed.
-    let (scripts, unanalyzed, completeness) = extract_deb_maintainer_scripts(&analysis_body);
+    let (scripts, unanalyzed, completeness) = extract_deb_maintainer_scripts(deb_head);
     debug_assert!(
         scripts
             .iter()
@@ -3279,30 +4926,23 @@ async fn persist_debian_upload(
             .all(|s| s.kind.runs_as_root()),
         "debian maintainer scripts are root-privileged hooks"
     );
-    if let Err(e) = record_install_scripts(
-        &state.db,
-        artifact.id,
-        "debian",
-        scripts,
-        unanalyzed,
-        completeness,
-    )
-    .await
+    if let Err(e) =
+        record_install_scripts(db, artifact_id, "debian", scripts, unanalyzed, completeness).await
     {
         tracing::warn!(
-            artifact_id = %artifact.id,
+            artifact_id = %artifact_id,
             error = %e,
             "debian maintainer-script analysis could not be recorded"
         );
     }
 
-    PackageService::new(state.db.clone())
+    PackageService::new(db.clone())
         .try_create_or_update_from_artifact(
-            repo.id,
+            repo_id,
             &upload.control.package,
             &upload.control.version,
-            artifact.size_bytes,
-            &artifact.checksum_sha256,
+            size_bytes,
+            checksum_sha256,
             package_description(&upload.control),
             Some(build_debian_package_catalog_metadata(upload)),
         )
@@ -3310,12 +4950,235 @@ async fn persist_debian_upload(
 
     let _ = sqlx::query!(
         "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
-        repo.id,
+        repo_id,
     )
-    .execute(&state.db)
+    .execute(db)
     .await;
+}
 
-    Ok(artifact)
+// ---------------------------------------------------------------------------
+// Generic chunked completion of a `.deb` (#1846)
+// ---------------------------------------------------------------------------
+
+/// Largest `control.tar` member a chunked `.deb` completion reads into memory.
+/// Real control archives are kilobytes (maintainer scripts, `md5sums`); the
+/// native upload routes hold the whole package in memory, so this is a looser
+/// bound than theirs, not a tighter one.
+const STAGED_DEB_CONTROL_MAX: u64 = 64 * 1024 * 1024;
+
+/// ar members walked looking for `control.tar*` before giving up. dpkg
+/// requires it as the second member; a few extra allow for tooling that
+/// inserts signature members.
+const STAGED_DEB_MAX_MEMBERS: usize = 16;
+
+/// A `.deb` that arrived through the generic chunked upload flow
+/// (`/api/v1/uploads`), parsed and validated exactly as the native upload
+/// routes do, ready for [`record_debian_package`] once its `artifacts` row
+/// exists.
+pub(crate) struct StagedDebianPackage {
+    upload: DebianPackageUpload,
+    /// The package's head through the end of its `control.tar` member: all the
+    /// control parse and the maintainer-script analysis read.
+    deb_head: Vec<u8>,
+}
+
+impl StagedDebianPackage {
+    /// The parsed upload and the package head, as [`record_debian_package`]
+    /// takes them once the artifact row exists.
+    pub(crate) fn parts(&self) -> (&DebianPackageUpload, &[u8]) {
+        (&self.upload, &self.deb_head)
+    }
+
+    /// The `artifact_metadata` control document (`format = 'debian'`) the
+    /// native upload stores, which `Packages` and `Release` render from.
+    pub(crate) fn control_document(&self) -> &serde_json::Value {
+        &self.upload.metadata
+    }
+}
+
+/// Split a Debian repository artifact path into `(component, path)` when it is
+/// a binary package in the pool, the layout `Packages` indexes
+/// (`pool/<component>/.../<file>.deb`, also `.udeb`/`.ddeb`). Anything else
+/// (a source tarball, a file outside `pool/`) is not finalized as a package.
+pub(crate) fn staged_package_target(artifact_path: &str) -> Option<(&str, &str)> {
+    let (component, path) = artifact_path.strip_prefix("pool/")?.split_once('/')?;
+    let filename = path.rsplit('/').next()?;
+    let is_package = [".deb", ".udeb", ".ddeb"]
+        .iter()
+        .any(|ext| filename.ends_with(ext));
+    (!component.is_empty() && is_package).then_some((component, path))
+}
+
+/// The `(package, version)` a pool `.deb` path names, read from its
+/// `{name}_{version}_{arch}.deb` file name. Known before the bytes are, so
+/// the chunked completion's immutability gate checks the same coordinates the
+/// row is written with ([`parse_debian_upload`] later requires the control
+/// file to agree).
+pub(crate) fn package_coordinates_from_path(artifact_path: &str) -> Option<(String, String)> {
+    let (_, path) = staged_package_target(artifact_path)?;
+    let info = parse_deb_filename(path.rsplit('/').next()?)?;
+    Some((info.name, info.version))
+}
+
+/// Read a staged `.deb`'s head through the end of its `control.tar` member,
+/// seeking past the members before it, so a multi-GiB package costs one
+/// bounded read instead of a full buffer. The result is a valid ar prefix
+/// (`!<arch>` + the control member) for [`DebianHandler::control_tar_member`].
+async fn read_deb_head(file: &std::path::Path) -> io::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
+
+    let mut f = tokio::fs::File::open(file).await?;
+    let mut head = vec![0u8; 8];
+    f.read_exact(&mut head)
+        .await
+        .map_err(|_| invalid("not an ar archive"))?;
+    if head != b"!<arch>\n" {
+        return Err(invalid("not an ar archive"));
+    }
+    for _ in 0..STAGED_DEB_MAX_MEMBERS {
+        let mut header = [0u8; 60];
+        if f.read_exact(&mut header).await.is_err() {
+            break;
+        }
+        let name = std::str::from_utf8(&header[..16])
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('/');
+        let size: u64 = std::str::from_utf8(&header[48..58])
+            .unwrap_or("0")
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if name.starts_with("control.tar") {
+            if size > STAGED_DEB_CONTROL_MAX {
+                return Err(invalid("control.tar member is too large"));
+            }
+            head.extend_from_slice(&header);
+            (&mut f).take(size).read_to_end(&mut head).await?;
+            return Ok(head);
+        }
+        f.seek(io::SeekFrom::Current((size + size % 2) as i64))
+            .await?;
+    }
+    Err(invalid("control.tar not found in .deb file"))
+}
+
+/// Read a stored `.deb`'s head through the end of its `control.tar` member
+/// with ranged storage reads, so the source-free backfill (#4740) validates a
+/// package without downloading the whole file. The result is the same ar
+/// prefix [`read_deb_head`] produces.
+async fn read_deb_head_from_storage(
+    storage: &dyn StorageBackend,
+    storage_key: &str,
+) -> Result<Vec<u8>, String> {
+    let invalid = |msg: &str| format!("Invalid Debian package metadata: {msg}");
+    let read = |offset: u64, length: usize| storage.get_range(storage_key, offset, length);
+
+    let magic = read(0, 8)
+        .await
+        .map_err(|e| format!("could not read stored .deb: {e}"))?;
+    if magic.as_ref() != b"!<arch>\n" {
+        return Err(invalid("not an ar archive"));
+    }
+    let mut head = magic.to_vec();
+    let mut offset = 8u64;
+    for _ in 0..STAGED_DEB_MAX_MEMBERS {
+        let header = match read(offset, 60).await {
+            Ok(header) if header.len() == 60 => header,
+            Ok(_) => break,
+            Err(e) => return Err(format!("could not read stored .deb: {e}")),
+        };
+        let name = std::str::from_utf8(&header[..16])
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('/');
+        let size: u64 = std::str::from_utf8(&header[48..58])
+            .unwrap_or("0")
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if name.starts_with("control.tar") {
+            if size > STAGED_DEB_CONTROL_MAX {
+                return Err(invalid("control.tar member is too large"));
+            }
+            let body_offset = offset
+                .checked_add(60)
+                .ok_or_else(|| invalid("ar member offset overflow"))?;
+            let body_len =
+                usize::try_from(size).map_err(|_| invalid("control.tar member is too large"))?;
+            let body = read(body_offset, body_len)
+                .await
+                .map_err(|e| format!("could not read stored .deb: {e}"))?;
+            if body.len() != body_len {
+                return Err(invalid("truncated ar member"));
+            }
+            head.extend_from_slice(&header);
+            head.extend_from_slice(&body);
+            return Ok(head);
+        }
+        let member_len = 60u64
+            .checked_add(size)
+            .and_then(|len| len.checked_add(size % 2))
+            .ok_or_else(|| invalid("ar member offset overflow"))?;
+        offset = offset
+            .checked_add(member_len)
+            .ok_or_else(|| invalid("ar member offset overflow"))?;
+    }
+    Err(invalid("control.tar not found in stored .deb"))
+}
+
+/// Parse and validate a `.deb` head for `artifact_path`. Shared by the chunked
+/// completion's staged file, the migration importer, and the source-free
+/// backfill's stored object.
+async fn finalize_from_head(
+    artifact_path: &str,
+    deb_head: Vec<u8>,
+) -> Result<Option<StagedDebianPackage>, String> {
+    let Some((component, path)) = staged_package_target(artifact_path) else {
+        return Ok(None);
+    };
+    let (component, path) = (component.to_string(), path.to_string());
+    tokio::task::spawn_blocking(move || {
+        parse_debian_upload(&component, &path, &deb_head)
+            .map(|upload| Some(StagedDebianPackage { upload, deb_head }))
+    })
+    .await
+    .map_err(|e| format!("Debian package parse failed: {e}"))?
+}
+
+/// Format-native finalize for a `.deb` completed through the generic chunked
+/// flow (#1846): parse and validate the control file of the staged package at
+/// `file` exactly as `PUT /debian/{repo}/pool/...` does. `Ok(None)` when
+/// `artifact_path` is not a pool package (nothing format-specific to record);
+/// `Err` carries the client-facing reason a package the native routes would
+/// refuse with 400 is refused.
+pub(crate) async fn finalize_from_staged(
+    artifact_path: &str,
+    file: &std::path::Path,
+) -> Result<Option<StagedDebianPackage>, String> {
+    if staged_package_target(artifact_path).is_none() {
+        return Ok(None);
+    }
+    let deb_head = read_deb_head(file)
+        .await
+        .map_err(|e| format!("Invalid Debian package metadata: {e}"))?;
+    finalize_from_head(artifact_path, deb_head).await
+}
+
+/// Validate a `.deb` already stored under `storage_key` without reading its
+/// payload bytes (#4740). Returns `Ok(None)` when `artifact_path` is not a
+/// canonical `pool/<component>/.../<file>.deb` package path.
+pub(crate) async fn finalize_from_storage(
+    artifact_path: &str,
+    storage: &dyn StorageBackend,
+    storage_key: &str,
+) -> Result<Option<StagedDebianPackage>, String> {
+    if staged_package_target(artifact_path).is_none() {
+        return Ok(None);
+    }
+    let deb_head = read_deb_head_from_storage(storage, storage_key).await?;
+    finalize_from_head(artifact_path, deb_head).await
 }
 
 // ---------------------------------------------------------------------------
@@ -3521,7 +5384,7 @@ type ExtractedScripts = (Vec<InstallScript>, Vec<UnanalyzedScript>, Completeness
 
 fn collect_deb_maintainer_scripts<R: Read>(decoded: R) -> ExtractedScripts {
     use crate::util::bounded_archive::{
-        budgeted, read_capped, MAX_INGEST_ARCHIVE_ENTRIES, MAX_INGEST_METADATA_ENTRY_BYTES,
+        budgeted, max_ingest_archive_entries, read_capped, MAX_INGEST_METADATA_ENTRY_BYTES,
     };
 
     let mut archive = tar::Archive::new(budgeted(decoded));
@@ -3542,6 +5405,7 @@ fn collect_deb_maintainer_scripts<R: Read>(decoded: R) -> ExtractedScripts {
     let mut unanalyzed = Vec::new();
     let mut problems: Vec<String> = Vec::new();
     let mut scripts_seen: i32 = 0;
+    let max_entries = max_ingest_archive_entries();
     let mut entries_seen: u64 = 0;
     for entry in entries {
         let mut entry = match entry {
@@ -3561,7 +5425,7 @@ fn collect_deb_maintainer_scripts<R: Read>(decoded: R) -> ExtractedScripts {
             }
         };
         entries_seen += 1;
-        if entries_seen > MAX_INGEST_ARCHIVE_ENTRIES {
+        if entries_seen > max_entries {
             problems.push("control.tar exceeds the entry-count cap".to_string());
             break;
         }
@@ -5257,74 +7121,83 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn append_ar_member(out: &mut Vec<u8>, name: &str, content: &[u8]) {
+    let header = format!(
+        "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+        name,
+        0,
+        0,
+        0,
+        "100644",
+        content.len()
+    );
+    assert_eq!(header.len(), 60, "ar header must be exactly 60 bytes");
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(content);
+    if content.len() % 2 == 1 {
+        out.push(b'\n');
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn control_tar_gz(control: &str) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(control.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "./control", control.as_bytes())
+        .expect("append control file");
+    builder.finish().expect("finish control.tar");
+    let tar_bytes = builder.into_inner().expect("control.tar bytes");
+    gzip_compress(&tar_bytes).expect("gzip control.tar")
+}
+
+#[cfg(test)]
+fn empty_data_tar_gz() -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    builder.finish().expect("finish data.tar");
+    let tar_bytes = builder.into_inner().expect("data.tar bytes");
+    gzip_compress(&tar_bytes).expect("gzip data.tar")
+}
+
+#[cfg(test)]
+pub(crate) fn minimal_deb(
+    package: &str,
+    version: &str,
+    architecture: &str,
+    description: &str,
+) -> Vec<u8> {
+    let control = format!(
+        "Package: {package}\n\
+         Version: {version}\n\
+         Architecture: {architecture}\n\
+         Maintainer: Test Maintainer <test@example.local>\n\
+         Installed-Size: 7\n\
+         Depends: libc6 (>= 2.36)\n\
+         Section: utils\n\
+         Priority: optional\n\
+         Homepage: https://example.local/{package}\n\
+         Description: {description}\n\
+         {description_continuation}",
+        description_continuation = " extended description line\n",
+    );
+
+    let mut deb = Vec::new();
+    deb.extend_from_slice(b"!<arch>\n");
+    append_ar_member(&mut deb, "debian-binary", b"2.0\n");
+    append_ar_member(&mut deb, "control.tar.gz", &control_tar_gz(&control));
+    append_ar_member(&mut deb, "data.tar.gz", &empty_data_tar_gz());
+    deb
+}
+
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod upload_db_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
-
-    fn append_ar_member(out: &mut Vec<u8>, name: &str, content: &[u8]) {
-        let header = format!(
-            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
-            name,
-            0,
-            0,
-            0,
-            "100644",
-            content.len()
-        );
-        assert_eq!(header.len(), 60, "ar header must be exactly 60 bytes");
-        out.extend_from_slice(header.as_bytes());
-        out.extend_from_slice(content);
-        if content.len() % 2 == 1 {
-            out.push(b'\n');
-        }
-    }
-
-    fn control_tar_gz(control: &str) -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
-        let mut header = tar::Header::new_gnu();
-        header.set_size(control.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "./control", control.as_bytes())
-            .expect("append control file");
-        builder.finish().expect("finish control.tar");
-        let tar_bytes = builder.into_inner().expect("control.tar bytes");
-        gzip_compress(&tar_bytes).expect("gzip control.tar")
-    }
-
-    fn empty_data_tar_gz() -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
-        builder.finish().expect("finish data.tar");
-        let tar_bytes = builder.into_inner().expect("data.tar bytes");
-        gzip_compress(&tar_bytes).expect("gzip data.tar")
-    }
-
-    fn minimal_deb(package: &str, version: &str, architecture: &str, description: &str) -> Vec<u8> {
-        let control = format!(
-            "Package: {package}\n\
-             Version: {version}\n\
-             Architecture: {architecture}\n\
-             Maintainer: Test Maintainer <test@example.local>\n\
-             Installed-Size: 7\n\
-             Depends: libc6 (>= 2.36)\n\
-             Section: utils\n\
-             Priority: optional\n\
-             Homepage: https://example.local/{package}\n\
-             Description: {description}\n\
-             {description_continuation}",
-            description_continuation = " extended description line\n",
-        );
-
-        let mut deb = Vec::new();
-        deb.extend_from_slice(b"!<arch>\n");
-        append_ar_member(&mut deb, "debian-binary", b"2.0\n");
-        append_ar_member(&mut deb, "control.tar.gz", &control_tar_gz(&control));
-        append_ar_member(&mut deb, "data.tar.gz", &empty_data_tar_gz());
-        deb
-    }
 
     fn headers_with_replication(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -5550,6 +7423,366 @@ mod upload_db_tests {
         assert!(release.contains("main/binary-amd64/Packages.xz\n"));
 
         f.teardown().await;
+    }
+
+    /// #1329 end to end through the handlers: after a rotation, InRelease and
+    /// Release.gpg carry a signature from each key (the pre-rotation cache
+    /// entry is not reused) and gpg-key.asc serves both keys.
+    #[tokio::test]
+    async fn rotation_dual_signs_inrelease_and_serves_both_keys_1329() {
+        use pgp::composed::cleartext::CleartextSignedMessage;
+        use pgp::composed::{Deserializable, SignedPublicKey, StandaloneSignature};
+
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let svc = SigningService::new(f.pool.clone(), &f.state.config.jwt_secret);
+        let key = svc
+            .create_key(crate::services::signing_service::CreateKeyRequest {
+                repository_id: Some(f.repo_id),
+                name: format!("deb-sign-{}", f.repo_key),
+                key_type: "gpg".to_string(),
+                algorithm: crate::services::signing_service::ED25519_ALGORITHM.to_string(),
+                uid_name: None,
+                uid_email: None,
+                created_by: None,
+            })
+            .await
+            .expect("create signing key");
+        svc.update_signing_config(f.repo_id, Some(key.id), true, false, false)
+            .await
+            .expect("attach signing key");
+
+        let app = f.router_with_auth(super::router());
+        let deb = minimal_deb("ak-rotate", "1.0-1", "amd64", "rotation test");
+        let uri = format!(
+            "/{}/pool/main/a/ak-rotate/ak-rotate_1.0-1_amd64.deb",
+            f.repo_key
+        );
+        let (status, _) = tdh::send(app.clone(), tdh::put(uri, Bytes::from(deb))).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let fetch = |path: &'static str| {
+            let app = app.clone();
+            let uri = format!("/{}/{}", f.repo_key, path);
+            async move {
+                let (status, body) = tdh::send(app, tdh::get(uri)).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{path}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                String::from_utf8(body.to_vec()).unwrap()
+            }
+        };
+        let inrelease_sigs = |text: &str| {
+            CleartextSignedMessage::from_string(text)
+                .unwrap()
+                .0
+                .signatures()
+                .len()
+        };
+        let detached_sigs = |text: &str| {
+            StandaloneSignature::from_string_many(text)
+                .unwrap()
+                .0
+                .count()
+        };
+        let keys = |text: &str| SignedPublicKey::from_string_many(text).unwrap().0.count();
+
+        // Warm the signed-Release cache with the single-key signature.
+        assert_eq!(inrelease_sigs(&fetch("dists/bookworm/InRelease").await), 1);
+        assert_eq!(detached_sigs(&fetch("dists/bookworm/Release.gpg").await), 1);
+        assert_eq!(keys(&fetch("gpg-key.asc").await), 1);
+
+        let new = svc.rotate_key(key.id, None).await.expect("rotate");
+
+        let inrelease = fetch("dists/bookworm/InRelease").await;
+        assert_eq!(
+            inrelease_sigs(&inrelease),
+            2,
+            "old + new signature after rotation"
+        );
+        let msg = CleartextSignedMessage::from_string(&inrelease).unwrap().0;
+        for pem in [&key.public_key_pem, &new.public_key_pem] {
+            msg.verify(&SignedPublicKey::from_string(pem).unwrap().0)
+                .expect("each key alone verifies the dual-signed InRelease");
+        }
+        assert_eq!(detached_sigs(&fetch("dists/bookworm/Release.gpg").await), 2);
+        assert_eq!(keys(&fetch("gpg-key.asc").await), 2);
+        assert_eq!(keys(&fetch("dists/bookworm/gpg-key.asc").await), 2);
+
+        // Revoking the predecessor ends the overlap on the next request.
+        svc.revoke_key(key.id, None).await.expect("revoke");
+        assert_eq!(inrelease_sigs(&fetch("dists/bookworm/InRelease").await), 1);
+        assert_eq!(keys(&fetch("gpg-key.asc").await), 1);
+
+        f.teardown().await;
+    }
+
+    /// #1846: a `.deb` pushed through the generic chunked flow
+    /// (`/api/v1/uploads`) gets the native finalize: the control-derived
+    /// `name`/`version`, the `artifact_metadata` control document and the
+    /// catalog row. Before the fix the row was named after the file, its
+    /// version was the pool directory segment, and `Packages` fell back to
+    /// the file name with "No description available" and no `Depends`.
+    #[tokio::test]
+    async fn chunked_deb_upload_runs_native_finalize_1846() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let (package, version, arch) = ("ak-chunked-deb", "2.0.1-1", "amd64");
+        let deb = minimal_deb(package, version, arch, "chunked Debian package");
+        let path = format!("pool/main/a/{package}/{package}_{version}_{arch}.deb");
+        let mut events = f.state.event_bus.subscribe();
+        let (status, body) = f
+            .chunked_upload(&path, &deb, serde_json::json!({}), false)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "chunked completion failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        // The catalog write is silent: completion emits its one
+        // `artifact.uploaded` itself (#3939), so the finalize must not add one.
+        tdh::assert_one_artifact_uploaded_event(
+            &mut events,
+            f.repo_id,
+            tdh::artifact_id_at(&f.pool, f.repo_id, &path).await,
+        );
+
+        let (artifact_id, name, row_version): (uuid::Uuid, String, Option<String>) =
+            sqlx::query_as(
+                "SELECT id, name, version FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+            )
+            .bind(f.repo_id)
+            .bind(&path)
+            .fetch_one(&f.pool)
+            .await
+            .expect("chunked artifact row");
+        assert_eq!(name, package, "named by the control Package, not the file");
+        assert_eq!(row_version.as_deref(), Some(version));
+
+        let (format, metadata): (String, serde_json::Value) =
+            sqlx::query_as("SELECT format, metadata FROM artifact_metadata WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("chunked upload must write the debian artifact_metadata row");
+        assert_eq!(format, "debian");
+        assert_eq!(metadata["component"], "main");
+        assert_eq!(metadata["control"]["package"], package);
+        assert_eq!(metadata["control"]["depends"][0], "libc6 (>= 2.36)");
+
+        let catalog: (String, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT version, metadata FROM packages WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(f.repo_id)
+        .bind(package)
+        .fetch_one(&f.pool)
+        .await
+        .expect("catalog row");
+        assert_eq!(catalog.0, version);
+        assert_eq!(catalog.1.expect("catalog metadata")["component"], "main");
+
+        let (status, packages_body) = tdh::send(
+            f.router_with_auth(super::router()),
+            tdh::get(format!(
+                "/{}/dists/bookworm/main/binary-amd64/Packages",
+                f.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let packages_text = String::from_utf8(packages_body.to_vec()).unwrap();
+        assert!(packages_text.contains(&format!("Package: {package}\n")));
+        assert!(packages_text.contains("Depends: libc6 (>= 2.36)\n"));
+        assert!(
+            packages_text.contains("Description: chunked Debian package\n"),
+            "Packages must render the control description: {packages_text}"
+        );
+
+        f.teardown().await;
+    }
+
+    /// #1846: a chunked `.deb` whose control file disagrees with its file name
+    /// is refused with 400, as the native route refuses it, and nothing is
+    /// stored.
+    #[tokio::test]
+    async fn chunked_deb_with_mismatched_control_is_rejected_1846() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let deb = minimal_deb("ak-other-name", "1.0", "amd64", "mismatched");
+        let path = "pool/main/a/ak-named/ak-named_1.0_amd64.deb";
+        let (status, body) = f
+            .chunked_upload(path, &deb, serde_json::json!({}), false)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            String::from_utf8_lossy(&body).contains("Package name mismatch"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "a refused package leaves no artifact row");
+        use sha2::{Digest, Sha256};
+        let key = ArtifactService::storage_key_from_checksum(&hex::encode(Sha256::digest(&deb)));
+        assert!(
+            !f.storage_dir.join(key).exists(),
+            "a refused package stores nothing at its content key"
+        );
+        f.teardown().await;
+    }
+
+    /// Chunked upload of a `.deb` whose control (`ak-src`) disagrees with its
+    /// file name, as a replication session carrying the source row's metadata.
+    async fn replicated_mismatched_deb(
+        f: &tdh::Fixture,
+        auth: AuthExtension,
+    ) -> (StatusCode, Bytes) {
+        let deb = minimal_deb("ak-src", "1.0", "amd64", "replicated");
+        let extra = serde_json::json!({
+            "artifact_name": "ak-replica",
+            "artifact_version": "1.0",
+            "artifact_metadata_format": "debian",
+            "artifact_metadata": {"format": "debian", "source": "replica-row"},
+        });
+        f.chunked_upload_as(
+            auth,
+            "pool/main/a/ak-replica/ak-replica_1.0_amd64.deb",
+            &deb,
+            extra,
+            true,
+        )
+        .await
+    }
+
+    /// #1846: a TRUSTED replication session (admin) brings the source row's
+    /// metadata, so the native finalize is skipped: the session metadata is
+    /// kept and the package is not re-validated.
+    #[tokio::test]
+    async fn trusted_replication_skips_chunked_deb_finalize_1846() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let (status, body) =
+            replicated_mismatched_deb(&f, tdh::admin_auth(f.user_id, &f.username)).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (name, metadata): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT a.name, am.metadata FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("replicated row with metadata");
+        assert_eq!(name, "ak-replica", "the session's coordinates are kept");
+        assert_eq!(
+            metadata["source"], "replica-row",
+            "session metadata is kept"
+        );
+        f.teardown().await;
+    }
+
+    /// #1846: the replication header alone is client-set, so an ordinary
+    /// user's "replication" session still gets the native finalize and its
+    /// mismatched package is still refused.
+    #[tokio::test]
+    async fn untrusted_replication_still_runs_chunked_deb_finalize_1846() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let (status, body) =
+            replicated_mismatched_deb(&f, tdh::make_auth(f.user_id, &f.username)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        f.teardown().await;
+    }
+
+    #[test]
+    fn staged_package_target_accepts_only_pool_packages_1846() {
+        assert_eq!(
+            staged_package_target("pool/main/h/hello/hello_1.0_amd64.deb"),
+            Some(("main", "h/hello/hello_1.0_amd64.deb"))
+        );
+        assert_eq!(
+            staged_package_target("pool/contrib/x_1_all.udeb"),
+            Some(("contrib", "x_1_all.udeb"))
+        );
+        assert_eq!(
+            staged_package_target("pool/main/h/hello/hello.tar.gz"),
+            None
+        );
+        assert_eq!(
+            staged_package_target("dists/main/hello_1.0_amd64.deb"),
+            None
+        );
+        assert_eq!(staged_package_target("pool//hello_1.0_amd64.deb"), None);
+        assert_eq!(staged_package_target("pool/hello_1.0_amd64.deb"), None);
+        assert_eq!(
+            package_coordinates_from_path("pool/main/h/hello/hello_1.0-2_amd64.deb"),
+            Some(("hello".to_string(), "1.0-2".to_string()))
+        );
+        assert_eq!(package_coordinates_from_path("pool/main/notadeb.deb"), None);
+    }
+
+    /// #1846: the staged read seeks past members ahead of `control.tar`
+    /// (here a large one) and returns only the head through the control
+    /// member, which still parses; a package without one, or not an ar
+    /// archive at all, is an error.
+    #[tokio::test]
+    async fn read_deb_head_reads_only_through_the_control_member_1846() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = "Package: big\nVersion: 1\nArchitecture: all\nDescription: d\n";
+        let mut deb = b"!<arch>\n".to_vec();
+        append_ar_member(&mut deb, "debian-binary", b"2.0\n");
+        append_ar_member(&mut deb, "_gpgbuilder", &vec![7u8; 300_001]);
+        append_ar_member(&mut deb, "control.tar.gz", &control_tar_gz(control));
+        append_ar_member(&mut deb, "data.tar.gz", &vec![0u8; 500_000]);
+        let file = dir.path().join("big_1_all.deb");
+        std::fs::write(&file, &deb).unwrap();
+
+        let head = read_deb_head(&file).await.expect("control member found");
+        assert!(head.len() < 10_000, "only the control member is read");
+        let parsed = DebianHandler::extract_control(&head).expect("head parses");
+        assert_eq!(parsed.package, "big");
+
+        let staged = finalize_from_staged("pool/main/b/big/big_1_all.deb", &file)
+            .await
+            .expect("valid package")
+            .expect("pool package is finalized");
+        assert_eq!(staged.upload.control.package, "big");
+        assert!(finalize_from_staged("pool/main/b/big/big.tar.gz", &file)
+            .await
+            .expect("not a package")
+            .is_none());
+
+        let mut no_control = b"!<arch>\n".to_vec();
+        append_ar_member(&mut no_control, "debian-binary", b"2.0\n");
+        std::fs::write(&file, &no_control).unwrap();
+        assert!(read_deb_head(&file).await.is_err());
+        let err = finalize_from_staged("pool/main/b/big/big_1_all.deb", &file)
+            .await
+            .err()
+            .expect("no control.tar is refused");
+        assert!(err.contains("control.tar not found"), "{err}");
+
+        std::fs::write(&file, b"plain text, not a package").unwrap();
+        assert!(read_deb_head(&file).await.is_err());
     }
 }
 
@@ -6182,6 +8415,21 @@ mod virtual_dists_cap_tests {
         );
     }
 
+    /// #5170: Ubuntu's release pockets publish `Packages.xz` as two xz streams,
+    /// and the data can be in the second.
+    #[test]
+    fn test_decompress_packages_index_reads_every_xz_stream() {
+        let body = b"Package: hello\nFilename: pool/main/h/hello/hello_1_amd64.deb\n";
+        let mut two_streams = xz(b"");
+        two_streams.extend(xz(body));
+        assert_eq!(
+            decompress_packages_index("dists/noble/main/binary-amd64/Packages.xz", &two_streams)
+                .as_deref()
+                .map(str::as_bytes),
+            Some(&body[..])
+        );
+    }
+
     #[test]
     fn test_decompress_packages_index_bomb_hits_cap_returns_none() {
         // A highly-compressible payload that expands past the decompressed cap.
@@ -6206,6 +8454,100 @@ mod virtual_dists_cap_tests {
             decompress_packages_index("dists/x/main/binary-amd64/Packages.gz", &too_big),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn tier_b_reads_index_paths_from_catalog() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let index_path = "dists/noble/main/binary-amd64/Packages";
+        let deb = "pool/main/h/hello/hello_1.0_amd64.deb";
+        let sha = "a".repeat(64);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{index_path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "Package: hello\nFilename: {deb}\nSize: 4\nSHA256: {sha}\n"
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/dists/noble/InRelease"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("release"))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dbg-tierb-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let repo_id = insert_remote_debian_member(&pool, root, &server.uri()).await;
+        let repo_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("repo key");
+        let repo = proxy_helpers::build_remote_repo_with_format(
+            repo_id,
+            &repo_key,
+            &server.uri(),
+            RepositoryFormat::Debian,
+        );
+        proxy
+            .fetch_artifact(&repo, index_path)
+            .await
+            .expect("cache index");
+        proxy
+            .fetch_artifact(&repo, "dists/noble/InRelease")
+            .await
+            .expect("cache release");
+
+        let listed = resolve_pool_expected_checksum(&pool, &proxy, repo_id, &repo_key, "main", deb)
+            .await
+            .expect("listed");
+        let unlisted = resolve_pool_expected_checksum(
+            &pool,
+            &proxy,
+            repo_id,
+            &repo_key,
+            "main",
+            "pool/main/h/hello/hello_2.0_amd64.deb",
+        )
+        .await
+        .expect("unlisted");
+
+        sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2")
+            .bind(repo_id)
+            .bind(index_path)
+            .execute(&pool)
+            .await
+            .expect("drop index row");
+        let not_in_catalog =
+            resolve_pool_expected_checksum(&pool, &proxy, repo_id, &repo_key, "main", deb)
+                .await
+                .expect("not in catalog");
+
+        sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("drop catalog");
+        let pre_catalog =
+            resolve_pool_expected_checksum(&pool, &proxy, repo_id, &repo_key, "main", deb)
+                .await
+                .expect("pre-catalog cache");
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(listed, Some(sha.clone()));
+        assert_eq!(unlisted, None);
+        assert_eq!(not_in_catalog, None);
+        assert_eq!(pre_catalog, Some(sha));
     }
 }
 
@@ -7444,5 +9786,1954 @@ mod maintainer_script_tests {
             "/usr/bin/env python3"
         ));
         assert!(!super::super::rpm::is_shell_interpreter("<lua>"));
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod flat_repository_tests {
+    //! #4619: flat APT repositories (`deb <uri> /`), shaped like pkgs.k8s.io.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use uuid::Uuid;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The path the Kubernetes CDN serves its v1.34 flat repository under,
+    /// colons and all.
+    const BASE: &str = "/repositories/isv:/kubernetes:/core:/stable:/v1.34/deb";
+    const DEB: &str = "amd64/kubectl_1.34.0-1.1_amd64.deb";
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    struct FlatUpstream {
+        server: MockServer,
+        in_release: Vec<u8>,
+        packages_gz: Vec<u8>,
+        deb: Vec<u8>,
+    }
+
+    /// A flat upstream: signed `InRelease` listing `Packages` and
+    /// `Packages.gz` at the root, a `.deb` under `amd64/`, no `dists/` tree
+    /// (the CDN answers 403 there), and a `Packages` that does NOT match the
+    /// signed `Release` so Tier A can be observed.
+    async fn flat_upstream() -> FlatUpstream {
+        let deb = b"!<arch>\nnot a real kubectl, but stable bytes".repeat(8);
+        let packages = format!(
+            "Package: kubectl\nVersion: 1.34.0-1.1\nArchitecture: amd64\n\
+             Filename: {DEB}\nSize: {}\nSHA256: {}\n\n",
+            deb.len(),
+            sha256_hex(&deb)
+        );
+        let packages_gz = gzip_compress(packages.as_bytes()).expect("gzip");
+        let in_release = format!(
+            "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nArchive: deb\nCodename: deb\n\
+             SHA256:\n {} {} Packages\n {} {} Packages.gz\n\
+             -----BEGIN PGP SIGNATURE-----\n\nc2lnbmF0dXJl\n-----END PGP SIGNATURE-----\n",
+            sha256_hex(packages.as_bytes()),
+            packages.len(),
+            sha256_hex(&packages_gz),
+            packages_gz.len()
+        )
+        .into_bytes();
+
+        let server = MockServer::start().await;
+        let ok = |p: String, body: Vec<u8>| {
+            Mock::given(method("GET"))
+                .and(wm_path(p))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        };
+        ok(format!("{BASE}/InRelease"), in_release.clone())
+            .mount(&server)
+            .await;
+        ok(format!("{BASE}/Packages.gz"), packages_gz.clone())
+            .mount(&server)
+            .await;
+        ok(
+            format!("{BASE}/Packages"),
+            b"Package: tampered\n\n".to_vec(),
+        )
+        .mount(&server)
+        .await;
+        ok(format!("{BASE}/{DEB}"), deb.clone())
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("{BASE}/dists/stable/InRelease")))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        // Not part of an APT flat repository: must never be fetched.
+        Mock::given(method("GET"))
+            .and(wm_path(format!("{BASE}/robots.txt")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("nope"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        FlatUpstream {
+            server,
+            in_release,
+            packages_gz,
+            deb,
+        }
+    }
+
+    #[test]
+    fn classify_flat_path_accepts_only_apt_flat_shapes() {
+        use FlatRequestKind::*;
+        for (path, kind) in [
+            ("InRelease", Some(ReleaseDocument)),
+            ("Release", Some(ReleaseDocument)),
+            ("sub/InRelease", Some(ReleaseDocument)),
+            ("Release.gpg", Some(ReleaseSignature)),
+            ("Packages", Some(Index)),
+            ("Packages.gz", Some(Index)),
+            ("Packages.xz", Some(Index)),
+            ("Packages.lzma", Some(Index)),
+            ("Sources.xz", Some(Index)),
+            ("Translation-en", Some(Index)),
+            ("by-hash/SHA256/abc", Some(Index)),
+            (DEB, Some(Package)),
+            ("foo_1.0_all.udeb", Some(Package)),
+            ("robots.txt", None),
+            ("index.html", None),
+            ("Release.key", None),
+            ("dists/stable/InRelease", None),
+            ("", None),
+        ] {
+            assert_eq!(classify_flat_path(path), kind, "{path}");
+        }
+    }
+
+    #[test]
+    fn flat_suite_dir_and_release_relative_path() {
+        assert_eq!(flat_suite_dir("Packages.gz"), "");
+        assert_eq!(flat_suite_dir("sub/Packages.gz"), "sub");
+        assert_eq!(flat_suite_dir("by-hash/SHA256/abc"), "");
+        assert_eq!(flat_suite_dir("sub/by-hash/SHA256/abc"), "sub");
+        assert_eq!(
+            flat_release_relative("sub/Packages.gz", "sub"),
+            "Packages.gz"
+        );
+        assert_eq!(flat_release_relative("Packages.gz", ""), "Packages.gz");
+        assert_eq!(flat_release_path("", "InRelease"), "InRelease");
+        assert_eq!(
+            flat_release_path("dists/trixie", "InRelease"),
+            "dists/trixie/InRelease"
+        );
+        assert_eq!(
+            flat_packages_index_candidates(DEB),
+            vec![
+                "Packages",
+                "Packages.gz",
+                "Packages.xz",
+                "amd64/Packages",
+                "amd64/Packages.gz",
+                "amd64/Packages.xz"
+            ]
+        );
+    }
+
+    #[test]
+    fn gate_flat_request_applies_dist_and_arch_allowlists() {
+        let base = format!("https://prod-cdn.packages.k8s.io{BASE}");
+        let open = DebianRepositoryConfig::default();
+        assert_eq!(
+            gate_flat_request(&open, &base, "InRelease").unwrap(),
+            ("InRelease".to_string(), FlatRequestKind::ReleaseDocument)
+        );
+        assert!(gate_flat_request(&open, &base, "robots.txt").is_err());
+        assert!(gate_flat_request(&open, &base, "amd64/../../../etc/passwd").is_err());
+
+        // A distribution allowlist names suites; the flat suite is `/`.
+        let suites = DebianRepositoryConfig {
+            distribution_paths: vec!["bookworm".into()],
+            ..Default::default()
+        };
+        assert!(gate_flat_request(&suites, &base, "InRelease").is_err());
+        let flat_listed = DebianRepositoryConfig {
+            distribution_paths: vec!["/".into()],
+            ..Default::default()
+        };
+        assert!(gate_flat_request(&flat_listed, &base, "InRelease").is_ok());
+
+        // Architecture allowlist: gated on the package filename, fail closed.
+        let arm_only = DebianRepositoryConfig {
+            architectures: vec!["arm64".into()],
+            ..Default::default()
+        };
+        assert!(gate_flat_request(&arm_only, &base, DEB).is_err());
+        assert!(gate_flat_request(&arm_only, &base, "arm64/kubectl_1.34.0-1.1_arm64.deb").is_ok());
+        assert!(gate_flat_request(&arm_only, &base, "amd64/not-a-deb-name.deb").is_err());
+        // Indices are not arch-scoped in a flat repository.
+        assert!(gate_flat_request(&arm_only, &base, "Packages.gz").is_ok());
+    }
+
+    #[tokio::test]
+    async fn remote_serves_flat_repository_like_pkgs_k8s_io_4619() {
+        let Some(fx) = tdh::Fixture::setup("remote", "debian").await else {
+            return;
+        };
+        let up = flat_upstream().await;
+        let upstream = format!("{}{BASE}/", up.server.uri());
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream).await;
+        let app = || tdh::router_anon(super::router(), state.clone());
+        let get = |p: &str| tdh::get(format!("/{}/{}", fx.repo_key, p));
+
+        let (status, body) = tdh::send(app(), get("InRelease")).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            &body[..],
+            &up.in_release[..],
+            "InRelease is served byte-for-byte"
+        );
+
+        let (status, body) = tdh::send(app(), get("Packages.gz")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &up.packages_gz[..]);
+
+        // Tier A: an index the signed Release does not vouch for is refused.
+        let (status, _) = tdh::send(app(), get("Packages")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let (status, body) = tdh::send(app(), get(DEB)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &up.deb[..]);
+        // Tier B: the body matches the SHA-256 the cached Packages records,
+        // so the tee writer commits it (asynchronously, after the stream).
+        let proxy = state.proxy_service.as_deref().expect("proxy");
+        assert_eq!(
+            resolve_flat_expected_checksum(proxy, &fx.repo_key, DEB)
+                .await
+                .expect("resolve"),
+            Some(sha256_hex(&up.deb)),
+            "the cached flat Packages index vouches for the package"
+        );
+        let mut cached = false;
+        for _ in 0..50 {
+            if proxy
+                .get_cached_artifact_by_path(&fx.repo_key, DEB)
+                .await
+                .expect("cache read")
+                .is_some()
+            {
+                cached = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            cached,
+            "a package matching the cached Packages SHA-256 is committed to the cache"
+        );
+
+        let (status, _) = tdh::send(app(), get("robots.txt")).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "not an APT path: never proxied"
+        );
+
+        // The suite form against a flat upstream: 404 naming the flat form,
+        // instead of the 502 the CDN's 403 used to produce.
+        let (status, body) = tdh::send(app(), get("dists/stable/InRelease")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("flat") && text.contains(" /`"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn flat_repository_setting_refuses_dists_without_contacting_upstream_4619() {
+        let Some(fx) = tdh::Fixture::setup("remote", "debian").await else {
+            return;
+        };
+        let up = flat_upstream().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("{BASE}/dists/stable/Release")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Suite: stable\n"))
+            .expect(0)
+            .mount(&up.server)
+            .await;
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+        )
+        .bind(fx.repo_id)
+        .bind(DEBIAN_CONFIG_KEY)
+        .bind(r#"{"flat_repository": true}"#)
+        .execute(&fx.pool)
+        .await
+        .expect("set debian config");
+        let upstream = format!("{}{BASE}", up.server.uri());
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream).await;
+        let app = || tdh::router_anon(super::router(), state.clone());
+
+        let (status, body) = tdh::send(
+            app(),
+            tdh::get(format!("/{}/dists/stable/Release", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(String::from_utf8_lossy(&body).contains("flat"));
+
+        let (status, _) = tdh::send(app(), tdh::get(format!("/{}/InRelease", fx.repo_key))).await;
+        assert_eq!(status, StatusCode::OK, "the flat form is still served");
+    }
+
+    #[tokio::test]
+    async fn virtual_repository_serves_flat_member_4619() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let up = flat_upstream().await;
+        let tmp = std::env::temp_dir().join(format!("flat-virt-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let (member_id, member_key, _) = tdh::create_repo(&pool, "remote", "debian").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}{BASE}", up.server.uri()))
+            .bind(member_id)
+            .execute(&pool)
+            .await
+            .expect("member upstream");
+        tdh::publish_repo(&pool, member_id).await;
+        let (virtual_id, virtual_key, _) = tdh::create_repo(&pool, "virtual", "debian").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .execute(&pool)
+        .await
+        .expect("enrol member");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let app = || tdh::router_anon(super::router(), state.clone());
+
+        let (status, body) = tdh::send(app(), tdh::get(format!("/{virtual_key}/InRelease"))).await;
+        let (deb_status, deb) = tdh::send(app(), tdh::get(format!("/{virtual_key}/{DEB}"))).await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![virtual_id, member_id])
+            .execute(&pool)
+            .await;
+        let _ = member_key;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &up.in_release[..]);
+        assert_eq!(deb_status, StatusCode::OK);
+        assert_eq!(&deb[..], &up.deb[..]);
+    }
+}
+
+/// #4111: scan-on-proxy for Debian packages, Remote and Virtual. The shared
+/// archive scenarios on the pool route, the `dists/` and flat layouts, the
+/// identity rule and the release lookup.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod scan_on_proxy_4111 {
+    use super::*;
+    use crate::api::handlers::proxy_scan_archive::test_support::{
+        self as ts, archive_scan_suite, deb_with_control, ArchiveCase, Rig,
+    };
+    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// The pin the gate grades `deb()` as: its `+deb12u1` names Debian 12.
+    fn pin() -> Option<crate::services::scanner_service::ExpectedComponent> {
+        crate::services::scanner_service::ExpectedComponent::os_package(
+            crate::services::scanner_service::ComponentEcosystem::Debian,
+            "libdtf",
+            "1.0-1+deb12u1",
+            crate::services::scanner_service::OsPackageContext {
+                release: crate::services::scanner_service::OsRelease::new("debian", "12")?,
+                arch: "amd64".to_string(),
+                source: Some("dtf".to_string()),
+            },
+        )
+    }
+
+    const FILE: &str = "libdtf_1.0-1+deb12u1_amd64.deb";
+    const POOL: &str = "pool/main/d/dtf";
+
+    /// A real `.deb` for `FILE`; the random description keeps every
+    /// fixture's digest unique.
+    fn deb() -> Vec<u8> {
+        deb_with_control(&format!(
+            "Package: libdtf\nSource: dtf (1.0-1+deb12u1)\nVersion: 1.0-1+deb12u1\n\
+             Architecture: amd64\nDescription: {}\n",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn case(_mock: &str) -> ArchiveCase {
+        let path = format!("{POOL}/{FILE}");
+        ArchiveCase {
+            format: "debian",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/{POOL}/{FILE}")),
+            package_path: format!("/{path}"),
+            extra: Vec::new(),
+            body: deb(),
+            recorded_path: path,
+            file: FILE.to_string(),
+            pin: pin(),
+        }
+    }
+
+    archive_scan_suite!(case);
+
+    /// A vendor layout keeping the binaries under `dists/` (#3596).
+    fn dists_case(_mock: &str) -> ArchiveCase {
+        let path = format!("dists/bookworm/main/binary-amd64/{FILE}");
+        ArchiveCase {
+            format: "debian",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/dists/bookworm/main/binary-amd64/{FILE}")),
+            package_path: format!("/{path}"),
+            extra: Vec::new(),
+            body: deb(),
+            recorded_path: path,
+            file: FILE.to_string(),
+            pin: pin(),
+        }
+    }
+
+    /// A flat repository (`deb <uri> /`).
+    fn flat_case(_mock: &str) -> ArchiveCase {
+        ArchiveCase {
+            format: "debian",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/{FILE}")),
+            package_path: format!("/{FILE}"),
+            extra: Vec::new(),
+            body: deb(),
+            recorded_path: FILE.to_string(),
+            file: FILE.to_string(),
+            pin: pin(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_package_under_dists_is_gated() {
+        ts::vulnerable_is_blocked(dists_case).await;
+        ts::fail_closed_without_a_verdict_is_locked(dists_case).await;
+        ts::virtual_member_is_gated(dists_case).await;
+        ts::without_scan_on_proxy_streams_unscanned(dists_case).await;
+    }
+
+    #[tokio::test]
+    async fn a_flat_repository_package_is_gated() {
+        ts::vulnerable_is_blocked(flat_case).await;
+        ts::fail_closed_without_a_verdict_is_locked(flat_case).await;
+        ts::fail_open_first_pull_is_served_pending(flat_case).await;
+        ts::virtual_member_is_gated(flat_case).await;
+    }
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched, on every package route.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused_on_every_route() {
+        let Some(rig) = Rig::new(case, Some("fail_closed")).await else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/{POOL}/{FILE}%3F.dsc"),
+                format!("/{key}/{POOL}/{FILE}%23x"),
+                format!("/{key}/dists/bookworm/main/binary-amd64/{FILE}%3Fx"),
+                format!("/{key}/{FILE}%3B"),
+            ] {
+                let (status, _, _) = tdh::send_with_headers(
+                    tdh::router_anon(super::router(), rig.state.clone()),
+                    tdh::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    /// A pool package whose version names no release (`1.0-1`).
+    fn unmarked_case(_mock: &str) -> ArchiveCase {
+        const UNMARKED: &str = "libdtf_1.0-1_amd64.deb";
+        let path = format!("{POOL}/{UNMARKED}");
+        ArchiveCase {
+            format: "debian",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/{POOL}/{UNMARKED}")),
+            package_path: format!("/{path}"),
+            extra: Vec::new(),
+            body: deb_with_control(&format!(
+                "Package: libdtf\nVersion: 1.0-1\nArchitecture: amd64\nDescription: {}\n",
+                uuid::Uuid::new_v4()
+            )),
+            recorded_path: path,
+            file: UNMARKED.to_string(),
+            pin: None,
+        }
+    }
+
+    /// #4952 on Debian: the release is part of what a verdict was graded
+    /// as. With no release determinable the pull is inconclusive, and it
+    /// does not inherit a clean verdict the same bytes were graded on Debian
+    /// 12 (fail-open serves it pending); once the remote's `Release` names
+    /// Debian 12, that verdict is this pull's and is reused.
+    #[tokio::test]
+    async fn without_a_release_a_pull_never_inherits_a_clean_verdict() {
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        let graded_on_12 = ExpectedComponent::os_package(
+            ComponentEcosystem::Debian,
+            "libdtf",
+            "1.0-1",
+            OsPackageContext {
+                release: OsRelease::new("debian", "12").expect("release"),
+                arch: "amd64".to_string(),
+                source: None,
+            },
+        )
+        .expect("pinnable");
+        crate::services::proxy_scan_service::ProxyScanService::new(rig.fx.pool.clone())
+            .record_verdict_with_catalog(
+                &rig.digest(),
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-4952-test"),
+                Some(rig.fx.repo_id),
+                Some(1),
+                Some(&graded_on_12.pin_identity()),
+            )
+            .await
+            .expect("seed verdict");
+
+        let (status, served, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            ts::scan_header(&headers).as_deref(),
+            Some("pending"),
+            "no release: inconclusive, never the Debian 12 verdict"
+        );
+        assert_eq!(&served[..], &rig.case.body[..]);
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/dists/bookworm/Release"))
+            // #5695: the Release names the index by its SHA-256.
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(plain_release(packages_listing(&rig).as_bytes())),
+            )
+            .mount(&rig.server)
+            .await;
+        let _ = tdh::send_with_headers(
+            tdh::router_anon(super::router(), rig.state.clone()),
+            tdh::get(format!("/{}/dists/bookworm/Release", rig.fx.repo_key)),
+        )
+        .await;
+        let listing = packages_listing(&rig);
+        pull_through(
+            &rig,
+            "dists/bookworm/main/binary-amd64/Packages",
+            listing.into_bytes(),
+        )
+        .await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            ts::scan_header(&headers).as_deref(),
+            Some("clean"),
+            "the remote names Debian 12: the verdict graded on Debian 12 is reused"
+        );
+        rig.teardown().await;
+    }
+
+    /// The release a pool package is graded against comes from the `Release`
+    /// of the suite whose cached index lists it: with none cached, from nothing.
+    #[tokio::test]
+    async fn the_release_comes_from_the_remotes_cached_release() {
+        let Some(rig) = Rig::new(case, Some("fail_closed")).await else {
+            return;
+        };
+        let proxy = rig.state.proxy_service.clone().expect("proxy");
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1+deb12u1_amd64.deb",
+        };
+        let (expected, release) = deb_member_digest_and_release(
+            &rig.state,
+            &proxy,
+            (rig.fx.repo_id, &rig.fx.repo_key, &rig.server.uri()),
+            route,
+        )
+        .await
+        .expect("lookup");
+        assert_eq!((expected, release), (None, None));
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/dists/bookworm/Release"))
+            // #5695: the Release names the index by its SHA-256.
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(plain_release(packages_listing(&rig).as_bytes())),
+            )
+            .mount(&rig.server)
+            .await;
+        let _ = tdh::send_with_headers(
+            tdh::router_anon(super::router(), rig.state.clone()),
+            tdh::get(format!("/{}/dists/bookworm/Release", rig.fx.repo_key)),
+        )
+        .await;
+        // A `Release` alone now has the index it names fetched (#5170, see
+        // `an_index_no_client_fetched_is_read_from_what_the_release_names_5170`);
+        // here a client fetches it.
+        let listing = packages_listing(&rig);
+        pull_through(
+            &rig,
+            "dists/bookworm/main/binary-amd64/Packages",
+            listing.into_bytes(),
+        )
+        .await;
+        let (_, release) = deb_member_digest_and_release(
+            &rig.state,
+            &proxy,
+            (rig.fx.repo_id, &rig.fx.repo_key, &rig.server.uri()),
+            route,
+        )
+        .await
+        .expect("lookup");
+        assert_eq!(release.map(|r| r.label()).as_deref(), Some("debian:12"));
+        rig.teardown().await;
+    }
+
+    /// #2459 Tier B on the scanned path: bytes that disagree with the cached
+    /// `Packages` digest are refused with 502 before the gate.
+    #[tokio::test]
+    async fn bytes_that_disagree_with_the_packages_digest_are_refused() {
+        use crate::api::handlers::proxy_helpers::ScannedProxyFile;
+        let Some(rig) = Rig::new(case, Some("fail_closed")).await else {
+            return;
+        };
+        let proxy = rig.state.proxy_service.clone().expect("proxy");
+        let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+            proxy: &proxy,
+            kind: DebPackage {
+                release: None,
+                expected_sha256: Some("0".repeat(64)),
+            },
+            disposition: None,
+        };
+        let req = proxy_helpers::ScannedProxyRequest {
+            repo_id: rig.fx.repo_id,
+            repo_key: &rig.fx.repo_key,
+            fetch_base: "http://upstream.invalid",
+            format: RepositoryFormat::Debian,
+            source_path: "pool/main/d/dtf/x.deb",
+            cache_path: "pool/main/d/dtf/x.deb",
+            filename: "x.deb",
+            action: crate::services::proxy_scan_service::ProxyScanAction::FailClosed,
+            severity_gate: crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+            ctx: None,
+        };
+        let bytes = Bytes::from(deb());
+        let digest = crate::services::storage_service::StorageService::calculate_hash(&bytes);
+        let refused = file
+            .after_buffered_fetch(&rig.state, &req, &bytes, &digest)
+            .await
+            .expect_err("mismatch");
+        assert_eq!(refused.status(), StatusCode::BAD_GATEWAY);
+        let matching = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+            proxy: &proxy,
+            kind: DebPackage {
+                release: None,
+                expected_sha256: Some(digest.clone()),
+            },
+            disposition: None,
+        };
+        assert!(matching
+            .after_buffered_fetch(&rig.state, &req, &bytes, &digest)
+            .await
+            .is_ok());
+        rig.teardown().await;
+    }
+
+    #[test]
+    fn a_deb_that_is_the_requested_package_is_pinned_as_it() {
+        let ArchiveIdentity::Pinned(pin) = deb_identity(FILE, &Bytes::from(deb()), None) else {
+            panic!("a .deb whose control agrees is pinned");
+        };
+        assert_eq!(pin.name, "libdtf");
+        assert_eq!(pin.version, "1.0-1+deb12u1");
+        let os = pin.os.expect("an OS pin");
+        assert_eq!(os.release.label(), "debian:12", "named by +deb12u1");
+        assert_eq!(os.source.as_deref(), Some("dtf"));
+        assert_eq!(os.arch, "amd64");
+
+        // The remote's release wins over the version's.
+        let ubuntu = crate::services::scanner_service::OsRelease::new("ubuntu", "22.04");
+        let ArchiveIdentity::Pinned(pin) = deb_identity(FILE, &Bytes::from(deb()), ubuntu) else {
+            panic!("pinned");
+        };
+        assert_eq!(pin.os.unwrap().release.label(), "ubuntu:22.04");
+
+        // An epoch is in the control file, never in the pool file name.
+        let epoch = deb_with_control(
+            "Package: libdtf\nVersion: 2:1.0-1\nArchitecture: amd64\nDescription: x\n",
+        );
+        let ArchiveIdentity::Pinned(pin) = deb_identity(
+            "libdtf_1.0-1_amd64.deb",
+            &Bytes::from(epoch),
+            crate::services::scanner_service::OsRelease::new("debian", "12"),
+        ) else {
+            panic!("pinned");
+        };
+        assert_eq!(pin.version, "2:1.0-1");
+    }
+
+    #[test]
+    fn a_deb_that_is_not_the_requested_package_is_unestablished() {
+        let bytes = Bytes::from(deb());
+        for requested in [
+            "other_1.0-1+deb12u1_amd64.deb",
+            "libdtf_1.0-2+deb12u1_amd64.deb",
+            "libdtf_1.0-1+deb12u1_arm64.deb",
+        ] {
+            assert!(
+                matches!(
+                    deb_identity(requested, &bytes, None),
+                    ArchiveIdentity::Disagrees(_)
+                ),
+                "{requested}"
+            );
+        }
+        // No release from the remote and none in the version: not graded.
+        let unreleased = deb_with_control(
+            "Package: libdtf\nVersion: 1.0-1\nArchitecture: amd64\nDescription: x\n",
+        );
+        assert!(matches!(
+            deb_identity("libdtf_1.0-1_amd64.deb", &Bytes::from(unreleased), None),
+            ArchiveIdentity::Unreadable(_)
+        ));
+        // Not a binary package name, not a package.
+        for (name, body) in [
+            ("dtf_1.0.orig.tar.xz", bytes.clone()),
+            (FILE, Bytes::from_static(b"not a deb")),
+        ] {
+            assert!(
+                matches!(
+                    deb_identity(name, &body, None),
+                    ArchiveIdentity::Unreadable(_)
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_distribution_of_a_packages_index_path() {
+        assert_eq!(
+            packages_index_distribution("dists/bookworm/main/binary-amd64/Packages.xz", "main")
+                .as_deref(),
+            Some("bookworm")
+        );
+        assert_eq!(
+            packages_index_distribution(
+                "dists/bookworm/updates/main/binary-amd64/Packages",
+                "main"
+            )
+            .as_deref(),
+            Some("bookworm/updates")
+        );
+        assert_eq!(
+            packages_index_distribution("dists/main/binary-amd64/Packages", "main"),
+            None
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #5170: the release a package is graded against is its own suite's.
+    // -----------------------------------------------------------------------
+
+    /// What a `.deb` of `version` is graded as in a suite naming `suite`:
+    /// `Some(label)` when pinned, `None` when inconclusive.
+    fn graded_as(version: &str, suite: Option<&str>) -> Option<String> {
+        use crate::api::handlers::proxy_scan_archive::strip_version_epoch;
+        use crate::services::scanner_service::OsRelease;
+        let file = format!("libdtf_{}_amd64.deb", strip_version_epoch(version));
+        let body = deb_with_control(&format!(
+            "Package: libdtf\nVersion: {version}\nArchitecture: amd64\nDescription: x\n"
+        ));
+        let release = suite.map(|s| {
+            let (id, v) = s.split_once(':').expect("id:version");
+            OsRelease::new(id, v).expect("a graded release")
+        });
+        match deb_identity(&file, &Bytes::from(body), release) {
+            ArchiveIdentity::Pinned(pin) => Some(pin.os.expect("OS pin").release.label()),
+            _ => None,
+        }
+    }
+
+    /// Every row is a version shape found in the real archives' indexes.
+    #[test]
+    fn a_version_marker_is_checked_against_the_release_its_suite_names() {
+        const D12: Option<&str> = Some("debian:12");
+        const D11: Option<&str> = Some("debian:11");
+        const NOBLE: Option<&str> = Some("ubuntu:24.04");
+        let graded: &[(&str, Option<&str>, &str)] = &[
+            // A stable update in its own release, either separator.
+            ("7.88.1-10+deb12u15", D12, "debian:12"),
+            ("2.9.14+dfsg-1.3~deb12u6", D12, "debian:12"),
+            ("1:9.2p1-2+deb12u3", D12, "debian:12"),
+            // A native package has no revision: the marker is in its version.
+            ("12.4+deb12u5", D12, "debian:12"),
+            // binNMU and derivative suffixes after the marker.
+            ("1.0-1+deb12u1+b2", D12, "debian:12"),
+            // A backport in its suite.
+            ("1.0-1~bpo12+1", D12, "debian:12"),
+            ("6.1.76-1~bpo11+1", D11, "debian:11"),
+            // A backport of a newer release's stable update: the rightmost
+            // marker is the build's target.
+            ("25.01+dfsg-1~deb13u1~bpo12+1", D12, "debian:12"),
+            ("2.56.2-1+deb13u1~bpo12+1", D12, "debian:12"),
+            // A newer release's update rebuilt for an older one's security suite.
+            ("115.3.1-1+deb12u1~deb11u1", D11, "debian:11"),
+            // No marker at all: the suite decides.
+            ("2.10-3", D12, "debian:12"),
+            ("1:1.2.13.dfsg-1", D12, "debian:12"),
+            ("1.0-1~debug5", D12, "debian:12"),
+            // Not release markers: upstream version text, not the revision.
+            ("0.960+bzr41+deb10-4", D11, "debian:11"),
+            ("0.6.0+deb1-6", D11, "debian:11"),
+            ("13.0.1-1+deb131u", D12, "debian:12"),
+            // Ubuntu: a marker on another family's package says nothing.
+            ("3.0.2-0ubuntu1.10", NOBLE, "ubuntu:24.04"),
+            ("2.0-1ubuntu0.24.04.1", NOBLE, "ubuntu:24.04"),
+            ("1.0-1+deb12u1", NOBLE, "ubuntu:24.04"),
+            ("1.0-1~bpo11+1", NOBLE, "ubuntu:24.04"),
+            ("1.0-1~bpo24.04.1", NOBLE, "ubuntu:24.04"),
+            // No suite release (a derivative's Origin, sid, nothing cached):
+            // the rightmost marker, else nothing.
+            ("1.0-1+deb12u1", None, "debian:12"),
+            ("1.0-1+deb12u1+rpi1", None, "debian:12"),
+            ("1.0-1+deb13u1~bpo12+1", None, "debian:12"),
+            ("1:10.11.5+maria~deb12", None, "debian:12"),
+            ("1.0-1~bpo70+1", None, "debian:7"),
+        ];
+        for (version, suite, want) in graded {
+            assert_eq!(
+                graded_as(version, *suite).as_deref(),
+                Some(*want),
+                "{version} in {suite:?}"
+            );
+        }
+        let inconclusive: &[(&str, Option<&str>)] = &[
+            // The marker names another Debian release than the suite.
+            ("1.0-1+deb11u1", D12),
+            ("1:15.0.2-0+deb11u1", D12),
+            ("1.0-1~deb11u1", D12),
+            ("1.0-1~bpo11+1", D12),
+            ("1.0-1+deb12u1", D11),
+            ("8.14.1-2+deb13u2~bpo13+1", D12),
+            // A release with no feed still is not the suite's.
+            ("1.0-1+deb6u1", D12),
+            ("1.0-1+deb15u1", D12),
+            // Nothing names a release.
+            ("2.10-3", None),
+            ("3.0.2-0ubuntu1.10", None),
+            ("1.0-1~bpo24.04.1", None),
+            ("1.0-1~bpo12.04.1", None),
+            ("1.0-1+kali1", None),
+            ("16.1-1.pgdg120+1", None),
+            ("0.960+bzr41+deb10-4", None),
+            ("1.0-1+deb15u1", None),
+        ];
+        for (version, suite) in inconclusive {
+            assert_eq!(graded_as(version, *suite), None, "{version} in {suite:?}");
+        }
+    }
+
+    const BOOKWORM_RELEASE: &str = "Origin: Debian\nLabel: Debian\nSuite: oldstable\n\
+        Version: 12.15\nCodename: bookworm\nAcquire-By-Hash: yes\nComponents: main\n\
+        Architectures: amd64\n";
+    const TRIXIE_RELEASE: &str = "Origin: Debian\nLabel: Debian\nSuite: stable\n\
+        Version: 13.7\nCodename: trixie\nAcquire-By-Hash: yes\nComponents: main\n\
+        Architectures: amd64\n";
+
+    /// A pool package of `version`, with a unique digest.
+    fn versioned_case(version: &str) -> ArchiveCase {
+        let file = format!("libdtf_{version}_amd64.deb");
+        let path = format!("{POOL}/{file}");
+        let uri_path = path.clone();
+        ArchiveCase {
+            format: "debian",
+            router: super::router,
+            uri: Box::new(move |key| format!("/{key}/{uri_path}")),
+            package_path: format!("/{path}"),
+            extra: Vec::new(),
+            body: deb_with_control(&format!(
+                "Package: libdtf\nVersion: {version}\nArchitecture: amd64\nDescription: {}\n",
+                uuid::Uuid::new_v4()
+            )),
+            recorded_path: path,
+            file,
+            pin: None,
+        }
+    }
+
+    fn stale_marker_case(_mock: &str) -> ArchiveCase {
+        versioned_case("1.0-1+deb11u1")
+    }
+
+    fn backport_of_a_stable_update_case(_mock: &str) -> ArchiveCase {
+        versioned_case("1.0-1+deb13u1~bpo12+1")
+    }
+
+    /// Serve `body` at `path` upstream and pull it through the Remote, so it
+    /// is cached exactly as a client's request caches it.
+    async fn pull_through(rig: &Rig, path: &str, body: Vec<u8>) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{path}")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&rig.server)
+            .await;
+        let (status, _, _) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), rig.state.clone()),
+            tdh::get(format!("/{}/{path}", rig.fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+    }
+
+    /// `(Packages, its SHA-256 line in the Release)` listing `rig`'s package.
+    fn packages_listing(rig: &Rig) -> String {
+        format!(
+            "Package: libdtf\nFilename: {}\nSize: {}\nSHA256: {}\n\n",
+            rig.case.recorded_path,
+            rig.case.body.len(),
+            rig.digest()
+        )
+    }
+
+    /// `(the by-hash path of an xz index of `packages`, its bytes, an
+    /// `InRelease` naming it)` for `dists/{suite}`.
+    fn by_hash_suite(suite: &str, release: &str, packages: &str) -> (String, Vec<u8>, String) {
+        use std::io::Write;
+        let mut enc = xz2::write::XzEncoder::new(Vec::new(), 6);
+        enc.write_all(packages.as_bytes()).unwrap();
+        let index = enc.finish().unwrap();
+        let sha = crate::services::storage_service::StorageService::calculate_hash(&index);
+        let in_release = format!(
+            "{release}SHA256:\n {sha} {} main/binary-amd64/Packages.xz\n",
+            index.len()
+        );
+        (
+            format!("dists/{suite}/main/binary-amd64/by-hash/SHA256/{sha}"),
+            index,
+            in_release,
+        )
+    }
+
+    /// Cache `dists/{suite}` the way `apt-get update` does against an archive
+    /// with `Acquire-By-Hash: yes`: `InRelease`, then `Packages.xz` under
+    /// `by-hash/`, never under its own name.
+    async fn apt_update_by_hash(rig: &Rig, suite: &str, release: &str, packages: &str) {
+        let (index_path, index, in_release) = by_hash_suite(suite, release, packages);
+        pull_through(
+            rig,
+            &format!("dists/{suite}/InRelease"),
+            in_release.into_bytes(),
+        )
+        .await;
+        pull_through(rig, &index_path, index).await;
+    }
+
+    /// A client whose lists are current re-fetches `InRelease` and no index, so
+    /// the Remote can hold a `Release` and nothing it names. The suite is still
+    /// found: the index is fetched from what the `Release` names, for every
+    /// cached suite, and only the suite listing the file decides.
+    async fn current_client_on_a_cold_remote(rig: &Rig, bookworm_index_body: Option<Vec<u8>>) {
+        let listing = packages_listing(rig);
+        for (suite, release, packages) in [
+            ("bookworm", BOOKWORM_RELEASE, listing.as_str()),
+            (
+                "trixie",
+                TRIXIE_RELEASE,
+                "Package: other\nFilename: pool/main/o/other/other_1_amd64.deb\nSize: 1\nSHA256: 00\n\n",
+            ),
+        ] {
+            let (index_path, index, in_release) = by_hash_suite(suite, release, packages);
+            let served = match (&bookworm_index_body, suite) {
+                (Some(forged), "bookworm") => forged.clone(),
+                _ => index,
+            };
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!("/{index_path}")))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(served))
+                .mount(&rig.server)
+                .await;
+            pull_through(
+                rig,
+                &format!("dists/{suite}/InRelease"),
+                in_release.into_bytes(),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_index_no_client_fetched_is_read_from_what_the_release_names_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        current_client_on_a_cold_remote(&rig, None).await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("clean"));
+        rig.teardown().await;
+    }
+
+    /// A derivative's `Release` names no release the scanner grades, so its
+    /// index could not decide anything and is not fetched for this.
+    #[tokio::test]
+    async fn a_derivatives_index_is_not_fetched_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_closed")).await else {
+            return;
+        };
+        let (_, _, in_release) = by_hash_suite(
+            "kali-rolling",
+            "Origin: Kali\nSuite: kali-rolling\nCodename: kali-rolling\nAcquire-By-Hash: yes\n",
+            &packages_listing(&rig),
+        );
+        pull_through(
+            &rig,
+            "dists/kali-rolling/InRelease",
+            in_release.into_bytes(),
+        )
+        .await;
+        let (status, _, _) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::LOCKED, "no marker, no release");
+        let requests = rig.server.received_requests().await.unwrap_or_default();
+        assert!(
+            !requests.iter().any(|r| r.url.path().contains("by-hash")),
+            "{requests:?}"
+        );
+        rig.teardown().await;
+    }
+
+    /// An upstream index that is not the one its `Release` names decides
+    /// nothing, however it lists the file.
+    #[tokio::test]
+    async fn an_index_that_is_not_the_one_named_decides_nothing_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        let forged = packages_listing(&rig).replace("Package: libdtf", "Package: libdtf\nX: y");
+        current_client_on_a_cold_remote(&rig, Some(forged.into_bytes())).await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        for pull in ["first", "second, with the forgery cached"] {
+            let (status, _, headers) = rig.pull_remote().await;
+            assert_eq!(status, StatusCode::OK, "{pull}");
+            assert_eq!(
+                ts::scan_header(&headers).as_deref(),
+                Some("pending"),
+                "{pull}"
+            );
+        }
+        rig.teardown().await;
+    }
+
+    /// Record a `verdict` on `rig`'s bytes as graded on `release`: only a pull
+    /// that grades the same way uses it.
+    async fn seed_graded_on(rig: &Rig, version: &str, release: &str, verdict: &str) {
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+        let (id, v) = release.split_once(':').expect("id:version");
+        let pin = ExpectedComponent::os_package(
+            ComponentEcosystem::Debian,
+            "libdtf",
+            version,
+            OsPackageContext {
+                release: OsRelease::new(id, v).expect("release"),
+                arch: "amd64".to_string(),
+                source: None,
+            },
+        )
+        .expect("pinnable");
+        let vulnerable = verdict == "vulnerable";
+        crate::services::proxy_scan_service::ProxyScanService::new(rig.fx.pool.clone())
+            .record_verdict_with_catalog(
+                &rig.digest(),
+                "grype",
+                verdict,
+                i32::from(vulnerable),
+                i32::from(vulnerable),
+                0,
+                0,
+                0,
+                vulnerable.then_some("critical"),
+                Some("grype-5170-test"),
+                Some(rig.fx.repo_id),
+                Some(1),
+                Some(&pin.pin_identity()),
+            )
+            .await
+            .expect("seed verdict");
+    }
+
+    async fn member_release(
+        rig: &Rig,
+        route: DebPackageRoute<'_>,
+    ) -> (Option<String>, Option<String>) {
+        let proxy = rig.state.proxy_service.clone().expect("proxy");
+        let (sha, release) = deb_member_digest_and_release(
+            &rig.state,
+            &proxy,
+            (rig.fx.repo_id, &rig.fx.repo_key, &rig.server.uri()),
+            route,
+        )
+        .await
+        .expect("lookup");
+        (sha, release.map(|r| r.label()))
+    }
+
+    /// `+deb11u1` in a Debian 12 suite is found in that suite, is not pinned as
+    /// either release, and is withheld under fail-closed.
+    #[tokio::test]
+    async fn a_marker_disagreeing_with_its_suite_is_withheld_5170() {
+        let Some(rig) = Rig::new(stale_marker_case, Some("fail_closed")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        apt_update_by_hash(&rig, "bookworm", BOOKWORM_RELEASE, &listing).await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1+deb11u1_amd64.deb",
+        };
+        let (_, suite) = member_release(&rig, route).await;
+        assert_eq!(suite.as_deref(), Some("debian:12"));
+        let identity = deb_identity(
+            "libdtf_1.0-1+deb11u1_amd64.deb",
+            &Bytes::from(rig.case.body.clone()),
+            crate::services::scanner_service::OsRelease::new("debian", "12"),
+        );
+        assert!(
+            matches!(identity, ArchiveIdentity::Disagrees(_)),
+            "{identity:?}"
+        );
+        let (status, _, _) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::LOCKED);
+        rig.teardown().await;
+    }
+
+    /// The same under fail-open: served pending, not as either verdict.
+    #[tokio::test]
+    async fn a_marker_disagreeing_with_its_suite_is_pending_under_fail_open_5170() {
+        let Some(rig) = Rig::new(stale_marker_case, Some("fail_open")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        apt_update_by_hash(&rig, "bookworm", BOOKWORM_RELEASE, &listing).await;
+        seed_graded_on(&rig, "1.0-1+deb11u1", "debian:12", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("pending"));
+        rig.teardown().await;
+    }
+
+    /// Control: a backport of a newer release's stable update is its own
+    /// suite's package and is served from the verdict on that release.
+    #[tokio::test]
+    async fn a_backport_of_a_stable_update_is_graded_on_its_suite_5170() {
+        let Some(rig) = Rig::new(backport_of_a_stable_update_case, Some("fail_open")).await else {
+            return;
+        };
+        let release = BOOKWORM_RELEASE.replace("Origin: Debian", "Origin: Debian Backports");
+        let release = release.replace("Version: 12.15\n", "");
+        let release = release.replace("Codename: bookworm", "Codename: bookworm-backports");
+        let listing = packages_listing(&rig);
+        apt_update_by_hash(&rig, "bookworm-backports", &release, &listing).await;
+        seed_graded_on(&rig, "1.0-1+deb13u1~bpo12+1", "debian:12", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("clean"));
+        rig.teardown().await;
+    }
+
+    /// Real `apt-get` traffic: an index fetched under `by-hash/` names the
+    /// suite of an unmarked package, which a package with no marker depends on
+    /// once no other suite's release can stand in for its own.
+    #[tokio::test]
+    async fn a_by_hash_index_names_the_suite_of_a_pool_package_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        apt_update_by_hash(&rig, "bookworm", BOOKWORM_RELEASE, &listing).await;
+        // Another suite that does not list the file must not unseat it.
+        apt_update_by_hash(
+            &rig,
+            "trixie",
+            TRIXIE_RELEASE,
+            "Package: other\nFilename: pool/main/o/other/other_1_amd64.deb\nSize: 1\nSHA256: 00\n\n",
+        )
+        .await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(
+            member_release(&rig, route).await,
+            (Some(rig.digest()), Some("debian:12".to_string()))
+        );
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("clean"));
+        rig.teardown().await;
+    }
+
+    /// An `_all` package is listed in each architecture's index, which is the
+    /// only one apt fetches: half of an archive's files have no `binary-all`
+    /// index to be found in.
+    #[tokio::test]
+    async fn an_arch_all_package_is_found_in_an_architectures_index_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_closed")).await else {
+            return;
+        };
+        let listing = "Package: tzdata\nArchitecture: all\n\
+            Filename: pool/main/t/tzdata/tzdata_2024a-0_all.deb\nSize: 1\nSHA256: abc\n\n";
+        apt_update_by_hash(&rig, "bookworm", BOOKWORM_RELEASE, listing).await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "t/tzdata/tzdata_2024a-0_all.deb",
+        };
+        assert_eq!(
+            member_release(&rig, route).await,
+            (Some("abc".to_string()), Some("debian:12".to_string()))
+        );
+        rig.teardown().await;
+    }
+
+    /// The security archive's pool is `pool/updates/{component}`, but its index
+    /// is `dists/{suite}/{component}`: the route's first segment is not the
+    /// index's component there.
+    #[tokio::test]
+    async fn a_security_archive_package_is_found_in_its_suites_index_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_closed")).await else {
+            return;
+        };
+        let release = BOOKWORM_RELEASE
+            .replace("Label: Debian", "Label: Debian-Security")
+            .replace("Suite: oldstable", "Suite: oldstable-security")
+            .replace("Version: 12.15", "Version: 12")
+            .replace("Codename: bookworm", "Codename: bookworm-security");
+        let listing = "Package: libdatetime-timezone-perl\n\
+            Filename: pool/updates/main/libd/libdatetime-timezone-perl/libdatetime-timezone-perl_2.60-1+2026f_all.deb\n\
+            Size: 1\nSHA256: abc\n\n\
+            Package: openssl\n\
+            Filename: pool/updates/main/o/openssl/openssl_3.0.22-1~deb12u2_amd64.deb\n\
+            Size: 1\nSHA256: def\n\n";
+        apt_update_by_hash(&rig, "bookworm-security", &release, listing).await;
+        for (path, sha) in [
+            (
+                "main/libd/libdatetime-timezone-perl/libdatetime-timezone-perl_2.60-1+2026f_all.deb",
+                "abc",
+            ),
+            ("main/o/openssl/openssl_3.0.22-1~deb12u2_amd64.deb", "def"),
+        ] {
+            let route = DebPackageRoute::Pool {
+                component: "updates",
+                path,
+            };
+            assert_eq!(
+                member_release(&rig, route).await,
+                (Some(sha.to_string()), Some("debian:12".to_string())),
+                "{path}"
+            );
+        }
+        rig.teardown().await;
+    }
+
+    /// Another suite's `Release` is not this package's: with no cached index
+    /// listing an unmarked file it is inconclusive, whatever else is cached.
+    #[tokio::test]
+    async fn a_release_is_not_borrowed_from_a_suite_not_listing_the_file_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        pull_through(
+            &rig,
+            "dists/trixie/InRelease",
+            TRIXIE_RELEASE.as_bytes().to_vec(),
+        )
+        .await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(member_release(&rig, route).await, (None, None));
+        // Nor is the `dists/` route's suite another's.
+        let dists = DebPackageRoute::Dists {
+            distribution: "bookworm",
+            dists_path: "main/binary-amd64/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(member_release(&rig, dists).await, (None, None));
+        seed_graded_on(&rig, "1.0-1", "debian:13", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("pending"));
+        rig.teardown().await;
+    }
+
+    /// The index lists the file but its own suite's `Release` is not cached:
+    /// still no borrowing, and a marker then names the release.
+    #[tokio::test]
+    async fn a_listed_file_whose_release_is_not_cached_borrows_nothing_5170() {
+        let Some(rig) = Rig::new(case, Some("fail_open")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        pull_through(
+            &rig,
+            "dists/bookworm/main/binary-amd64/Packages",
+            listing.into_bytes(),
+        )
+        .await;
+        pull_through(
+            &rig,
+            "dists/trixie/InRelease",
+            TRIXIE_RELEASE.as_bytes().to_vec(),
+        )
+        .await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1+deb12u1_amd64.deb",
+        };
+        assert_eq!(
+            member_release(&rig, route).await,
+            (Some(rig.digest()), None)
+        );
+        // `+deb12u1` names Debian 12, the release it is served from the verdict of.
+        seed_graded_on(&rig, "1.0-1+deb12u1", "debian:12", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("clean"));
+        rig.teardown().await;
+    }
+
+    /// An `InRelease` past its short TTL still names the same release: a pull
+    /// a while after `apt-get update` is not withheld for the wait.
+    #[tokio::test]
+    async fn an_expired_release_still_names_the_suite_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_closed")).await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', '1')",
+        )
+        .bind(rig.fx.repo_id)
+        .execute(&rig.fx.pool)
+        .await
+        .expect("short ttl");
+        let listing = packages_listing(&rig);
+        apt_update_by_hash(&rig, "bookworm", BOOKWORM_RELEASE, &listing).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        let proxy = rig.state.proxy_service.clone().expect("proxy");
+        assert!(
+            proxy
+                .get_cached_artifact_by_path(&rig.fx.repo_key, "dists/bookworm/InRelease")
+                .await
+                .expect("read")
+                .is_none(),
+            "the InRelease has expired"
+        );
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(
+            member_release(&rig, route).await,
+            (Some(rig.digest()), Some("debian:12".to_string()))
+        );
+        rig.teardown().await;
+    }
+    // #5695: a suite without `Acquire-By-Hash` keeps its index under its own
+    // name, which carries no digest of its own: only the suite's `Release`
+    // says what it must hash to, and the gate holds it to that before the
+    // bytes are cached or decide a pull.
+
+    const PLAIN_INDEX: &str = "dists/bookworm/main/binary-amd64/Packages";
+
+    /// A `Release` for `dists/bookworm` (no `Acquire-By-Hash`) naming `index`
+    /// as `main/binary-amd64/Packages`.
+    fn plain_release(index: &[u8]) -> String {
+        format!(
+            "{}SHA256:\n {} {} main/binary-amd64/Packages\n",
+            BOOKWORM_RELEASE.replace("Acquire-By-Hash: yes\n", ""),
+            crate::services::storage_service::StorageService::calculate_hash(index),
+            index.len()
+        )
+    }
+
+    /// The upstream serves `served` as the suite's index while its `Release`
+    /// (cached, as a client's `apt-get update` leaves it) names `named`. No
+    /// client fetches the index, so the gate fetches the one the `Release`
+    /// names.
+    async fn plain_suite(rig: &Rig, named: &[u8], served: Vec<u8>) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{PLAIN_INDEX}")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(served))
+            .mount(&rig.server)
+            .await;
+        pull_through(
+            rig,
+            "dists/bookworm/Release",
+            plain_release(named).into_bytes(),
+        )
+        .await;
+    }
+
+    async fn cached_plain_index(rig: &Rig) -> Option<Bytes> {
+        let proxy = rig.state.proxy_service.clone().expect("proxy");
+        proxy
+            .get_cached_artifact_by_path_ignoring_expiry(&rig.fx.repo_key, PLAIN_INDEX)
+            .await
+            .expect("read")
+            .map(|body| body.content)
+    }
+
+    async fn plain_index_fetches(rig: &Rig) -> usize {
+        rig.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == format!("/{PLAIN_INDEX}"))
+            .count()
+    }
+
+    /// The reproduction: an upstream index that is not the one its `Release`
+    /// names is refused on the first pull AND never cached, so no later pull
+    /// grades on it. Before the fix the first pull was 423 and every later
+    /// one 200, graded on the cached forgery.
+    #[tokio::test]
+    async fn a_tampered_index_is_never_cached_and_every_pull_stays_locked_5695() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_closed")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        let forged = listing.replace("Package: libdtf", "Package: libdtf\nX: y");
+        plain_suite(&rig, listing.as_bytes(), forged.into_bytes()).await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        for pull in ["first", "second", "third"] {
+            let (status, _, _) = rig.pull_remote().await;
+            assert_eq!(status, StatusCode::LOCKED, "{pull} pull");
+            assert_eq!(
+                cached_plain_index(&rig).await,
+                None,
+                "{pull} pull: the rejected index is not cached"
+            );
+        }
+        assert!(plain_index_fetches(&rig).await >= 1, "the gate fetched it");
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(member_release(&rig, route).await, (None, None));
+        rig.teardown().await;
+    }
+
+    /// The same under fail-open: every pull is served pending, never from the
+    /// verdict graded on the release the forged index would have named.
+    #[tokio::test]
+    async fn a_tampered_index_never_names_the_release_under_fail_open_5695() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        let forged = listing.replace("Package: libdtf", "Package: libdtf\nX: y");
+        plain_suite(&rig, listing.as_bytes(), forged.into_bytes()).await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        for pull in ["first", "second", "third"] {
+            let (status, _, headers) = rig.pull_remote().await;
+            assert_eq!(status, StatusCode::OK, "{pull} pull");
+            assert_eq!(
+                ts::scan_header(&headers).as_deref(),
+                Some("pending"),
+                "{pull} pull"
+            );
+            assert_eq!(cached_plain_index(&rig).await, None, "{pull} pull");
+        }
+        rig.teardown().await;
+    }
+
+    /// Bytes a client's fetch left in the cache before Tier A evicted them
+    /// (or before any check existed) decide nothing either: a cached index
+    /// is read only if its suite's `Release` names its digest.
+    #[tokio::test]
+    async fn a_cached_index_its_release_does_not_name_decides_nothing_5695() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_closed")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        let forged = listing.replace("Package: libdtf", "Package: libdtf\nX: y");
+        // The forgery is cached first (no `Release` to check it against yet),
+        // then the suite's `Release` naming the genuine index arrives.
+        pull_through(&rig, PLAIN_INDEX, forged.clone().into_bytes()).await;
+        assert_eq!(
+            cached_plain_index(&rig).await.as_deref(),
+            Some(forged.as_bytes())
+        );
+        pull_through(
+            &rig,
+            "dists/bookworm/Release",
+            plain_release(listing.as_bytes()).into_bytes(),
+        )
+        .await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(member_release(&rig, route).await, (None, None));
+        let (status, _, _) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::LOCKED);
+        rig.teardown().await;
+    }
+
+    /// Control: the index the `Release` names is fetched once, cached, and
+    /// names the suite the package is graded on (fail-open, so the stored
+    /// verdict decides without a live scanner).
+    #[tokio::test]
+    async fn a_matching_index_is_cached_and_decides_the_pull_5695() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        plain_suite(&rig, listing.as_bytes(), listing.clone().into_bytes()).await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        for pull in ["first", "second"] {
+            let (status, _, headers) = rig.pull_remote().await;
+            assert_eq!(status, StatusCode::OK, "{pull} pull");
+            assert_eq!(
+                ts::scan_header(&headers).as_deref(),
+                Some("clean"),
+                "{pull}"
+            );
+        }
+        assert_eq!(
+            cached_plain_index(&rig).await.as_deref(),
+            Some(listing.as_bytes())
+        );
+        assert_eq!(
+            plain_index_fetches(&rig).await,
+            1,
+            "fetched once, then cached"
+        );
+        rig.teardown().await;
+    }
+
+    /// A cached index is held to the `Release` cached now, not the one it was
+    /// verified against: once the suite's `InRelease` names another index the
+    /// old one decides nothing, and the stale copy is evicted when the gate
+    /// fetches the index named now.
+    #[tokio::test]
+    async fn a_cached_index_is_re_verified_when_the_release_changes_5695() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        plain_suite(&rig, listing.as_bytes(), listing.clone().into_bytes()).await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            ts::scan_header(&headers).as_deref(),
+            Some("clean"),
+            "graded on the verified index"
+        );
+        assert!(cached_plain_index(&rig).await.is_some());
+
+        // The suite moves on: its `InRelease` (read before `Release`) names
+        // an index the upstream does not (yet) serve.
+        let newer = format!("{listing}Package: other\nFilename: pool/main/o/other/o_1_amd64.deb\n");
+        pull_through(
+            &rig,
+            "dists/bookworm/InRelease",
+            plain_release(newer.as_bytes()).into_bytes(),
+        )
+        .await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(member_release(&rig, route).await, (None, None));
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            ts::scan_header(&headers).as_deref(),
+            Some("pending"),
+            "the old index no longer decides"
+        );
+        assert_eq!(
+            cached_plain_index(&rig).await,
+            None,
+            "the index the Release no longer names is evicted, not refilled"
+        );
+        rig.teardown().await;
+    }
+    /// A `Release` with no SHA256 table vouches for no index (every Debian
+    /// and Ubuntu `Release` carries one), so a cached index under it names no
+    /// release for the file and the verdict graded on Debian 12 is not used.
+    #[tokio::test]
+    async fn a_release_without_a_sha256_table_names_nothing_5695() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        pull_through(
+            &rig,
+            "dists/bookworm/Release",
+            BOOKWORM_RELEASE
+                .replace("Acquire-By-Hash: yes\n", "")
+                .into_bytes(),
+        )
+        .await;
+        let listing = packages_listing(&rig);
+        pull_through(&rig, PLAIN_INDEX, listing.into_bytes()).await;
+        assert!(cached_plain_index(&rig).await.is_some());
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(member_release(&rig, route).await, (None, None));
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("pending"));
+        rig.teardown().await;
+    }
+}
+
+/// #4365 item 1: Debian decides by path: every `pool/` file except the
+/// source-package documents, and the binary packages under `dists/` and in a
+/// flat repository, are gated; the cache key is the streaming arm's path.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn the_serve_key_is_the_streaming_cache_path_and_decides_by_name() {
+        for (path, scannable) in [
+            ("pool/main/o/openssl/libssl3_3.0.11-1_amd64.deb", true),
+            ("pool/main/o/openssl/openssl_3.0.11.orig.tar.gz", true),
+            ("pool/main/d/debian-installer/x_1_amd64.udeb", true),
+            ("pool/main/o/openssl/openssl_3.0.11-1.dsc", false),
+            (
+                "pool/main/o/openssl/openssl_3.0.11-1_amd64.buildinfo",
+                false,
+            ),
+            ("pool/main/o/openssl/openssl_3.0.11-1_amd64.changes", false),
+            ("dists/bookworm/main/binary-amd64/x_1_amd64.deb", true),
+            ("dists/bookworm/main/binary-amd64/x_1_amd64.ddeb", true),
+            ("dists/bookworm/main/binary-amd64/Packages.xz", false),
+            ("x_1_amd64.deb", true),
+            ("sub/x_1_amd64.deb", true),
+            ("Packages.gz", false),
+            ("pool/main/o/openssl/openssl_3.0.11-1.dsc?x", true),
+        ] {
+            let key = deb_serve_key(path);
+            assert_eq!(key.scannable, scannable, "{path}");
+            assert_eq!(key.cache_key, path, "{path}");
+        }
+    }
+}
+
+/// #5198: a repository whose active signing key cannot produce OpenPGP is an
+/// operator's config mistake, and these routes are anonymous, so it is a 409
+/// (as on RPM), never a 500. Keys are bound through the service, not the config
+/// route, because that is what a binding from before the route's check looks
+/// like (`signing.rs` covers the route refusing a new one).
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod signing_key_capability_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::signing_service::CreateKeyRequest;
+    use uuid::Uuid;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Every anonymous route that can only serve OpenPGP.
+    const OPENPGP_ROUTES: [&str; 4] = [
+        "dists/stable/InRelease",
+        "dists/stable/Release.gpg",
+        "gpg-key.asc",
+        "dists/stable/gpg-key.asc",
+    ];
+
+    /// Create a global key of `key_type` and bind it to `repo_id`. `key_type`
+    /// `rsa` is what `POST /api/v1/signing/keys` makes when it is not told
+    /// otherwise.
+    async fn bind_new_key(f: &tdh::Fixture, repo_id: Uuid, key_type: &str) -> Uuid {
+        let svc = SigningService::new(f.pool.clone(), &f.state.config.jwt_secret);
+        let key = svc
+            .create_key(CreateKeyRequest {
+                repository_id: None,
+                name: format!("deb-5198-{}", Uuid::new_v4()),
+                key_type: key_type.to_string(),
+                algorithm: match key_type {
+                    "gpg" => crate::services::signing_service::ED25519_ALGORITHM.to_string(),
+                    _ => "rsa2048".to_string(),
+                },
+                uid_name: None,
+                uid_email: None,
+                created_by: None,
+            })
+            .await
+            .expect("create signing key");
+        svc.update_signing_config(repo_id, Some(key.id), true, false, false)
+            .await
+            .expect("bind signing key");
+        key.id
+    }
+
+    async fn delete_key(f: &tdh::Fixture, repo_id: Uuid, key_id: Uuid) {
+        sqlx::query("DELETE FROM repository_signing_config WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("delete signing config");
+        sqlx::query("DELETE FROM signing_keys WHERE id = $1")
+            .bind(key_id)
+            .execute(&f.pool)
+            .await
+            .expect("delete signing key");
+    }
+
+    async fn anon_get(state: &SharedState, repo_key: &str, path: &str) -> (StatusCode, String) {
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(format!("/{repo_key}/{path}")),
+        )
+        .await;
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn assert_all_conflict(state: &SharedState, repo_key: &str) {
+        for path in OPENPGP_ROUTES {
+            let (status, body) = anon_get(state, repo_key, path).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{path}: {body}");
+            assert!(
+                body.contains("key_type='gpg'"),
+                "{path}: the 409 must name the key type that would work: {body}"
+            );
+        }
+    }
+
+    /// Mount an upstream that serves `stable`'s release documents, and return
+    /// the marker its bodies carry.
+    async fn mount_upstream_release(server: &MockServer) -> &'static str {
+        const MARKER: &str = "Origin: upstream-5198\n";
+        for name in ["InRelease", "Release", "Release.gpg"] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/dists/stable/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(MARKER))
+                .mount(server)
+                .await;
+        }
+        MARKER
+    }
+
+    /// Insert a Remote Debian repository and return its id.
+    async fn insert_remote_member(f: &tdh::Fixture, upstream_url: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        let key = format!("deb-5198-mem-{}", id.simple());
+        sqlx::query(
+            "INSERT INTO repositories \
+             (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
+             VALUES ($1, $2, $2, $3, 'remote'::repository_type, 'debian'::repository_format, \
+             $4, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&*f.storage_dir.to_string_lossy())
+        .bind(upstream_url)
+        .execute(&f.pool)
+        .await
+        .expect("insert remote member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(f.repo_id)
+        .bind(id)
+        .execute(&f.pool)
+        .await
+        .expect("insert virtual member");
+        id
+    }
+
+    #[tokio::test]
+    async fn hosted_repo_with_rsa_key_is_conflict_with_or_without_packages_5198() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let key_id = bind_new_key(&f, f.repo_id, "rsa").await;
+        assert_all_conflict(&f.state, &f.repo_key).await;
+
+        let deb = minimal_deb("ak-5198", "1.0-1", "amd64", "signing capability test");
+        let uri = format!(
+            "/{}/pool/main/a/ak-5198/ak-5198_1.0-1_amd64.deb",
+            f.repo_key
+        );
+        let app = f.router_with_auth(super::router());
+        let (status, _) = tdh::send(app, tdh::put(uri, Bytes::from(deb))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_all_conflict(&f.state, &f.repo_key).await;
+
+        // The unsigned document does not need the key and stays available.
+        let (status, _) = anon_get(&f.state, &f.repo_key, "dists/stable/Release").await;
+        assert_eq!(status, StatusCode::OK);
+
+        delete_key(&f, f.repo_id, key_id).await;
+        f.teardown().await;
+    }
+
+    /// The other side of the distinction: a key that claims `gpg` but cannot be
+    /// used is a server fault and stays loud. A 409 here would hide it.
+    #[tokio::test]
+    async fn gpg_key_with_broken_secret_material_stays_500_5198() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let key_id = bind_new_key(&f, f.repo_id, "gpg").await;
+        let (status, body) = anon_get(&f.state, &f.repo_key, "dists/stable/InRelease").await;
+        assert_eq!(status, StatusCode::OK, "control: {body}");
+
+        sqlx::query("UPDATE signing_keys SET private_key_enc = '\\x00' WHERE id = $1")
+            .bind(key_id)
+            .execute(&f.pool)
+            .await
+            .expect("break key material");
+        // A different dist, so the signed-Release cache cannot answer.
+        let (status, body) = anon_get(&f.state, &f.repo_key, "dists/testing/InRelease").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+
+        delete_key(&f, f.repo_id, key_id).await;
+        f.teardown().await;
+    }
+
+    /// A Virtual repo with nothing upstream to serve signs its own `Release`
+    /// with its own key, so it reaches the same path as a hosted repo.
+    #[tokio::test]
+    async fn virtual_repo_signing_locally_with_rsa_key_is_conflict_5198() {
+        let Some(f) = tdh::Fixture::setup("virtual", "debian").await else {
+            return;
+        };
+        let key_id = bind_new_key(&f, f.repo_id, "rsa").await;
+
+        // No members at all, and no proxy service.
+        assert_all_conflict(&f.state, &f.repo_key).await;
+
+        // A Remote member that does not have the dist: the walk falls through.
+        let server = MockServer::start().await;
+        let member = insert_remote_member(&f, &server.uri()).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        assert_all_conflict(&state, &f.repo_key).await;
+
+        delete_key(&f, f.repo_id, key_id).await;
+        tdh::cleanup_member_repo(&f.pool, member, &f.storage_dir).await;
+        f.teardown().await;
+    }
+
+    /// A Virtual repo whose Remote member has the dist serves the member's own
+    /// signed bytes. It never signs, so its key is not consulted for those
+    /// routes; only the public key route still depends on it.
+    #[tokio::test]
+    async fn virtual_repo_serving_a_remote_member_does_not_need_its_key_5198() {
+        let Some(f) = tdh::Fixture::setup("virtual", "debian").await else {
+            return;
+        };
+        let key_id = bind_new_key(&f, f.repo_id, "rsa").await;
+        let server = MockServer::start().await;
+        let marker = mount_upstream_release(&server).await;
+        let member = insert_remote_member(&f, &server.uri()).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        for path in ["dists/stable/InRelease", "dists/stable/Release.gpg"] {
+            let (status, body) = anon_get(&state, &f.repo_key, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(body, marker, "{path} must be the upstream's bytes");
+        }
+
+        delete_key(&f, f.repo_id, key_id).await;
+        tdh::cleanup_member_repo(&f.pool, member, &f.storage_dir).await;
+        f.teardown().await;
+    }
+
+    /// A Remote repo answers every release route from upstream, whatever the
+    /// upstream says, so a bound key never reaches the signing path.
+    #[tokio::test]
+    async fn remote_repo_with_upstream_never_consults_its_key_5198() {
+        let Some(f) = tdh::Fixture::setup("remote", "debian").await else {
+            return;
+        };
+        let key_id = bind_new_key(&f, f.repo_id, "rsa").await;
+
+        let server = MockServer::start().await;
+        let marker = mount_upstream_release(&server).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        for path in ["dists/stable/InRelease", "dists/stable/Release.gpg"] {
+            let (status, body) = anon_get(&state, &f.repo_key, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(body, marker, "{path} must be the upstream's bytes");
+        }
+
+        // The upstream lacks the dist: its 404, not the key's 409.
+        for path in ["dists/absent/InRelease", "dists/absent/Release.gpg"] {
+            let (status, body) = anon_get(&state, &f.repo_key, path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+        }
+
+        delete_key(&f, f.repo_id, key_id).await;
+        f.teardown().await;
+    }
+
+    /// A Remote repo with no way to reach upstream falls through to signing
+    /// locally, so it must get the 409 too.
+    #[tokio::test]
+    async fn remote_repo_without_proxy_service_is_conflict_5198() {
+        let Some(f) = tdh::Fixture::setup("remote", "debian").await else {
+            return;
+        };
+        let key_id = bind_new_key(&f, f.repo_id, "rsa").await;
+        assert_all_conflict(&f.state, &f.repo_key).await;
+        delete_key(&f, f.repo_id, key_id).await;
+        f.teardown().await;
     }
 }

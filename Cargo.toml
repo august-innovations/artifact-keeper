@@ -3,7 +3,7 @@ resolver = "2"
 members = ["backend"]
 
 [workspace.package]
-version = "1.10.0"
+version = "1.12.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/yourorg/artifact-keeper"
@@ -87,7 +87,7 @@ tokio = { version = "1.50", features = ["full"] }
 # Web framework
 axum = { version = "0.7", features = ["multipart", "tokio"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip", "compression-br"] }
 
 # Database
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"] }
@@ -119,10 +119,11 @@ aes-gcm = "0.10"
 zeroize = { version = "1.8", features = ["alloc", "derive"] }
 
 # S3 storage using Apache object_store crate (supports custom CA certs for TLS)
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 
 # HTTP types (used for presigned URL methods)
 http = "1"
+http-body = "1"
 http-body-util = "0.1"
 
 # Logging/Tracing
@@ -130,8 +131,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
 
 # OpenTelemetry (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT)
-opentelemetry = { version = "0.32", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "metrics"] }
+opentelemetry = "0.33"
+# The backend's dev-dependencies add `testing` (in-memory log exporter) and
+# `experimental_metrics_custom_reader` (`ManualReader`) for the #4337 tests
+# only; the production build does not compile either.
+opentelemetry_sdk = { version = "0.33.1", features = ["rt-tokio"] }
 # The HTTP/protobuf exporter must use the BLOCKING reqwest client, supplied by
 # opentelemetry-otlp's default `reqwest-blocking-client` feature. Do not add
 # `reqwest-client` here: when it is enabled the builder picks the async client
@@ -145,13 +149,17 @@ opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "metrics"] }
 # Do not re-add a direct `opentelemetry-http` pin with `features = ["reqwest"]`
 # -- that is the async impl, unused in this tree, and the most likely prompt
 # to re-enable `reqwest-client` on otlp. #835 pinned it for two coexisting
-# reqwest versions; otlp 0.32 resolves to the same reqwest 0.13 the app uses.
-opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "http-proto", "metrics"] }
-tracing-opentelemetry = "0.33"
+# reqwest versions; otlp 0.33 resolves to the same reqwest 0.13 the app uses.
+opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic", "http-proto", "logs"] }
+tracing-opentelemetry = "0.34"
 
 # Metrics
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
+# `layers::Fanout` puts the Prometheus and OTel recorders side by side (#4337);
+# it needs no feature. The backend's dev-dependencies add `debugging` for the
+# `DebuggingRecorder` tests.
+metrics-util = { version = "0.20", default-features = false }
 
 # Error handling
 thiserror = "2.0"
@@ -165,7 +173,7 @@ uuid = { version = "1.7", features = ["v4", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
-cron = "0.15"
+cron = "0.17"
 
 # HTTP client (for proxy repos)
 reqwest = { version = "0.13", features = ["json", "stream", "form"] }
@@ -183,8 +191,8 @@ bytes = "1.5"
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # WASM runtime
-wasmtime = { version = "36.0.17", features = ["component-model", "async"] }
-wasmtime-wasi = "36.0.17"
+wasmtime = { version = "36.0.20", features = ["component-model", "async"] }
+wasmtime-wasi = "36.0.20"
 
 # Git operations
 git2 = "0.21"

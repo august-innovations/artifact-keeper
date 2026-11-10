@@ -135,6 +135,11 @@
 #      asks whether it will be described correctly -- which is the failure
 #      mode that actually shipped, four times in eight releases (#3537). Full
 #      rationale at the check itself.
+#   6. CURATED NOTES ARE FINISHED (hard): `.github/release-notes/<version>.md`
+#      for the version Cargo.toml names, when it exists, carries no `TODO` or
+#      `DRAFT` marker. The 1.11.0 notes were drafted on main ahead of the cut
+#      with TODOs in HTML comments (#4468); a comment does not render, so an
+#      unfinished draft would publish silently as the Release body.
 #
 # Exit-code contract (mirrors scripts/ci/check-migration-ledger.sh):
 #   0  ready       -- no blocking problem found.
@@ -795,18 +800,25 @@ else
     # repository's linked-issue gate means this is populated for every PR that
     # is not explicitly exempted, which is what makes the mapping reliable
     # enough to gate on.
+    #
+    # The lookup is `issueOrPullRequest`, not `pullRequest`: a commit
+    # rebase-merged onto a release line keeps its cherry-picked subject, which
+    # can end in the ISSUE number it fixes (`... (#4933)`). `pullRequest` on
+    # an issue number is a NOT_FOUND error that fails the whole query; here an
+    # issue resolves to an empty object, is left out of the map, and is still
+    # in range_prs, so an entry citing that issue accounts for the commit.
     closes_map=""
     if [[ -n "$range_prs" ]]; then
       gql="query{repository(owner:\"${REPO%%/*}\",name:\"${REPO##*/}\"){"
       idx=0
       while IFS= read -r p; do
         [[ -z "$p" ]] && continue
-        gql+=" p${idx}: pullRequest(number:${p}){number closingIssuesReferences(first:20){nodes{number}}}"
+        gql+=" p${idx}: issueOrPullRequest(number:${p}){... on PullRequest{number closingIssuesReferences(first:20){nodes{number}}}}"
         idx=$((idx + 1))
       done <<< "$range_prs"
       gql+="}}"
       if ! closes_map="$(gh api graphql -f query="$gql" \
-            --jq '.data.repository | to_entries[] | "\(.value.number):\([.value.closingIssuesReferences.nodes[].number] | join(","))"' \
+            --jq '.data.repository | to_entries[] | select(.value.number != null) | "\(.value.number):\([.value.closingIssuesReferences.nodes[].number] | join(","))"' \
             2>/dev/null)"; then
         echo "INFRA: could not resolve the PR->closing-issue map for ${prev_tag}..HEAD" >&2
         infra_exit
@@ -900,6 +912,41 @@ else
 
     if [[ -z "$unresolved" && "$undocumented" -eq 0 ]]; then
       ok "pending sections reconcile with ${prev_tag}..HEAD ($(printf '%s\n' "$primary_refs" | grep -c . || true) distinct entry references, $(printf '%s\n' "$range_prs" | grep -c . || true) merged PRs, $exempted exempt)"
+    fi
+  fi
+fi
+echo
+
+# --- check 6: the curated notes for the version being cut are finished -------
+#
+# release.yml publishes `.github/release-notes/<version>.md` verbatim as the
+# Release body, and release prep may commit that file well before the cut
+# (the 1.11.0 notes were drafted early, #4468). Unfinished items in a draft are
+# marked `TODO` -- usually inside `<!-- -->`, which GitHub does not render -- so
+# a forgotten draft would publish with the gaps invisible: no reader would see
+# the TODO, only the missing paragraph. Any uppercase `TODO` or `DRAFT` word in
+# the notes for the version Cargo.toml names blocks the cut.
+#
+# No notes file yet is reported, not blocked: until the prep PR bumps the
+# version this check is looking at the previous release's notes or none, and
+# the absence of a file for a stable tag is already refused by release.yml and
+# the candidate's bookkeeping assertion (#3537).
+echo "6) curated release notes for the version being cut are finished"
+notes_ver="${cargo_ver:-}"
+if [[ -z "$notes_ver" ]]; then
+  note "no Cargo.toml version to look up (check 2 reported it); skipped."
+else
+  notes_file=".github/release-notes/${notes_ver}.md"
+  if [[ ! -f "$notes_file" ]]; then
+    note "${notes_file} does not exist yet; nothing to check (release.yml refuses a stable tag without it)."
+  else
+    unfinished="$(grep -nwE 'TODO|DRAFT' "$notes_file" || true)"
+    if [[ -n "$unfinished" ]]; then
+      bad "${notes_file} still has unfinished markers; it is published verbatim as the Release body:"
+      printf '%s\n' "$unfinished" | head -20 | cut -c1-110 | sed 's/^/    line /'
+      note "  -> resolve each TODO/DRAFT (an HTML comment hides it from readers, not from this check)."
+    else
+      ok "${notes_file} has no TODO or DRAFT markers"
     fi
   fi
 fi

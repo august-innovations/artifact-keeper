@@ -27,19 +27,67 @@ ignore = [
     # Re-evaluate once upstream deps bump their rand pins.
     "RUSTSEC-2026-0097",
 
-    # quick-xml XML-parser DoS batch (RUSTSEC-2026-0194: O(N^2) start-tag
-    # duplicate-attribute check; RUSTSEC-2026-0195: unbounded NsReader
-    # namespace-declaration allocation; both fixed in quick-xml >= 0.41.0).
-    # Our DIRECT quick-xml dependency is now 0.41.0, which patches every
-    # attacker-reachable parse path (SAML response parsing, proxied
-    # maven-metadata/nuget, rpm, and artifactory import). The ONLY remaining
-    # 0.39.x instance is bundled transitively by object_store 0.13.2, which we
-    # use solely to parse trusted operator-configured storage responses
-    # (S3/GCS/Azure ListBucket, multipart, and delete XML) -- never attacker
-    # input. No published object_store release depends on quick-xml >= 0.41 yet
-    # (0.13.2 and 0.14.0 both cap at ^0.39/^0.40.1), so it cannot be upgraded
-    # out today. Removal of the object_store-transitive 0.39.x is tracked in
-    # issue #2158.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
+    # zip extraction batch (RUSTSEC-2026-0367: SUID/SGID bits preserved on
+    # extraction; -0368: ZipArchive::extract creates symlinks pointing outside
+    # the destination; -0369: extract() applies Unix permissions through
+    # symlinks; -0429: extract() aborts the process on a symlink entry with a
+    # large declared size; all fixed in zip >= 9.0.0). Our DIRECT zip
+    # dependency and the one rattler_package_streaming pulls are both 9.x
+    # (#4705), and the backend never calls extract(): it reads entries by
+    # index and writes with ZipWriter. The ONLY remaining pre-9 instance is
+    # zip 2.4.2, a BUILD-dependency of utoipa-swagger-ui 8.1.0 (`cargo tree -i
+    # zip@2.4.2 -e normal` prints nothing): its build.rs unpacks the
+    # swagger-ui distribution vendored inside the crate with its own by_index
+    # loop and never calls extract(), at build time, and nothing from it is
+    # linked into the shipped binary. No utoipa-swagger-ui release depends on
+    # zip 9 yet (10.0.1 still requires ^8.6 and needs utoipa 6), so it cannot
+    # be upgraded out today. Remove these four once utoipa-swagger-ui builds
+    # with zip 9 or the backend moves to utoipa 6 (#4705, #5162).
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
+
+    # crypto-bigint timing variability (RUSTSEC-2026-0387, patched only in
+    # >= 0.7.6). The 0.7.x copy (via kryptering under bergshamra) is on 0.7.6.
+    # The other copy, 0.5.5, comes from elliptic-curve 0.13, which pgp 0.14
+    # and bergshamra 0.5 both require, and the 0.5 line has no patched
+    # release. Even the latest pgp (0.21) still requires elliptic-curve 0.13,
+    # so no update removes it today. Exposure is low: the signing keys the
+    # backend generates are RSA or Ed25519, which do not use this crate, and
+    # bergshamra only verifies SAML signatures with IdP public keys.
+    # cargo-audit ignores by id, so this also covers the 0.7.x copy: keep it
+    # at >= 0.7.6. Remove once `cargo tree -i crypto-bigint@0.5.5` prints
+    # nothing (#4940).
+    "RUSTSEC-2026-0387",
+    # zstd / zstd-safe advisories of 2026-10-16 (RUSTSEC-2026-0391 zstd,
+    # -0398 and -0403 zstd-safe; patched in zstd >= 0.14.3 and zstd-safe >=
+    # 8.2.0). Every copy the backend reaches at run time is on the patched
+    # line: the direct zstd dependency, zip, async-compression and
+    # rattler_package_streaming (0.27.16) all use zstd 0.14.3 / zstd-safe
+    # 8.2.0. The ONLY pre-fix copy left, zstd 0.13.3 with zstd-safe 7.2.4,
+    # comes from wasmtime-internal-cache, which wasmtime's default `cache`
+    # feature links. That crate only runs when an Engine is built from a
+    # Config with a compilation cache configured, and wasm_runtime.rs never
+    # configures one, so its zstd calls are unreachable. No wasmtime release
+    # (through 50.0.0) requires zstd 0.14 yet. Remove these three once
+    # `cargo tree -i zstd@0.13.3` prints nothing.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
+
+    # libsqlite3-sys 0.30.1 bundles a C SQLite affected by CVE-2026-119375
+    # (RUSTSEC-2026-0459, patched in libsqlite3-sys >= 0.39.0). It is in
+    # Cargo.lock only as the dependency of sqlx-sqlite 0.9.0, which sqlx and
+    # sqlx-macros-core name through weak `sqlx-sqlite?/...` features (any,
+    # chrono, json, uuid, migrate). Cargo writes such optional deps into the
+    # lockfile even when they are never activated; we enable only the
+    # postgres driver, so `cargo tree -i libsqlite3-sys -e normal,build,dev
+    # --target all` prints nothing: no SQLite code is compiled, linked or
+    # executed. Same situation as rsa via sqlx-mysql above. It cannot be
+    # updated away: sqlx 0.9.0 is the latest release and sqlx-sqlite 0.9.0
+    # requires libsqlite3-sys < 0.38, and turning off sqlx's default features
+    # leaves it in the lock. Remove once sqlx allows libsqlite3-sys >= 0.39 or
+    # the lock no longer contains it (#5555).
+    "RUSTSEC-2026-0459",
 ]

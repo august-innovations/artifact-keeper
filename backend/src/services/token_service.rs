@@ -104,6 +104,10 @@ pub(crate) const ALLOWED_SCOPES: &[&str] = &[
     // publish packages must not thereby be able to write the verdicts the
     // download gate, the promotion gate and the repository score read.
     "write:findings",
+    // #5253: the MCP introspection worker's credential (claim jobs, post
+    // results). Dedicated so no other token can feed observed capability
+    // snapshots, and admin-only to mint.
+    "mcp:introspect",
     "admin",
     "*",
 ];
@@ -162,6 +166,7 @@ pub(crate) const ADMIN_ONLY_SCOPES: &[&str] = &[
     "trigger:sync",
     "write:users",
     "write:findings",
+    "mcp:introspect",
 ];
 
 /// Enforce that a non-admin caller may not grant any admin-class scope
@@ -188,6 +193,47 @@ pub(crate) fn enforce_admin_only_scopes(
         }
     }
     Ok(())
+}
+
+/// Why a CI OIDC service account may not mint an API token for itself, or
+/// `Ok(())` for any other account. Split from [`refuse_ci_account_mint`] so
+/// the decision is testable without a database.
+///
+/// A CI OIDC exchange (any provider type) hands out a credential for the
+/// mapping's `ci-...` service account that lives no longer than the CI
+/// assertion it was exchanged for; a Kubernetes exchange is also pull-only
+/// and has no refresh token. Letting that credential mint an API token would
+/// turn it into a long-lived (with the default policy, never-expiring) one,
+/// undoing both properties. The refusal is keyed on the account
+/// (`users.auth_provider = 'ci'`) rather than on a claim of the presented
+/// token, because the account is the only thing every exchanged credential
+/// has in common: a GitHub/GitLab access token carries no CI-specific claim,
+/// and the same account is reached through a Bearer, a Basic password or a
+/// `/v2/token` re-mint. Admins can still issue tokens for a CI account
+/// through the admin endpoints; this only refuses the account minting its own.
+pub(crate) fn ci_account_mint_refusal(
+    provider: Option<crate::models::user::AuthProvider>,
+) -> std::result::Result<(), String> {
+    match provider {
+        Some(crate::models::user::AuthProvider::Ci) => Err(
+            "A CI OIDC service account cannot mint API tokens; exchange a fresh CI token \
+             at /api/v1/auth/ci/token instead"
+                .to_string(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse (403) a self-service API-token mint when the caller is a CI OIDC
+/// service account. See [`ci_account_mint_refusal`].
+pub(crate) async fn refuse_ci_account_mint(db: &PgPool, user_id: Uuid) -> Result<()> {
+    let provider: Option<crate::models::user::AuthProvider> =
+        sqlx::query_scalar("SELECT auth_provider FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    ci_account_mint_refusal(provider).map_err(AppError::Authorization)
 }
 
 /// Determine if a token is expired given an optional expiration timestamp.
@@ -431,8 +477,7 @@ impl TokenService {
         match auth_service.validate_api_token(token).await {
             Ok(validation) => {
                 // Get token details
-                if token.len() >= 8 {
-                    let prefix = &token[..8];
+                if let Some(prefix) = AuthService::api_token_prefix(token) {
                     if let Ok(Some(token_info)) = sqlx::query!(
                         "SELECT scopes, expires_at FROM api_tokens WHERE token_prefix = $1",
                         prefix
@@ -482,11 +527,11 @@ impl TokenService {
     /// # Returns
     /// * `Ok(bool)` - Whether the token has the scope
     pub async fn has_scope(&self, token: &str, required_scope: &str) -> Result<bool> {
-        if token.len() < 8 {
+        // `None` for a short token and for one whose byte 8 is inside a
+        // multibyte character (#5525); `&token[..8]` panicked on the latter.
+        let Some(prefix) = AuthService::api_token_prefix(token) else {
             return Err(AppError::Authentication("Invalid token format".to_string()));
-        }
-
-        let prefix = &token[..8];
+        };
         let token_info = sqlx::query!(
             "SELECT scopes FROM api_tokens WHERE token_prefix = $1",
             prefix
@@ -567,6 +612,57 @@ pub struct TokenStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_ci_account_is_refused_a_mint() {
+        use crate::models::user::AuthProvider;
+        let refused = ci_account_mint_refusal(Some(AuthProvider::Ci)).unwrap_err();
+        assert!(refused.contains("CI OIDC service account"), "{refused}");
+        for provider in [
+            AuthProvider::Local,
+            AuthProvider::Ldap,
+            AuthProvider::Saml,
+            AuthProvider::Oidc,
+        ] {
+            assert_eq!(
+                ci_account_mint_refusal(Some(provider)),
+                Ok(()),
+                "{provider:?}"
+            );
+        }
+        // An unknown caller is left to the handler's own checks.
+        assert_eq!(ci_account_mint_refusal(None), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn refuse_ci_account_mint_reads_the_account() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (local, _) = tdh::create_user(&pool).await;
+        let (ci, _) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET auth_provider = 'ci' WHERE id = $1")
+            .bind(ci)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        refuse_ci_account_mint(&pool, local)
+            .await
+            .expect("local mints");
+        let err = refuse_ci_account_mint(&pool, ci).await.unwrap_err();
+        assert_eq!(
+            axum::response::IntoResponse::into_response(err).status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+        refuse_ci_account_mint(&pool, Uuid::new_v4())
+            .await
+            .expect("no such account: left to the handler");
+
+        tdh::cleanup_user(&pool, local).await;
+        tdh::cleanup_user(&pool, ci).await;
+    }
 
     fn validate_expiration_days(days: Option<i64>) -> std::result::Result<(), String> {
         if let Some(d) = days {

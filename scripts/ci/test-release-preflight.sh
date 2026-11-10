@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Self-test for scripts/ci/release-preflight.sh checks 1, 3 and 4
+# Self-test for scripts/ci/release-preflight.sh checks 1, 3, 4, 5 and 6
 # (issues #3308, #3309, #3338 and #3339).
 #
 # WHY THIS EXISTS
@@ -86,6 +86,14 @@ case "$1" in
         # The PR -> closing-issue map for check 5. $FAKE_CLOSES_MAP is already
         # in the `<pr>:<issue>,<issue>` shape the real --jq produces.
         [ "${FAKE_GRAPHQL_FAIL-0}" = "1" ] && exit 1
+        # $FAKE_ISSUE_NUMBER is an ISSUE that a range subject ends in. The
+        # real API answers `pullRequest(number:N)` on it with NOT_FOUND and gh
+        # exits 1, failing the whole query; `issueOrPullRequest` resolves it.
+        if [ -n "${FAKE_ISSUE_NUMBER-}" ] \
+           && printf '%s ' "$@" | grep -qE "[^A-Za-z]pullRequest\(number:${FAKE_ISSUE_NUMBER}\)"; then
+          echo "gh: Could not resolve to a PullRequest with the number of ${FAKE_ISSUE_NUMBER}." >&2
+          exit 1
+        fi
         [ -n "${FAKE_CLOSES_MAP-}" ] && printf '%s\n' "$FAKE_CLOSES_MAP"
         exit 0
         ;;
@@ -893,6 +901,72 @@ else
   fail "no previous stable tag: expected exit 2 with INFRA, got $rc"
   sed 's/^/        /' "$WORK/out.txt" >&2
 fi
+
+# 11. A commit rebase-merged onto a release line keeps its cherry-picked
+#     subject, which can end in the ISSUE number it fixes rather than a PR
+#     number (`fix(c): gamma (#203)`; 1.11.8 had two). Looking that number up
+#     as a pull request is a NOT_FOUND error that used to fail the whole
+#     PR -> issue query and turn every line cut INFRA. An entry citing the
+#     issue accounts for the commit.
+REPO5C="$WORK/repo5c"
+cp -r "$REPO5" "$REPO5C"
+# Back to the base fixture (#101-#104): later cases add #105 and #106 to REPO5.
+git -C "$REPO5C" reset -q --hard "$(git -C "$REPO5C" log --format=%H -1 --grep='(#104)$')"
+git -C "$REPO5C" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "fix(c): gamma (#203)"
+cat > "$REPO5C/CHANGELOG.md" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+- **alpha is fixed** (#201). prose about alpha.
+- **beta is fixed** (#202). prose about beta.
+- **gamma is fixed** (#203). prose about gamma.
+
+## [9.9.8] - 2026-01-01
+- older work
+EOF
+( cd "$REPO5C" && PATH="$STUB4:$PATH" PREFLIGHT_REPO=artifact-keeper/artifact-keeper \
+    PREFLIGHT_SKIP_DOCKER_HEALTH=1 PREFLIGHT_SKIP_VERSION_PIN=1 \
+    FAKE_CLOSES_MAP="$CLOSES_MAP" FAKE_ISSUE_NUMBER=203 \
+    bash scripts/ci/release-preflight.sh >"$WORK/out.txt" 2>&1 )
+rc=$?
+if [ "$rc" = "0" ] && grep -qF "pending sections reconcile" "$WORK/out.txt"; then
+  pass "range subject ending in an issue number -> READY (exit 0)"
+else
+  fail "range subject ending in an issue number: expected exit 0, got $rc"
+  sed 's/^/        /' "$WORK/out.txt" >&2
+fi
+
+echo
+echo "release-preflight check 6 (curated notes finished, #4468)"
+
+# Check 6 reads .github/release-notes/<Cargo.toml version>.md. The base
+# fixture (version 9.9.9, green publish, checks 4 and 5 skipped) is READY, so
+# these exit codes are a statement about check 6 alone. Delete the `bad` in
+# check 6 and case 6a goes green; widen its pattern and 6b goes red.
+mkdir -p "$REPO_DIR/.github/release-notes"
+
+# 6a. THE REGRESSION: a TODO hidden in an HTML comment still blocks.
+printf '# Artifact Keeper 9.9.9\n\nText.\n<!-- TODO(W5): add #1234 -->\n' \
+  > "$REPO_DIR/.github/release-notes/9.9.9.md"
+expect "notes with a hidden TODO -> NOT READY" 1 "unfinished markers"
+
+# 6b. Finished notes pass, including prose that merely contains the letters
+#     ("todolist", "drafted") -- matching is
+#     whole-word and uppercase.
+printf '# Artifact Keeper 9.9.9\n\nThe plan was drafted early; see the todolist.\n' \
+  > "$REPO_DIR/.github/release-notes/9.9.9.md"
+expect "finished notes -> READY" 0 "has no TODO or DRAFT markers"
+
+# 6c. A DRAFT banner blocks too.
+printf '<!-- DRAFT for the 9.9.9 cut -->\n# Artifact Keeper 9.9.9\n' \
+  > "$REPO_DIR/.github/release-notes/9.9.9.md"
+expect "notes marked DRAFT -> NOT READY" 1 "unfinished markers"
+
+# 6d. No notes file for the version is reported, not blocked.
+rm -f "$REPO_DIR/.github/release-notes/9.9.9.md"
+expect "no notes file yet -> READY (noted)" 0 "does not exist yet"
 
 echo
 if [ "$fails" -eq 0 ]; then

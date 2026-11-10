@@ -287,6 +287,42 @@ pub fn request_base_url_from_request(headers: &HeaderMap, uri: Option<&Uri>) -> 
     }
 }
 
+/// Whether `X-Forwarded-Proto` / `X-Forwarded-Host` from `peer` may decide
+/// an externally visible URL (#4143).
+///
+/// Once `RATE_LIMIT_TRUSTED_PROXY_CIDRS` names the reverse proxies, only a TCP
+/// peer inside those ranges is believed, the same rule #4681 applies to
+/// `X-Forwarded-For`; a request with no known peer is untrusted. An EMPTY list
+/// keeps the historical accept-all behaviour, as #4195 does for
+/// `traceparent`, so a deployment that relies on its proxy's
+/// `X-Forwarded-Proto` without having listed it keeps working.
+pub fn forwarded_headers_trusted(
+    peer: Option<std::net::IpAddr>,
+    trusted_proxies: &[crate::api::middleware::rate_limit::CidrRange],
+) -> bool {
+    if trusted_proxies.is_empty() {
+        return true;
+    }
+    peer.is_some_and(|ip| trusted_proxies.iter().any(|cidr| cidr.contains(ip)))
+}
+
+/// [`request_base_url_from_request`] for a request whose forwarding headers
+/// are NOT trusted (#4143): `AK_EXTERNAL_URL` when set, otherwise the request
+/// URI's own scheme and authority, then the `Host` header, never
+/// `X-Forwarded-Proto` / `X-Forwarded-Host`.
+pub fn request_base_url_ignoring_forwarded(headers: &HeaderMap, uri: Option<&Uri>) -> String {
+    if let Some(external) = configured_external_url() {
+        return external.to_string();
+    }
+    let scheme = uri.and_then(Uri::scheme_str).unwrap_or("http");
+    let host = uri
+        .and_then(Uri::authority)
+        .map(|a| a.as_str())
+        .or_else(|| headers.get("host").and_then(|v| v.to_str().ok()))
+        .unwrap_or("localhost");
+    format!("{scheme}://{host}")
+}
+
 /// Derive an external base URL without consulting `X-Forwarded-Host` or an
 /// absolute-form request URI.
 ///

@@ -8,7 +8,11 @@
 # compose file, and starts the full stack.
 #
 # Usage:
-#   curl -fsSL https://get.artifactkeeper.com | bash
+#   curl -fsSL https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/scripts/install.sh | bash
+#
+# Options go on the `bash` side of the pipe: `AK_X=1 curl ... | bash` sets
+# the variable for curl only, and the installer never sees it (#4313).
+#   curl -fsSL <url> | AK_HTTP_PORT=8080 AK_ADMIN_PASSWORD='...' bash
 #
 # Or run directly:
 #   bash scripts/install.sh
@@ -16,16 +20,21 @@
 # Options (environment variables):
 #   INSTALL_DIR       - Where to create the project directory (default: ./artifact-keeper)
 #   AK_VERSION        - Version to install (default: latest)
-#   AK_HTTP_PORT      - HTTP port (default: 80)
-#   AK_HTTPS_PORT     - HTTPS port (default: 443)
-#   AK_ADMIN_PASSWORD - Admin password (default: auto-generated)
+#   AK_HTTP_PORT      - HTTP port (default: 30080, the compose file's default)
+#   AK_HTTPS_PORT     - HTTPS port (default: 30443)
+#   AK_ADMIN_PASSWORD - Admin password (default: auto-generated). Used on the
+#                       first start only, when the admin account is created.
 #   AK_SKIP_START     - Set to 1 to generate files without starting (default: 0)
-#   AK_MINIMAL        - Set to 1 to skip scanners (Trivy, OpenSCAP, Dependency-Track)
+#   AK_MINIMAL        - Set to 1 to pull only the core images
+#   AK_DTRACK         - Set to 1 to also run Dependency-Track (the compose
+#                       `dtrack` profile; a heavy Java service, off by default)
 #
 # Requirements:
-#   - Docker 20.10+ with Compose V2, or Podman 4+ with podman-compose
+#   - Docker 20.10+ with Compose V2, or Podman 4+ with podman-compose or
+#     `podman compose`
 #   - 2 GB RAM minimum (4 GB recommended with scanners enabled)
-#   - Ports 80 and 443 available (configurable)
+#   - Ports 30080 and 30443 available (configurable). Rootless Podman cannot
+#     publish ports below 1024 without a sysctl change.
 #
 # =============================================================================
 set -euo pipefail
@@ -36,11 +45,12 @@ set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-./artifact-keeper}"
 AK_VERSION="${AK_VERSION:-latest}"
-AK_HTTP_PORT="${AK_HTTP_PORT:-80}"
-AK_HTTPS_PORT="${AK_HTTPS_PORT:-443}"
+AK_HTTP_PORT="${AK_HTTP_PORT:-30080}"
+AK_HTTPS_PORT="${AK_HTTPS_PORT:-30443}"
 AK_ADMIN_PASSWORD="${AK_ADMIN_PASSWORD:-}"
 AK_SKIP_START="${AK_SKIP_START:-0}"
 AK_MINIMAL="${AK_MINIMAL:-0}"
+AK_DTRACK="${AK_DTRACK:-0}"
 
 REPO_BASE="https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main"
 
@@ -66,6 +76,17 @@ generate_password() {
     fi
 }
 
+generate_webhook_key() {
+    # 32 random bytes, base64 encoded: the only shape AK_WEBHOOK_SECRET_KEY
+    # accepts (#4313). Without it the compose file's placeholder used to stop
+    # the backend from starting.
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 32
+    else
+        head -c 32 /dev/urandom | base64 | tr -d '\n'
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Pre-flight checks
 # ---------------------------------------------------------------------------
@@ -73,12 +94,18 @@ generate_password() {
 info "Artifact Keeper Quickstart Installer"
 echo ""
 
-# Detect container runtime
+# Detect container runtime. A docker CLI whose daemon cannot be reached (not
+# running, or no permission on its socket) is skipped in favour of Podman when
+# Podman is installed, instead of stopping the install.
+docker_usable() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }
+podman_present() { command -v podman >/dev/null 2>&1; }
 COMPOSE_CMD=""
-if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 \
+    && { docker_usable || ! podman_present; }; then
     COMPOSE_CMD="docker compose"
     info "Found Docker with Compose V2"
-elif command -v docker >/dev/null 2>&1 && command -v docker-compose >/dev/null 2>&1; then
+elif command -v docker >/dev/null 2>&1 && command -v docker-compose >/dev/null 2>&1 \
+    && { docker_usable || ! podman_present; }; then
     COMPOSE_CMD="docker-compose"
     info "Found Docker with docker-compose"
 elif command -v podman >/dev/null 2>&1 && command -v podman-compose >/dev/null 2>&1; then
@@ -127,7 +154,7 @@ done
 info "Generating secure credentials..."
 
 JWT_SECRET="$(generate_password)$(generate_password)"
-DB_PASSWORD="$(generate_password)"
+AK_WEBHOOK_SECRET_KEY="$(generate_webhook_key)"
 
 if [ -z "$AK_ADMIN_PASSWORD" ]; then
     AK_ADMIN_PASSWORD="$(generate_password)"
@@ -184,11 +211,14 @@ cat > .env <<ENVEOF
 # Version (omit the "v" prefix)
 ARTIFACT_KEEPER_VERSION=${AK_VERSION}
 
-# Admin password for the web UI
+# Admin password for the web UI (user: admin). Applied ONLY on the first
+# start, when the admin account is created: editing it later does not change
+# the password (change it in the UI instead).
 ADMIN_PASSWORD=${AK_ADMIN_PASSWORD}
 
 # Security keys (auto-generated, keep these secret)
 JWT_SECRET=${JWT_SECRET}
+AK_WEBHOOK_SECRET_KEY=${AK_WEBHOOK_SECRET_KEY}
 
 # Search backend (OpenSearch runs in single-node mode with the security
 # plugin disabled for local self-host deployments. The service is bound to
@@ -209,15 +239,20 @@ SITE_ADDRESS=localhost
 ENVIRONMENT=production
 RUST_LOG=info
 
-# Scanners (set to false to disable)
-DEPENDENCY_TRACK_ENABLED=true
+# Dependency-Track runs only with the compose "dtrack" profile, so the
+# integration flag and the profile are set together (re-run with AK_DTRACK=1,
+# or set both here, to enable it).
+DEPENDENCY_TRACK_ENABLED=false
 ENVEOF
 
-# If minimal mode, disable scanners
-if [ "$AK_MINIMAL" = "1" ]; then
-    sed -i.bak 's/DEPENDENCY_TRACK_ENABLED=true/DEPENDENCY_TRACK_ENABLED=false/' .env
+if [ "$AK_DTRACK" = "1" ] && [ "$AK_MINIMAL" != "1" ]; then
+    sed -i.bak 's/^DEPENDENCY_TRACK_ENABLED=false$/DEPENDENCY_TRACK_ENABLED=true/' .env
     rm -f .env.bak
-    info "Minimal mode: scanners disabled"
+    echo "COMPOSE_PROFILES=dtrack" >> .env
+    info "Dependency-Track enabled (compose profile: dtrack)"
+fi
+if [ "$AK_MINIMAL" = "1" ]; then
+    info "Minimal mode: only the core images are pre-pulled"
 fi
 
 # ---------------------------------------------------------------------------
@@ -228,6 +263,8 @@ if [ "$AK_SKIP_START" = "1" ]; then
     ok "Configuration written to $INSTALL_DIR"
     echo ""
     echo "  To start: cd $INSTALL_DIR && $COMPOSE_CMD up -d"
+    echo "  Then open http://localhost:${AK_HTTP_PORT} and log in as admin with the"
+    echo "  ADMIN_PASSWORD in $INSTALL_DIR/.env (applied on the first start only)."
     echo ""
     exit 0
 fi
@@ -284,7 +321,8 @@ echo "  Username:  admin"
 if [ "$ADMIN_PW_GENERATED" = "1" ]; then
 echo "  Password:  ${AK_ADMIN_PASSWORD}"
 echo ""
-echo "  (password saved in $INSTALL_DIR/.env)"
+echo "  (password saved as ADMIN_PASSWORD in $INSTALL_DIR/.env; it is applied on"
+echo "   the first start only, so change the password in the UI, not in .env)"
 fi
 echo ""
 echo "  Quick start:"

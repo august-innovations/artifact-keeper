@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::services::http_client;
+use crate::services::upstream_tracing::send_upstream;
 
 const PYPI_CACHE_TTL: Duration = Duration::from_secs(60);
 
@@ -135,10 +136,7 @@ impl UpstreamMetadataCache {
         }
 
         let url = pypi_json_url(upstream_url, project);
-        let response = client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
+        let response = send_upstream(client.get(&url).header("Accept", "application/json"))
             .await
             .map_err(|e| AppError::BadGateway(format!("PyPI metadata fetch failed: {e}")))?;
 
@@ -430,10 +428,13 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_pypi_publish_times_fetches_and_reuses_cache() {
+        // The PyPI JSON fetch goes through `send_upstream` (#4455).
+        let _otel = crate::testing::otel::trace_upstream_sends();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/pypi/demo/json"))
             .and(header("Accept", "application/json"))
+            .and(wiremock::matchers::header_exists("traceparent"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "releases": {
                     "1.0.0": [

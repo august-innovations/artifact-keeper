@@ -1,7 +1,16 @@
 # Rolling back to an earlier Artifact Keeper release
 
 **The short version:** set `SKIP_MIGRATIONS=true` on the older deployment. That
-is the supported rollback path.
+is the supported rollback path, within the limits listed under
+[Releases you cannot roll back across](#releases-you-cannot-roll-back-across).
+
+> **Warning: 1.11.x to 1.10.x.** A database that has run the 1.11.0 migrations
+> cannot serve a 1.10.x backend for OCI and Docker pushes. Migration 243
+> replaced the unique key the 1.10.x upload path names in its `ON CONFLICT`
+> clause, so after such a rollback every `docker push` fails with
+> `there is no unique or exclusion constraint matching the ON CONFLICT
+> specification`. Stay on the 1.11.x line, or roll back by restoring a database
+> backup taken before the upgrade to 1.11.0. See the table below (#4915).
 
 It is worth reading the rest of this page *before* you need it, because the
 procedure is counter-intuitive in a way that makes it useless to discover under
@@ -108,6 +117,15 @@ flag silences the startup ledger check; it cannot conjure back a dropped column.
 The failure mode is worse than the one you were avoiding, because it surfaces as
 scattered runtime errors under load rather than as a clean refusal to boot.
 
+The same holds for a migration that **drops or replaces a unique constraint or
+unique index that an older binary's `INSERT ... ON CONFLICT (...)` names**.
+Postgres resolves `ON CONFLICT (columns)` against an existing unique index on
+exactly those columns; when that index is gone the statement fails with `there
+is no unique or exclusion constraint matching the ON CONFLICT specification`,
+even though every column it names still exists. Look for `DROP CONSTRAINT`,
+`DROP INDEX` and `ADD CONSTRAINT ... UNIQUE` as well as the column changes
+below.
+
 There is currently **no marker in the codebase distinguishing an additive
 migration from a destructive one**, so this is a judgement call each time rather
 than a rule you can check. In practice the project's migration discipline
@@ -118,16 +136,35 @@ for `DROP COLUMN`, `DROP TABLE`, `ALTER COLUMN ... TYPE`, and `RENAME`.
 
 ```bash
 # Everything added between the version you are rolling back TO and the one you are on.
-git diff v1.7.1..v1.7.3 -- backend/migrations/ | grep -iE '^\+.*(DROP|RENAME|ALTER COLUMN)'
+git diff v1.7.1..v1.7.3 -- backend/migrations/ | grep -iE '^\+.*(DROP|RENAME|ALTER COLUMN|UNIQUE)'
 ```
 
 Empty output means the rollback is within the additive case this page covers.
+Output is not automatically a blocker: many migrations drop and recreate an
+index or a check constraint in a compatible form. Check each hit against the
+table below first, and read the migration's header comment, which says when a
+rollback needs more than this page.
 
 > **Maintainer note.** Flagging destructive migrations as such at authoring time
 > — a header comment convention, or a filename marker, checked by CI — would let
 > this section point at a rule instead of a judgement call, and would let the
 > startup path tell an operator which kind of rollback they are attempting.
 > Tracked on #3314.
+
+## Releases you cannot roll back across
+
+Migrations known to break an older binary that runs against the migrated
+database with `SKIP_MIGRATIONS=true`. A rollback from a release at or above
+**Introduced in** to a release below it is not supported for the affected
+paths; restore a database backup taken before the upgrade, or stay on the newer
+line.
+
+| Migration | Introduced in | Older binaries affected | What breaks | Way back |
+|---|---|---|---|---|
+| `243_oci_cleanup_keys_per_repository` (#3851) | 1.11.0 | 1.10.x and older | Every OCI and Docker push (upload POST, PATCH and PUT). The migration replaced `UNIQUE (storage_key)` on `oci_upload_cleanup_keys` with `UNIQUE (repository_id, storage_key)`; the 1.10.x upload path registers cleanup keys with `ON CONFLICT (storage_key)` and fails with `there is no unique or exclusion constraint matching the ON CONFLICT specification`. Pulls and the other formats are not affected. | Stay on 1.11.x, or restore a pre-1.11.0 backup. Re-adding the old constraint is not a fix: it fails once two repositories hold rows for one key, and where it succeeds it brings back the cross-repository push failure #3851 fixed (#4915). |
+
+When a later migration is found to break a rollback, add a row here and a line
+to that release's upgrade notes in `CHANGELOG.md`.
 
 ## How far back this is known to work
 
@@ -136,7 +173,10 @@ migrations in that range (193, 194, 195) are additive — an index, a nullable
 timestamp plus a partial index, and six columns on `curation_packages` that
 either default or accept `NULL`.
 
-**Untested:** everything wider. Rolling back across a minor version, or across
+**Known not to work:** rolling a 1.11.x database back to a 1.10.x binary, for
+OCI pushes (migration 243, see the table above).
+
+**Untested:** everything else wider. Rolling back across a minor version, or across
 several patch releases, has not been exercised. The mechanism is not
 version-specific and there is no reason to expect it to fail, but that is a
 prediction, not a result — treat a wider rollback as something to verify against

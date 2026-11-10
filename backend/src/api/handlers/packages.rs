@@ -16,7 +16,10 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
 use crate::services::curation_service::version_compare;
-use crate::services::package_service::{live_package_predicate, live_package_version_predicate};
+use crate::services::package_service::{
+    live_package_predicate, live_package_version_predicate, newest_catalog_version,
+    package_download_count_over_versions, package_download_counts, version_download_count_sql,
+};
 use crate::services::repository_service::{
     build_visibility_clause_for, RepoVisibility, VisibilityBind,
 };
@@ -80,6 +83,23 @@ struct ResolvedRepoFilter {
     report_key: Option<String>,
 }
 
+impl ResolvedRepoFilter {
+    fn empty() -> Self {
+        Self {
+            repo_ids: Some(Vec::new()),
+            report_key: None,
+        }
+    }
+
+    fn visibility(&self, auth: Option<&AuthExtension>) -> RepoVisibility {
+        if self.report_key.is_some() {
+            RepoVisibility::Ids(self.repo_ids.clone().unwrap_or_default())
+        } else {
+            repo_visibility_for(auth)
+        }
+    }
+}
+
 /// Resolve the `repository_key` filter into the concrete repository ids whose
 /// packages should be listed, plus the key to report on each row.
 ///
@@ -93,6 +113,7 @@ struct ResolvedRepoFilter {
 async fn resolve_package_filter(
     db: &sqlx::PgPool,
     repository_key: Option<&str>,
+    auth: Option<&AuthExtension>,
 ) -> Result<ResolvedRepoFilter> {
     let Some(key) = repository_key else {
         return Ok(ResolvedRepoFilter {
@@ -101,36 +122,31 @@ async fn resolve_package_filter(
         });
     };
 
-    // Single indexed lookup: the repo id plus whether it is a virtual repo
-    // (i.e. appears as a `virtual_repo_members.virtual_repo_id`).
-    let repo: Option<(Uuid, bool)> = sqlx::query_as::<_, (Uuid, bool)>(
-        r#"
-        SELECT r.id,
-               EXISTS(
-                   SELECT 1 FROM virtual_repo_members vrm WHERE vrm.virtual_repo_id = r.id
-               ) AS is_virtual
-        FROM repositories r
-        WHERE r.key = $1
-        "#,
-    )
-    .bind(key)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let Some((id, is_virtual)) = repo else {
-        // Unknown key: no repository, therefore no packages.
-        return Ok(ResolvedRepoFilter {
-            repo_ids: Some(Vec::new()),
-            report_key: None,
-        });
+    // Single indexed lookup: the repository supplies its own type and ACL,
+    // including an empty virtual repository with no membership edges.
+    let service = crate::services::repository_service::RepositoryService::new(db.clone());
+    let repo = match service.get_by_key(key).await {
+        Ok(repo) => repo,
+        Err(AppError::NotFound(_)) => {
+            // Unknown key: no repository, therefore no packages.
+            return Ok(ResolvedRepoFilter::empty());
+        }
+        Err(error) => return Err(error),
     };
 
-    if !is_virtual {
+    if repo.repo_type != crate::models::repository::RepositoryType::Virtual {
         return Ok(ResolvedRepoFilter {
-            repo_ids: Some(vec![id]),
+            repo_ids: Some(vec![repo.id]),
             report_key: None,
         });
+    }
+    match super::repositories::require_visible(&repo, &auth.cloned(), &service).await {
+        Ok(()) => {}
+        Err(AppError::NotFound(_)) => return Ok(ResolvedRepoFilter::empty()),
+        Err(error) => return Err(error),
+    }
+    if auth.is_some_and(|a| !a.has_scope("read:artifacts")) {
+        return Ok(ResolvedRepoFilter::empty());
     }
 
     // Expand the virtual repo to its leaf members through the same recursive
@@ -139,51 +155,19 @@ async fn resolve_package_filter(
     // hosted members their pushed artifacts. The walk's resolution order
     // (depth-first pre-order priority) keeps the listing stable and
     // deterministic.
-    let member_ids: Vec<Uuid> =
-        crate::api::handlers::proxy_helpers::fetch_virtual_member_leaf_ids(db, id)
-            .await
-            .map_err(|resp| crate::api::handlers::proxy_helpers::member_walk_app_error(&resp))?;
+    let members = super::proxy_helpers::fetch_virtual_members(db, repo.id)
+        .await
+        .map_err(|resp| super::proxy_helpers::member_walk_app_error(&resp))?;
+    let members = super::proxy_helpers::try_authorize_virtual_members(db, auth, repo.id, members)
+        .await
+        .map_err(|resp| super::proxy_helpers::member_walk_app_error(&resp))?;
 
     // Aggregated rows are reported under the virtual repo's key, not the
     // member's, so the whole page reads as the virtual repo.
     Ok(ResolvedRepoFilter {
-        repo_ids: Some(member_ids),
+        repo_ids: Some(members.into_iter().map(|member| member.id).collect()),
         report_key: Some(key.to_string()),
     })
-}
-
-/// True when the package is owned by a member of the virtual repository named
-/// `virtual_key`. Used by the by-id detail lookup to report the virtual key
-/// when the caller is viewing the package through that virtual repo, keeping
-/// the detail view consistent with the virtual repo's listing.
-async fn package_in_virtual_repo(
-    db: &sqlx::PgPool,
-    package_id: Uuid,
-    virtual_key: &str,
-) -> Result<bool> {
-    let virtual_id: Option<Uuid> =
-        sqlx::query_scalar("SELECT id FROM repositories WHERE key = $1 AND repo_type = 'virtual'")
-            .bind(virtual_key)
-            .fetch_optional(db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-    let Some(virtual_id) = virtual_id else {
-        return Ok(false);
-    };
-    // Same recursive member walk as the listing paths (#3840): a package
-    // owned by a leaf of a NESTED virtual still reports the top virtual's key.
-    let member_ids =
-        crate::api::handlers::proxy_helpers::fetch_virtual_member_leaf_ids(db, virtual_id)
-            .await
-            .map_err(|resp| crate::api::handlers::proxy_helpers::member_walk_app_error(&resp))?;
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM packages p WHERE p.id = $1 AND p.repository_id = ANY($2))",
-    )
-    .bind(package_id)
-    .bind(&member_ids)
-    .fetch_one(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))
 }
 
 /// Create package routes
@@ -213,7 +197,11 @@ pub struct PackageRow {
     pub format: String,
     pub description: Option<String>,
     pub size_bytes: i64,
-    pub download_count: i64,
+    /// Downloads of the package's versions, from the same download history
+    /// the artifact download stats read (#5346). `null` when the repository
+    /// cannot attribute downloads to this package (a Remote package cataloged
+    /// without a digest), so a client can tell "not tracked" from a real 0.
+    pub download_count: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     #[schema(value_type = Object)]
@@ -229,7 +217,11 @@ pub struct PackageResponse {
     pub format: String,
     pub description: Option<String>,
     pub size_bytes: i64,
-    pub download_count: i64,
+    /// Downloads of the package's versions, from the same download history
+    /// the artifact download stats read (#5346). `null` when the repository
+    /// cannot attribute downloads to this package (a Remote package cataloged
+    /// without a digest), so a client can tell "not tracked" from a real 0.
+    pub download_count: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     #[schema(value_type = Object)]
@@ -278,7 +270,6 @@ pub async fn list_packages(
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(query): Query<ListPackagesQuery>,
 ) -> Result<Json<PackageListResponse>> {
-    let visibility = repo_visibility_for(auth.as_ref());
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(24).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -307,7 +298,9 @@ pub async fn list_packages(
     // A `repository_key` naming a virtual repo expands to its members' ids so
     // the aggregated Packages page shows the packages each member actually
     // owns. `None` means "no repository filter".
-    let filter = resolve_package_filter(&state.db, query.repository_key.as_deref()).await?;
+    let filter =
+        resolve_package_filter(&state.db, query.repository_key.as_deref(), auth.as_ref()).await?;
+    let visibility = filter.visibility(auth.as_ref());
 
     // Per-user repository visibility. The page query binds the visibility
     // parameter at $6 (after repo ids/format/search/offset/limit); the
@@ -324,10 +317,57 @@ pub async fn list_packages(
     // and keeps `total` honest at the same time.
     let live_packages = live_package_predicate();
 
+    // MCP rows (#5253): the catalog rows of the whole filtered set this
+    // caller is shown (`None`: the listing cannot contain an MCP row). The
+    // page and the count both keep only those, so `total` and every page
+    // count the rows the caller sees.
+    let mcp_shown: Option<Vec<Uuid>> = if query.format.as_deref().is_none_or(|f| f == "mcp") {
+        let mcp_sql = format!(
+            r#"
+            SELECT p.id, p.repository_id, p.name, p.version
+            FROM packages p
+            JOIN repositories r ON r.id = p.repository_id
+            WHERE ($1::uuid[] IS NULL OR r.id = ANY($1))
+              AND r.format::text = 'mcp'
+              AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
+              AND ({count_clause})
+              AND {live_packages}
+              AND ($2::text IS NULL OR $2 = 'mcp')
+            ORDER BY p.updated_at DESC
+            LIMIT $5
+            "#
+        );
+        let mcp_query =
+            sqlx::query_as::<_, (Uuid, Uuid, String, String)>(sqlx::AssertSqlSafe(&*mcp_sql))
+                .bind(filter.repo_ids.clone())
+                .bind(&query.format)
+                .bind(&search_pattern);
+        let mcp_query = match &count_ids {
+            Some(ids) => mcp_query.bind(ids.clone()),
+            None => mcp_query.bind(count_user_id),
+        };
+        let rows = mcp_query
+            .bind(super::mcp::GENERIC_LISTING_VERSION_CAP)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let mut shown = Vec::with_capacity(rows.len());
+        for (id, repo_id, name, version) in rows {
+            let view =
+                super::mcp::catalog_view(&state, auth.as_ref(), repo_id, &name, &version).await;
+            if view != super::mcp::CatalogView::Hide {
+                shown.push(id);
+            }
+        }
+        Some(shown)
+    } else {
+        None
+    };
+
     let page_sql = format!(
         r#"
         SELECT p.id, r.key as repository_key, p.name, p.version, r.format::text as format,
-               p.description, p.size_bytes, p.download_count, p.created_at, p.updated_at,
+               p.description, p.size_bytes, NULL::BIGINT AS download_count, p.created_at, p.updated_at,
                p.metadata
         FROM packages p
         JOIN repositories r ON r.id = p.repository_id
@@ -336,6 +376,7 @@ pub async fn list_packages(
           AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
           AND ({page_clause})
           AND {live_packages}
+          AND ($7::uuid[] IS NULL OR r.format::text <> 'mcp' OR p.id = ANY($7))
         ORDER BY p.updated_at DESC
         OFFSET $4
         LIMIT $5
@@ -353,9 +394,15 @@ pub async fn list_packages(
         None => page_query.bind(page_user_id),
     };
     let packages: Vec<PackageRow> = page_query
+        .bind(mcp_shown.clone())
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+    // The rows were decided above; this applies each one's view (a held
+    // version's row shows the newest servable one).
+    let (packages, _hidden) = apply_mcp_catalog_views(&state, auth.as_ref(), packages).await;
+    let packages = with_live_latest(&state, packages).await?;
+    let packages = with_download_counts(&state, auth.as_ref(), packages).await?;
 
     let count_sql = format!(
         r#"
@@ -367,6 +414,7 @@ pub async fn list_packages(
           AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
           AND ({count_clause})
           AND {live_packages}
+          AND ($5::uuid[] IS NULL OR r.format::text <> 'mcp' OR p.id = ANY($5))
         "#
     );
     let count_query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*count_sql))
@@ -378,7 +426,11 @@ pub async fn list_packages(
         Some(ids) => count_query.bind(ids.clone()),
         None => count_query.bind(count_user_id),
     };
-    let total: i64 = count_query.fetch_one(&state.db).await.unwrap_or(0);
+    let total: i64 = count_query
+        .bind(mcp_shown)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
@@ -437,16 +489,21 @@ pub async fn get_package(
     Path(id): Path<Uuid>,
     Query(detail_query): Query<PackageDetailQuery>,
 ) -> Result<Json<PackageResponse>> {
-    let visibility = repo_visibility_for(auth.as_ref());
-
     let table_exists = packages_table_exists(&state.db).await;
 
     if !table_exists {
         return Err(AppError::NotFound("Package not found".to_string()));
     }
+    let filter = resolve_package_filter(
+        &state.db,
+        detail_query.repository_key.as_deref(),
+        auth.as_ref(),
+    )
+    .await?;
+    let visibility = filter.visibility(auth.as_ref());
 
-    // The visibility parameter is bound at $2 (after the package id at $1).
-    let (clause, bind) = build_visibility_clause_for(&visibility, "r", 2);
+    // The visibility parameter is bound at $3, after the package id and context.
+    let (clause, bind) = build_visibility_clause_for(&visibility, "r", 3);
     let (user_id, ids) = split_visibility_bind(bind);
 
     // #3660: the detail view must agree with the listing — a ghost row is a
@@ -456,34 +513,45 @@ pub async fn get_package(
     let sql = format!(
         r#"
         SELECT p.id, r.key as repository_key, p.name, p.version, r.format::text as format,
-               p.description, p.size_bytes, p.download_count, p.created_at, p.updated_at,
+               p.description, p.size_bytes, NULL::BIGINT AS download_count, p.created_at, p.updated_at,
                p.metadata
         FROM packages p
         JOIN repositories r ON r.id = p.repository_id
         WHERE p.id = $1
+          AND ($2::uuid[] IS NULL OR r.id = ANY($2))
           AND ({clause})
           AND {live_packages}
         "#
     );
-    let query = sqlx::query_as::<_, PackageRow>(sqlx::AssertSqlSafe(&*sql)).bind(id);
-    // $2 shape depends on the visibility variant (single uuid vs uuid[]).
+    let query = sqlx::query_as::<_, PackageRow>(sqlx::AssertSqlSafe(&*sql))
+        .bind(id)
+        .bind(filter.repo_ids);
+    // $3 shape depends on the visibility variant (single uuid vs uuid[]).
     let query = match &ids {
         Some(ids) => query.bind(ids.clone()),
         None => query.bind(user_id),
     };
-    let mut package: PackageRow = query
+    let package: PackageRow = query
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
+    let package = apply_mcp_catalog_views(&state, auth.as_ref(), vec![package])
+        .await
+        .0
+        .pop()
+        .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
+    let package = with_live_latest(&state, vec![package]).await?;
+    let mut package = with_download_counts(&state, auth.as_ref(), package)
+        .await?
+        .pop()
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
 
     // A virtual-repo context (`?repository_key=<virtual>`) reports the virtual
     // key so the detail view matches the aggregated listing. Without it (or
     // for a non-virtual key) the owning member's key is reported.
-    if let Some(key) = detail_query.repository_key.as_deref() {
-        if package_in_virtual_repo(&state.db, package.id, key).await? {
-            package.repository_key = key.to_string();
-        }
+    if let Some(key) = filter.report_key {
+        package.repository_key = key;
     }
 
     Ok(Json(PackageResponse::from(package)))
@@ -493,7 +561,9 @@ pub async fn get_package(
 pub struct PackageVersionRow {
     pub version: String,
     pub size_bytes: i64,
-    pub download_count: i64,
+    /// Downloads of this version (#5346); `null` when not tracked, as on
+    /// [`PackageResponse::download_count`].
+    pub download_count: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub checksum_sha256: String,
 }
@@ -502,7 +572,9 @@ pub struct PackageVersionRow {
 pub struct PackageVersionResponse {
     pub version: String,
     pub size_bytes: i64,
-    pub download_count: i64,
+    /// Downloads of this version (#5346); `null` when not tracked, as on
+    /// [`PackageResponse::download_count`].
+    pub download_count: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub checksum_sha256: String,
 }
@@ -531,7 +603,8 @@ pub struct PackageVersionsResponse {
     context_path = "/api/v1/packages",
     tag = "packages",
     params(
-        ("id" = Uuid, Path, description = "Package ID")
+        ("id" = Uuid, Path, description = "Package ID"),
+        PackageDetailQuery,
     ),
     responses(
         (status = 200, description = "List of package versions", body = PackageVersionsResponse),
@@ -544,18 +617,20 @@ pub async fn get_package_versions(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
+    Query(context): Query<PackageDetailQuery>,
 ) -> Result<Json<PackageVersionsResponse>> {
-    let visibility = repo_visibility_for(auth.as_ref());
-
     let table_exists = packages_table_exists(&state.db).await;
 
     if !table_exists {
         return Err(AppError::NotFound("Package not found".to_string()));
     }
 
+    let filter =
+        resolve_package_filter(&state.db, context.repository_key.as_deref(), auth.as_ref()).await?;
+    let visibility = filter.visibility(auth.as_ref());
     // Verify the package exists and belongs to a repository visible to the
-    // caller. The visibility parameter is bound at $2 (after the id at $1).
-    let (clause, bind) = build_visibility_clause_for(&visibility, "r", 2);
+    // caller. The visibility parameter is bound at $3, after id and context.
+    let (clause, bind) = build_visibility_clause_for(&visibility, "r", 3);
     let (user_id, ids) = split_visibility_bind(bind);
 
     let live_packages = live_package_predicate();
@@ -566,13 +641,16 @@ pub async fn get_package_versions(
             SELECT 1 FROM packages p
             JOIN repositories r ON r.id = p.repository_id
             WHERE p.id = $1
+              AND ($2::uuid[] IS NULL OR r.id = ANY($2))
               AND ({clause})
               AND {live_packages}
         )
         "#
     );
-    let exists_query = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(&*exists_sql)).bind(id);
-    // $2 shape depends on the visibility variant (single uuid vs uuid[]).
+    let exists_query = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(&*exists_sql))
+        .bind(id)
+        .bind(filter.repo_ids);
+    // $3 shape depends on the visibility variant (single uuid vs uuid[]).
     let exists_query = match &ids {
         Some(ids) => exists_query.bind(ids.clone()),
         None => exists_query.bind(user_id),
@@ -599,9 +677,11 @@ pub async fn get_package_versions(
     // soft-deleted version disappears from the list and comes back on restore
     // without any catalog write.
     let live_versions = live_package_version_predicate();
+    let download_count = version_download_count_sql();
     let versions_sql = format!(
         r#"
-        SELECT pv.version, pv.size_bytes, pv.download_count, pv.created_at, pv.checksum_sha256
+        SELECT pv.version, pv.size_bytes, {download_count} AS download_count,
+               pv.created_at, pv.checksum_sha256
         FROM package_versions pv
         JOIN packages p ON p.id = pv.package_id
         JOIN repositories r ON r.id = p.repository_id
@@ -615,6 +695,10 @@ pub async fn get_package_versions(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+    if let Some(visible) = mcp_visible_versions(&state, auth.as_ref(), id).await {
+        versions.retain(|v| visible.contains(&v.version));
+    }
+
     versions.sort_by(|a, b| match version_compare(&a.version, &b.version) {
         n if n < 0 => std::cmp::Ordering::Greater,
         n if n > 0 => std::cmp::Ordering::Less,
@@ -627,6 +711,221 @@ pub async fn get_package_versions(
             .map(PackageVersionResponse::from)
             .collect(),
     }))
+}
+
+/// Show each row's newest LIVE version as its Latest (#5632).
+///
+/// `packages.version` is moved off a deleted version when the delete runs
+/// ([`crate::services::package_service::refresh_package_latest`]); this
+/// is the read-side backstop for a row that still names a version whose bytes
+/// are gone (a delete path that bypassed it, or rows written before it): the
+/// row reports its newest version with a live artifact, by the same liveness
+/// test the version list uses, instead of an install that fails. Rows whose
+/// version is live, MCP rows (decided by [`apply_mcp_catalog_views`]) and
+/// rows with no live version (already filtered out) pass through.
+async fn with_live_latest(
+    state: &SharedState,
+    mut rows: Vec<PackageRow>,
+) -> Result<Vec<PackageRow>> {
+    let ids: Vec<Uuid> = rows
+        .iter()
+        .filter(|r| r.format != "mcp")
+        .map(|r| r.id)
+        .collect();
+    if ids.is_empty() {
+        return Ok(rows);
+    }
+    let live_versions = live_package_version_predicate();
+    let sql = format!(
+        r#"
+        SELECT pv.package_id, pv.version, pv.size_bytes
+        FROM package_versions pv
+        JOIN packages p ON p.id = pv.package_id
+        JOIN repositories r ON r.id = p.repository_id
+        WHERE pv.package_id = ANY($1)
+          AND {live_versions}
+        "#
+    );
+    let live: Vec<(Uuid, String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+        .bind(&ids)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let mut by_package: std::collections::HashMap<Uuid, Vec<(String, i64)>> =
+        std::collections::HashMap::new();
+    for (id, version, size) in live {
+        by_package.entry(id).or_default().push((version, size));
+    }
+    for row in rows.iter_mut().filter(|r| r.format != "mcp") {
+        let Some(versions) = by_package.get(&row.id) else {
+            continue;
+        };
+        if versions.iter().any(|(v, _)| *v == row.version) {
+            continue;
+        }
+        if let Some((version, size)) = newest_catalog_version(versions) {
+            row.version = version.clone();
+            row.size_bytes = *size;
+        }
+    }
+    Ok(rows)
+}
+
+/// Fill each row's `download_count` from the recorded download history
+/// (#5346), one batched query for the whole page rather than one per row.
+///
+/// An MCP package (#5253) counts only the versions `auth` may list
+/// ([`mcp_visible_versions`]), the same versions its version list shows, so
+/// a reader who does not hold the registry never sees a held version's
+/// downloads. A failed lookup lists no version, so the count is `null`.
+async fn with_download_counts(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    mut rows: Vec<PackageRow>,
+) -> Result<Vec<PackageRow>> {
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let counts = package_download_counts(&state.db, &ids)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    for row in &mut rows {
+        row.download_count = counts.get(&row.id).copied().flatten();
+        if row.format != "mcp" {
+            continue;
+        }
+        if let Some(versions) = mcp_visible_versions(state, auth, row.id).await {
+            let versions: Vec<String> = versions.into_iter().collect();
+            row.download_count = package_download_count_over_versions(&state.db, row.id, &versions)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+    }
+    Ok(rows)
+}
+
+/// The MCP rows of `rows` as `auth` may see them (#5253): a row whose
+/// version is held is kept for a holder (with `metadata.servable: false`),
+/// shown to any other reader as the server's newest servable version, or left
+/// out when none is served ([`super::mcp::catalog_view`], the registry
+/// surface's own decision). Other formats pass through. Also returns how
+/// many rows were left out.
+async fn apply_mcp_catalog_views(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    rows: Vec<PackageRow>,
+) -> (Vec<PackageRow>, usize) {
+    use super::mcp::CatalogView;
+    let mut out = Vec::with_capacity(rows.len());
+    let mut hidden = 0;
+    for mut row in rows {
+        if row.format != "mcp" {
+            out.push(row);
+            continue;
+        }
+        let repo_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM repositories WHERE key = $1")
+                .bind(&row.repository_key)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
+        let view = match repo_id {
+            Some(id) => super::mcp::catalog_view(state, auth, id, &row.name, &row.version).await,
+            None => CatalogView::Hide,
+        };
+        match view {
+            CatalogView::Keep { servable } => {
+                if let Some(serde_json::Value::Object(m)) = row.metadata.as_mut() {
+                    m.insert("servable".into(), servable.into());
+                }
+                out.push(row);
+            }
+            CatalogView::Show {
+                artifact_id,
+                version,
+                description,
+                metadata,
+            } => {
+                // The figures and times are the shown version's own, never
+                // the held one's (#5253): its `package_versions` row, or its
+                // artifact when it has none. A failed read hides the row.
+                let Some(figures) =
+                    shown_version_figures(state, row.id, artifact_id, &version).await
+                else {
+                    hidden += 1;
+                    continue;
+                };
+                // The download count is filled afterwards over the versions
+                // the reader may list ([`with_download_counts`]).
+                row.size_bytes = figures.0;
+                row.created_at = figures.1;
+                row.updated_at = figures.2;
+                row.version = version;
+                row.description = description;
+                let mut metadata = metadata;
+                metadata["servable"] = true.into();
+                row.metadata = Some(metadata);
+                out.push(row);
+            }
+            CatalogView::Hide => hidden += 1,
+        }
+    }
+    (out, hidden)
+}
+
+/// `(size_bytes, created_at, updated_at)` of the version an MCP catalog row
+/// shows a reader in place of a held one: its `package_versions` row
+/// (`updated_at` is the version's own creation), else its server.json
+/// artifact. `None` on a read failure.
+async fn shown_version_figures(
+    state: &SharedState,
+    package_id: Uuid,
+    artifact_id: Uuid,
+    version: &str,
+) -> Option<(
+    i64,
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+)> {
+    let pv: Option<(i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT size_bytes, created_at FROM package_versions \
+         WHERE package_id = $1 AND version = $2",
+    )
+    .bind(package_id)
+    .bind(version)
+    .fetch_optional(&state.db)
+    .await
+    .ok()?;
+    if let Some((size, created)) = pv {
+        return Some((size, created, created));
+    }
+    sqlx::query_as("SELECT size_bytes, created_at, updated_at FROM artifacts WHERE id = $1")
+        .bind(artifact_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()?
+}
+
+/// For an MCP package, the versions `auth` may list (`None`: all of them, a
+/// holder or another format). A lookup that fails lists none (fail closed).
+async fn mcp_visible_versions(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    package_id: Uuid,
+) -> Option<std::collections::HashSet<String>> {
+    let row: Option<(Uuid, String)> = match sqlx::query_as(
+        "SELECT p.repository_id, p.name FROM packages p \
+         JOIN repositories r ON r.id = p.repository_id \
+         WHERE p.id = $1 AND r.format = 'mcp'",
+    )
+    .bind(package_id)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(row) => row,
+        Err(_) => return Some(Default::default()),
+    };
+    let (repo_id, name) = row?;
+    super::mcp::catalog_visible_versions(state, auth, repo_id, &name).await
 }
 
 #[derive(OpenApi)]
@@ -650,6 +949,23 @@ mod tests {
     use chrono::Utc;
     use serde_json;
 
+    /// #5253: when the MCP package lookup fails, an MCP package's version
+    /// list is empty (fail closed), never every version.
+    #[tokio::test]
+    async fn mcp_visible_versions_fails_closed() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
+            .expect("lazy pool");
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::api::handlers::test_db_helpers::build_state(pool, dir.path().to_str().unwrap());
+        assert_eq!(
+            mcp_visible_versions(&state, None, Uuid::new_v4()).await,
+            Some(Default::default())
+        );
+    }
+
     fn make_package_row() -> PackageRow {
         let now = Utc::now();
         PackageRow {
@@ -660,7 +976,7 @@ mod tests {
             format: "npm".to_string(),
             description: Some("A test package".to_string()),
             size_bytes: 1024,
-            download_count: 42,
+            download_count: Some(42),
             created_at: now,
             updated_at: now,
             metadata: Some(serde_json::json!({"license": "MIT"})),
@@ -748,7 +1064,7 @@ mod tests {
         PackageVersionRow {
             version: "2.0.0".to_string(),
             size_bytes: 2048,
-            download_count: 10,
+            download_count: Some(10),
             created_at: Utc::now(),
             checksum_sha256: "abc123def456".to_string(),
         }
@@ -770,7 +1086,7 @@ mod tests {
         assert_eq!(resp.format, "npm");
         assert_eq!(resp.description.as_deref(), Some("A test package"));
         assert_eq!(resp.size_bytes, 1024);
-        assert_eq!(resp.download_count, 42);
+        assert_eq!(resp.download_count, Some(42));
         assert!(resp.metadata.is_some());
     }
 
@@ -801,9 +1117,9 @@ mod tests {
     #[test]
     fn test_package_row_to_response_zero_downloads() {
         let mut row = make_package_row();
-        row.download_count = 0;
+        row.download_count = Some(0);
         let resp = PackageResponse::from(row);
-        assert_eq!(resp.download_count, 0);
+        assert_eq!(resp.download_count, Some(0));
     }
 
     // -----------------------------------------------------------------------
@@ -816,7 +1132,7 @@ mod tests {
         let resp = PackageVersionResponse::from(row);
         assert_eq!(resp.version, "2.0.0");
         assert_eq!(resp.size_bytes, 2048);
-        assert_eq!(resp.download_count, 10);
+        assert_eq!(resp.download_count, Some(10));
         assert_eq!(resp.checksum_sha256, "abc123def456");
     }
 
@@ -1042,6 +1358,361 @@ mod tests {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::http::StatusCode;
 
+        struct VirtualCatalog {
+            fixture: tdh::Fixture,
+            member_id: Uuid,
+            member_key: String,
+            member_dir: std::path::PathBuf,
+            package_id: Uuid,
+        }
+
+        impl VirtualCatalog {
+            async fn setup() -> Option<Self> {
+                Self::setup_with("local", "docker").await
+            }
+
+            async fn setup_with(member_type: &str, format: &str) -> Option<Self> {
+                let fixture = tdh::Fixture::setup("virtual", format).await?;
+                let (member_id, member_key, member_dir) =
+                    tdh::create_repo(&fixture.pool, member_type, format).await;
+                tdh::link_virtual_member(&fixture.pool, fixture.repo_id, member_id, 1).await;
+                tdh::grant_repo_access(&fixture.pool, member_id, fixture.user_id).await;
+                let package_id = seed_package(&fixture.pool, member_id).await;
+                Some(Self {
+                    fixture,
+                    member_id,
+                    member_key,
+                    member_dir,
+                    package_id,
+                })
+            }
+
+            fn auth(&self) -> AuthExtension {
+                make_auth(
+                    self.fixture.user_id,
+                    false,
+                    Some(vec![self.fixture.repo_id]),
+                )
+            }
+
+            async fn request(&self, path: String) -> (StatusCode, serde_json::Value) {
+                let (status, body) =
+                    tdh::send(app_for(&self.fixture, Some(self.auth())), tdh::get(path)).await;
+                (
+                    status,
+                    serde_json::from_slice(&body).expect("catalog response"),
+                )
+            }
+
+            async fn teardown(self) {
+                tdh::cleanup_member_repo(&self.fixture.pool, self.member_id, &self.member_dir)
+                    .await;
+                self.fixture.teardown().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn virtual_context_listing_uses_the_parent_token_scope() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            let (status, body) = f
+                .request(format!("/?repository_key={}", f.fixture.repo_key))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["pagination"]["total"], 1, "{body}");
+            assert_eq!(body["items"][0]["id"], f.package_id.to_string());
+            assert_eq!(body["items"][0]["repository_key"], f.fixture.repo_key);
+            assert!(!f.auth().can_access_repo(f.member_id));
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn virtual_context_detail_uses_the_parent_token_scope() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            let (status, body) = f
+                .request(format!(
+                    "/{}?repository_key={}",
+                    f.package_id, f.fixture.repo_key
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["repository_key"], f.fixture.repo_key);
+            assert!(!f.auth().can_access_repo(f.member_id));
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn virtual_context_versions_use_the_parent_token_scope() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            let (status, body) = f
+                .request(format!(
+                    "/{}/versions?repository_key={}",
+                    f.package_id, f.fixture.repo_key
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["versions"][0]["version"], "1.0.0");
+            assert!(!f.auth().can_access_repo(f.member_id));
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn virtual_context_does_not_authorize_direct_or_unrelated_reads() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            for path in [
+                format!("/{}", f.package_id),
+                format!("/{}/versions", f.package_id),
+                format!("/{}?repository_key={}", f.package_id, f.member_key),
+                format!("/{}?repository_key=unknown-virtual", f.package_id),
+                format!("/{}/versions?repository_key=unknown-virtual", f.package_id),
+            ] {
+                let (status, body) = f.request(path.clone()).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+            }
+            let (status, body) = f
+                .request(format!("/?repository_key={}", f.member_key))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["pagination"]["total"], 0);
+            let (other_id, other_key, other_dir) =
+                tdh::create_repo(&f.fixture.pool, "local", "docker").await;
+            tdh::grant_repo_access(&f.fixture.pool, other_id, f.fixture.user_id).await;
+            let other_package = seed_package(&f.fixture.pool, other_id).await;
+            for suffix in ["", "/versions"] {
+                let (status, body) = f
+                    .request(format!(
+                        "/{other_package}{suffix}?repository_key={}",
+                        f.fixture.repo_key
+                    ))
+                    .await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            }
+            assert!(!f.auth().can_access_repo(other_id));
+            let _ = other_key;
+            tdh::cleanup_member_repo(&f.fixture.pool, other_id, &other_dir).await;
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn virtual_context_requires_read_access_to_the_parent_and_member() {
+            for revoke_parent in [false, true] {
+                let Some(f) = VirtualCatalog::setup().await else {
+                    return;
+                };
+                sqlx::query(
+                    "DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2",
+                )
+                .bind(f.fixture.user_id)
+                .bind(if revoke_parent {
+                    f.fixture.repo_id
+                } else {
+                    f.member_id
+                })
+                .execute(&f.fixture.pool)
+                .await
+                .expect("revoke fixture grant");
+                let (status, body) = f
+                    .request(format!("/?repository_key={}", f.fixture.repo_key))
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["pagination"]["total"], 0, "{body}");
+                for suffix in ["", "/versions"] {
+                    let (status, body) = f
+                        .request(format!(
+                            "/{}{suffix}?repository_key={}",
+                            f.package_id, f.fixture.repo_key
+                        ))
+                        .await;
+                    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+                }
+                f.teardown().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn virtual_context_nested_members_and_remote_catalog_rows_are_readable() {
+            for member_type in ["local", "remote"] {
+                let Some(f) = VirtualCatalog::setup_with(member_type, "docker").await else {
+                    return;
+                };
+                let (nested_id, nested_key, nested_dir) =
+                    tdh::create_repo(&f.fixture.pool, "virtual", "docker").await;
+                sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 AND member_repo_id = $2")
+                    .bind(f.fixture.repo_id).bind(f.member_id).execute(&f.fixture.pool).await.unwrap();
+                tdh::link_virtual_member(&f.fixture.pool, f.fixture.repo_id, nested_id, 1).await;
+                tdh::link_virtual_member(&f.fixture.pool, nested_id, f.member_id, 1).await;
+                let (status, body) = f
+                    .request(format!("/?repository_key={}", f.fixture.repo_key))
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["pagination"]["total"], 1);
+                for suffix in ["", "/versions"] {
+                    let (status, body) = f
+                        .request(format!(
+                            "/{}{suffix}?repository_key={}",
+                            f.package_id, f.fixture.repo_key
+                        ))
+                        .await;
+                    assert_eq!(status, StatusCode::OK, "{body}");
+                    let (status, _) = f
+                        .request(format!(
+                            "/{}{suffix}?repository_key={nested_key}",
+                            f.package_id
+                        ))
+                        .await;
+                    assert_eq!(status, StatusCode::NOT_FOUND);
+                }
+                tdh::cleanup_member_repo(&f.fixture.pool, nested_id, &nested_dir).await;
+                f.teardown().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn virtual_context_does_not_disclose_an_unreadable_parent_to_a_member_reader() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
+                .bind(f.fixture.user_id)
+                .bind(f.fixture.repo_id)
+                .execute(&f.fixture.pool)
+                .await
+                .unwrap();
+            let auth = make_auth(f.fixture.user_id, false, None);
+            let (status, _) = tdh::send(
+                app_for(&f.fixture, Some(auth.clone())),
+                tdh::get(format!("/{}", f.package_id)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            for context in [&f.fixture.repo_key[..], "unknown-virtual"] {
+                let (status, body) = tdh::send(
+                    app_for(&f.fixture, Some(auth.clone())),
+                    tdh::get(format!("/?repository_key={context}")),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["pagination"]["total"], 0);
+                for suffix in ["", "/versions"] {
+                    let (status, body) = tdh::send(
+                        app_for(&f.fixture, Some(auth.clone())),
+                        tdh::get(format!(
+                            "/{}{suffix}?repository_key={context}",
+                            f.package_id
+                        )),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::NOT_FOUND);
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["message"],
+                        "Package not found"
+                    );
+                }
+            }
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn virtual_context_keeps_token_action_ceilings_and_denies_write_only_member_grants() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            let mut auth = f.auth();
+            auth.scopes = Some(vec!["write:artifacts".to_string()]);
+            for suffix in ["", "/versions"] {
+                let (status, _) = tdh::send(
+                    app_for(&f.fixture, Some(auth.clone())),
+                    tdh::get(format!(
+                        "/{}{suffix}?repository_key={}",
+                        f.package_id, f.fixture.repo_key
+                    )),
+                )
+                .await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+            }
+            sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
+                .bind(f.fixture.user_id)
+                .bind(f.member_id)
+                .execute(&f.fixture.pool)
+                .await
+                .unwrap();
+            tdh::grant_repo_actions(&f.fixture.pool, f.member_id, f.fixture.user_id, &["write"])
+                .await;
+            let (status, body) = f
+                .request(format!("/?repository_key={}", f.fixture.repo_key))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["pagination"]["total"], 0, "{body}");
+            let (status, _) = f
+                .request(format!(
+                    "/{}?repository_key={}",
+                    f.package_id, f.fixture.repo_key
+                ))
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn virtual_context_anonymous_and_internal_member_baselines_are_preserved() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            sqlx::query("UPDATE repositories SET visibility = 'public' WHERE id = $1 OR id = $2")
+                .bind(f.fixture.repo_id)
+                .bind(f.member_id)
+                .execute(&f.fixture.pool)
+                .await
+                .unwrap();
+            let (status, body) = tdh::send(
+                app_for(&f.fixture, None),
+                tdh::get(format!("/?repository_key={}", f.fixture.repo_key)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["pagination"]["total"],
+                1
+            );
+            sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+                .bind(f.member_id)
+                .execute(&f.fixture.pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
+                .bind(f.fixture.user_id)
+                .bind(f.member_id)
+                .execute(&f.fixture.pool)
+                .await
+                .unwrap();
+            let (status, body) = f
+                .request(format!("/?repository_key={}", f.fixture.repo_key))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["pagination"]["total"], 1);
+            let (status, _) = f.request(format!("/{}", f.package_id)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let (status, body) = tdh::send(
+                app_for(&f.fixture, None),
+                tdh::get(format!("/?repository_key={}", f.fixture.repo_key)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["pagination"]["total"],
+                0
+            );
+            f.teardown().await;
+        }
+
         /// Insert a minimal `packages` row in `repo_id` and return its id.
         ///
         /// The row is backed by a live `artifacts` row and a matching
@@ -1194,7 +1865,7 @@ mod tests {
             let Some(f) = tdh::Fixture::setup("local", "docker").await else {
                 return;
             };
-            let result = resolve_package_filter(&f.pool, None)
+            let result = resolve_package_filter(&f.pool, None, None)
                 .await
                 .expect("resolve");
             assert_eq!(
@@ -1210,7 +1881,7 @@ mod tests {
             let Some(f) = tdh::Fixture::setup("local", "docker").await else {
                 return;
             };
-            let result = resolve_package_filter(&f.pool, Some("definitely-not-a-key"))
+            let result = resolve_package_filter(&f.pool, Some("definitely-not-a-key"), None)
                 .await
                 .expect("resolve");
             assert_eq!(
@@ -1227,7 +1898,7 @@ mod tests {
             let Some(f) = tdh::Fixture::setup("local", "docker").await else {
                 return;
             };
-            let result = resolve_package_filter(&f.pool, Some(&f.repo_key))
+            let result = resolve_package_filter(&f.pool, Some(&f.repo_key), None)
                 .await
                 .expect("resolve");
             assert_eq!(
@@ -1259,9 +1930,14 @@ mod tests {
             .await
             .expect("link member into virtual repo");
 
-            let result = resolve_package_filter(&member.pool, Some(&virtual_key))
-                .await
-                .expect("resolve");
+            tdh::grant_repo_access(&member.pool, virtual_id, member.user_id).await;
+            let result = resolve_package_filter(
+                &member.pool,
+                Some(&virtual_key),
+                Some(&make_auth(member.user_id, false, None)),
+            )
+            .await
+            .expect("resolve");
             assert_eq!(
                 result.repo_ids,
                 Some(vec![member.repo_id]),
@@ -1307,6 +1983,7 @@ mod tests {
             .expect("link member into virtual repo");
 
             seed_package(&member.pool, member.repo_id).await;
+            tdh::grant_repo_access(&member.pool, virtual_id, member.user_id).await;
 
             // The fixture user holds a grant on the member, so the aggregated
             // listing (visibility applied to the member repo) surfaces it.
@@ -1325,57 +2002,6 @@ mod tests {
                     .as_str()
                     .expect("repo key"),
                 virtual_key
-            );
-
-            sqlx::query("DELETE FROM repositories WHERE id = $1")
-                .bind(virtual_id)
-                .execute(&member.pool)
-                .await
-                .expect("delete virtual repo");
-            let _ = std::fs::remove_dir_all(&virtual_dir);
-            member.teardown().await;
-        }
-
-        // -------------------------------------------------------------------
-        // package_in_virtual_repo: by-id virtual context helper
-        // -------------------------------------------------------------------
-
-        #[tokio::test]
-        async fn package_in_virtual_repo_detects_membership() {
-            let Some(member) = tdh::Fixture::setup("local", "docker").await else {
-                return;
-            };
-            let (virtual_id, virtual_key, virtual_dir) =
-                tdh::create_repo(&member.pool, "virtual", "docker").await;
-            sqlx::query(
-                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
-                 VALUES ($1, $2, 1)",
-            )
-            .bind(virtual_id)
-            .bind(member.repo_id)
-            .execute(&member.pool)
-            .await
-            .expect("link member into virtual repo");
-
-            let pkg = seed_package(&member.pool, member.repo_id).await;
-
-            assert!(
-                package_in_virtual_repo(&member.pool, pkg, &virtual_key)
-                    .await
-                    .expect("membership check"),
-                "package owned by a member is part of the virtual repo"
-            );
-            assert!(
-                !package_in_virtual_repo(&member.pool, pkg, "some-other-virtual")
-                    .await
-                    .expect("membership check"),
-                "a different virtual key must not match"
-            );
-            assert!(
-                !package_in_virtual_repo(&member.pool, pkg, &member.repo_key)
-                    .await
-                    .expect("membership check"),
-                "a hosted (non-virtual) key must not match"
             );
 
             sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -1409,6 +2035,7 @@ mod tests {
             .expect("link member into virtual repo");
 
             let pkg = seed_package(&member.pool, member.repo_id).await;
+            tdh::grant_repo_access(&member.pool, virtual_id, member.user_id).await;
             let auth = || Some(make_auth(member.user_id, false, None));
 
             // Without context: reports the owning member's key.
@@ -1617,6 +2244,85 @@ mod tests {
             f.teardown().await;
         }
 
+        /// #5632 read-side backstop: a row whose stored `packages.version`
+        /// names a version with no live artifact (soft-deleted behind the
+        /// delete hook's back) reports its newest live version as Latest, in
+        /// the listing and the detail view, and goes back once it is restored.
+        #[tokio::test]
+        async fn latest_falls_back_to_newest_live_version_5632() {
+            let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+                return;
+            };
+            let (pkg, _) = seed_backed_package(&f.pool, f.repo_id, "latest-chart", "1.0.0").await;
+            seed_backed_package(&f.pool, f.repo_id, "latest-chart", "1.1.0").await;
+            let (_, newest) =
+                seed_backed_package(&f.pool, f.repo_id, "latest-chart", "2.0.0").await;
+
+            let listed_latest = |f: &tdh::Fixture| {
+                let app = app(f);
+                let key = f.repo_key.clone();
+                async move {
+                    let (status, body) =
+                        tdh::send(app, tdh::get(format!("/?repository_key={key}"))).await;
+                    assert_eq!(status, StatusCode::OK);
+                    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    json["items"][0]["version"].as_str().unwrap().to_string()
+                }
+            };
+            let detail_latest = |f: &tdh::Fixture| {
+                let app = app(f);
+                async move {
+                    let (status, body) = tdh::send(app, tdh::get(format!("/{pkg}"))).await;
+                    assert_eq!(status, StatusCode::OK);
+                    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    json["version"].as_str().unwrap().to_string()
+                }
+            };
+            assert_eq!(listed_latest(&f).await, "2.0.0");
+
+            set_deleted(&f.pool, f.repo_id, &newest, true).await;
+            let after_listed = listed_latest(&f).await;
+            let after_detail = detail_latest(&f).await;
+            let after_versions = listed_versions(&f, pkg).await;
+
+            // Restore through the real trash restore (its object must exist).
+            let path = "latest-chart/2.0.0/asset.bin";
+            let id: Uuid = sqlx::query_scalar(
+                "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(f.repo_id)
+            .bind(path)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            f.state
+                .storage_for_repo(
+                    &tdh::make_repo_info(f.repo_id, &f.repo_key, &f.storage_dir, "local", None)
+                        .storage_location(),
+                )
+                .unwrap()
+                .put(path, bytes::Bytes::from_static(b"chart"))
+                .await
+                .unwrap();
+            crate::api::handlers::trash::trash_service(&f.state)
+                .restore(id)
+                .await
+                .expect("restore");
+            let restored = detail_latest(&f).await;
+            f.teardown().await;
+
+            assert_eq!(
+                after_listed, "1.1.0",
+                "listing Latest skips the deleted 2.0.0"
+            );
+            assert_eq!(
+                after_detail, "1.1.0",
+                "detail Latest skips the deleted 2.0.0"
+            );
+            assert_eq!(after_versions, vec!["1.1.0", "1.0.0"]);
+            assert_eq!(restored, "2.0.0", "a restore makes 2.0.0 Latest again");
+        }
+
         /// Remote repositories are exempt: proxy-cached artifacts are
         /// deliberately not written to `artifacts` (#1278/#1280) while their
         /// catalog rows are (#1999), so a liveness join must not hide them.
@@ -1637,6 +2343,246 @@ mod tests {
             let total = listed_total(&f).await;
             f.teardown().await;
             assert_eq!(total, 1, "proxy-cached catalog rows must stay listed");
+        }
+    }
+
+    /// An untracked count serializes as an explicit `null` (#5346), so a
+    /// client can tell "not tracked" from a real 0.
+    #[test]
+    fn test_untracked_download_count_serializes_as_null() {
+        let mut row = make_package_row();
+        row.download_count = None;
+        let json = serde_json::to_value(PackageResponse::from(row)).unwrap();
+        assert!(json.as_object().unwrap().contains_key("download_count"));
+        assert!(json["download_count"].is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // #5346: package and version download counts come from the recorded
+    // download history (`download_statistics`, `proxy_download_statistics`),
+    // not from the never-written `download_count` columns.
+    // -----------------------------------------------------------------------
+    mod download_counts_db {
+        use super::catalog_liveness_db::seed_backed_package;
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        fn app(f: &tdh::Fixture) -> axum::Router {
+            tdh::router_with_auth(router(), f.state.clone(), make_auth(f.user_id, false, None))
+        }
+
+        async fn get_json(f: &tdh::Fixture, path: String) -> serde_json::Value {
+            let (status, body) = tdh::send(app(f), tdh::get(path)).await;
+            assert_eq!(status, StatusCode::OK);
+            serde_json::from_slice(&body).expect("json body")
+        }
+
+        async fn package_count(f: &tdh::Fixture, pkg: Uuid) -> serde_json::Value {
+            get_json(f, format!("/{pkg}")).await["download_count"].clone()
+        }
+
+        async fn listed_count(f: &tdh::Fixture, name: &str) -> serde_json::Value {
+            let json = get_json(f, format!("/?repository_key={}", f.repo_key)).await;
+            json["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .find(|i| i["name"] == name)
+                .unwrap_or_else(|| panic!("{name} listed"))["download_count"]
+                .clone()
+        }
+
+        async fn version_counts(
+            f: &tdh::Fixture,
+            pkg: Uuid,
+        ) -> std::collections::HashMap<String, serde_json::Value> {
+            get_json(f, format!("/{pkg}/versions")).await["versions"]
+                .as_array()
+                .expect("versions")
+                .iter()
+                .map(|v| {
+                    (
+                        v["version"].as_str().unwrap().to_string(),
+                        v["download_count"].clone(),
+                    )
+                })
+                .collect()
+        }
+
+        async fn artifact_id(pool: &sqlx::PgPool, repo_id: Uuid, checksum: &str) -> Uuid {
+            sqlx::query_scalar(
+                "SELECT id FROM artifacts WHERE repository_id = $1 AND checksum_sha256 = $2",
+            )
+            .bind(repo_id)
+            .bind(checksum)
+            .fetch_one(pool)
+            .await
+            .expect("artifact id")
+        }
+
+        /// What `record_download`'s batch flush writes: one row per served body.
+        async fn record_downloads(pool: &sqlx::PgPool, artifact_id: Uuid, n: usize) {
+            for _ in 0..n {
+                sqlx::query("INSERT INTO download_statistics (artifact_id) VALUES ($1)")
+                    .bind(artifact_id)
+                    .execute(pool)
+                    .await
+                    .expect("record download");
+            }
+        }
+
+        /// One proxy serve as `proxy_catalog::record_proxy_download` writes it.
+        async fn record_proxy_download(
+            pool: &sqlx::PgPool,
+            repo_id: Uuid,
+            path: &str,
+            checksum: Option<&str>,
+            proxy_cache_id: Option<Uuid>,
+        ) {
+            sqlx::query(
+                "INSERT INTO proxy_download_statistics \
+                 (proxy_cache_id, repository_id, path, checksum_sha256) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(proxy_cache_id)
+            .bind(repo_id)
+            .bind(path)
+            .bind(checksum)
+            .execute(pool)
+            .await
+            .expect("record proxy download");
+        }
+
+        async fn seed_remote_version(
+            pool: &sqlx::PgPool,
+            repo_id: Uuid,
+            name: &str,
+            version: &str,
+            checksum: &str,
+        ) -> Uuid {
+            let pkg: Uuid = sqlx::query_scalar(
+                "INSERT INTO packages (repository_id, name, version, size_bytes) \
+                 VALUES ($1, $2, $3, 1) \
+                 ON CONFLICT (repository_id, name) DO UPDATE SET version = EXCLUDED.version \
+                 RETURNING id",
+            )
+            .bind(repo_id)
+            .bind(name)
+            .bind(version)
+            .fetch_one(pool)
+            .await
+            .expect("seed remote package");
+            sqlx::query(
+                "INSERT INTO package_versions (package_id, version, size_bytes, checksum_sha256) \
+                 VALUES ($1, $2, 1, $3)",
+            )
+            .bind(pkg)
+            .bind(version)
+            .bind(checksum)
+            .execute(pool)
+            .await
+            .expect("seed remote version");
+            pkg
+        }
+
+        /// After N downloads of a hosted package version, the version list,
+        /// the package detail and the listing all report them. A version's
+        /// count includes every file of that version (here a second asset
+        /// recorded under the same name and version), and a package with no
+        /// downloads reports a real 0, not `null`.
+        #[tokio::test]
+        async fn hosted_package_and_versions_report_recorded_downloads() {
+            let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+                return;
+            };
+            let (pkg, v1) = seed_backed_package(&f.pool, f.repo_id, "dl-chart", "1.0.0").await;
+            let (_, v2) = seed_backed_package(&f.pool, f.repo_id, "dl-chart", "2.0.0").await;
+            let (quiet, _) = seed_backed_package(&f.pool, f.repo_id, "quiet-chart", "1.0.0").await;
+            let extra: Uuid = sqlx::query_scalar(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, 'dl-chart/1.0.0/extra.bin', 'dl-chart', '1.0.0', 1, $2, \
+                 'application/octet-stream', 'dl-chart/1.0.0/extra.bin') RETURNING id",
+            )
+            .bind(f.repo_id)
+            .bind("e".repeat(64))
+            .fetch_one(&f.pool)
+            .await
+            .expect("seed second asset");
+
+            record_downloads(&f.pool, artifact_id(&f.pool, f.repo_id, &v1).await, 3).await;
+            record_downloads(&f.pool, extra, 1).await;
+            record_downloads(&f.pool, artifact_id(&f.pool, f.repo_id, &v2).await, 2).await;
+
+            let versions = version_counts(&f, pkg).await;
+            let detail = package_count(&f, pkg).await;
+            let listed = listed_count(&f, "dl-chart").await;
+            let quiet_detail = package_count(&f, quiet).await;
+            let quiet_listed = listed_count(&f, "quiet-chart").await;
+            f.teardown().await;
+
+            assert_eq!(versions["1.0.0"], 4, "1.0.0: 3 + 1 downloads of its files");
+            assert_eq!(versions["2.0.0"], 2);
+            assert_eq!(detail, 6, "package detail sums its versions");
+            assert_eq!(listed, 6, "listing reports the same count");
+            assert_eq!(quiet_detail, 0, "no downloads is a real 0");
+            assert_eq!(quiet_listed, 0);
+        }
+
+        /// A Remote package reports its pull-through serves from
+        /// `proxy_download_statistics`: rows that carry the version's digest,
+        /// and older rows with no digest that link to a cached object with it.
+        /// A version cataloged without a digest cannot be attributed and is
+        /// `null`, as is a package with only such versions.
+        #[tokio::test]
+        async fn remote_package_reports_proxy_downloads_or_null() {
+            let Some(f) = tdh::Fixture::setup("remote", "maven").await else {
+                return;
+            };
+            let digest = "a".repeat(64);
+            let pkg =
+                seed_remote_version(&f.pool, f.repo_id, "com.example:proxied", "1.0.0", &digest)
+                    .await;
+            seed_remote_version(&f.pool, f.repo_id, "com.example:proxied", "0.9.0", "").await;
+            let untracked =
+                seed_remote_version(&f.pool, f.repo_id, "com.example:streamed", "1.0.0", "").await;
+
+            let path = "com/example/proxied/1.0.0/proxied-1.0.0.jar";
+            let cache_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO proxy_cache_artifacts \
+                 (repository_id, path, storage_key, metadata_key, size_bytes, checksum_sha256) \
+                 VALUES ($1, $2, $2, $2, 1, $3) RETURNING id",
+            )
+            .bind(f.repo_id)
+            .bind(path)
+            .bind(&digest)
+            .fetch_one(&f.pool)
+            .await
+            .expect("seed proxy cache row");
+            record_proxy_download(&f.pool, f.repo_id, path, Some(&digest), Some(cache_id)).await;
+            record_proxy_download(&f.pool, f.repo_id, path, Some(&digest), None).await;
+            // Recorded before the digest column existed (#4542).
+            record_proxy_download(&f.pool, f.repo_id, path, None, Some(cache_id)).await;
+            // Another object's serve.
+            record_proxy_download(&f.pool, f.repo_id, "other.jar", Some(&"b".repeat(64)), None)
+                .await;
+
+            let versions = version_counts(&f, pkg).await;
+            let detail = package_count(&f, pkg).await;
+            let listed = listed_count(&f, "com.example:proxied").await;
+            let untracked_detail = package_count(&f, untracked).await;
+            let untracked_listed = listed_count(&f, "com.example:streamed").await;
+            f.teardown().await;
+
+            assert_eq!(versions["1.0.0"], 3, "three serves of the version's digest");
+            assert!(versions["0.9.0"].is_null(), "no digest: not tracked");
+            assert_eq!(detail, 3);
+            assert_eq!(listed, 3);
+            assert!(
+                untracked_detail.is_null(),
+                "untracked package is null, not 0"
+            );
+            assert!(untracked_listed.is_null());
         }
     }
 }

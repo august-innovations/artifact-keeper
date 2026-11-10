@@ -127,45 +127,14 @@ impl RubygemsHandler {
 
     /// Parse gemspec name (also used for gem filename without extension)
     fn parse_gemspec_name(name: &str) -> Result<(String, String, Option<String>)> {
-        // Try to find version - it starts with a digit after a hyphen
         let parts: Vec<&str> = name.split('-').collect();
+        let invalid = || AppError::Validation(format!("Invalid gem name format: {}", name));
 
-        if parts.len() < 2 {
-            return Err(AppError::Validation(format!(
-                "Invalid gem name format: {}",
-                name
-            )));
-        }
-
-        // Find where version starts
-        let mut name_parts = Vec::new();
-        let mut version_parts = Vec::new();
-        let mut found_version = false;
-
-        for part in &parts {
-            if !found_version
-                && part
-                    .chars()
-                    .next()
-                    .map(|c| c.is_ascii_digit())
-                    .unwrap_or(false)
-            {
-                found_version = true;
-            }
-
-            if found_version {
-                version_parts.push(*part);
-            } else {
-                name_parts.push(*part);
-            }
-        }
-
-        if name_parts.is_empty() || version_parts.is_empty() {
-            return Err(AppError::Validation(format!(
-                "Invalid gem name format: {}",
-                name
-            )));
-        }
+        // #4645: a gem name may itself contain a hyphen-digit segment
+        // (`qa-gem-2`), so the version starts at the LAST qualifying boundary,
+        // not the first. See `gem_version_start`.
+        let start = gem_version_start(&parts).ok_or_else(invalid)?;
+        let (name_parts, version_parts) = parts.split_at(start);
 
         let gem_name = name_parts.join("-");
 
@@ -586,6 +555,51 @@ fn parse_gemspec_dependencies(content: &str) -> Option<Vec<GemDependency>> {
     Some(deps)
 }
 
+/// OS tokens that `Gem::Platform#to_s` follows with an OS version
+/// (`x86_64-darwin-19`, `x86-mswin32-60`). A digit-leading segment right after
+/// one of these is part of the platform, not the gem version.
+const VERSIONED_PLATFORM_OS: &[&str] = &[
+    "darwin",
+    "freebsd",
+    "openbsd",
+    "netbsdelf",
+    "solaris",
+    "aix",
+    "mswin32",
+    "mswin64",
+];
+
+/// Index of the segment where the version starts in a `-`-split
+/// `<name>-<version>[-<platform>]` basename, or `None` when no segment after
+/// the first is digit-leading.
+///
+/// `Gem::Package` names a gem file `#{name}-#{version}[-#{platform}]` and the
+/// name may itself contain hyphen-digit segments, so the version starts at the
+/// LAST hyphen followed by a digit-leading segment (#4645): `qa-gem-2-1.0.0`
+/// splits as `qa-gem-2` / `1.0.0`. Two guards keep the platform out of the
+/// version: candidates stop at the first dotted digit-leading segment (a
+/// `1.15.4` is a version, never part of a name), and a digit-leading segment
+/// right after a versioned OS token (`darwin-19`) is skipped.
+fn gem_version_start(parts: &[&str]) -> Option<usize> {
+    let digit_leading = |p: &str| p.starts_with(|c: char| c.is_ascii_digit());
+    let mut best = None;
+    for (i, part) in parts.iter().enumerate().skip(1) {
+        if !digit_leading(part) {
+            continue;
+        }
+        let after_os = VERSIONED_PLATFORM_OS
+            .iter()
+            .any(|os| parts[i - 1].eq_ignore_ascii_case(os));
+        if best.is_none() || !after_os {
+            best = Some(i);
+        }
+        if part.contains('.') {
+            break;
+        }
+    }
+    best
+}
+
 /// Parse the gem name out of a `<name>-<version>[-<platform>].gem` filename.
 ///
 /// Returns `None` if the filename does not parse as a gem (no `.gem`
@@ -601,19 +615,9 @@ fn parse_gemspec_dependencies(content: &str) -> Option<Vec<GemDependency>> {
 pub(crate) fn package_name_from_gem_filename(filename: &str) -> Option<String> {
     let lowered = filename.to_ascii_lowercase();
     let without_ext = lowered.strip_suffix(".gem")?;
-    for (i, _) in without_ext.match_indices('-') {
-        if without_ext
-            .get(i + 1..)
-            .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()))
-        {
-            let candidate = &without_ext[..i];
-            if is_valid_rubygems_name(candidate) {
-                return Some(candidate.to_string());
-            }
-            return None;
-        }
-    }
-    None
+    let parts: Vec<&str> = without_ext.split('-').collect();
+    let candidate = parts[..gem_version_start(&parts)?].join("-");
+    is_valid_rubygems_name(&candidate).then_some(candidate)
 }
 
 /// Split a stored gem filename (`<name>-<version>(-<platform>)?.gem`) into the
@@ -696,6 +700,10 @@ impl FormatHandler for RubygemsHandler {
             if let Ok(Ok(gemspec)) = crate::util::bounded_archive::with_ingest_extraction(|| {
                 Self::extract_gemspec(content)
             }) {
+                // #4645: the gemspec is authoritative for coordinates; the
+                // filename split is only a fallback when it cannot be read.
+                metadata["name"] = serde_json::Value::String(gemspec.name.clone());
+                metadata["version"] = serde_json::Value::String(gemspec.version.clone());
                 metadata["gemspec"] = serde_json::to_value(&gemspec)?;
             }
         }
@@ -2387,6 +2395,52 @@ summary: A summary
         assert_eq!(
             coordinates_from_gem_filename("aws-sdk-s3-1.140.0.gem"),
             Some(("aws-sdk-s3".to_string(), "1.140.0".to_string()))
+        );
+    }
+
+    /// #4645: a gem name may itself contain a hyphen-digit segment
+    /// (`qa-gem-2`), so the version starts at the LAST hyphen followed by a
+    /// digit-leading segment, not the first. A platform suffix carrying an OS
+    /// version (`x86_64-darwin-19`) must not be mistaken for the version.
+    #[test]
+    fn test_coordinates_from_gem_filename_table_4645() {
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            ("qa-gem-2-1.0.0.gem", Some(("qa-gem-2", "1.0.0"))),
+            ("my-gem-2-1.0.0.gem", Some(("my-gem-2", "1.0.0"))),
+            ("rails-7.1.0.beta1.gem", Some(("rails", "7.1.0.beta1"))),
+            ("rails-7.0.8.gem", Some(("rails", "7.0.8"))),
+            ("aws-sdk-s3-1.140.0.gem", Some(("aws-sdk-s3", "1.140.0"))),
+            ("oauth2-2.0.9.gem", Some(("oauth2", "2.0.9"))),
+            ("net-http2-0-1.2.3.gem", Some(("net-http2-0", "1.2.3"))),
+            (
+                "nokogiri-1.15.4-x86_64-linux.gem",
+                Some(("nokogiri", "1.15.4")),
+            ),
+            (
+                "libv8-8.4.255.0-x86_64-darwin-19.gem",
+                Some(("libv8", "8.4.255.0")),
+            ),
+            ("ffi-1.15.5-java.gem", Some(("ffi", "1.15.5"))),
+            ("archive.tar.gz", None),
+            ("noversion.gem", None),
+        ];
+        for (filename, want) in cases {
+            let got = coordinates_from_gem_filename(filename);
+            let want = want.map(|(n, v)| (n.to_string(), v.to_string()));
+            assert_eq!(got, want, "coordinates for {filename}");
+        }
+    }
+
+    /// #4645: the shadowing-guard name parser follows the same rule.
+    #[test]
+    fn test_package_name_from_gem_filename_hyphen_digit_name_4645() {
+        assert_eq!(
+            package_name_from_gem_filename("qa-gem-2-1.0.0.gem").as_deref(),
+            Some("qa-gem-2")
+        );
+        assert_eq!(
+            package_name_from_gem_filename("libv8-8.4.255.0-x86_64-darwin-19.gem").as_deref(),
+            Some("libv8")
         );
     }
 

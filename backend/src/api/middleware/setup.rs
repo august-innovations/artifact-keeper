@@ -104,17 +104,20 @@ mod tests {
     /// message; REST routes keep the instructional SETUP_REQUIRED body.
     #[tokio::test]
     async fn setup_guard_emits_oci_envelope_on_v2_and_rest_shape_elsewhere() {
-        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+        // Own database: the gate is keyed on the built-in `admin` username
+        // (#4634), which the shared unit-test database may already hold.
+        let Some(iso) = crate::testing::try_isolated_pool().await else {
             return;
         };
-        // Seed the DB-side condition `setup_still_required` re-checks: an
-        // admin account that must still change its password.
-        let admin = format!("setup-guard-admin-{}", uuid::Uuid::new_v4().simple());
+        let pool = iso.pool.clone();
+        // Seed the DB-side condition `setup_still_required` re-checks: the
+        // built-in admin account must still change its password.
+        let admin = crate::api::BUILTIN_ADMIN_USERNAME;
         sqlx::query(
             "INSERT INTO users (username, email, password_hash, is_admin, must_change_password) \
              VALUES ($1, $2, 'x', true, true)",
         )
-        .bind(&admin)
+        .bind(admin)
         .bind(format!("{admin}@test.local"))
         .execute(&pool)
         .await
@@ -163,7 +166,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM users WHERE username = $1")
-            .bind(&admin)
+            .bind(admin)
             .execute(&pool)
             .await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -175,15 +178,16 @@ mod tests {
     /// before refusing a request, so it has to agree with login.
     #[tokio::test]
     async fn setup_still_required_ignores_inactive_admin_3723() {
-        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+        let Some(iso) = crate::testing::try_isolated_pool().await else {
             return;
         };
-        let admin = format!("setup-3723-admin-{}", uuid::Uuid::new_v4().simple());
+        let pool = iso.pool.clone();
+        let admin = crate::api::BUILTIN_ADMIN_USERNAME;
         sqlx::query(
             "INSERT INTO users (username, email, password_hash, is_admin, must_change_password, is_active) \
              VALUES ($1, $2, 'x', true, true, false)",
         )
-        .bind(&admin)
+        .bind(admin)
         .bind(format!("{admin}@test.local"))
         .execute(&pool)
         .await
@@ -200,7 +204,7 @@ mod tests {
 
         // Control: the same row, active, still gates.
         sqlx::query("UPDATE users SET is_active = true WHERE username = $1")
-            .bind(&admin)
+            .bind(admin)
             .execute(&pool)
             .await
             .expect("reactivate admin");
@@ -210,7 +214,7 @@ mod tests {
         // Clean up BEFORE asserting: a leaked local pending admin poisons
         // every later run of the bin-side provisioning test on this DB.
         let _ = sqlx::query("DELETE FROM users WHERE username = $1")
-            .bind(&admin)
+            .bind(admin)
             .execute(&pool)
             .await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -236,15 +240,16 @@ mod tests {
     /// and on `main` it was gated along with everything else.
     #[tokio::test]
     async fn setup_guard_passes_authenticated_request_with_inactive_admin_3723() {
-        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+        let Some(iso) = crate::testing::try_isolated_pool().await else {
             return;
         };
-        let admin = format!("setup-3723-admin-{}", uuid::Uuid::new_v4().simple());
+        let pool = iso.pool.clone();
+        let admin = crate::api::BUILTIN_ADMIN_USERNAME;
         sqlx::query(
             "INSERT INTO users (username, email, password_hash, is_admin, must_change_password, is_active) \
              VALUES ($1, $2, 'x', true, true, false)",
         )
-        .bind(&admin)
+        .bind(admin)
         .bind(format!("{admin}@test.local"))
         .execute(&pool)
         .await
@@ -282,7 +287,7 @@ mod tests {
 
         // Clean up BEFORE asserting (see the sibling test).
         let _ = sqlx::query("DELETE FROM users WHERE username = $1 OR id = $2")
-            .bind(&admin)
+            .bind(admin)
             .bind(sso_id)
             .execute(&pool)
             .await;
@@ -296,11 +301,15 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "body: {body}");
     }
 
-    /// Seed a local admin with a pending password change and the given
-    /// `is_active`, returning its id. Callers delete it by id.
-    async fn seed_pending_local_admin(pool: &sqlx::PgPool, is_active: bool) -> uuid::Uuid {
+    /// Seed a local admin named `name` with a pending password change and the
+    /// given `is_active`, returning its id. Callers delete it by id.
+    async fn seed_pending_local_admin(
+        pool: &sqlx::PgPool,
+        name: &str,
+        is_active: bool,
+    ) -> uuid::Uuid {
         let id = uuid::Uuid::new_v4();
-        let name = format!("setup-3723-admin-{}", id.simple());
+        let name = name.to_owned();
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, \
                                 must_change_password, is_active) \
@@ -352,10 +361,12 @@ mod tests {
     /// is refused again, rather than only at the next restart.
     #[tokio::test]
     async fn setup_guard_rearms_when_pending_admin_is_reactivated_3723() {
-        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+        let Some(iso) = crate::testing::try_isolated_pool().await else {
             return;
         };
-        let admin_id = seed_pending_local_admin(&pool, false).await;
+        let pool = iso.pool.clone();
+        let admin_id =
+            seed_pending_local_admin(&pool, crate::api::BUILTIN_ADMIN_USERNAME, false).await;
         let sso_id = seed_oidc_admin(&pool).await;
 
         let dir = std::env::temp_dir().join(format!("ak-setup-3723-{}", uuid::Uuid::new_v4()));
@@ -419,7 +430,8 @@ mod tests {
         let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
             return;
         };
-        let admin_id = seed_pending_local_admin(&pool, true).await;
+        let admin_name = format!("setup-3723-admin-{}", uuid::Uuid::new_v4().simple());
+        let admin_id = seed_pending_local_admin(&pool, &admin_name, true).await;
 
         let dir = std::env::temp_dir().join(format!("ak-setup-3723-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -452,6 +464,67 @@ mod tests {
             status,
             StatusCode::PRECONDITION_REQUIRED,
             "a pending admin must be 428'd on an admin route, got {status}: {body}"
+        );
+    }
+
+    /// #4634: the gate belongs to the built-in `admin` alone. Other admins
+    /// created with a temporary password and not yet logged in must neither
+    /// keep an armed gate up once `admin` has rotated, nor arm it themselves.
+    #[tokio::test]
+    async fn setup_still_required_tracks_only_builtin_admin_4634() {
+        let Some(iso) = crate::testing::try_isolated_pool().await else {
+            return;
+        };
+        let pool = iso.pool.clone();
+        let dir = std::env::temp_dir().join(format!("ak-setup-4634-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state =
+            crate::api::handlers::test_db_helpers::build_state(pool.clone(), dir.to_str().unwrap());
+
+        // Built-in admin rotated; two other admins still hold a temporary
+        // password.
+        let admin = crate::api::BUILTIN_ADMIN_USERNAME;
+        sqlx::query(
+            "INSERT INTO users (username, email, password_hash, auth_provider, is_admin, \
+                                must_change_password) \
+             VALUES ($1, $2, 'x', 'local', true, false)",
+        )
+        .bind(admin)
+        .bind(format!("{admin}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("seed built-in admin");
+        let other_a = seed_pending_local_admin(&pool, "pending-a-4634", true).await;
+        let other_b = seed_pending_local_admin(&pool, "pending-b-4634", true).await;
+
+        state.setup_required.store(true, Ordering::Relaxed);
+        let others_only_required = state.setup_still_required().await;
+        let latched_off = !state.setup_required.load(Ordering::Relaxed);
+
+        // Control: the same state with `admin` itself pending still gates.
+        sqlx::query("UPDATE users SET must_change_password = true WHERE username = $1")
+            .bind(admin)
+            .execute(&pool)
+            .await
+            .expect("flag built-in admin");
+        state.setup_required.store(true, Ordering::Relaxed);
+        let builtin_still_required = state.setup_still_required().await;
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1 OR id = $2")
+            .bind(other_a)
+            .bind(other_b)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !others_only_required,
+            "pending non-built-in admins must not hold the gate once `admin` has rotated"
+        );
+        assert!(latched_off, "the re-check latches the flag off");
+        assert!(
+            builtin_still_required,
+            "a pending built-in admin still gates"
         );
     }
 }

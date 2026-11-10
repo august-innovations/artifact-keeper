@@ -39,6 +39,7 @@ use crate::api::handlers::cache_headers::{
     negotiated_cacheable_response, VARY_ACCEPT,
 };
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
+use crate::api::handlers::proxy_helpers::AgeGateOutcome;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
@@ -47,7 +48,7 @@ use crate::error::AppError;
 use crate::formats::pypi::{is_wheel_core_metadata_entry, PkgInfo, PypiHandler};
 use crate::formats::pypi_name::{NormalizedProjectName, PEP508_NAME_PATTERN};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
-use crate::services::age_gate_service::AgeGateService;
+use crate::services::age_gate_service::{AgeGateService, UpstreamVersionEvidence};
 use crate::services::metrics_service::{record_pypi_simple_cache_lookup, PYPI_SIMPLE_CACHE_ROUTE};
 use crate::services::pypi_simple_cache::{
     simple_cache_decision, CacheMode, CachedSimplePage, LookupOutcome, PypiSimpleCacheKey,
@@ -535,7 +536,7 @@ async fn fetch_remote_simple_root(
     if content.len() > MAX_SIMPLE_ROOT_BODY_BYTES {
         warn!(
             repo_key = %repo_key,
-            upstream = %effective_upstream,
+            upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&effective_upstream),
             body_bytes = content.len(),
             cap_bytes = MAX_SIMPLE_ROOT_BODY_BYTES,
             "upstream PEP 503 root index exceeds size cap; skipping parse. \
@@ -889,7 +890,7 @@ async fn simple_project(
 
     // PEP 691 content negotiation also governs the proxy path: a JSON client
     // must get the upstream's JSON representation (which carries PEP 700
-    // `upload-time`), not its HTML index (which never does). HTML and JSON
+    // `upload-time`), not its HTML index (which rarely does). HTML and JSON
     // are separate cache entries.
     let wants_json = wants_pypi_simple_json(&headers);
     let mode = simple_cache_decision(state.config.pypi_simple_cache_ttl_secs, &repo.format);
@@ -2090,7 +2091,8 @@ async fn serve_virtual_metadata(
     }
 
     let members =
-        proxy_helpers::authorize_virtual_members(&state.db, auth, virtual_repo.id, members).await;
+        proxy_helpers::try_authorize_virtual_members(&state.db, auth, virtual_repo.id, members)
+            .await?;
     // #3452: a fully-filtered member set must answer the SAME body the
     // genuinely-empty set above answers, or the pair is an existence oracle
     // over the private members this virtual aggregates.
@@ -2320,7 +2322,12 @@ async fn serve_remote_metadata(
     //
     // A probe error counts as a miss, so a cache fault degrades to a refetch
     // rather than failing the request.
-    if let Ok(Some((content, _content_type, content_encoding))) = proxy
+    if let Ok(Some(proxy_helpers::CachedBody {
+        content,
+        content_type: _,
+        content_encoding,
+        stale_since,
+    })) = proxy
         .cached_metadata_if_servable(
             &proxy_helpers::build_remote_repo_with_format(
                 repo_id,
@@ -2335,6 +2342,7 @@ async fn serve_remote_metadata(
         return Ok(pep658_metadata_response(
             content,
             content_encoding.as_deref(),
+            stale_since,
         ));
     }
 
@@ -2371,9 +2379,15 @@ async fn serve_remote_metadata(
         )
         .await
     {
-        Ok((content, _content_type, content_encoding)) => Ok(pep658_metadata_response(
+        Ok(proxy_helpers::CachedBody {
+            content,
+            content_type: _,
+            content_encoding,
+            stale_since,
+        }) => Ok(pep658_metadata_response(
             content,
             content_encoding.as_deref(),
+            stale_since,
         )),
         // A missing sidecar falls back to the wheel. 403 counts as missing
         // here only (#3886): CloudFront/S3 answer an absent key with 403, and
@@ -2462,7 +2476,7 @@ async fn serve_remote_metadata(
                 AppError::NotFound("Metadata not available".to_string()).into_response()
             })?;
             // Extracted here, so the bytes are plain: no coding to declare.
-            Ok(pep658_metadata_response(Bytes::from(metadata), None))
+            Ok(pep658_metadata_response(Bytes::from(metadata), None, None))
         }
         Err(error) => Err(error.into_response()),
     }
@@ -2493,13 +2507,18 @@ fn wheel_matches_index_digest(wheel: &[u8], expected_sha256: Option<&str>) -> bo
 /// Shared by every arm that produces a sidecar (cache hit, upstream fetch,
 /// wheel extraction) so one resource carries identical headers whichever
 /// served it.
-fn pep658_metadata_response(content: Bytes, content_encoding: Option<&str>) -> Response {
+fn pep658_metadata_response(
+    content: Bytes,
+    content_encoding: Option<&str>,
+    stale_since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Response {
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8");
     if let Some(enc) = content_encoding {
         builder = builder.header(CONTENT_ENCODING, enc);
     }
+    let builder = proxy_helpers::apply_stale_markers(builder, stale_since);
     builder.body(Body::from(content)).unwrap()
 }
 
@@ -2518,8 +2537,25 @@ fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
 /// spellings of one request could address two different cache entries -- or,
 /// worse, one spelling could address the entry another package's bytes were
 /// written under. The newtype makes that unrepresentable.
+///
+/// The key of [`pypi_file_serve_key`], so every PyPI proxy-cache key goes
+/// through the shared helper (#4365 item 1).
 fn build_pypi_proxy_cache_path(project: &NormalizedProjectName, filename: &str) -> String {
-    format!("simple/{}/{}", project.as_str(), filename)
+    pypi_file_serve_key(project, filename).cache_key
+}
+
+/// The canonical `(cache_key, scannable)` decision for a proxied PyPI file
+/// (#4365 item 1), cached under `simple/{project}/{filename}`. Every
+/// distribution is a package; a PEP 658 `.metadata` sidecar (the core
+/// metadata the resolver reads, served by its own route) is not.
+fn pypi_file_serve_key(
+    project: &NormalizedProjectName,
+    filename: &str,
+) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::proxy_serve_key(
+        &format!("simple/{}/{}", project.as_str(), filename),
+        |file| !file.to_ascii_lowercase().ends_with(".metadata"),
+    )
 }
 
 /// Apply the age-gate listing filter to a rewritten PEP 691 JSON simple
@@ -2615,14 +2651,17 @@ async fn filter_pypi_simple_html_response(
         let Ok(client) = metadata_http_client() else {
             return html;
         };
-        let Ok(times) = svc
+        match svc
             .metadata_cache()
             .fetch_pypi_publish_times(&client, repo.id, effective_upstream, project)
             .await
-        else {
-            return html;
-        };
-        times
+        {
+            Ok(times) => times,
+            // No JSON API, but the index dates its own files (#5151). The
+            // download reads the same attribute, so the two stay in step.
+            Err(_) if html.contains("data-upload-time=") => std::collections::HashMap::new(),
+            Err(_) => return html,
+        }
     } else {
         std::collections::HashMap::new()
     };
@@ -2635,18 +2674,151 @@ async fn filter_pypi_simple_html_response(
     }
 }
 
+/// `Accept` for the age gate's simple-index read: the PEP 691 representation
+/// is the one with PEP 700 `upload-time`, and HTML is every upstream's floor.
+const PYPI_GATE_INDEX_ACCEPT: &str = "application/vnd.pypi.simple.v1+json, text/html;q=0.9";
+
+/// PEP 629's marker, the one thing a simple-index HTML page carries when it
+/// has no files to identify it by.
+const PEP629_REPOSITORY_VERSION_META: &str = "pypi:repository-version";
+
+/// Read one version's evidence out of an upstream simple-index body.
+///
+/// Only a document that is about this project can say "not hosted", because a
+/// 200 from an upstream may be a login page or a captive proxy whose links
+/// happen to parse as distribution filenames. So only files named for this
+/// project count, and the document has to show it is this project's index:
+///
+/// - a file of this project with a PEP 440 version, or
+/// - no files at all and an identifying mark: PEP 691's `name`, or PEP 629's
+///   meta tag on a page with no anchors. A bare empty page has neither, so it
+///   stays no answer and fails closed.
+///
+/// A filename mentioned anywhere else in the body (a yank reason, a file the
+/// parse could not read) is also no answer. The name is the client's, so it
+/// must not count as a listing or it could start a `first_seen` clock on a
+/// version nobody published.
+fn pypi_index_version_evidence(
+    body: &[u8],
+    repo_key: &str,
+    project: &str,
+    filename: &str,
+    version: &str,
+) -> UpstreamVersionEvidence {
+    use crate::services::age_gate_service::{
+        collect_pypi_simple_json_versions, parse_pypi_project_index_anchors,
+        parse_pypi_simple_index_anchors, pypi_filename_names_project, pypi_listed_version,
+    };
+
+    let text = String::from_utf8_lossy(body);
+    let (versions, identified_empty) = match sniff_simple_index(body) {
+        SniffedSimpleIndex::Json => {
+            let Ok(mut doc) = serde_json::from_slice::<serde_json::Value>(body) else {
+                return UpstreamVersionEvidence::Unknown;
+            };
+            let name = doc
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(PypiHandler::normalize_name);
+            if name.as_deref().is_some_and(|name| name != project) {
+                return UpstreamVersionEvidence::Unknown;
+            }
+            let Some(files) = doc.get_mut("files").and_then(|f| f.as_array_mut()) else {
+                return UpstreamVersionEvidence::Unknown;
+            };
+            let identified_empty = files.is_empty() && name.is_some();
+            files.retain(|file| {
+                file.get("filename")
+                    .and_then(|f| f.as_str())
+                    .is_some_and(|f| pypi_filename_names_project(f, project))
+            });
+            (collect_pypi_simple_json_versions(&doc), identified_empty)
+        }
+        SniffedSimpleIndex::Html => {
+            let html = rewrite_upstream_urls(&text, repo_key, project);
+            let (anchors, _) = parse_pypi_simple_index_anchors(&html);
+            (
+                parse_pypi_project_index_anchors(&html, project),
+                anchors.is_empty() && text.contains(PEP629_REPOSITORY_VERSION_META),
+            )
+        }
+        SniffedSimpleIndex::Binary => return UpstreamVersionEvidence::Unknown,
+    };
+    if let Some(published_at) = pypi_listed_version(&versions, version) {
+        return UpstreamVersionEvidence::Listed(published_at);
+    }
+    let lists_a_release = versions
+        .iter()
+        .any(|(listed, _)| PypiHandler::pep440_sort_key(listed).is_some());
+    if text.contains(filename) || !(lists_a_release || identified_empty) {
+        return UpstreamVersionEvidence::Unknown;
+    }
+    UpstreamVersionEvidence::NotHosted
+}
+
+/// What a Remote's upstream says about `version`.
+///
+/// The Warehouse JSON API comes first, so an upstream that has one pays no
+/// extra read. Its failure says nothing about the package: an index with no
+/// such endpoint answers 404 or 403 for projects it hosts (#5151). The simple
+/// index is the document every PyPI upstream serves, so it dates the version
+/// when it can and is the only source of "not hosted" (#5150). It is read from
+/// the upstream itself, with the Remote's configured credentials, and never
+/// from the proxy cache; see [`proxy_helpers::age_gate_upstream_evidence`].
+async fn pypi_version_evidence(
+    state: &SharedState,
+    repo: &RepoInfo,
+    project: &NormalizedProjectName,
+    filename: &str,
+    version: &str,
+) -> UpstreamVersionEvidence {
+    let Some(upstream_url) = &repo.upstream_url else {
+        return UpstreamVersionEvidence::Unknown;
+    };
+    if let (Some(svc), Ok(client)) = (state.age_gate_service.as_deref(), metadata_http_client()) {
+        let published_at = svc
+            .metadata_cache()
+            .fetch_pypi_publish_times(&client, repo.id, upstream_url, project.as_str())
+            .await
+            .ok()
+            .and_then(|times| {
+                crate::services::age_gate_service::pypi_publish_time(&times, version)
+            });
+        if published_at.is_some() {
+            return UpstreamVersionEvidence::Listed(published_at);
+        }
+    }
+    let Some(proxy) = &state.proxy_service else {
+        return UpstreamVersionEvidence::Unknown;
+    };
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
+    let (effective_upstream, upstream_path) =
+        pypi_upstream_url_and_path(upstream_url, &format!("{}/", project.as_str()), &index_path);
+    proxy_helpers::age_gate_upstream_evidence(
+        proxy,
+        repo.id,
+        &repo.key,
+        &effective_upstream,
+        &upstream_path,
+        Some(PYPI_GATE_INDEX_ACCEPT),
+        |body| pypi_index_version_evidence(body, &repo.key, project.as_str(), filename, version),
+    )
+    .await
+}
+
 async fn apply_pypi_download_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
-    project: &str,
+    project: &NormalizedProjectName,
     filename: &str,
-) -> Result<Option<String>, Response> {
+    as_virtual_member: bool,
+) -> Result<AgeGateOutcome<String>, Response> {
     // Cheap struct-derived pre-check, then DB-resolve the authoritative
     // policy (mode + upstream identity) by id — struct-derived params can
     // carry a stale or defaulted mode (e.g. a virtual member's RepoInfo),
     // and gate policy is enforcement input (#2264).
     if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
-        return Ok(None);
+        return Ok(AgeGateOutcome::Allowed);
     }
     let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
         .await
@@ -2658,71 +2830,107 @@ async fn apply_pypi_download_age_gate(
         AppError::Validation("Missing version in filename".to_string()).into_response()
     })?;
 
-    let svc = state.age_gate_service.as_deref();
-    // Publish-time evidence from the project's upstream JSON metadata; under
-    // `first_seen` the time itself is ignored, but presence in the document
-    // is the existence evidence that may start the observation clock.
-    let published_at = if let (Some(svc), Some(upstream_url), Ok(client)) =
-        (svc, &repo.upstream_url, metadata_http_client())
-    {
-        svc.metadata_cache()
-            .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
-            .await
-            .ok()
-            .and_then(|times| times.get(&version).copied())
+    // Publish-time evidence from the upstream; under `first_seen` the time
+    // itself is ignored, but a listing is the existence evidence that may
+    // start the observation clock. A threshold of 0 needs neither, so it never
+    // waits on the upstream (#5151).
+    let evidence = if params.age_gate_min_age_days > 0 {
+        pypi_version_evidence(state, repo, project, filename, &version).await
     } else {
-        None
-    };
-    let basis = match svc {
-        Some(svc) => svc
-            .download_basis(
-                &params,
-                project,
-                &version,
-                published_at,
-                published_at.is_some(),
-            )
-            .await
-            .map_err(|e| e.into_response())?,
-        None => published_at,
+        UpstreamVersionEvidence::Unknown
     };
 
     // The shared seam (#2264) owns the decision and the terminal 451; only
     // the LKG wheel-filename substitution below is pypi-specific.
-    let lkg = proxy_helpers::enforce_age_gate(svc, &params, project, &version, basis).await?;
-    Ok(lkg.map(|blocked| {
-        pypi_lkg_filename_from_artifact_path(&blocked.last_known_good.artifact_path)
-    }))
+    Ok(
+        match proxy_helpers::decide_download_age_gate(
+            state.age_gate_service.as_deref(),
+            &params,
+            project.as_str(),
+            &version,
+            evidence,
+            as_virtual_member,
+        )
+        .await?
+        {
+            AgeGateOutcome::Allowed => AgeGateOutcome::Allowed,
+            AgeGateOutcome::NotHosted => AgeGateOutcome::NotHosted,
+            AgeGateOutcome::Substitute(blocked) => AgeGateOutcome::Substitute(
+                pypi_lkg_filename_from_artifact_path(&blocked.last_known_good.artifact_path),
+            ),
+        },
+    )
 }
 
 /// Run the remote-PyPI download age gate and, when the requested version is
 /// withheld, resolve the response the caller should return: the last-known-good
-/// wheel served via the proxy cache (presigned redirect / cache stream /
-/// upstream refetch), or the 451 block propagated as an `Err`.
+/// wheel (through the scan gate when the repository scans on proxy, otherwise
+/// via the proxy cache: presigned redirect / cache stream / upstream
+/// refetch), or the 451 block propagated as an `Err`.
 ///
-/// Returns `Ok(Some(response))` when the gate handled the request and
-/// `Ok(None)` when the version is allowed and the caller should keep serving
-/// normally. Shared by both the cache-miss and the local-`artifacts`-hit
+/// Returns `Substitute(response)` when the gate handled the request and
+/// `Allowed` when the version is allowed and the caller should keep serving
+/// normally. `NotHosted` is only for a Virtual member (`virtual_id` is `Some`)
+/// whose upstream does not host the version: the caller skips the member
+/// (#5150). Shared by both the cache-miss and the local-`artifacts`-hit
 /// branches of `serve_file` so a young version is never streamed just because a
 /// local row exists (parity with npm's unconditional `serve_tarball` gate).
+///
+/// When `repo` scans on proxy, the substitute is served through the scan gate
+/// ([`serve_scanned_pypi_file`]) exactly as a requested file would be, never
+/// through the unscanned redirect / stream / refetch below. `virtual_id` names
+/// the Virtual repository when `repo` is one of its members, so the
+/// stricter-of-two policy applies as it does to the member's other files.
 async fn enforce_pypi_download_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
     repo_key: &str,
     project: &NormalizedProjectName,
     filename: &str,
+    virtual_id: Option<uuid::Uuid>,
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
-) -> Result<Option<Response>, Response> {
+) -> Result<AgeGateOutcome<Response>, Response> {
     let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
         (Some(u), Some(p)) => (u, p),
-        _ => return Ok(None),
+        _ => return Ok(AgeGateOutcome::Allowed),
     };
 
     let lkg_filename =
-        match apply_pypi_download_age_gate(state, repo, project.as_str(), filename).await? {
-            Some(lkg) => lkg,
-            None => return Ok(None),
+        match apply_pypi_download_age_gate(state, repo, project, filename, virtual_id.is_some())
+            .await?
+        {
+            AgeGateOutcome::Substitute(lkg) => lkg,
+            AgeGateOutcome::Allowed => return Ok(AgeGateOutcome::Allowed),
+            AgeGateOutcome::NotHosted => return Ok(AgeGateOutcome::NotHosted),
         };
+
+    // The substitute is a download like any other: a repository that scans
+    // on proxy serves it through the scan gate.
+    let scan = match virtual_id {
+        Some(virtual_id) => {
+            proxy_helpers::effective_virtual_scan_policy(&state.db, virtual_id, repo.id).await?
+        }
+        None if repo.repo_type == RepositoryType::Remote => {
+            proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+        }
+        None => None,
+    };
+    if let Some((action, severity_gate)) = scan {
+        return serve_scanned_pypi_file(
+            state,
+            proxy,
+            repo.id,
+            repo_key,
+            upstream_url,
+            project,
+            &lkg_filename,
+            action,
+            severity_gate,
+            ctx,
+        )
+        .await
+        .map(AgeGateOutcome::Substitute);
+    }
 
     // The gate above and this cache key are now the SAME string by
     // construction (#3186); they used to be `project` and
@@ -2739,7 +2947,7 @@ async fn enforce_pypi_download_age_gate(
         // Without this, whether a cache hit counted depended on nothing but
         // `presigned_downloads_enabled`.
         record_lkg_proxy_download(state, repo.id, repo_key, &lkg_cache_path, ctx).await;
-        return Ok(Some(redirect));
+        return Ok(AgeGateOutcome::Substitute(redirect));
     }
     if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
         proxy,
@@ -2753,7 +2961,10 @@ async fn enforce_pypi_download_age_gate(
     {
         // #3649: a warm cache hit is a served download.
         record_lkg_proxy_download(state, repo.id, repo_key, &lkg_cache_path, ctx).await;
-        return Ok(Some(build_streaming_file_response(&lkg_filename, result)));
+        return Ok(AgeGateOutcome::Substitute(build_streaming_file_response(
+            &lkg_filename,
+            result,
+        )));
     }
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
     let result = fetch_from_pypi_remote_streaming(
@@ -2765,11 +2976,15 @@ async fn enforce_pypi_download_age_gate(
         &lkg_filename,
         &index_path,
         RepositoryFormat::Pypi,
+        ctx.is_some_and(|c| c.is_head),
     )
     .await?;
     // #3649: and so is the cold fetch that substituted it.
     record_lkg_proxy_download(state, repo.id, repo_key, &lkg_cache_path, ctx).await;
-    Ok(Some(build_streaming_file_response(&lkg_filename, result)))
+    Ok(AgeGateOutcome::Substitute(build_streaming_file_response(
+        &lkg_filename,
+        result,
+    )))
 }
 
 /// Record a last-known-good substitution served by
@@ -2833,6 +3048,12 @@ async fn serve_file(
     auth: Option<&AuthExtension>,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    // #4365 item 3: the file name is joined into the upstream path and keys
+    // the proxy cache.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[filename],
+    )?;
     // Find artifact by filename (last path segment matches)
     let artifact = sqlx::query!(
         r#"
@@ -2861,12 +3082,13 @@ async fn serve_file(
                     // Enforce the download age gate before any proxy fetch, and
                     // serve the last-known-good wheel if the requested version is
                     // withheld. Shared with the local-`artifacts`-hit branch below.
-                    if let Some(resp) = enforce_pypi_download_age_gate(
+                    if let AgeGateOutcome::Substitute(resp) = enforce_pypi_download_age_gate(
                         state,
                         repo,
                         repo_key,
                         project,
                         filename,
+                        None,
                         Some(ctx),
                     )
                     .await?
@@ -2881,15 +3103,9 @@ async fn serve_file(
                     // which serve bytes without consulting a scan verdict. Repos
                     // that have not enabled scan-on-proxy skip this entirely and
                     // keep today's untouched streaming behavior (no regression).
-                    if crate::services::scan_config_service::ScanConfigService::new(
-                        state.db.clone(),
-                    )
-                    .is_proxy_scan_enabled(repo.id)
-                    .await
-                    .unwrap_or(false)
+                    if let Some((action, severity_gate)) =
+                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
                     {
-                        let (action, severity_gate) =
-                            proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                         return serve_scanned_pypi_file(
                             state,
                             proxy,
@@ -2900,7 +3116,7 @@ async fn serve_file(
                             filename,
                             action,
                             severity_gate,
-                            ctx,
+                            Some(ctx),
                         )
                         .await;
                     }
@@ -2977,6 +3193,7 @@ async fn serve_file(
                         filename,
                         &index_path,
                         RepositoryFormat::Pypi,
+                        ctx.is_head,
                     )
                     .await?;
 
@@ -3019,8 +3236,8 @@ async fn serve_file(
                 // is never leaked. Routes through the SAME helper the Maven
                 // download path uses.
                 let members =
-                    proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members)
-                        .await;
+                    proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members)
+                        .await?;
                 // #3452: a fully-filtered member set must answer the SAME body
                 // the genuinely-empty set above answers, or the pair is an
                 // existence oracle over the private members this virtual
@@ -3117,10 +3334,13 @@ async fn serve_file(
                     // of its bytes can be served — including from a local
                     // `artifacts` cache row below (parity with the direct
                     // artifacts-hit fix). For local / ungated members the helper
-                    // early-returns `Ok(None)` (no upstream_url / not applicable)
+                    // early-returns `Allowed` (no upstream_url / not applicable)
                     // so normal resolution proceeds; an aged version also returns
-                    // `Ok(None)`. A withheld young version returns the
-                    // last-known-good wheel (`Ok(Some(resp))`) or 451 (`Err`).
+                    // `Allowed`. A withheld young version returns the
+                    // last-known-good wheel (`Substitute`) or 451 (`Err`). A
+                    // member whose upstream does not host the version answers
+                    // `NotHosted` and is skipped whole, bytes included, since its
+                    // gate cleared none of them (#5150).
                     let member_info = proxy_helpers::repo_info_from_member(member);
 
                     // #2912: enforce THIS member's curation rules before any of its
@@ -3144,17 +3364,27 @@ async fn serve_file(
                     // `None`: a Remote virtual MEMBER's proxy pass-through is
                     // deliberately uncounted (#1278/#2260); #3649 does not
                     // change that policy from inside the age gate.
-                    if let Some(resp) = enforce_pypi_download_age_gate(
+                    match enforce_pypi_download_age_gate(
                         state,
                         &member_info,
                         &member.key,
                         project,
                         filename,
+                        Some(repo.id),
                         None,
                     )
                     .await?
                     {
-                        return Ok(resp);
+                        AgeGateOutcome::Allowed => {}
+                        AgeGateOutcome::Substitute(resp) => return Ok(resp),
+                        AgeGateOutcome::NotHosted => {
+                            debug!(
+                                member_key = %member.key,
+                                %filename,
+                                "age-gated pypi member does not host this version; skipping"
+                            );
+                            continue;
+                        }
                     }
 
                     // Try local storage first (works for hosted repos and
@@ -3222,12 +3452,11 @@ async fn serve_file(
                             // a not-found or other error falls through to the next
                             // member. A member with scanning disabled keeps the
                             // untouched streaming cache path below (no regression).
-                            let (scan_enabled, action, severity_gate) =
-                                proxy_helpers::effective_virtual_scan_policy(
-                                    &state.db, repo.id, member.id,
-                                )
-                                .await;
-                            if scan_enabled {
+                            let scan = proxy_helpers::effective_virtual_scan_policy(
+                                &state.db, repo.id, member.id,
+                            )
+                            .await?;
+                            if let Some((action, severity_gate)) = scan {
                                 match serve_scanned_pypi_file(
                                     state,
                                     proxy,
@@ -3238,14 +3467,16 @@ async fn serve_file(
                                     filename,
                                     action,
                                     severity_gate,
-                                    ctx,
+                                    Some(ctx),
                                 )
                                 .await
                                 {
                                     Ok(resp) => return Ok(resp),
                                     Err(resp) => {
                                         let status = resp.status();
-                                        if status == StatusCode::FORBIDDEN
+                                        // 403 / 409 (quarantine hold) / 423 are
+                                        // the member's verdict: final, not a miss.
+                                        if proxy_helpers::is_member_policy_block_response(&resp)
                                             || status == StatusCode::LOCKED
                                         {
                                             return Err(resp);
@@ -3308,6 +3539,7 @@ async fn serve_file(
                                 filename,
                                 &member_index_path,
                                 member.format.clone(),
+                                ctx.is_head,
                             )
                             .await
                             {
@@ -3347,9 +3579,16 @@ async fn serve_file(
     // withheld version returns 451 (or the last-known-good wheel) instead of the
     // young local artifact.
     if repo.repo_type == RepositoryType::Remote {
-        if let Some(resp) =
-            enforce_pypi_download_age_gate(state, repo, repo_key, project, filename, Some(ctx))
-                .await?
+        if let AgeGateOutcome::Substitute(resp) = enforce_pypi_download_age_gate(
+            state,
+            repo,
+            repo_key,
+            project,
+            filename,
+            None,
+            Some(ctx),
+        )
+        .await?
         {
             return Ok(resp);
         }
@@ -3401,6 +3640,9 @@ async fn serve_file(
                         filename,
                         &index_path,
                         RepositoryFormat::Pypi,
+                        // A body fetch even for a HEAD: this refetch is
+                        // written back to the stored object it replaces.
+                        false,
                     )
                     .await
                 },
@@ -3893,7 +4135,7 @@ async fn resolve_pypi_remote_fetch_target(
         if let Err(e) = validate_outbound_url(url, "PyPI upstream file URL") {
             tracing::warn!(
                 "SSRF check rejected resolved file URL '{}' from upstream index: {}",
-                url,
+                crate::services::proxy_service::redact_url_for_diagnostics(url),
                 e
             );
             // Fall through to the fallback path instead of fetching the
@@ -3911,7 +4153,7 @@ async fn resolve_pypi_remote_fetch_target(
     // packages/requests/2.31.0/requests-2.31.0.tar.gz which differ from the
     // simple/ convention. A stable cache key ensures the cache-check
     // optimization in serve_file works for all upstream registry types.
-    let cache_path = format!("simple/{}/{}", normalized, filename);
+    let cache_path = build_pypi_proxy_cache_path(project, filename);
 
     let (fetch_base, fetch_path) = match file_url.as_deref().and_then(split_url_base_and_path) {
         Some(pair) => pair,
@@ -3961,6 +4203,16 @@ async fn pypi_proxy_cache_redirect(
     if !proxy.is_cache_fresh(repo_key, cache_path).await {
         return None;
     }
+    // #4506: a Remote whose origin policy refuses its content gets no
+    // redirect; the gated fetch below answers the 403.
+    if proxy.cache_origin_policy_gate(repo_key).await.is_err() {
+        return None;
+    }
+    // #4514: nor does a body its stored scan verdict refuses, or, under
+    // fail-closed, one with no reusable clean verdict.
+    if !proxy_helpers::cache_scan_allows_redirect(state, proxy, repo_key, cache_path).await {
+        return None;
+    }
     let cache_key = crate::services::proxy_service::ProxyService::cache_storage_key(
         proxy.cache_scope(),
         repo_key,
@@ -3989,6 +4241,10 @@ async fn pypi_proxy_cache_redirect(
 /// (CUDA / ML packages routinely exceed 400 MiB) previously OOM-killed
 /// memory-constrained pods when several `pip install` runs downloaded
 /// concurrently through the buffered path.
+///
+/// `is_head` (#5343): the client sent `HEAD`, so a cache miss is answered from
+/// an upstream `HEAD` of the package file (the simple index is still resolved,
+/// to find it) instead of a body download the HEAD response would drop.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_from_pypi_remote_streaming(
     proxy: &crate::services::proxy_service::ProxyService,
@@ -3999,6 +4255,7 @@ async fn fetch_from_pypi_remote_streaming(
     filename: &str,
     index_path: &str,
     format: RepositoryFormat,
+    is_head: bool,
 ) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
     let target = resolve_pypi_remote_fetch_target(
         proxy,
@@ -4023,6 +4280,7 @@ async fn fetch_from_pypi_remote_streaming(
         &target.cache_path,
         target.expected_sha256,
         format,
+        is_head,
     )
     .await
 }
@@ -4078,44 +4336,10 @@ fn build_streaming_file_response(
 // block/lock response shapes, and the scan-and-record orchestration — were
 // lifted into `proxy_helpers` (#3003) so npm (and later OCI) share ONE
 // implementation of the #2954 fail-closed gate and the #2976 freshness gate.
-// This module keeps only the PyPI-specific glue: index-target resolution, the
+// The serve sequence itself is the generic `serve_scanned_proxy_file` (#4098);
+// this module keeps only the PyPI-specific glue: index-target resolution, the
 // synthetic-artifact shape, and the PyPI response builders.
 // ---------------------------------------------------------------------------
-
-use super::proxy_helpers::{is_over_cap_error, scan_pending_locked_response, sha256_hex};
-
-/// Build the synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
-/// that [`ScannerService::scan_content`] runs the leaf scanners over. There is
-/// NO `artifacts` row: proxy-cached bytes are deliberately not persisted as
-/// artifacts (#1278/#1280). The filename drives per-scanner applicability +
-/// workspace naming exactly as for a hosted wheel.
-fn pypi_synthetic_artifact(
-    repo_id: uuid::Uuid,
-    filename: &str,
-    digest: &str,
-    size: i64,
-) -> crate::models::artifact::Artifact {
-    let now = Utc::now();
-    crate::models::artifact::Artifact {
-        id: uuid::Uuid::new_v4(),
-        repository_id: repo_id,
-        path: filename.to_string(),
-        name: filename.to_string(),
-        version: version_from_pypi_filename(filename),
-        size_bytes: size,
-        checksum_sha256: digest.to_string(),
-        checksum_md5: None,
-        checksum_sha1: None,
-        content_type: pypi_content_type(filename).to_string(),
-        storage_key: String::new(),
-        is_deleted: false,
-        uploaded_by: None,
-        quarantine_status: None,
-        quarantine_until: None,
-        created_at: now,
-        updated_at: now,
-    }
-}
 
 /// Build a buffered 200 response for scanned bytes. `pending` adds the loud
 /// `X-AK-Scan: pending` header for the fail-open serve-before-verdict path so a
@@ -4156,13 +4380,14 @@ fn build_scanned_file_response(
     builder.body(Body::from(bytes)).unwrap()
 }
 
-/// Inline scan-and-block for a PyPI proxy file download (#2954).
+/// Inline scan-and-block for a PyPI proxy file download (#2954), on the
+/// generic gate ([`proxy_helpers::serve_scanned_proxy_file`], #4098).
 ///
 /// Runs ONLY when scan-on-proxy is enabled for the repo; the caller falls back
 /// to the untouched streaming path otherwise, so repos that have not opted in
-/// see NO change. Flow: buffered capped fetch (cache-first, so a repeat pull is
-/// served from cache with no upstream hit) → content digest → verdict lookup →
-/// serve / block / scan-inline per the fail-open/closed action.
+/// see NO change. The file is fetched from the target the simple index
+/// resolves (often a different host, e.g. files.pythonhosted.org) and cached
+/// under the stable `simple/{project}/{filename}` key.
 #[allow(clippy::too_many_arguments)]
 async fn serve_scanned_pypi_file(
     state: &SharedState,
@@ -4174,7 +4399,7 @@ async fn serve_scanned_pypi_file(
     filename: &str,
     action: crate::services::proxy_scan_service::ProxyScanAction,
     severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
-    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
 ) -> Result<Response, Response> {
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
     let target = resolve_pypi_remote_fetch_target(
@@ -4187,141 +4412,124 @@ async fn serve_scanned_pypi_file(
         &index_path,
     )
     .await?;
-
-    // Buffered capped fetch (cache-first). The proxy caches the bytes under
-    // cache_path, so a repeat pull returns from cache with NO upstream fetch.
-    let repo = proxy_helpers::build_remote_repo_with_format(
+    let req = proxy_helpers::ScannedProxyRequest {
         repo_id,
         repo_key,
-        &target.fetch_base,
-        RepositoryFormat::Pypi,
-    );
-    // `content_encoding` is the coding these exact bytes arrived under. It has
-    // to travel with them to `build_scanned_file_response` below: this arm
-    // forwards the buffered body VERBATIM, so dropping the coding here is the
-    // #3149 bug (#3184).
-    let (bytes, content_type, content_encoding) = match proxy
-        .fetch_artifact_with_cache_path_capped(
-            &repo,
-            &target.fetch_path,
-            &target.cache_path,
-            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
-        )
-        .await
-    {
-        Ok(triple) => triple,
-        Err(e) if is_over_cap_error(&e) => {
-            // Over the byte cap: never buffer unbounded (#895 OOM).
-            return match crate::services::proxy_scan_service::decide_inconclusive(action) {
-                crate::services::proxy_scan_service::InconclusiveOutcome::Locked => {
-                    warn!(
-                        repo_id = %repo_id, file = %filename,
-                        "proxy object exceeds scan byte cap; fail-closed -> 423"
-                    );
-                    Err(scan_pending_locked_response(filename))
-                }
-                crate::services::proxy_scan_service::InconclusiveOutcome::ServePending => {
-                    // Fail-open oversized: serve via the untouched streaming path
-                    // (loud: X-AK-Scan pending header carried on the stream).
-                    warn!(
-                        repo_id = %repo_id, file = %filename,
-                        "proxy object exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
-                    );
-                    let result = fetch_from_pypi_remote_streaming(
-                        proxy,
-                        repo_id,
-                        repo_key,
-                        upstream_url,
-                        project,
-                        filename,
-                        &index_path,
-                        RepositoryFormat::Pypi,
-                    )
-                    .await?;
-                    proxy_helpers::record_proxy_download(
-                        state,
-                        repo_id,
-                        repo_key,
-                        &target.cache_path,
-                        ctx,
-                    )
-                    .await;
-                    let mut resp = build_streaming_file_response(filename, result);
-                    resp.headers_mut()
-                        .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
-                    Ok(resp)
-                }
-            };
-        }
-        Err(e) => return Err(e.into_response()),
-    };
-
-    let digest = sha256_hex(&bytes);
-
-    // #3003: the identity these bytes are being served as. `project` is the
-    // requested distribution and the version comes from the filename, so the
-    // coordinate is request-derived, never upstream-controlled.
-    //
-    // This is what finally grades an SDIST. syft/grype catalog a wheel from its
-    // `.dist-info/METADATA`, but an sdist ships only a ROOT `PKG-INFO`, which
-    // syft does not catalog — so a vulnerable sdist scanned with zero cataloged
-    // components, reported zero findings, and served 200 "clean" while the same
-    // release's wheel was correctly blocked. Pinning the coordinate gives the
-    // CVE engine the component to grade, and the shared assessment gate refuses
-    // to call the result clean unless it actually graded it.
-    //
-    // Filenames we cannot parse a version from keep the prior behavior (no
-    // pin, no assessment gate) rather than newly withholding an odd-but-legit
-    // artifact.
-    let identity = match version_from_pypi_filename(filename) {
-        Some(version) => proxy_helpers::ProxyScanIdentity::Established(
-            crate::services::scanner_service::ExpectedComponent::new(
-                crate::services::scanner_service::ComponentEcosystem::Python,
-                // The canonical name. The scan gate grades a component by
-                // name+version, so before #3186 it could grade `acme sdk`
-                // while the fetch resolved `acme-sdk` -- the same divergence,
-                // in the component identity the verdict is keyed on.
-                project.as_str(),
-                &version,
-            ),
-        ),
-        // An unparseable filename keeps the pre-#3003 behavior rather than
-        // newly withholding an odd-but-legitimate artifact.
-        None => proxy_helpers::ProxyScanIdentity::NotApplicable,
-    };
-
-    // Digest-keyed verdict gate, shared with every proxy format (#3003):
-    // lookup → `decide_serve` (freshness incl. the #2976 unknown-live-version
-    // fail-closed tightening) → inline scan / async scan per the action, with
-    // the #2954 fail-closed contract enforced inside the shared scanner loop.
-    let synthetic = pypi_synthetic_artifact(repo_id, filename, &digest, bytes.len() as i64);
-    match proxy_helpers::gate_proxy_scan_serve(
-        state,
-        repo_id,
+        fetch_base: &target.fetch_base,
+        format: RepositoryFormat::Pypi,
+        source_path: &target.fetch_path,
+        cache_path: &target.cache_path,
         filename,
-        &digest,
-        synthetic,
-        &bytes,
         action,
         severity_gate,
-        identity,
-        proxy_helpers::ProxyScanMode::File,
-    )
-    .await
-    {
-        proxy_helpers::ProxyScanServeOutcome::Deny(resp) => Err(resp),
-        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => {
-            proxy_helpers::record_proxy_download(state, repo_id, repo_key, &target.cache_path, ctx)
-                .await;
-            Ok(build_scanned_file_response(
-                filename,
-                bytes,
-                content_type,
-                content_encoding.as_deref(),
-                Some(&digest),
-                pending,
-            ))
+        ctx,
+    };
+    let file = PypiScannedFile {
+        proxy,
+        upstream_url,
+        project,
+        index_path: &index_path,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The PyPI half of the generic proxy scan gate. The wrapper records the download on
+/// both serve arms, including [`proxy_helpers::ScannedProxyFile::serve_unscanned_stream`].
+struct PypiScannedFile<'a> {
+    proxy: &'a crate::services::proxy_service::ProxyService,
+    /// The repository's configured upstream (the index host), which the
+    /// streaming fallback resolves the file target from again.
+    upstream_url: &'a str,
+    project: &'a NormalizedProjectName,
+    index_path: &'a str,
+}
+
+#[async_trait::async_trait]
+impl proxy_helpers::ScannedProxyFile for PypiScannedFile<'_> {
+    const LABEL: &'static str = "pypi file";
+
+    /// The filename drives per-scanner applicability + workspace naming
+    /// exactly as for a hosted wheel.
+    fn synthetic_content_type(filename: &str) -> String {
+        pypi_content_type(filename).to_string()
+    }
+
+    fn synthetic_version(filename: &str) -> Option<String> {
+        version_from_pypi_filename(filename)
+    }
+
+    /// #3003: the identity these bytes are being served as. `project` is the
+    /// requested distribution and the version comes from the filename, so the
+    /// coordinate is request-derived, never upstream-controlled.
+    ///
+    /// This is what finally grades an SDIST. syft/grype catalog a wheel from
+    /// its `.dist-info/METADATA`, but an sdist ships only a ROOT `PKG-INFO`,
+    /// which syft does not catalog — so a vulnerable sdist scanned with zero
+    /// cataloged components, reported zero findings, and served 200 "clean"
+    /// while the same release's wheel was correctly blocked. Pinning the
+    /// coordinate gives the CVE engine the component to grade, and the shared
+    /// assessment gate refuses to call the result clean unless it actually
+    /// graded it.
+    fn identity(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        _bytes: &Bytes,
+        _digest: &str,
+    ) -> proxy_helpers::ProxyScanIdentity {
+        match version_from_pypi_filename(req.filename) {
+            Some(version) => proxy_helpers::ProxyScanIdentity::Established(
+                crate::services::scanner_service::ExpectedComponent::new(
+                    crate::services::scanner_service::ComponentEcosystem::Python,
+                    // The canonical name. The scan gate grades a component by
+                    // name+version, so before #3186 it could grade `acme sdk`
+                    // while the fetch resolved `acme-sdk` -- the same
+                    // divergence, in the component identity the verdict is
+                    // keyed on.
+                    self.project.as_str(),
+                    &version,
+                ),
+            ),
+            // An unparseable filename keeps the pre-#3003 behavior (no pin, no
+            // assessment gate) rather than newly withholding an
+            // odd-but-legitimate artifact.
+            None => proxy_helpers::ProxyScanIdentity::NotApplicable,
         }
+    }
+
+    async fn serve_unscanned_stream(
+        &self,
+        _state: &SharedState,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+    ) -> Result<Response, Response> {
+        let result = fetch_from_pypi_remote_streaming(
+            self.proxy,
+            req.repo_id,
+            req.repo_key,
+            self.upstream_url,
+            self.project,
+            req.filename,
+            self.index_path,
+            RepositoryFormat::Pypi,
+            req.is_head(),
+        )
+        .await?;
+        Ok(build_streaming_file_response(req.filename, result))
+    }
+
+    fn scanned_response(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        body: proxy_helpers::ScannedProxyBody,
+        pending: bool,
+    ) -> Response {
+        build_scanned_file_response(
+            req.filename,
+            body.bytes,
+            body.content_type,
+            body.content_encoding.as_deref(),
+            Some(&body.digest),
+            pending,
+        )
     }
 }
 
@@ -4508,8 +4716,8 @@ async fn serve_metadata(
 
 /// Entry-count ceiling for locating a wheel's METADATA (#3886).
 ///
-/// The shared `MAX_INGEST_ARCHIVE_ENTRIES` (10,000) is sized for walks that
-/// inflate or inspect every entry. Real wheels exceed it: `torch 2.12.0+cpu`
+/// The shared ingest entry cap (`MAX_INGEST_ARCHIVE_ENTRIES`, 10,000 by
+/// default) is sized for walks that inflate or inspect every entry. Real wheels exceed it: `torch 2.12.0+cpu`
 /// ships 12,704 entries, so every PEP 658 sidecar for it answered "Metadata not
 /// available" (404) while the wheel itself downloaded fine. This lookup
 /// inflates exactly ONE entry, still capped at `MAX_INGEST_METADATA_ENTRY_BYTES`,
@@ -5787,7 +5995,7 @@ impl XmlRpcParser<'_> {
                     xmlrpc_echo_text(&e.to_string())
                 ))
             })?;
-            let name = |raw: &[u8]| String::from_utf8_lossy(raw).into_owned();
+            let name = |raw: &str| raw.to_owned();
             // quick-xml validates syntax, not the `Char` production: a NUL
             // or U+0001 passes through as text. Refuse it here so it can
             // neither reach a jsonb bind (#3673) nor be echoed.
@@ -5804,17 +6012,8 @@ impl XmlRpcParser<'_> {
                 Event::Start(e) => XmlRpcToken::Start(name(e.name().as_ref())),
                 Event::End(e) => XmlRpcToken::End(name(e.name().as_ref())),
                 Event::Empty(e) => XmlRpcToken::Empty(name(e.name().as_ref())),
-                Event::Text(t) => checked(
-                    t.decode()
-                        .map_err(|e| {
-                            XmlRpcFault::parse(format!(
-                                "malformed XML: {}",
-                                xmlrpc_echo_text(&e.to_string())
-                            ))
-                        })?
-                        .into_owned(),
-                )?,
-                Event::CData(c) => checked(String::from_utf8_lossy(&c).into_owned())?,
+                Event::Text(t) => checked(t.to_string())?,
+                Event::CData(c) => checked(c.to_string())?,
                 // Character references and the five predefined entities are
                 // the only references XML without a DTD can carry; anything
                 // else would need the DTD refused below.
@@ -5822,13 +6021,13 @@ impl XmlRpcParser<'_> {
                     let resolved = if r.is_char_ref() {
                         r.resolve_char_ref().ok().flatten().map(|c| c.to_string())
                     } else {
-                        let entity: &[u8] = &r;
+                        let entity: &str = &r;
                         match entity {
-                            b"amp" => Some("&".to_string()),
-                            b"lt" => Some("<".to_string()),
-                            b"gt" => Some(">".to_string()),
-                            b"quot" => Some("\"".to_string()),
-                            b"apos" => Some("'".to_string()),
+                            "amp" => Some("&".to_string()),
+                            "lt" => Some("<".to_string()),
+                            "gt" => Some(">".to_string()),
+                            "quot" => Some("\"".to_string()),
+                            "apos" => Some("'".to_string()),
                             _ => None,
                         }
                     };
@@ -6345,7 +6544,7 @@ async fn upload(
     let mut action: Option<String> = None;
     let mut pkg_name: Option<String> = None;
     let mut pkg_version: Option<String> = None;
-    let mut staged_content: Option<proxy_helpers::StagedUpload> = None;
+    let mut staged_content: Option<super::repositories::GenericStagedBody> = None;
     let mut content_digests: Option<crate::services::artifact_service::ContentDigests> = None;
     let mut file_name: Option<String> = None;
     let mut sha256_digest: Option<String> = None;
@@ -6398,10 +6597,11 @@ async fn upload(
             }
             "content" => {
                 file_name = field.file_name().map(|s| s.to_string());
-                // Spool the wheel straight to a bounded scratch file while
-                // computing SHA-256/SHA-1/MD5 incrementally — never buffered.
+                // Stage the wheel on the repository's backend when it streams
+                // natively, else in local scratch, computing SHA-256/SHA-1/MD5
+                // incrementally — never buffered (#4990).
                 let (s, d) =
-                    proxy_helpers::stage_upload_field_content_addressed(&state, field).await?;
+                    super::repositories::stage_upload_field_for_repo(&state, &repo, field).await?;
                 staged_content = Some(s);
                 content_digests = Some(d);
             }
@@ -6534,11 +6734,18 @@ async fn upload(
     // The identity gate parses the archive's METADATA / PKG-INFO; keep what it
     // parsed so the stored `pkg_info` carries the distribution's classifiers
     // and URLs (#3783) without a second walk.
+    // The identity gate and the content analysis below both read the staged
+    // distribution as a local file. A locally staged body borrows its scratch
+    // file; a backend-staged body is materialized once and the temporary copy
+    // is removed when `staged_local` drops (#4990).
+    let staged_local =
+        super::repositories::materialize_staged_for_repo(&state, &repo, &staged_content).await?;
+    let staged_path = staged_local.path().to_path_buf();
     let extracted_pkg_info: Option<PkgInfo> = {
-        let staged_path = staged_content.path().to_path_buf();
         let expected_name = normalized.clone();
         let expected_version = pkg_version.clone();
         let dist_filename = filename.clone();
+        let staged_path = staged_path.clone();
         crate::util::bounded_archive::with_ingest_extraction_async(|| {
             tokio::task::spawn_blocking(move || {
                 let file = std::fs::File::open(&staged_path).map_err(|e| {
@@ -6563,10 +6770,10 @@ async fn upload(
     // #4033: read the distribution's own bytes for the two things its Python
     // metadata never names — native libraries a wheel-repair tool copied in,
     // and the `setup.py` an sdist install executes. Done here, while the
-    // staged scratch file still exists (it is consumed and dropped further
+    // staged local copy still exists (it is consumed and dropped further
     // down); the row it produces is written after the artifact is committed.
-    let content_analysis =
-        analyze_pypi_upload(staged_content.path().to_path_buf(), filename.clone()).await;
+    let content_analysis = analyze_pypi_upload(staged_path, filename.clone()).await;
+    drop(staged_local);
 
     // SHA-256 was computed incrementally while the body was spooled to disk.
     let computed_sha256 = digests.sha256.clone();
@@ -6631,32 +6838,47 @@ async fn upload(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
     let artifact_service = state.create_artifact_service(storage);
-    // Re-read the staged scratch file as a `'static` stream; the service does the
-    // dedup `exists()` check first and only streams into storage on a miss.
-    let content_stream = proxy_helpers::open_staged_upload_stream(&staged_content).await?;
+    // Hand the service the staged body directly: local scratch is re-read as a
+    // `'static` stream, a backend-staged object is promoted server-side. The
+    // service does the dedup `exists()` check first and only moves bytes on a
+    // miss.
+    let content = staged_content.upload_content().await?;
     let artifact = artifact_service
-        .upload_stream_with_sync_options(
+        .upload_content_with_sync_options(
             repo.id,
             &artifact_path,
             &normalized,
             Some(&pkg_version),
             content_type,
-            content_stream,
+            content,
             digests,
             size_bytes,
             Some(user_id),
-            should_enqueue_pypi_sync_tasks(&headers),
+            // #4889: queue after the metadata write below, not before it.
+            false,
+            None,
             None,
         )
         .await
         .map_err(|e| e.into_response())?;
-    // Scratch file no longer needed once the service has consumed the stream.
-    drop(staged_content);
+    // The staging copy is no longer needed once the service has consumed it.
+    staged_content.discard().await;
 
     artifact_service
         .set_metadata(artifact.id, "pypi", pkg_metadata, serde_json::json!({}))
         .await
         .map_err(|e| e.into_response())?;
+
+    if should_enqueue_pypi_sync_tasks(&headers) {
+        super::queue_push_sync_tasks_now(
+            &state.db,
+            repo.id,
+            artifact.id,
+            &artifact_path,
+            size_bytes,
+        )
+        .await;
+    }
 
     record_pypi_package_analysis(&state, artifact.id, content_analysis).await;
 
@@ -6713,7 +6935,7 @@ async fn upload(
 /// [`Completeness::NotRead`] analysis carrying the reason, because "we could
 /// not read it" is a result the user is entitled to see, and because analysis
 /// must not be able to fail an otherwise-valid upload.
-async fn analyze_pypi_upload(
+pub(crate) async fn analyze_pypi_upload(
     staged_path: std::path::PathBuf,
     filename: String,
 ) -> crate::services::pypi_analysis::PypiAnalysis {
@@ -6742,7 +6964,7 @@ async fn analyze_pypi_upload(
 /// so a failure here must not fail the publish. But a distribution with
 /// nothing in it still records a row, because "we looked and there was
 /// nothing" and "we never looked" have to stay distinguishable (#4047).
-async fn record_pypi_package_analysis(
+pub(crate) async fn record_pypi_package_analysis(
     state: &SharedState,
     artifact_id: uuid::Uuid,
     analysis: crate::services::pypi_analysis::PypiAnalysis,
@@ -6809,7 +7031,7 @@ mod content_analysis_tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut w = zip::ZipWriter::new(&mut cursor);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (name, data) in entries {
                 w.start_file(*name, opts).unwrap();
@@ -6871,7 +7093,7 @@ fn should_enqueue_pypi_sync_tasks(headers: &HeaderMap) -> bool {
     !super::is_replication_request(headers)
 }
 
-fn build_pypi_package_catalog_metadata(
+pub(crate) fn build_pypi_package_catalog_metadata(
     filename: &str,
     requires_python: Option<&str>,
 ) -> serde_json::Value {
@@ -6886,7 +7108,7 @@ fn build_pypi_package_catalog_metadata(
 }
 
 /// Determine the Content-Type for a PyPI filename based on its extension.
-fn pypi_content_type(filename: &str) -> &'static str {
+pub(crate) fn pypi_content_type(filename: &str) -> &'static str {
     if filename.ends_with(".whl") || filename.ends_with(".zip") {
         "application/zip"
     } else if filename.ends_with(".tar.gz") {
@@ -6949,7 +7171,7 @@ fn html_escape(s: &str) -> String {
 /// Most trove classifiers kept per distribution (see [`build_upload_pkg_info`]).
 const PYPI_MAX_STORED_CLASSIFIERS: usize = 500;
 
-fn build_upload_pkg_info(
+pub(crate) fn build_upload_pkg_info(
     extracted: Option<PkgInfo>,
     requires_python: Option<&str>,
     summary: Option<&str>,
@@ -8031,7 +8253,9 @@ impl PypiOwnershipGuard {
 mod tests {
     use super::*;
     use crate::api::handlers::cache_headers::{DEFAULT_CACHE_CONTROL, PRIVATE_CACHE_CONTROL};
-    use crate::api::handlers::proxy_helpers::scan_blocked_response;
+    use crate::api::handlers::proxy_helpers::{
+        is_over_cap_error, scan_blocked_response, scan_pending_locked_response, sha256_hex,
+    };
     use sha2::{Digest, Sha256};
 
     fn cached_pypi_repo(repo_id: uuid::Uuid, format: &str) -> crate::api::CachedRepo {
@@ -9035,7 +9259,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut zip = zip::ZipWriter::new(&mut cursor);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zip.start_file(
                 format!("{meta_name}-{meta_version}.dist-info/METADATA"),
@@ -11370,6 +11594,7 @@ mod tests {
             content_length: len,
             artifact_id: None,
             etag: None,
+            stale_since: None,
         }
     }
 
@@ -11487,6 +11712,7 @@ mod tests {
             content_length: Some(content.len() as u64),
             artifact_id: None,
             etag: None,
+            stale_since: None,
         }
     }
 
@@ -12052,6 +12278,7 @@ mod tests {
             content_length,
             artifact_id: None,
             etag: None,
+            stale_since: None,
         }
     }
 
@@ -15198,6 +15425,10 @@ mod tests {
         let server = MockServer::start().await;
         let wheel_body = b"fake-wheel-bytes";
 
+        // Per-test repo key: `load_cache_metadata` memoises sidecars (including
+        // misses) in a process-global LRU keyed by the storage key (#4814).
+        let repo_key = format!("pypi-remote-4814-{}", uuid::Uuid::new_v4());
+
         // Empty simple-index page → find_upstream_url_for_file returns None →
         // resolve_pypi_remote_fetch_target falls back to simple/{project}/{filename}.
         Mock::given(method("GET"))
@@ -15229,12 +15460,13 @@ mod tests {
         let result = fetch_from_pypi_remote_streaming(
             &proxy,
             repo_id,
-            "pypi-remote",
+            &repo_key,
             &server.uri(),
             &proj("numpy"),
             "numpy-2.0.0-py3-none-any.whl",
             "simple",
             RepositoryFormat::Pypi,
+            false,
         )
         .await
         .expect("streaming fetch via fallback path must succeed");
@@ -15250,7 +15482,7 @@ mod tests {
         let cache_path = "simple/numpy/numpy-2.0.0-py3-none-any.whl";
         let metadata_key = crate::services::proxy_service::ProxyService::cache_metadata_key(
             &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
-            "pypi-remote",
+            &repo_key,
             cache_path,
         )
         .expect("metadata key");
@@ -15347,7 +15579,7 @@ mod tests {
 
         let mut cursor = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(&mut cursor);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file(format!("{dist_info}.dist-info/METADATA"), options)
             .expect("start METADATA entry");
@@ -15419,6 +15651,45 @@ mod tests {
             metadata,
             "served metadata must be the wheel's METADATA bytes"
         );
+    }
+
+    /// #5343: pip and uv may `HEAD` a wheel before they download it. A cold
+    /// `HEAD` of a Remote package file is answered from an upstream `HEAD` of
+    /// the file the simple index points at, so the wheel leaves the upstream
+    /// once across HEAD, GET and a warm GET, and the HEAD keeps the
+    /// attachment name.
+    #[tokio::test]
+    async fn test_remote_pypi_cold_head_downloads_the_wheel_once_5343() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let wheel = "headprobe-2.0-py3-none-any.whl";
+        Mock::given(method("GET"))
+            .and(path("/simple/headprobe/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        let body: Vec<u8> = (0..4096u32).map(|i| (i % 233) as u8).collect();
+        let uri = format!("/{}/simple/headprobe/{wheel}", fx.repo_key);
+        let head = tdh::assert_cold_head_fetches_body_once(
+            fx,
+            upstream,
+            super::router,
+            true,
+            &format!("/packages/{wheel}"),
+            &uri,
+            &[("content-type", "application/octet-stream")],
+            &body,
+        )
+        .await;
+        let disposition =
+            tdh::header_str(&head, axum::http::header::CONTENT_DISPOSITION).unwrap_or_default();
+        assert!(disposition.contains(wheel), "{disposition}");
     }
 
     // -----------------------------------------------------------------------
@@ -15506,7 +15777,7 @@ mod tests {
 
         let mut cursor = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(&mut cursor);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("torch/_vendor/decoy-0.1.dist-info/METADATA", options)
             .expect("decoy entry");
@@ -17380,6 +17651,7 @@ mod tests {
             content_length: Some(data_len),
             artifact_id: None,
             etag: None,
+            stale_since: None,
         };
 
         let response = build_streaming_file_response("numpy-1.0-py3-none-any.whl", result);
@@ -17418,11 +17690,13 @@ mod tests {
         // Empty MissingStorage → streaming probe returns None without errors.
         let proxy = build_proxy_service_no_db();
         let repo_id = uuid::Uuid::new_v4();
+        // Per-test repo key: the sidecar LRU is process-global (#4814).
+        let repo_key = format!("pypi-remote-4814-{}", uuid::Uuid::new_v4());
 
         let result = super::proxy_helpers::proxy_check_cache_streaming(
             &proxy,
             repo_id,
-            "pypi-remote",
+            &repo_key,
             "https://pypi.org/simple",
             "simple/numpy/numpy-2.0.0-py3-none-any.whl",
             RepositoryFormat::Pypi,
@@ -18022,7 +18296,9 @@ mod tests {
         let repo_id = uuid::Uuid::new_v4();
         let filename = "PyYAML-5.3.1-cp38-cp38-manylinux1_x86_64.whl";
         let digest = "deadbeef".repeat(8);
-        let art = pypi_synthetic_artifact(repo_id, filename, &digest, 1234);
+        let art = <PypiScannedFile<'_> as proxy_helpers::ScannedProxyFile>::synthetic_artifact(
+            repo_id, filename, &digest, 1234,
+        );
 
         // The synthetic artifact drives scanner applicability + workspace
         // naming exactly as a hosted wheel would.
@@ -18039,7 +18315,12 @@ mod tests {
         assert_eq!(art.quarantine_status, None);
 
         // sdist naming resolves version + gzip content type too.
-        let sdist = pypi_synthetic_artifact(repo_id, "requests-2.31.0.tar.gz", &digest, 1);
+        let sdist = <PypiScannedFile<'_> as proxy_helpers::ScannedProxyFile>::synthetic_artifact(
+            repo_id,
+            "requests-2.31.0.tar.gz",
+            &digest,
+            1,
+        );
         assert_eq!(sdist.version.as_deref(), Some("2.31.0"));
         assert_eq!(sdist.content_type, "application/gzip");
     }
@@ -18304,6 +18585,70 @@ mod tests {
             )
             .mount(upstream)
             .await;
+    }
+
+    /// A scanning member's quarantine hold (409) is final for the virtual
+    /// file walk: the next member must not serve the same wheel.
+    #[tokio::test]
+    async fn test_virtual_serve_file_stops_at_a_quarantined_scanning_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "heldpkg";
+        let filename = "heldpkg-1.0.0-py3-none-any.whl";
+        let wheel: &'static [u8] = b"PK\x03\x04 heldpkg-wheel-quarantine";
+        let held = wiremock::MockServer::start().await;
+        mount_scan_upstream(&held, project, filename, wheel).await;
+        let fallback = wiremock::MockServer::start().await;
+        {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+            Mock::given(method("GET"))
+                .and(path(format!("/simple/{project}/{filename}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel))
+                .expect(0)
+                .mount(&fallback)
+                .await;
+        }
+        let (first, _, first_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "pypi", &held.uri(), 1).await;
+        let (second, _, second_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "pypi", &fallback.uri(), 2).await;
+        for member in [first, second] {
+            enable_proxy_scan(&fx.pool, member, "fail_open").await;
+        }
+        tdh::enable_proxy_quarantine(&fx.pool, first, 60).await;
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let status = match super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            &proj(project),
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await
+        {
+            Ok(r) => r.status(),
+            Err(r) => r.status(),
+        };
+
+        fallback.verify().await;
+        cleanup_virtual_member(&fx.pool, first, &first_dir).await;
+        cleanup_virtual_member(&fx.pool, second, &second_dir).await;
+        fx.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the hold is final, not a miss"
+        );
     }
 
     // ── #3023: the inline scan gate on the VIRTUAL pypi serve path ─────────
@@ -19541,6 +19886,129 @@ mod tests {
         }
     }
 
+    /// The age gate's last-known-good substitute is a download like any
+    /// other: on a Remote that scans on proxy it goes through the scan gate.
+    /// A young version is withheld, the substitute's bytes carry a blocking
+    /// verdict, and the pull must be refused, never answered with the
+    /// substitute's bytes or a redirect to them.
+    #[tokio::test]
+    async fn test_serve_file_age_gate_substitute_goes_through_the_scan_gate() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "agedsub";
+        let young = "agedsub-2.0.0-py3-none-any.whl";
+        let lkg = "agedsub-1.0.0-py3-none-any.whl";
+        let wheel: &'static [u8] = b"PK\x03\x04 age-gate-substitute-blocked-wheel";
+        let digest = sha256_hex(&Bytes::from_static(wheel));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, lkg, wheel).await;
+        let old = (Utc::now() - chrono::Duration::days(3650)).to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        Mock::given(method("GET"))
+            .and(path(format!("/pypi/{project}/json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "releases": {
+                    "1.0.0": [ { "upload_time_iso_8601": old } ],
+                    "2.0.0": [ { "upload_time_iso_8601": now } ],
+                }
+            })))
+            .mount(&upstream)
+            .await;
+
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = true, \
+             age_gate_min_age_days = 30 WHERE id = $2",
+        )
+        .bind(upstream.uri())
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable age gate");
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        // The last-known-good version is the newest older row the repository
+        // holds; only its row is needed, the gate fetches its bytes.
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, '1.0.0', $4, $5, 'application/zip', $6, $7)",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("simple/{project}/{lkg}"))
+        .bind(project)
+        .bind(wheel.len() as i64)
+        .bind(&digest)
+        .bind(format!("rows/{}", uuid::Uuid::new_v4()))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed last-known-good row");
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed blocking verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+        repo_info.age_gate_enabled = true;
+        repo_info.age_gate_min_age_days = 30;
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            &proj(project),
+            young,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "the age-gate substitute must go through the scan gate, got {} \
+                 (location {:?})",
+                r.status(),
+                r.headers().get(axum::http::header::LOCATION)
+            ),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+        }
+    }
+
     /// The cached-`clean` fast path serves 200 `X-AK-Scan: clean` (#2954) —
     /// exercised here on a FAIL-OPEN repo with no scanner service, where the
     /// header is the discriminator: without the cached verdict this pull would
@@ -19587,6 +20055,16 @@ mod tests {
             )
             .await
             .expect("seed clean verdict");
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Python,
+                "verified",
+                "3.2.1",
+            ),
+        )
+        .await;
 
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
         let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
@@ -19792,6 +20270,16 @@ mod tests {
             )
             .await
             .expect("seed clean verdict");
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Python,
+                "sameversion",
+                "1.0.0",
+            ),
+        )
+        .await;
 
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
         let state = scan_state_with_live_scanner(
@@ -19967,6 +20455,66 @@ mod tests {
             1,
             "the second download must reuse the verdict the first one recorded, \
              not re-run the inline scan (#4019)"
+        );
+    }
+
+    /// #4594 is conda-only: a PyPI wheel whose own METADATA agrees with the
+    /// file name, scanned to completion with NOTHING cataloged, is still
+    /// inconclusive. Fail-closed withholds it (423) and records no verdict.
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_zero_catalog_wheel_stays_locked_4594() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "zerocat";
+        let filename = "zerocat-1.0.0-py3-none-any.whl";
+        let wheel: &'static [u8] =
+            Box::leak(build_test_wheel("zerocat", "1.0.0").into_boxed_slice());
+        let digest = sha256_hex(&Bytes::from_static(wheel));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let (cve, scans) = VersionedCveScanner::counting(
+            Some("grype-0.84.0-test"),
+            MockCveRescan::CatalogedNothing,
+        );
+        let state = scan_state_with_live_scanner(&fx, &storage_path, cve);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let status = match super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            &proj(project),
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await
+        {
+            Ok(r) | Err(r) => r.status(),
+        };
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT verdict FROM proxy_scan_results WHERE checksum_sha256 = $1")
+                .bind(&digest)
+                .fetch_optional(&fx.pool)
+                .await
+                .expect("read verdict");
+        tdh::drop_proxy_verdicts(&fx.pool, std::slice::from_ref(&digest)).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(stored, None, "an inconclusive scan records no verdict");
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the wheel was scanned (its identity is established), not skipped"
         );
     }
 
@@ -20235,6 +20783,16 @@ mod tests {
             )
             .await
             .expect("seed clean verdict");
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Python,
+                "probenoneopen",
+                "1.0.0",
+            ),
+        )
+        .await;
 
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
         let state = scan_state_with_live_scanner(
@@ -20843,6 +21401,7 @@ mod content_encoding_forwarding_tests {
             etag: None,
             content_encoding: encoding.map(str::to_owned),
             commit_sha: None,
+            stale_since: None,
         }
     }
 
@@ -21764,14 +22323,14 @@ mod legacy_json_xmlrpc_unit_tests {
             loop {
                 match reader.read_event().expect("well-formed fault XML") {
                     quick_xml::events::Event::Eof => break,
-                    quick_xml::events::Event::Text(t) => current.push_str(&t.decode().unwrap()),
+                    quick_xml::events::Event::Text(t) => current.push_str(&t),
                     quick_xml::events::Event::GeneralRef(r) => {
-                        let entity: &[u8] = &r;
+                        let entity: &str = &r;
                         current.push_str(match entity {
-                            b"quot" => "\"",
-                            b"amp" => "&",
-                            b"lt" => "<",
-                            b"gt" => ">",
+                            "quot" => "\"",
+                            "amp" => "&",
+                            "lt" => "<",
+                            "gt" => ">",
                             _ => "?",
                         });
                     }
@@ -22479,6 +23038,88 @@ mod legacy_json_xmlrpc_route_tests {
         assert_eq!(status7, StatusCode::NOT_FOUND);
     }
 
+    /// GHSA-24rf-2gv2-j47c, the advisory's live reproduction: an anonymous
+    /// download through a credentialed PyPI remote whose simple index names
+    /// the file by an absolute URL on ANOTHER origin. The file must still be
+    /// fetched from there, but without the remote's credentials, which keep
+    /// going to the configured upstream (the index fetch).
+    #[tokio::test]
+    async fn file_on_another_origin_is_fetched_without_upstream_credentials() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        // Same allow-listed address, another port: another origin.
+        let foreign_listener = std::net::TcpListener::bind((upstream.address().ip(), 0))
+            .expect("bind the foreign listener");
+        let foreign = MockServer::builder()
+            .listener(foreign_listener)
+            .start()
+            .await;
+        let file_url = format!("{}/files/advcpkg-1.0.tar.gz", foreign.uri());
+        Mock::given(method("GET"))
+            .and(path("/simple/advcpkg/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string(format!(
+                        "<html><body><a href=\"{file_url}\">advcpkg-1.0.tar.gz</a></body></html>"
+                    )),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files/advcpkg-1.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sdist-bytes".as_ref()))
+            .mount(&foreign)
+            .await;
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        crate::services::upstream_auth::save_upstream_auth(
+            &fx.pool,
+            fx.repo_id,
+            "basic",
+            r#"{"username":"ghsa-24rf","password":"not-a-real-secret"}"#,
+        )
+        .await
+        .expect("save upstream credentials");
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{}/simple/advcpkg/advcpkg-1.0.tar.gz",
+                fx.repo_key
+            )),
+        )
+        .await;
+        let index_requests = upstream.received_requests().await.unwrap_or_default();
+        let file_requests = foreign.received_requests().await.unwrap_or_default();
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"sdist-bytes");
+        assert!(
+            !file_requests.is_empty(),
+            "the file must come from the href's origin"
+        );
+        for r in &file_requests {
+            assert!(
+                !r.headers.contains_key("authorization"),
+                "the remote's credentials were sent to {}",
+                r.url
+            );
+        }
+        assert!(
+            index_requests
+                .iter()
+                .any(|r| r.headers.contains_key("authorization")),
+            "the configured upstream must still receive the credentials"
+        );
+    }
+
     /// Remote repository: the upstream document is proxied and every download
     /// URL is rewritten to this repository; an upstream 404 is a 404, and an
     /// upstream configured as its simple index still reaches `/pypi/...`.
@@ -23166,5 +23807,1274 @@ mod legacy_json_xmlrpc_route_tests {
                 .starts_with(&format!("{ROUTE_BASE}/pypi/{key}/")),
             "{doc}"
         );
+    }
+}
+
+/// #4365 item 1: PyPI decides by route (every distribution is a package);
+/// the cache key is the stable `simple/{project}/{filename}` path.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn pypi_file_serve_key_table() {
+        let project = NormalizedProjectName::parse("requests").expect("valid name");
+        for (file, scannable) in [
+            ("requests-2.31.0.tar.gz", true),
+            ("requests-2.31.0-py3-none-any.whl", true),
+            ("requests-2.31.0-py3-none-any.whl.metadata", false),
+        ] {
+            let got = pypi_file_serve_key(&project, file);
+            assert_eq!(got.cache_key, format!("simple/requests/{file}"));
+            assert_eq!(got.cache_key, build_pypi_proxy_cache_path(&project, file));
+            assert_eq!(got.scannable, scannable, "{file}");
+        }
+        // PEP 503: every spelling of a project name reaches one key.
+        for raw in ["Foo_Bar.baz", "foo-bar-baz", "FOO__bar--BAZ", "foo.bar_baz"] {
+            let project = NormalizedProjectName::parse(raw).expect("valid name");
+            assert_eq!(
+                pypi_file_serve_key(&project, "foo_bar_baz-1.0.tar.gz").cache_key,
+                "simple/foo-bar-baz/foo_bar_baz-1.0.tar.gz",
+                "{raw}"
+            );
+        }
+    }
+}
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::{identities_for_test, ProxyScanIdentity};
+    use crate::api::handlers::test_db_helpers as dup_tdh;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{
+        tar_bz2_with, tar_gz_with, tar_with, tar_zst_with, zip_with,
+    };
+
+    fn proxy_for_test() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::services::proxy_service::ProxyService>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = dup_tdh::build_proxy_service_with_fs(
+            dup_tdh::lazy_pool(),
+            dir.path().to_str().unwrap(),
+        );
+        (dir, proxy)
+    }
+
+    fn established(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Established(_))
+    }
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    /// PyPI's proxy identity comes from the file name, so the reader is not
+    /// fooled here; the archive is still refused, as for every format.
+    #[tokio::test]
+    async fn a_wheel_or_sdist_with_two_metadata_entries_is_not_established() {
+        let (_dir, proxy) = proxy_for_test();
+        let project = crate::formats::pypi_name::NormalizedProjectName::parse("demo").unwrap();
+        let file = PypiScannedFile {
+            proxy: &proxy,
+            upstream_url: "http://upstream.invalid",
+            project: &project,
+            index_path: "simple/demo/",
+        };
+        let good: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0.0\n";
+        let other: &[u8] =
+            b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0.0\nRequires-Dist: other\n";
+        let wheel_name = "demo-1.0.0-py3-none-any.whl";
+        let sdist_name = "demo-1.0.0.tar.gz";
+        let wheel = |entries: &[(&str, &[u8])]| zip_with(entries);
+        let sdist = |entries: &[(&str, &[u8])]| tar_gz_with(entries);
+
+        let dup_wheel = wheel(&[
+            ("demo-1.0.0.dist-info/METADATA", good),
+            ("demo/__init__.py", b""),
+            ("demo-1.0.0.dist-info/./METADATA", other),
+        ]);
+        let (own, gate) = identities_for_test(&file, DupFormat::Pypi, wheel_name, &dup_wheel);
+        assert!(established(&own));
+        assert!(unestablished(&gate));
+        let dup_sdist = sdist(&[
+            ("demo-1.0.0/PKG-INFO", good),
+            ("demo-1.0.0/PKG-INFO", other),
+        ]);
+        let (own, gate) = identities_for_test(&file, DupFormat::Pypi, sdist_name, &dup_sdist);
+        assert!(established(&own));
+        assert!(unestablished(&gate));
+
+        let ok_wheel = wheel(&[("demo-1.0.0.dist-info/METADATA", good)]);
+        assert!(established(
+            &identities_for_test(&file, DupFormat::Pypi, wheel_name, &ok_wheel).1
+        ));
+        let ok_sdist = sdist(&[("demo-1.0.0/PKG-INFO", good)]);
+        assert!(established(
+            &identities_for_test(&file, DupFormat::Pypi, sdist_name, &ok_sdist).1
+        ));
+    }
+}
+
+/// #5150 / #5151: which member of a PyPI virtual answers for a gated version,
+/// and what the gate reads when the upstream has no Warehouse JSON API.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod age_gate_upstream_evidence_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{header_regex, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const PROJECT: &str = "gated";
+    const VERSION: &str = "1.0.0";
+    const WHEEL: &str = "gated-1.0.0-py3-none-any.whl";
+    const OLD: &str = "2015-06-01T00:00:00Z";
+
+    fn young() -> String {
+        Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    fn proj() -> NormalizedProjectName {
+        NormalizedProjectName::parse(PROJECT).expect("valid project")
+    }
+
+    /// One Remote's upstream, served under its own path prefix of one mock
+    /// server: the SSRF allowlist guard can only be held once per test.
+    struct Upstream<'a> {
+        server: &'a MockServer,
+        prefix: &'static str,
+    }
+
+    impl Upstream<'_> {
+        fn url(&self) -> String {
+            format!("{}/{}", self.server.uri(), self.prefix)
+        }
+
+        fn file_url(&self, filename: &str) -> String {
+            format!("{}/files/{filename}", self.url())
+        }
+
+        /// The Warehouse JSON API, dating `version`.
+        async fn warehouse(&self, version: &str, published: &str) {
+            Mock::given(method("GET"))
+                .and(path(format!("/{}/pypi/{PROJECT}/json", self.prefix)))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "releases": { version: [{ "upload_time_iso_8601": published }] }
+                })))
+                .mount(self.server)
+                .await;
+        }
+
+        async fn warehouse_status(&self, status: u16) {
+            Mock::given(method("GET"))
+                .and(path(format!("/{}/pypi/{PROJECT}/json", self.prefix)))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(self.server)
+                .await;
+        }
+
+        async fn simple_status(&self, status: u16) {
+            Mock::given(method("GET"))
+                .and(path(format!("/{}/simple/{PROJECT}/", self.prefix)))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(self.server)
+                .await;
+        }
+
+        /// A PEP 503 HTML index with one anchor per `(filename, upload time)`.
+        async fn simple_html(&self, files: &[(&str, Option<&str>)]) {
+            let anchors: String = files
+                .iter()
+                .map(|(filename, time)| {
+                    let attr = time
+                        .map(|t| format!(" data-upload-time=\"{t}\""))
+                        .unwrap_or_default();
+                    let href = self.file_url(filename);
+                    format!("<a href=\"{href}\"{attr}>{filename}</a><br/>\n")
+                })
+                .collect();
+            Mock::given(method("GET"))
+                .and(path(format!("/{}/simple/{PROJECT}/", self.prefix)))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    format!("<!DOCTYPE html><html><body>{anchors}</body></html>"),
+                    "text/html",
+                ))
+                .mount(self.server)
+                .await;
+        }
+
+        async fn wheel(&self, filename: &str, bytes: &'static [u8]) {
+            Mock::given(method("GET"))
+                .and(path(format!("/{}/files/{filename}", self.prefix)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .mount(self.server)
+                .await;
+        }
+
+        /// A complete upstream hosting an old `WHEEL`.
+        async fn hosting_old_wheel(&self, bytes: &'static [u8]) {
+            self.warehouse(VERSION, OLD).await;
+            self.simple_html(&[(WHEEL, None)]).await;
+            self.wheel(WHEEL, bytes).await;
+        }
+    }
+
+    struct Member {
+        id: uuid::Uuid,
+        dir: std::path::PathBuf,
+    }
+
+    async fn add_member(
+        fx: &tdh::Fixture,
+        upstream: &Upstream<'_>,
+        priority: i32,
+        min_age_days: i32,
+    ) -> Member {
+        let (id, _key, dir) = tdh::create_repo(&fx.pool, "remote", "pypi").await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, is_public = true, \
+             age_gate_enabled = true, age_gate_min_age_days = $2 WHERE id = $3",
+        )
+        .bind(upstream.url())
+        .bind(min_age_days)
+        .bind(id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure member");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, id, priority).await;
+        tdh::publish_repo(&fx.pool, id).await;
+        Member { id, dir }
+    }
+
+    fn state_for(fx: &tdh::Fixture) -> crate::api::SharedState {
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), &storage, proxy)
+    }
+
+    /// Download `filename` through `fx`'s repository: `(status, body)`.
+    async fn download(
+        state: &crate::api::SharedState,
+        fx: &tdh::Fixture,
+        filename: &str,
+    ) -> (StatusCode, Bytes) {
+        let repo = super::resolve_pypi_repo(&fx.pool, &fx.repo_key)
+            .await
+            .unwrap_or_else(|_| panic!("repo resolves"));
+        let resp = match super::serve_file(
+            state,
+            &repo,
+            &fx.repo_key,
+            &proj(),
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await
+        {
+            Ok(r) | Err(r) => r,
+        };
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        (status, body)
+    }
+
+    async fn review_count(fx: &tdh::Fixture, repo_id: uuid::Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("count reviews")
+    }
+
+    async fn teardown(fx: tdh::Fixture, members: Vec<Member>) {
+        for member in members {
+            tdh::cleanup_member_repo(&fx.pool, member.id, &member.dir).await;
+        }
+        fx.teardown().await;
+    }
+
+    fn assert_451(status: StatusCode, body: &Bytes, requested_age_days: Option<i64>) {
+        assert_eq!(status.as_u16(), 451, "{}", String::from_utf8_lossy(body));
+        let json: serde_json::Value = serde_json::from_slice(body).expect("451 body");
+        assert_eq!(json["error"], "age_gate_blocked");
+        assert_eq!(json["requested_age_days"].as_i64(), requested_age_days);
+    }
+
+    /// Two gated members with the one that must not decide at priority 1.
+    async fn virtual_with_first_member<'a>(
+        fx: &tdh::Fixture,
+        first: &Upstream<'a>,
+        second: &Upstream<'a>,
+        first_min_age: i32,
+    ) -> Vec<Member> {
+        vec![
+            add_member(fx, first, 1, first_min_age).await,
+            add_member(fx, second, 2, 7).await,
+        ]
+    }
+
+    /// #5150: a member whose upstream has no such project has nothing to
+    /// refuse. No 451, no review row, and the member that hosts it serves.
+    #[tokio::test]
+    async fn member_without_the_project_steps_aside_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let reviews = (
+            review_count(&fx, members[0].id).await,
+            review_count(&fx, members[1].id).await,
+        );
+        teardown(fx, members).await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"wheel-from-b");
+        assert_eq!(reviews, (0, 0), "no review row for a package not hosted");
+    }
+
+    /// #5150 on a simple-only member: the JSON API's 404 proves nothing there,
+    /// the index that lists other versions of the project is what decides.
+    #[tokio::test]
+    async fn simple_only_member_without_the_version_steps_aside_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        a.simple_html(&[("gated-0.1.0-py3-none-any.whl", None)])
+            .await;
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let reviews = review_count(&fx, members[0].id).await;
+        teardown(fx, members).await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"wheel-from-b");
+        assert_eq!(reviews, 0);
+    }
+
+    /// #5150's table: a member at 0 days that does not host it is no veto.
+    #[tokio::test]
+    async fn zero_day_member_without_the_project_is_no_veto_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 0).await;
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        teardown(fx, members).await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"wheel-from-b");
+    }
+
+    /// A member that hides the version from its index while still answering
+    /// the file path is out of this request. Stepping aside must never hand
+    /// out that member's ungated bytes.
+    #[tokio::test]
+    async fn stepped_aside_member_never_serves_its_own_bytes_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        a.simple_html(&[("gated-0.1.0-py3-none-any.whl", None)])
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/{WHEEL}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(&b"hidden-bytes"[..]))
+            .mount(&server)
+            .await;
+        let members = vec![add_member(&fx, &a, 1, 7).await];
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        teardown(fx, members).await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// The other half of #5150: a member that hosts the version and refuses
+    /// it blocks the virtual. It must not fall through to a member that would
+    /// serve the same version.
+    #[tokio::test]
+    async fn hosting_member_too_young_still_blocks_the_virtual_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        a.warehouse(VERSION, &young()).await;
+        a.simple_html(&[(WHEEL, None)]).await;
+        a.wheel(WHEEL, b"young-wheel").await;
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let reviews = review_count(&fx, members[0].id).await;
+        teardown(fx, members).await;
+
+        assert_451(status, &body, Some(0));
+        assert_eq!(reviews, 1, "the review belongs to the hosting member");
+    }
+
+    /// Listed with no time anywhere is a hosted answer with an unknown age: it
+    /// blocks at a positive threshold and does not fall through (#5151 keeps
+    /// the fail-closed contract, #5150 keeps the block).
+    #[tokio::test]
+    async fn listed_without_a_time_blocks_and_does_not_fall_through_5151() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        a.simple_html(&[(WHEEL, None)]).await;
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        teardown(fx, members).await;
+
+        assert_451(status, &body, None);
+    }
+
+    /// An upstream that cannot be read has not said the package is missing:
+    /// transient and refused answers stay fail-closed, in every status shape.
+    #[tokio::test]
+    async fn unreadable_member_index_is_not_a_miss_5150() {
+        for (json_status, simple_status) in [(404, 500), (403, 403), (500, 401), (404, 429)] {
+            let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+                return;
+            };
+            let (server, guard) = tdh::non_loopback_mock_server().await;
+            let a = Upstream {
+                server: &server,
+                prefix: "a",
+            };
+            let b = Upstream {
+                server: &server,
+                prefix: "b",
+            };
+            a.warehouse_status(json_status).await;
+            a.simple_status(simple_status).await;
+            b.hosting_old_wheel(b"wheel-from-b").await;
+            let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+            let state = state_for(&fx);
+
+            let (status, body) = download(&state, &fx, WHEEL).await;
+            teardown(fx, members).await;
+            drop(guard);
+
+            assert_451(status, &body, None);
+        }
+    }
+
+    /// A 200 that is not a simple index (a login page, a captive proxy) says
+    /// nothing about the package either.
+    #[tokio::test]
+    async fn non_index_page_from_a_member_is_not_a_miss_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<html><body><a href=\"/forgot\">Forgot?</a></body></html>",
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        teardown(fx, members).await;
+
+        assert_451(status, &body, None);
+    }
+
+    /// An administrator's rejection on the member survives the upstream
+    /// dropping the version: a rejection is a decision, not an age.
+    #[tokio::test]
+    async fn rejected_review_on_a_non_hosting_member_still_blocks_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        sqlx::query(
+            "INSERT INTO age_gate_reviews (repository_id, package_name, package_version, status) \
+             VALUES ($1, $2, $3, 'rejected')",
+        )
+        .bind(members[0].id)
+        .bind(PROJECT)
+        .bind(VERSION)
+        .execute(&fx.pool)
+        .await
+        .expect("reject");
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        teardown(fx, members).await;
+
+        assert_451(status, &body, None);
+    }
+
+    /// A body that only mentions the filename (a yank reason here) is not a
+    /// listing. The name is the client's, so it must start no `first_seen`
+    /// clock: otherwise a client could pre-age a version not yet published.
+    #[tokio::test]
+    async fn filename_mentioned_outside_a_listing_starts_no_clock_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let other = a.file_url("gated-0.1.0-py3-none-any.whl");
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!(
+                    "<a href=\"{other}\" data-yanked=\"use {WHEEL} instead\">\
+                     gated-0.1.0-py3-none-any.whl</a>"
+                ),
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+        let Some(fx) = direct_remote(&a.url(), 7, "first_seen").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let observations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM age_gate_version_observations WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count observations");
+        fx.teardown().await;
+
+        assert_451(status, &body, None);
+        assert_eq!(observations, 0, "no clock from a mere mention");
+    }
+
+    /// A 200 page that is not about this project says nothing about it, even
+    /// when its links happen to parse as distribution filenames.
+    #[tokio::test]
+    async fn page_about_something_else_is_not_a_miss_5150() {
+        for page in [
+            "<html><a href=\"/client-setup.zip\">Get the client</a></html>",
+            "<html><a href=\"/gated-setup.zip\">Get the client</a></html>",
+            "<a href=\"/f/other-0.1.0-py3-none-any.whl\">other-0.1.0-py3-none-any.whl</a>",
+        ] {
+            let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+                return;
+            };
+            let (server, guard) = tdh::non_loopback_mock_server().await;
+            let a = Upstream {
+                server: &server,
+                prefix: "a",
+            };
+            let b = Upstream {
+                server: &server,
+                prefix: "b",
+            };
+            Mock::given(method("GET"))
+                .and(path(format!("/a/simple/{PROJECT}/")))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(page, "text/html"))
+                .mount(&server)
+                .await;
+            b.hosting_old_wheel(b"wheel-from-b").await;
+            let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+            let state = state_for(&fx);
+
+            let (status, body) = download(&state, &fx, WHEEL).await;
+            teardown(fx, members).await;
+            drop(guard);
+
+            assert_451(status, &body, None);
+        }
+    }
+
+    /// Another project's file carrying the requested version is not a listing
+    /// of this project, so it starts no clock either.
+    #[tokio::test]
+    async fn another_projects_file_starts_no_clock_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<a href=\"/client-1.0.0.zip\">Get the client</a>",
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+        let Some(fx) = direct_remote(&a.url(), 7, "first_seen").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        fx.teardown().await;
+
+        assert_451(status, &body, None);
+    }
+
+    /// A project page with no files is a real answer when it identifies itself
+    /// as a simple index: PEP 629's meta tag in HTML, `name` in PEP 691.
+    #[tokio::test]
+    async fn empty_index_that_identifies_itself_steps_aside_5150() {
+        let pages = [
+            (
+                "<!DOCTYPE html><html><head>\
+                 <meta name=\"pypi:repository-version\" content=\"1.0\"/>\
+                 </head><body></body></html>"
+                    .to_string(),
+                "text/html",
+            ),
+            (
+                serde_json::json!({
+                    "meta": {"api-version": "1.1"}, "name": PROJECT, "files": []
+                })
+                .to_string(),
+                PEP691_JSON_CONTENT_TYPE,
+            ),
+        ];
+        for (page, content_type) in pages {
+            let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+                return;
+            };
+            let (server, guard) = tdh::non_loopback_mock_server().await;
+            let a = Upstream {
+                server: &server,
+                prefix: "a",
+            };
+            let b = Upstream {
+                server: &server,
+                prefix: "b",
+            };
+            Mock::given(method("GET"))
+                .and(path(format!("/a/simple/{PROJECT}/")))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(page, content_type))
+                .mount(&server)
+                .await;
+            b.hosting_old_wheel(b"wheel-from-b").await;
+            let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+            let state = state_for(&fx);
+
+            let (status, body) = download(&state, &fx, WHEEL).await;
+            teardown(fx, members).await;
+            drop(guard);
+
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(&body[..], b"wheel-from-b");
+        }
+    }
+
+    /// The classification on its own, for the shapes a route test would only
+    /// repeat. Only a document about this project may say "not hosted".
+    #[test]
+    fn index_evidence_needs_a_document_about_this_project_5150() {
+        use UpstreamVersionEvidence::{Listed, NotHosted, Unknown};
+        let check = |body: &str, project: &str, filename: &str, version: &str| {
+            super::pypi_index_version_evidence(body.as_bytes(), "key", project, filename, version)
+        };
+        let html = |name: &str| format!("<a href=\"/f/{name}\">{name}</a>");
+        let json = |doc: serde_json::Value| doc.to_string();
+        let (file, ver) = ("foo_bar-1.0.0-py3-none-any.whl", "1.0.0");
+
+        // HTML: every PEP 503 spelling of the project name counts.
+        for other in [
+            "foo_bar-0.1.0-py3-none-any.whl",
+            "Foo.Bar-0.1.0.tar.gz",
+            "foo-bar-0.1.0.zip",
+        ] {
+            assert_eq!(
+                check(&html(other), "foo-bar", file, ver),
+                NotHosted,
+                "{other}"
+            );
+        }
+        assert_eq!(
+            check(&html("foo-bar-1.0.tar.gz"), "foo-bar", file, ver),
+            Listed(None),
+            "a PEP 440-equal spelling is the same version"
+        );
+        assert_eq!(
+            check(&html("foo-baz-0.1.0.tar.gz"), "foo-bar", file, ver),
+            Unknown
+        );
+        assert_eq!(check("<html></html>", "foo-bar", file, ver), Unknown);
+        // An empty page with the PEP 629 marker but a stray link is not empty.
+        assert_eq!(
+            check(
+                "<meta name=\"pypi:repository-version\" content=\"1.0\"><a href=\"/x\">x</a>",
+                "foo-bar",
+                file,
+                ver
+            ),
+            Unknown
+        );
+        // A non-PEP 440 spelling the name filter keeps but the lookup misses.
+        assert_eq!(
+            check(&html("foo-bar-custom.tar.gz"), "foo-bar", file, ver),
+            Unknown
+        );
+
+        // PEP 691.
+        let doc = |name: Option<&str>, files: Vec<&str>| {
+            let files: Vec<_> = files
+                .iter()
+                .map(|f| serde_json::json!({"filename": f, "url": "x"}))
+                .collect();
+            let mut doc = serde_json::json!({"meta": {"api-version": "1.1"}, "files": files});
+            if let Some(name) = name {
+                doc["name"] = serde_json::json!(name);
+            }
+            json(doc)
+        };
+        let some = Some("Foo_Bar");
+        assert_eq!(check(&doc(some, vec![]), "foo-bar", file, ver), NotHosted);
+        assert_eq!(check(&doc(None, vec![]), "foo-bar", file, ver), Unknown);
+        assert_eq!(
+            check(&doc(Some("baz"), vec![]), "foo-bar", file, ver),
+            Unknown
+        );
+        assert_eq!(
+            check(
+                &doc(some, vec!["foo_bar-0.1.0.tar.gz"]),
+                "foo-bar",
+                file,
+                ver
+            ),
+            NotHosted
+        );
+        assert_eq!(
+            check(
+                &doc(some, vec!["foo_bar-1.0.0.tar.gz"]),
+                "foo-bar",
+                file,
+                ver
+            ),
+            Listed(None)
+        );
+        assert_eq!(
+            check(&doc(some, vec!["baz-1.0.0.tar.gz"]), "foo-bar", file, ver),
+            Unknown
+        );
+        assert_eq!(
+            check(
+                &doc(Some("baz"), vec!["foo_bar-0.1.0.tar.gz"]),
+                "foo-bar",
+                file,
+                ver
+            ),
+            Unknown
+        );
+        // A yank reason naming the file: mentioned, not listed.
+        let mut yanked = serde_json::json!({
+            "meta": {"api-version": "1.1"}, "name": "foo-bar",
+            "files": [{"filename": "foo_bar-0.1.0.tar.gz", "url": "x", "yanked": file}]
+        });
+        assert_eq!(check(&json(yanked.take()), "foo-bar", file, ver), Unknown);
+    }
+
+    /// Reads of one member's index coalesce, so requests for one project cost
+    /// one upstream read however they arrive within the window (#5150).
+    #[tokio::test]
+    async fn repeated_requests_share_one_index_read_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        a.simple_html(&[("gated-0.1.0-py3-none-any.whl", None)])
+            .await;
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let concurrent = futures::future::join_all((0..4).map(|_| download(&state, &fx, WHEEL)));
+        let statuses: Vec<StatusCode> = concurrent.await.into_iter().map(|(s, _)| s).collect();
+        let (again, _) = download(&state, &fx, WHEEL).await;
+        let reads = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == format!("/a/simple/{PROJECT}/"))
+            .count();
+        teardown(fx, members).await;
+
+        assert!(
+            statuses.iter().all(|s| *s == StatusCode::OK),
+            "{statuses:?}"
+        );
+        assert_eq!(again, StatusCode::OK);
+        assert_eq!(reads, 1);
+    }
+
+    /// The window is what a "not hosted" answer can outlive the publish by.
+    /// Once it passes, a version published since blocks as it should.
+    #[tokio::test]
+    async fn not_hosted_does_not_outlive_its_window_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .respond_with(ResponseTemplate::new(404))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let now = young();
+        a.simple_html(&[(WHEEL, Some(now.as_str()))]).await;
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let (first, _) = download(&state, &fx, WHEEL).await;
+        tokio::time::sleep(
+            proxy_helpers::AGE_GATE_UPSTREAM_READ_TTL + std::time::Duration::from_millis(500),
+        )
+        .await;
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        teardown(fx, members).await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert_451(status, &body, Some(0));
+    }
+
+    /// Direct Remote with `gate`, on a fixture of its own.
+    async fn direct_remote(upstream_url: &str, min_age: i32, mode: &str) -> Option<tdh::Fixture> {
+        let fx = tdh::Fixture::setup("remote", "pypi").await?;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = true, \
+             age_gate_min_age_days = $2, age_gate_mode = $3 WHERE id = $4",
+        )
+        .bind(upstream_url)
+        .bind(min_age)
+        .bind(mode)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("gate the remote");
+        Some(fx)
+    }
+
+    /// A direct Remote has no sibling to defer to: its answer is unchanged.
+    #[tokio::test]
+    async fn direct_remote_without_the_project_is_unchanged_5150() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let Some(fx) = direct_remote(&a.url(), 7, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        fx.teardown().await;
+
+        assert_451(status, &body, None);
+    }
+
+    /// #5151: `min_age_days = 0` lets every version through, with no publish
+    /// time anywhere and no review row.
+    #[tokio::test]
+    async fn zero_days_serves_a_simple_only_upstream_with_no_times_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        a.simple_html(&[(WHEEL, None)]).await;
+        a.wheel(WHEEL, b"simple-only-wheel").await;
+        let Some(fx) = direct_remote(&a.url(), 0, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let reviews = review_count(&fx, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"simple-only-wheel");
+        assert_eq!(reviews, 0);
+    }
+
+    /// #5151: `0` also never depends on the upstream's metadata being
+    /// readable, and a pending row left by the old behaviour is released.
+    #[tokio::test]
+    async fn zero_days_releases_a_pending_row_without_metadata_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        a.warehouse_status(403).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!("<a href=\"{}\">{WHEEL}</a>", a.file_url(WHEEL)),
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+        a.wheel(WHEEL, b"simple-only-wheel").await;
+        let Some(fx) = direct_remote(&a.url(), 0, "upstream_publish_time").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO age_gate_reviews (repository_id, package_name, package_version, status) \
+             VALUES ($1, $2, $3, 'pending')",
+        )
+        .bind(fx.repo_id)
+        .bind(PROJECT)
+        .bind(VERSION)
+        .execute(&fx.pool)
+        .await
+        .expect("seed pending");
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let row: String =
+            sqlx::query_scalar("SELECT status FROM age_gate_reviews WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("row");
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(row, "approved");
+    }
+
+    /// #5151: a rejection still blocks at 0 days (the #1558 trusted-remote
+    /// contract); only the age delay goes away.
+    #[tokio::test]
+    async fn zero_days_still_honours_a_rejection_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        a.simple_html(&[(WHEEL, None)]).await;
+        a.wheel(WHEEL, b"simple-only-wheel").await;
+        let Some(fx) = direct_remote(&a.url(), 0, "upstream_publish_time").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO age_gate_reviews (repository_id, package_name, package_version, status) \
+             VALUES ($1, $2, $3, 'rejected')",
+        )
+        .bind(fx.repo_id)
+        .bind(PROJECT)
+        .bind(VERSION)
+        .execute(&fx.pool)
+        .await
+        .expect("seed rejection");
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        fx.teardown().await;
+
+        assert_eq!(status.as_u16(), 451, "{}", String::from_utf8_lossy(&body));
+    }
+
+    /// #5151: the upload time an HTML index publishes is read, including for
+    /// a percent-encoded local version like the ones PyTorch's index links.
+    #[tokio::test]
+    async fn old_data_upload_time_serves_without_a_json_api_5151() {
+        const CPU_WHEEL: &str = "gated-1.0.0+cpu-py3-none-any.whl";
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        a.warehouse_status(403).await;
+        let href = a.file_url("gated-1.0.0%2Bcpu-py3-none-any.whl");
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!(
+                    "<a href=\"{href}#sha256=7c9e\" data-upload-time=\"{OLD}\">{CPU_WHEEL}</a>"
+                ),
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+        a.wheel("gated-1.0.0%2Bcpu-py3-none-any.whl", b"cpu-wheel")
+            .await;
+        a.wheel(CPU_WHEEL, b"cpu-wheel").await;
+        let Some(fx) = direct_remote(&a.url(), 7, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, CPU_WHEEL).await;
+        let reviews = review_count(&fx, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert_ne!(status.as_u16(), 451, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(reviews, 0);
+    }
+
+    /// #5151: a young `data-upload-time` blocks with its real age, and the
+    /// row carries the time so the sweep can release it.
+    #[tokio::test]
+    async fn young_data_upload_time_blocks_with_its_age_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let now = young();
+        a.simple_html(&[(WHEEL, Some(now.as_str()))]).await;
+        a.wheel(WHEEL, b"young-wheel").await;
+        let Some(fx) = direct_remote(&a.url(), 7, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let dated: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT upstream_published_at FROM age_gate_reviews WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("review row");
+        fx.teardown().await;
+
+        assert_451(status, &body, Some(0));
+        assert!(dated.is_some(), "the review row records the time");
+    }
+
+    /// #5151: a PEP 691 upstream's PEP 700 `upload-time` is read too; it is
+    /// the representation that carries the time when HTML does not.
+    #[tokio::test]
+    async fn pep700_upload_time_dates_a_version_without_a_json_api_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let now = young();
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .and(header_regex("accept", r"vnd\.pypi\.simple\.v1\+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                serde_json::json!({
+                    "meta": { "api-version": "1.1" },
+                    "name": PROJECT,
+                    "files": [{ "filename": WHEEL, "url": a.file_url(WHEEL), "upload-time": now }]
+                })
+                .to_string(),
+                PEP691_JSON_CONTENT_TYPE,
+            ))
+            .mount(&server)
+            .await;
+        a.simple_html(&[(WHEEL, None)]).await;
+        a.wheel(WHEEL, b"young-wheel").await;
+        let Some(fx) = direct_remote(&a.url(), 7, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        fx.teardown().await;
+
+        assert_451(status, &body, Some(0));
+    }
+
+    /// The JSON API stays first: it is the existing source, and an upstream
+    /// that has it pays no extra read.
+    #[tokio::test]
+    async fn warehouse_time_is_read_before_the_simple_index_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let now = young();
+        a.warehouse(VERSION, &now).await;
+        a.simple_html(&[(WHEEL, Some(OLD))]).await;
+        let Some(fx) = direct_remote(&a.url(), 7, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        fx.teardown().await;
+
+        assert_451(status, &body, Some(0));
+    }
+
+    /// The documented way out for an upstream with no times is `first_seen`.
+    /// It must work there: a listed file is the existence evidence that starts
+    /// the clock even without a JSON API, and the block carries that age.
+    #[tokio::test]
+    async fn first_seen_starts_the_clock_from_the_simple_index_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        a.simple_html(&[(WHEEL, None)]).await;
+        let Some(fx) = direct_remote(&a.url(), 7, "first_seen").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        fx.teardown().await;
+
+        assert_451(status, &body, Some(0));
+    }
+
+    /// The listing makes the download's decision on the same evidence: an
+    /// HTML index without a JSON API withholds the young version it dates.
+    #[tokio::test]
+    async fn html_listing_filters_by_data_upload_time_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let Some(fx) = direct_remote(&a.url(), 7, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+        let repo = super::resolve_pypi_repo(&fx.pool, &fx.repo_key)
+            .await
+            .unwrap_or_else(|_| panic!("repo resolves"));
+        let now = young();
+        let html = format!(
+            "<a href=\"/x/gated-1.0.0-py3-none-any.whl\" data-upload-time=\"{OLD}\">o</a>\
+             <a href=\"/x/gated-2.0.0-py3-none-any.whl\" data-upload-time=\"{now}\">y</a>"
+        );
+
+        let filtered =
+            super::filter_pypi_simple_html_response(&state, &repo, &a.url(), PROJECT, html).await;
+        fx.teardown().await;
+
+        assert!(filtered.contains("gated-1.0.0"), "{filtered}");
+        assert!(!filtered.contains("gated-2.0.0"), "{filtered}");
     }
 }

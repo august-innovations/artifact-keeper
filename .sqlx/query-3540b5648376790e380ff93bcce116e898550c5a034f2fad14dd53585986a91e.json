@@ -6,7 +6,13 @@
       {
         "ordinal": 0,
         "name": "artifact_id!",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "artifact_id"
+          }
+        }
       }
     ],
     "parameters": {

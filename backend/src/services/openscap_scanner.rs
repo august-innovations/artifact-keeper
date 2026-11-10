@@ -175,8 +175,10 @@ impl OpenScapScanner {
         artifact: &Artifact,
         content: &Bytes,
     ) -> Result<WorkspaceGuard> {
+        // Per scan job, not per artifact (#4668): two scans of one artifact
+        // must not share (and delete) one tree.
         let workspace =
-            ScanWorkspace::workspace_dir(&self.scan_workspace, Some("openscap"), artifact);
+            ScanWorkspace::job_workspace_dir(&self.scan_workspace, Some("openscap"), artifact);
         // Create the base first (idempotent) so a missing/unwritable shared
         // volume root surfaces as a clear, actionable error rather than a bare
         // "Permission denied (os error 13)" against the per-scan subdir
@@ -278,6 +280,9 @@ impl OpenScapScanner {
                     fixed_version: None,
                     source: Some("openscap".to_string()),
                     source_url,
+                    // #3013: a failed XCCDF rule is a configuration /
+                    // compliance violation, not a known weakness.
+                    finding_class: crate::models::security::FindingClass::Policy,
                 }
             })
             .collect()
@@ -451,6 +456,10 @@ mod tests {
         );
         assert_eq!(findings[0].source_url, Some("CCE-27286-2".to_string()));
         assert_eq!(findings[1].severity, Severity::Medium);
+        // #3013: compliance rule failures are classed `policy`.
+        assert!(findings
+            .iter()
+            .all(|f| f.finding_class == crate::models::security::FindingClass::Policy));
     }
 
     // -----------------------------------------------------------------------
@@ -863,7 +872,10 @@ mod tests {
             "application/x-rpm",
             "rpm/nginx/1.24.0/nginx-1.24.0-1.el9.x86_64.rpm",
         );
-        let expected_workspace = ScanWorkspace::workspace_dir(
+        // The job directory is unique per scan (#4668); fix this thread's
+        // suffix so the expected path is known in advance.
+        crate::services::scanner_service::test_scan_job_suffix::fix("openscap-job");
+        let expected_workspace = ScanWorkspace::job_workspace_dir(
             &dir.path().to_string_lossy(),
             Some("openscap"),
             &artifact,
@@ -956,7 +968,10 @@ mod tests {
             "application/x-rpm",
             "rpm/nginx/1.24.0/nginx-1.24.0-1.el9.x86_64.rpm",
         );
-        let expected_path = ScanWorkspace::workspace_dir(
+        // The job directory is unique per scan (#4668); fix this thread's
+        // suffix so the expected path is known in advance.
+        crate::services::scanner_service::test_scan_job_suffix::fix("openscap-job");
+        let expected_path = ScanWorkspace::job_workspace_dir(
             &dir.path().to_string_lossy(),
             Some("openscap"),
             &artifact,

@@ -22,7 +22,6 @@ use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
@@ -54,6 +53,8 @@ pub fn router() -> Router<SharedState> {
         .route("/:repo_key/locks", post(create_lock).get(list_locks))
         .route("/:repo_key/locks/verify", post(verify_locks))
         .route("/:repo_key/locks/:lock_id/unlock", post(delete_lock))
+        // Bounds only the buffered JSON bodies (batch, verify, locks). Object
+        // uploads stream and are bounded by `MAX_UPLOAD_SIZE` (#4595).
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)) // 2 GB
 }
 
@@ -194,7 +195,7 @@ async fn resolve_lfs_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
     use sqlx::Row;
     let repo = sqlx::query(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
-         repo_type::text as repo_type, upstream_url, promotion_only FROM repositories WHERE key = $1",
+         repo_type::text as repo_type, upstream_url, promotion_only FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
     )
     .bind(repo_key)
     .fetch_optional(db)
@@ -249,6 +250,33 @@ fn validate_oid(oid: &str) -> Result<(), Response> {
         ));
     }
     Ok(())
+}
+
+/// The storage key a new LFS object is written to.
+///
+/// On a shared cloud namespace (S3/GCS/Azure) this is the repo-scoped
+/// `gitlfs/{repository_id}/{oid[..2]}/{oid}` of the #2624 scheme, so two
+/// repositories holding the same object (a fork and its upstream, a mirror)
+/// write two objects. The flat `gitlfs/{oid[..2]}/{oid}` key every
+/// repository used to share made the second repository's PUT fail the
+/// cross-repository write guard with 409 "already owned by another
+/// repository" once #5002 routed the LFS PUT through it (#5659).
+/// Filesystem backends (one directory per repository) and
+/// `STORAGE_KEY_SCHEME=flat` keep the flat key. Existing objects are
+/// untouched: every LFS read resolves the object through the `storage_key`
+/// its artifact row recorded.
+fn lfs_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: uuid::Uuid,
+    oid: &str,
+) -> String {
+    scheme.write_key(
+        storage_backend,
+        "gitlfs",
+        repo_id,
+        &format!("{}/{}", &oid[..2], oid),
+    )
 }
 
 fn lfs_json_response(status: StatusCode, body: &impl Serialize) -> Response {
@@ -309,7 +337,7 @@ async fn batch(
     // deny-by-default action choke-point (#2603 G1) shared with the artifact
     // write handlers; the subsequent object `PUT` is independently write-gated
     // by the same middleware.
-    let auth_header = if request.operation == "upload" {
+    if request.operation == "upload" {
         let ext = require_auth_basic(auth, "git-lfs")?;
         require_repo_action(&ext, repo.id, "write", &state.permission_service)
             .await
@@ -325,14 +353,19 @@ async fn batch(
                     "You do not have permission to upload to this repository",
                 )
             })?;
-        // Pass auth header through to action hrefs
-        headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_string())
-    } else {
-        None
-    };
+    }
+
+    // The caller's own `Authorization` header, handed back in every action
+    // (#4570). git-lfs follows an action marked `authenticated: true` with the
+    // action's headers ONLY; it does not add its own credentials. The object
+    // GET and PUT on a private repository need them, so a download action
+    // with an empty header made `git lfs pull` retry a 401 forever, while the
+    // upload actions, which always carried the header, worked. An action is
+    // marked authenticated only when it carries the credential.
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
 
     let base_url = build_base_url(request_base_url.as_str(), &repo_key);
     let mut response_objects = Vec::with_capacity(request.objects.len());
@@ -385,7 +418,7 @@ async fn batch(
                     BatchResponseObject {
                         oid: obj.oid.clone(),
                         size: obj.size,
-                        authenticated: Some(true),
+                        authenticated: auth_header.as_ref().map(|_| true),
                         actions: Some(BatchActions {
                             download: Some(BatchAction {
                                 href: format!("{}/objects/{}", base_url, obj.oid),
@@ -453,7 +486,14 @@ async fn batch(
         objects: response_objects,
     };
 
-    Ok(lfs_json_response(StatusCode::OK, &response))
+    // The actions can carry the caller's credential: never let a shared
+    // cache keep the response.
+    let mut response = lfs_json_response(StatusCode::OK, &response);
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
 }
 
 fn build_base_url(request_base_url: &str, repo_key: &str) -> String {
@@ -464,11 +504,25 @@ fn build_base_url(request_base_url: &str, repo_key: &str) -> String {
 // PUT /lfs/:repo_key/objects/:oid - Upload object
 // ---------------------------------------------------------------------------
 
+/// Whether a declared `Content-Length` is already over `MAX_UPLOAD_SIZE`
+/// (`max`, where `0` means unlimited), so the upload can be refused before
+/// any of the body is read. The staging helper enforces the same limit on the
+/// bytes actually received, which also covers a missing or wrong header.
+fn declared_length_exceeds(headers: &HeaderMap, max: u64) -> bool {
+    max != 0
+        && headers
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|n| n > max)
+}
+
 async fn upload_object(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, oid)): Path<(String, String)>,
-    body: Bytes,
+    headers: HeaderMap,
+    body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "git-lfs", "write:artifacts")?.user_id;
@@ -480,14 +534,35 @@ async fn upload_object(
 
     validate_oid(&oid)?;
 
-    if body.is_empty() {
+    // #4595: LFS objects follow `MAX_UPLOAD_SIZE` like every other upload
+    // path. The body streams to disk, so there is no reason for a lower cap.
+    let max = state.config.max_upload_size_bytes;
+    if declared_length_exceeds(&headers, max) {
+        return Err(lfs_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &format!("Object exceeds the maximum allowed size of {max} bytes"),
+        ));
+    }
+
+    // GHSA-9f9r-c4w8-rjv9: stream the body to the upload scratch disk,
+    // hashing as it arrives, instead of buffering the whole object in memory
+    // before the handler runs. The router-wide progress deadline bounds a
+    // stalled body, and the per-principal admission cap bounds how many of
+    // these one caller can run at once. The stager enforces
+    // `MAX_UPLOAD_SIZE` on the bytes received (413 mid-stream).
+    let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
+        &state,
+        &repo,
+        body.into_data_stream(),
+    )
+    .await?;
+
+    if staged.is_empty() {
         return Err(lfs_error_response(StatusCode::BAD_REQUEST, "Empty body"));
     }
 
     // Verify SHA-256 matches the OID
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
+    let computed_sha256 = digests.sha256.clone();
 
     if computed_sha256 != oid {
         return Err(lfs_error_response(
@@ -521,24 +596,41 @@ async fn upload_object(
             .unwrap());
     }
 
-    // Store the object
-    let storage_key = format!("gitlfs/{}/{}", &oid[..2], oid);
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-    })?;
-
-    let size_bytes = body.len() as i64;
     let artifact_path = format!("lfs/objects/{}/{}", &oid[..2], oid);
+    let size_bytes = staged.size_bytes();
+
+    // Store the object, streaming it from local scratch or copying the object
+    // the repository's backend already staged (#4990). The helper runs the
+    // quota preflight and the cross-repo write guard before writing. The key
+    // is repo-scoped on a shared cloud namespace (#5659), so the guard only
+    // ever refuses a key another repository could own on the legacy flat
+    // scheme (`STORAGE_KEY_SCHEME=flat`).
+    let storage_key = lfs_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &oid,
+    );
+    proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -558,9 +650,15 @@ async fn upload_object(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
+        lfs_error_response(
+            crate::api::handlers::db_status(&e),
+            crate::api::handlers::db_err_message(&e),
+        )
+    })?;
+    tx.commit().await.map_err(|e| {
         lfs_error_response(
             crate::api::handlers::db_status(&e),
             crate::api::handlers::db_err_message(&e),
@@ -569,6 +667,18 @@ async fn upload_object(
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
+    // #3939: Git LFS objects have no package catalog entry to hang the
+    // event off, so the upload emits it against the row it just wrote.
+    state
+        .event_bus
+        .emit_artifact_uploaded(artifact_id, repo.id, Some(user_id));
 
     // Update repository timestamp
     let _ = sqlx::query!(
@@ -576,6 +686,17 @@ async fn upload_object(
         repo.id,
     )
     .execute(&state.db)
+    .await;
+
+    // #4725: fan out to subscribed push peers now that the row is committed.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
     .await;
 
     info!(
@@ -641,6 +762,7 @@ async fn download_object(
                         upstream_url,
                         &upstream_path,
                         "application/octet-stream",
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -673,6 +795,7 @@ async fn download_object(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -1137,6 +1260,42 @@ async fn delete_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    // -----------------------------------------------------------------------
+    // #4595: the upload size limit is MAX_UPLOAD_SIZE, not a fixed 2 GiB
+    // -----------------------------------------------------------------------
+
+    fn content_length(n: u64) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, n.to_string().parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn declared_length_over_two_gib_is_allowed_under_max_upload_size_4595() {
+        let ten_gib = 10 * 1024 * 1024 * 1024;
+        let six_gb = 6_000_000_000;
+        assert!(!declared_length_exceeds(&content_length(six_gb), ten_gib));
+        assert!(!declared_length_exceeds(&content_length(ten_gib), ten_gib));
+        assert!(declared_length_exceeds(
+            &content_length(ten_gib + 1),
+            ten_gib
+        ));
+    }
+
+    #[test]
+    fn declared_length_zero_max_means_unlimited_4595() {
+        assert!(!declared_length_exceeds(&content_length(u64::MAX), 0));
+    }
+
+    #[test]
+    fn declared_length_missing_or_garbled_is_left_to_the_stager_4595() {
+        assert!(!declared_length_exceeds(&HeaderMap::new(), 1));
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, "lots".parse().unwrap());
+        assert!(!declared_length_exceeds(&headers, 1));
+    }
 
     // -----------------------------------------------------------------------
     // extract_credentials
@@ -1146,6 +1305,45 @@ mod tests {
     // #3667: lfs_error_response is the envelope the 15 DB sites in this file
     // build; the message they pass must never be the driver text.
     // -----------------------------------------------------------------------
+
+    /// #4765: a Git LFS batch against a database that went away must get a
+    /// retryable 503 in the LFS envelope (`{"message": …}`) with
+    /// `Retry-After: 1`, not a 500. Drives the real repository lookup every
+    /// LFS route starts with, against a closed pool.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_resolve_lfs_repo_db_unavailable_is_503_with_retry_after_4765() {
+        let pool = crate::api::handlers::test_db_helpers::lazy_pool();
+        pool.close().await;
+
+        let response = match resolve_lfs_repo(&pool, "lfs-repo").await {
+            Ok(_) => panic!("a closed pool cannot resolve a repository"),
+            Err(response) => response,
+        };
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            LFS_CONTENT_TYPE
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("LFS JSON envelope");
+        assert_eq!(
+            body["message"],
+            "Database is temporarily unavailable, retry shortly"
+        );
+    }
 
     #[tokio::test]
     #[allow(clippy::disallowed_methods)]
@@ -1482,11 +1680,37 @@ mod tests {
     #[test]
     fn test_lfs_storage_key_format() {
         let oid = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        let storage_key = format!("gitlfs/{}/{}", &oid[..2], oid);
+        let storage_key = lfs_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            uuid::Uuid::new_v4(),
+            oid,
+        );
         assert_eq!(
             storage_key,
             "gitlfs/ab/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
         );
+    }
+
+    /// #5659: a shared cloud namespace gets the repo-scoped key, and the
+    /// `STORAGE_KEY_SCHEME=flat` opt-out keeps the legacy shared key.
+    #[test]
+    fn test_lfs_storage_key_is_repo_scoped_on_cloud_5659() {
+        use crate::storage::StorageKeyScheme;
+        let oid = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let repo_id = uuid::Uuid::new_v4();
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                lfs_storage_key(StorageKeyScheme::RepoScoped, backend, repo_id, oid),
+                format!("gitlfs/{repo_id}/ab/{oid}"),
+                "{backend}"
+            );
+            assert_eq!(
+                lfs_storage_key(StorageKeyScheme::Flat, backend, repo_id, oid),
+                format!("gitlfs/ab/{oid}"),
+                "{backend}"
+            );
+        }
     }
 
     #[test]
@@ -1543,6 +1767,63 @@ mod tests {
         assert!(
             result.is_err(),
             "require_auth_basic(None, ...) must return Err to deny unauthenticated callers"
+        );
+    }
+
+    /// #4725: an LFS object upload to a hosted repository must queue a push
+    /// sync task for a subscribed push peer, and an upload that arrives as
+    /// peer replication must not be fanned back out. Fails on `main`
+    /// (nothing queued).
+    #[tokio::test]
+    async fn gitlfs_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(f) = tdh::Fixture::setup("local", "gitlfs").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "gitlfs").await;
+
+        let content = b"lfs-push-sync-bytes".to_vec();
+        let oid = format!("{:x}", Sha256::digest(&content));
+        let path = format!("lfs/objects/{}/{}", &oid[..2], oid);
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/objects/{}", f.repo_key, oid))
+            .body(axum::body::Body::from(content))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "LFS upload must succeed: {status} {:?}",
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the object
+        // but must not queue another task.
+        let repl_content = b"lfs-replicated-bytes".to_vec();
+        let repl_oid = format!("{:x}", Sha256::digest(&repl_content));
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/objects/{}", f.repo_key, repl_oid))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(repl_content))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated LFS upload must succeed: {status} {:?}",
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec![path],
+            "only the client upload queues a push task; the replicated one must not"
         );
     }
 
@@ -1641,11 +1922,17 @@ mod tests {
 
         /// Build the fixture, or `None` when no database is reachable.
         async fn fx() -> Option<Fx> {
+            fx_with(|_| {}).await
+        }
+
+        /// Like [`fx`], with the test `Config` adjusted before the state is built.
+        async fn fx_with(mutate: impl FnOnce(&mut crate::config::Config)) -> Option<Fx> {
             let pool = tdh::try_pool().await?;
             let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "gitlfs").await;
             let (user_id, username) = tdh::create_user(&pool).await;
             let (other_id, other_name) = tdh::create_user(&pool).await;
-            let state = tdh::build_state(pool.clone(), storage_dir.to_string_lossy().as_ref());
+            let state =
+                tdh::build_state_with(pool.clone(), storage_dir.to_string_lossy().as_ref(), mutate);
             Some(Fx {
                 pool,
                 state,
@@ -2319,5 +2606,372 @@ mod tests {
             );
             fx.cleanup().await;
         }
+
+        /// #3939: a Git LFS object upload writes an `artifacts` row and must
+        /// fire exactly one `artifact.uploaded` for it (it used to fire none).
+        #[tokio::test]
+        async fn upload_object_emits_artifact_uploaded_3939() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let content = b"lfs-object-bytes".to_vec();
+            let oid = format!("{:x}", Sha256::digest(&content));
+            let mut events = fx.state.event_bus.subscribe();
+
+            let (status, body) = parts(
+                upload_object(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path((fx.repo_key.clone(), oid.clone())),
+                    HeaderMap::new(),
+                    Body::from(content),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "upload failed: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let path = format!("lfs/objects/{}/{}", &oid[..2], oid);
+            let artifact_id = tdh::artifact_id_at(&fx.pool, fx.repo_id, &path).await;
+            tdh::assert_one_artifact_uploaded_event(&mut events, fx.repo_id, artifact_id);
+            fx.cleanup().await;
+        }
+        // -------------------------------------------------------------------
+        // #4595: uploads are bounded by MAX_UPLOAD_SIZE and verified by oid
+        // -------------------------------------------------------------------
+
+        /// Small `MAX_UPLOAD_SIZE` the size tests run against.
+        const TEST_MAX_UPLOAD: u64 = 64;
+
+        async fn fx_small_limit() -> Option<Fx> {
+            fx_with(|cfg| cfg.max_upload_size_bytes = TEST_MAX_UPLOAD).await
+        }
+
+        fn oid_of(content: &[u8]) -> String {
+            format!("{:x}", Sha256::digest(content))
+        }
+
+        async fn lfs_artifact_count(fx: &Fx) -> i64 {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count artifacts")
+        }
+
+        async fn put(
+            fx: &Fx,
+            oid: &str,
+            headers: HeaderMap,
+            content: Vec<u8>,
+        ) -> (StatusCode, Bytes) {
+            parts(
+                upload_object(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path((fx.repo_key.clone(), oid.to_string())),
+                    headers,
+                    Body::from(content),
+                )
+                .await,
+            )
+            .await
+        }
+
+        /// An object of exactly `MAX_UPLOAD_SIZE` bytes is stored, and the
+        /// stored bytes are the uploaded ones.
+        #[tokio::test]
+        async fn upload_object_at_max_upload_size_is_stored_4595() {
+            let Some(fx) = fx_small_limit().await else {
+                return;
+            };
+            let content = vec![b'a'; TEST_MAX_UPLOAD as usize];
+            let oid = oid_of(&content);
+
+            let (status, body) = put(&fx, &oid, HeaderMap::new(), content.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "upload failed: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let storage = fx
+                .state
+                .storage_for_repo(
+                    &resolve_lfs_repo(&fx.state.db, &fx.repo_key)
+                        .await
+                        .expect("repo")
+                        .storage_location(),
+                )
+                .expect("storage");
+            let stored = storage
+                .get(&format!("gitlfs/{}/{}", &oid[..2], oid))
+                .await
+                .expect("stored object");
+            assert_eq!(stored.as_ref(), content.as_slice());
+            assert_eq!(lfs_artifact_count(&fx).await, 1);
+            fx.cleanup().await;
+        }
+
+        /// A body over `MAX_UPLOAD_SIZE` with no `Content-Length` is cut off
+        /// while streaming with 413, and nothing is recorded.
+        #[tokio::test]
+        async fn upload_object_over_max_upload_size_is_413_4595() {
+            let Some(fx) = fx_small_limit().await else {
+                return;
+            };
+            let content = vec![b'a'; TEST_MAX_UPLOAD as usize + 1];
+            let oid = oid_of(&content);
+
+            let (status, _) = put(&fx, &oid, HeaderMap::new(), content).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(lfs_artifact_count(&fx).await, 0);
+            fx.cleanup().await;
+        }
+
+        /// A declared `Content-Length` over `MAX_UPLOAD_SIZE` is refused up
+        /// front with the LFS error envelope.
+        #[tokio::test]
+        async fn upload_object_declared_length_over_max_upload_size_is_413_4595() {
+            let Some(fx) = fx_small_limit().await else {
+                return;
+            };
+            let content = vec![b'a'; TEST_MAX_UPLOAD as usize + 1];
+            let oid = oid_of(&content);
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_LENGTH, content.len().to_string().parse().unwrap());
+
+            let (status, body) = put(&fx, &oid, headers, content).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert!(
+                as_json(&body)["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(&TEST_MAX_UPLOAD.to_string()),
+                "413 should name the configured limit"
+            );
+            assert_eq!(lfs_artifact_count(&fx).await, 0);
+            fx.cleanup().await;
+        }
+
+        /// A body whose sha256 is not the oid in the URL is refused with 422
+        /// and neither stored nor recorded.
+        #[tokio::test]
+        async fn upload_object_hash_mismatch_is_rejected_4595() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let oid = oid_of(b"the object the client announced");
+            let content = b"different bytes".to_vec();
+
+            let (status, body) = put(&fx, &oid, HeaderMap::new(), content).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(as_json(&body)["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SHA-256 mismatch"));
+            assert_eq!(lfs_artifact_count(&fx).await, 0);
+            let storage = fx
+                .state
+                .storage_for_repo(
+                    &resolve_lfs_repo(&fx.state.db, &fx.repo_key)
+                        .await
+                        .expect("repo")
+                        .storage_location(),
+                )
+                .expect("storage");
+            assert!(
+                storage
+                    .get(&format!("gitlfs/{}/{}", &oid[..2], oid))
+                    .await
+                    .is_err(),
+                "a mismatched body must not be stored under the oid"
+            );
+            fx.cleanup().await;
+        }
+    }
+}
+
+/// #5659: Git LFS storage keys are repository-scoped on shared cloud storage.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering a small test object in
+// an assertion is not an artifact path (#1608).
+mod repo_scoped_keys_5659 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::storage::StorageBackend;
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    const OBJECT: &[u8] = b"one LFS object shared by a fork and its upstream (#5659)";
+
+    async fn cloud_lfs_repo(pool: &sqlx::PgPool) -> (Uuid, String, std::path::PathBuf) {
+        let (repo_id, repo_key, dir) = tdh::create_repo(pool, "local", "gitlfs").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("set cloud backend");
+        (repo_id, repo_key, dir)
+    }
+
+    async fn parts(out: Result<Response, Response>) -> (StatusCode, Bytes) {
+        let response = out.unwrap_or_else(|r| r);
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        (status, body)
+    }
+
+    async fn put(
+        state: &SharedState,
+        auth: &AuthExtension,
+        repo_key: &str,
+        oid: &str,
+    ) -> (StatusCode, Bytes) {
+        parts(
+            upload_object(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Path((repo_key.to_string(), oid.to_string())),
+                HeaderMap::new(),
+                Body::from(OBJECT.to_vec()),
+            )
+            .await,
+        )
+        .await
+    }
+
+    async fn get(
+        state: &SharedState,
+        auth: &AuthExtension,
+        repo_key: &str,
+        oid: &str,
+    ) -> (StatusCode, Bytes) {
+        parts(
+            download_object(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Path((repo_key.to_string(), oid.to_string())),
+                crate::api::middleware::download_telemetry::DownloadContext::default(),
+            )
+            .await,
+        )
+        .await
+    }
+
+    async fn row_key(pool: &sqlx::PgPool, repo_id: Uuid) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_optional(pool)
+        .await
+        .expect("row key")
+    }
+
+    /// The same object pushes into two Git LFS repositories on a shared
+    /// cloud namespace, and each serves its own copy. On main the second
+    /// repository's PUT answered 409 "already owned by another repository;
+    /// refusing cross-repository overwrite".
+    #[tokio::test]
+    async fn same_object_pushes_to_two_cloud_repositories_5659() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let auth = tdh::make_auth(user_id, &username);
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let oid = hex::encode(Sha256::digest(OBJECT));
+        let mut repos = Vec::new();
+        for _ in 0..2 {
+            repos.push(cloud_lfs_repo(&pool).await);
+        }
+
+        let mut outcomes = Vec::new();
+        for (repo_id, repo_key, _) in &repos {
+            let pushed = put(&state, &auth, repo_key, &oid).await;
+            let fetched = get(&state, &auth, repo_key, &oid).await;
+            outcomes.push((*repo_id, pushed, fetched, row_key(&pool, *repo_id).await));
+        }
+        let objects: Vec<String> = mem.objects.lock().unwrap().keys().cloned().collect();
+
+        for (repo_id, _, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *repo_id, dir).await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        for (repo_id, pushed, fetched, key) in outcomes {
+            assert_eq!(
+                pushed.0,
+                StatusCode::OK,
+                "PUT into repository {repo_id} must be accepted: {}",
+                String::from_utf8_lossy(&pushed.1)
+            );
+            assert_eq!(fetched.0, StatusCode::OK, "GET from {repo_id}");
+            assert_eq!(&fetched.1[..], OBJECT);
+            let expected = format!("gitlfs/{repo_id}/{}/{oid}", &oid[..2]);
+            assert_eq!(key.as_deref(), Some(expected.as_str()));
+            assert!(objects.contains(&expected), "{expected} must be written");
+        }
+        assert!(
+            !objects.contains(&format!("gitlfs/{}/{oid}", &oid[..2])),
+            "the legacy flat key must not be written on a cloud backend: {objects:?}"
+        );
+    }
+
+    /// Existing data keeps serving: an object whose row records the legacy
+    /// flat `gitlfs/{oid[..2]}/{oid}` key is still downloadable, and its
+    /// repository still answers the batch download with an action.
+    #[tokio::test]
+    async fn legacy_flat_key_object_still_downloadable_5659() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let auth = tdh::make_auth(user_id, &username);
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let oid = hex::encode(Sha256::digest(OBJECT));
+        let (repo_id, repo_key, dir) = cloud_lfs_repo(&pool).await;
+        let legacy_key = format!("gitlfs/{}/{oid}", &oid[..2]);
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, 'sha256', $4, $3, 'application/octet-stream', $5)",
+        )
+        .bind(repo_id)
+        .bind(format!("lfs/objects/{}/{oid}", &oid[..2]))
+        .bind(&oid)
+        .bind(OBJECT.len() as i64)
+        .bind(&legacy_key)
+        .execute(&pool)
+        .await
+        .expect("seed legacy row");
+        mem.put(&legacy_key, Bytes::from_static(OBJECT))
+            .await
+            .expect("seed legacy object");
+
+        let fetched = get(&state, &auth, &repo_key, &oid).await;
+        // A re-push of an object the repository holds is the idempotent 200
+        // and leaves the row on its legacy key.
+        let repushed = put(&state, &auth, &repo_key, &oid).await;
+        let key = row_key(&pool, repo_id).await;
+
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert_eq!(fetched.0, StatusCode::OK, "legacy-key object must download");
+        assert_eq!(&fetched.1[..], OBJECT);
+        assert_eq!(repushed.0, StatusCode::OK);
+        assert_eq!(key, Some(legacy_key));
     }
 }

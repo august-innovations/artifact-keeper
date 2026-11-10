@@ -236,6 +236,12 @@ reconcile ledgers from older releases; they no-op on healthy databases.
 
 ## WASM plugin runtime
 
+The runtime is enabled by default. Setting `PLUGINS_ENABLED=false` (or `0`)
+prevents the registry and Wasmtime service from being constructed, skips startup
+plugin loading, and leaves the `/plugins`, `/formats`, and `/ext` routes
+unregistered. This is an outer runtime gate; `PLUGINS_REQUIRE_SIGNED` separately
+controls which plugins may be installed or reloaded when the runtime is enabled.
+
 Custom format handlers can ship as WASM plugins instead of native Rust. The
 contract is the WIT interface in `wit/format-plugin.wit`. A plugin exports a
 `handler` interface (`format-key`, `parse-metadata`, `validate`,

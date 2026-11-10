@@ -9,6 +9,30 @@ This is issue #3460. The policy ships **disabled**: until an administrator
 turns it on, token creation behaves exactly as before (`expires_in_days`
 optional, omitted = never expires).
 
+## Login sessions are short-lived: automation should use API tokens
+
+A login (`POST /api/v1/auth/login`, LDAP login, or the SSO exchange) returns
+an access token that lives `JWT_ACCESS_TOKEN_EXPIRY_MINUTES` (30 minutes by
+default). Every login response reports that lifetime in seconds as
+`expires_in`, with `token_type: "Bearer"`. A browser session renews itself
+with the refresh token (`POST /api/v1/auth/refresh`); a script that logs in
+once and loops will start getting `401` when the access token expires (#4648).
+
+Scripts, CI jobs and other long-running automation should instead mint an API
+token once, with `POST /api/v1/auth/tokens` (choosing its scopes and
+`expires_in_days`), and send it as the Bearer credential. Those tokens are what
+the rest of this page governs. Operators who need longer interactive sessions
+can raise `JWT_ACCESS_TOKEN_EXPIRY_MINUTES`; the legacy `JWT_EXPIRATION_SECS`
+does not affect any token lifetime.
+
+Prefer `Authorization: Bearer <api_token>` wherever the client supports it.
+Package clients that can only send Basic auth (Maven `settings.xml`, pixi/conda,
+an npm `.npmrc` `_auth`) may use `username:<api_token>` on the package routes.
+A Basic password that exactly matches the token shape (41 bytes, `_` at byte 8,
+hex elsewhere) is checked only as a token. It costs no password hash and never
+counts as a failed login against the account. The management API (`/api/v1`)
+refuses it as a Basic password (#5640).
+
 ## What the policy governs — and what it never touches
 
 The policy is enforced at **mint time only**, inside the single choke-point

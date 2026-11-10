@@ -185,7 +185,12 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub access_token: String,
     pub refresh_token: String,
+    /// Seconds until `access_token` expires (`JWT_ACCESS_TOKEN_EXPIRY_MINUTES`,
+    /// 30 minutes by default). Login sessions are short-lived: renew with the
+    /// refresh token, or have automation mint an API token
+    /// (`POST /api/v1/auth/tokens`) instead of logging in (#4648).
     pub expires_in: u64,
+    /// Always `Bearer`.
     pub token_type: String,
     pub must_change_password: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -358,6 +363,12 @@ pub async fn login(
     {
         Ok(result) => result,
         Err(failure) => {
+            if let Some(reason) = failure.metric_reason() {
+                crate::services::metrics_service::record_auth_failure(
+                    crate::services::metrics_service::AuthFailureSurface::Api,
+                    reason,
+                );
+            }
             // The response no longer says which arm rejected the login, so the
             // audit event carries it instead: a SIEM can still separate a
             // username sweep (`unknown_or_inactive_user`) from a locked-out
@@ -478,6 +489,33 @@ pub async fn login(
     ))
 }
 
+/// The refresh-token family of the login session whose access token
+/// authenticated this request (#4831): the JWT in `Authorization: Bearer`, or
+/// the web UI's `ak_access_token` cookie. Access tokens minted with a refresh
+/// token carry its `family_id`; API keys, Basic credentials, access-only
+/// mints and tokens minted before #4831 carry none. The token was already
+/// validated by the auth middleware; it is decoded again only to read the
+/// claim, and must belong to the authenticated user.
+fn presenting_session_family(
+    auth_service: &AuthService,
+    headers: &HeaderMap,
+    auth: &AuthExtension,
+) -> Option<Uuid> {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| {
+            h.strip_prefix("Bearer ")
+                .or_else(|| h.strip_prefix("bearer "))
+        });
+    let token = bearer.or_else(|| extract_cookie(headers, "ak_access_token"))?;
+    let claims = auth_service.validate_access_token(token.trim()).ok()?;
+    if claims.sub != auth.user_id {
+        return None;
+    }
+    claims.family_id
+}
+
 /// Logout current session
 #[utoipa::path(
     post,
@@ -500,19 +538,31 @@ pub async fn logout(
         // (#1807). Scoped to the session's family_id rather than a user-wide
         // watermark, so other concurrent sessions stay alive. Browser clients
         // carry the refresh token in the ak_refresh_token cookie; CLI/mobile
-        // clients pass it in the request body (like /auth/refresh). A missing
-        // or malformed refresh token is ignored: logout still clears cookies
-        // and succeeds.
+        // clients pass it in the request body (like /auth/refresh). The
+        // presenting access token carries the same family_id, so the session
+        // is revoked even when no refresh token is in the request: a bearer
+        // logout with an empty body, or a browser, which only sends the
+        // refresh cookie to /auth/refresh (#4831). A missing or malformed
+        // refresh token is ignored: logout still clears cookies and succeeds.
         let refresh = body
             .and_then(|Json(b)| b.refresh_token)
             .or_else(|| extract_cookie(&headers, "ak_refresh_token").map(String::from));
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
         if let Some(refresh) = refresh {
-            let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
             if let Err(err) = auth_service.revoke_refresh_token_family_for(&refresh).await {
                 tracing::warn!(
                     user_id = %auth.user_id,
                     error = %err,
                     "logout: failed to revoke refresh-token family",
+                );
+            }
+        }
+        if let Some(family_id) = presenting_session_family(&auth_service, &headers, &auth) {
+            if let Err(err) = auth_service.revoke_refresh_token_family(family_id).await {
+                tracing::warn!(
+                    user_id = %auth.user_id,
+                    error = %err,
+                    "logout: failed to revoke the session's refresh-token family",
                 );
             }
         }
@@ -688,6 +738,10 @@ pub async fn create_api_token(
     // that exceeds its own scopes. Interactive sessions (`scopes: None`)
     // are unaffected.
     auth.enforce_mint_ceiling(&payload.scopes)?;
+
+    // A CI OIDC exchanged credential must not outlive its CI token by minting
+    // an API token for its service account.
+    crate::services::token_service::refuse_ci_account_mint(&state.db, auth.user_id).await?;
 
     if let Some(selector) = &payload.repo_selector {
         crate::services::repo_selector_service::validate_token_repo_selector(selector)?;
@@ -1052,6 +1106,7 @@ fn validate_and_normalize_resource_path(input: &str) -> std::result::Result<Stri
         (status = 200, description = "Download ticket created", body = TicketResponse),
         (status = 400, description = "Invalid resource_path", body = super::super::openapi::ErrorResponse),
         (status = 401, description = "Not authenticated", body = super::super::openapi::ErrorResponse),
+        (status = 403, description = "The token lacks read:artifacts", body = super::super::openapi::ErrorResponse),
     )
 )]
 pub async fn create_download_ticket(
@@ -1059,6 +1114,10 @@ pub async fn create_download_ticket(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateTicketRequest>,
 ) -> Result<Json<TicketResponse>> {
+    // A ticket is a read credential, so minting one needs the read scope
+    // (sessions, `scopes: None`, pass). GHSA-2mfv-xg68-gq4p.
+    auth.require_scope("read:artifacts")?;
+
     // Validate and canonicalize the bound path before storage. See
     // `validate_and_normalize_resource_path` for the full policy.
     let normalized_path = match payload.resource_path.as_deref() {
@@ -1066,9 +1125,12 @@ pub async fn create_download_ticket(
         None => None,
     };
 
+    // The ticket carries the minting credential's repository restriction,
+    // and redemption restores it (GHSA-2mfv-xg68-gq4p).
     let ticket = AuthConfigService::create_download_ticket(
         &state.db,
         auth.user_id,
+        &auth.allowed_repo_ids,
         &payload.purpose,
         normalized_path.as_deref(),
     )
@@ -1152,6 +1214,52 @@ mod tests {
             serde_json::from_str("{\"username\":\"ab\",\"password\":\"p\\u0000w\"}").unwrap();
         assert_eq!(req.username, "ab");
         assert!(req.password.contains('\0'));
+    }
+
+    // -----------------------------------------------------------------------
+    // Database outage during login (#4756)
+    // -----------------------------------------------------------------------
+
+    /// #4756: with the database gone, `POST /api/v1/auth/login` cannot check
+    /// the credentials at all, so it must answer a retryable 503 with
+    /// Retry-After, for a correct and a wrong password alike, never a 401
+    /// and never a 500. Before the fix the user lookup's error mapped to
+    /// `500 DATABASE_ERROR`. The pool is closed, the shape of a database
+    /// that went away (the same fixture #4750 uses for the middleware).
+    #[tokio::test]
+    async fn test_login_db_unavailable_returns_503_not_500_4756() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::to_bytes;
+
+        let pool = tdh::lazy_pool();
+        pool.close().await;
+        let state = tdh::build_state(pool, std::env::temp_dir().to_string_lossy().as_ref());
+
+        for password in ["Correct!Horse9Battery", "wrong-password"] {
+            let req = LoginRequest {
+                username: "admin".to_string(),
+                password: password.to_string(),
+            };
+            let err = login(State(state.clone()), HeaderMap::new(), None, Json(req))
+                .await
+                .expect_err("login cannot succeed with the database closed");
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "login during a DB outage must be a retryable 503"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .expect("503 must carry Retry-After"),
+                "1"
+            );
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "DATABASE_UNAVAILABLE");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1390,6 +1498,176 @@ mod tests {
                 .await
                 .is_err(),
             "a refresh token presented after logout must be rejected"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mint and persist one login session (token pair) for `user_id`.
+    async fn mint_persisted_session(
+        pool: &sqlx::PgPool,
+        state: &crate::api::SharedState,
+        user_id: Uuid,
+    ) -> crate::services::auth_service::TokenPair {
+        let auth_service = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(pool)
+                .await
+                .expect("fetch user");
+        let tokens = auth_service.generate_tokens(&user).expect("mint tokens");
+        auth_service
+            .persist_refresh_jti_from_pair(&tokens, user_id)
+            .await
+            .expect("persist refresh jti");
+        tokens
+    }
+
+    /// POST `/logout` through the optional-auth layer, as routes.rs mounts it.
+    async fn send_logout(
+        pool: &sqlx::PgPool,
+        state: &crate::api::SharedState,
+        req: axum::http::Request<axum::body::Body>,
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(state.config.clone()),
+        ));
+        let app =
+            logout_router()
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_service,
+                    crate::api::middleware::auth::optional_auth_middleware,
+                ));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "logout must succeed, got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    async fn unrevoked_refresh_jti(pool: &sqlx::PgPool, user_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM refresh_token_jti WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("count unrevoked jti")
+    }
+
+    /// A bearer logout with an empty body (the API/CLI shape) carries no
+    /// refresh token, so it revoked nothing and the session's refresh token
+    /// kept minting access tokens after a 200 logout (#4831). The access
+    /// token carries the session's family, so logout revokes it.
+    #[tokio::test]
+    async fn logout_with_bearer_and_empty_body_revokes_refresh_token_family() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-logout-empty-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let tokens = mint_persisted_session(&pool, &state, user_id).await;
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .header("authorization", format!("Bearer {}", tokens.access_token))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        send_logout(&pool, &state, req).await;
+
+        assert_eq!(
+            unrevoked_refresh_jti(&pool, user_id).await,
+            0,
+            "a bearer logout without a refresh token must revoke the session's family"
+        );
+        let check = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        assert!(
+            check.refresh_tokens(&tokens.refresh_token).await.is_err(),
+            "the session's refresh token must be rejected after logout"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The browser shape: only the session cookie is sent (the refresh cookie
+    /// is scoped to /auth/refresh) and there is no body (#4831).
+    #[tokio::test]
+    async fn logout_with_session_cookies_only_revokes_refresh_token_family() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-logout-cookie-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let tokens = mint_persisted_session(&pool, &state, user_id).await;
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .header("cookie", format!("ak_access_token={}", tokens.access_token))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        send_logout(&pool, &state, req).await;
+
+        assert_eq!(
+            unrevoked_refresh_jti(&pool, user_id).await,
+            0,
+            "a cookie-only logout must revoke the session's family"
+        );
+        let check = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        assert!(
+            check.refresh_tokens(&tokens.refresh_token).await.is_err(),
+            "the session's refresh token must be rejected after logout"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Logout ends the presenting session only: another concurrent session of
+    /// the same user keeps refreshing (#1807 scoping, kept by #4831).
+    #[tokio::test]
+    async fn logout_revokes_only_the_presenting_session() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-logout-scope-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let first = mint_persisted_session(&pool, &state, user_id).await;
+        let second = mint_persisted_session(&pool, &state, user_id).await;
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .header("authorization", format!("Bearer {}", first.access_token))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        send_logout(&pool, &state, req).await;
+
+        let check = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        assert!(
+            check.refresh_tokens(&first.refresh_token).await.is_err(),
+            "the logged-out session's refresh token must be rejected"
+        );
+        assert!(
+            check.refresh_tokens(&second.refresh_token).await.is_ok(),
+            "another session of the same user must keep refreshing"
         );
 
         tdh::cleanup_user(&pool, user_id).await;
@@ -2593,6 +2871,7 @@ mod tests {
             },
             backstop: Arc::new(RateLimiter::new(10_000, 60)),
             failed_by_ip: Arc::new(RateLimiter::new(failed_per_ip, 60)),
+            audit: None,
         };
         login_router()
             .with_state(state)
@@ -2681,6 +2960,38 @@ mod tests {
         );
     }
 
+    /// #4676: a rejected login is counted in `ak_auth_failures_total` on the
+    /// `api` surface, bucketed by the reason its audit row records.
+    #[test]
+    fn test_login_rejection_is_counted_by_reason_4676() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::metrics_service::capture_counters_async;
+        let (ran, counted) = capture_counters_async(|| async {
+            let Some(pool) = tdh::try_pool().await else {
+                return false;
+            };
+            let dir = std::env::temp_dir().join(format!("ph-4676-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool, dir.to_string_lossy().as_ref());
+            let app = login_app_with_pad_budget(state, 10_000);
+            let (status, _) =
+                login_unknown_user_counting_bcrypt(&app, &format!("ph-ghost-{}", Uuid::new_v4()))
+                    .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            true
+        });
+        if !ran {
+            return;
+        }
+        assert_eq!(
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", "api"), ("reason", "unknown_user")]
+            ),
+            1
+        );
+        assert_eq!(counted.get("ak_auth_failures_total", &[]), 1);
+    }
+
     // -----------------------------------------------------------------------
     // #3888: the LOGIN audit row must carry the client IP, resolved under the
     // trusted-proxy policy (TCP peer authoritative; XFF believed only from a
@@ -2711,7 +3022,10 @@ mod tests {
         let app = login_router()
             .with_state(state)
             .layer(axum::middleware::from_fn_with_state(
-                Arc::new(Vec::new()),
+                Arc::new(crate::api::middleware::client_ip::ClientIpConfig {
+                    trusted_proxies: Vec::new(),
+                    xff_trusted_for_authz: false,
+                }),
                 crate::api::middleware::client_ip::client_ip_context_middleware,
             ));
 
@@ -3409,8 +3723,9 @@ mod personal_token_repo_selector_tests {
         );
         assert_eq!(
             write(&rig, &token, &rig.repo_b.1).await,
-            StatusCode::FORBIDDEN,
-            "a write to B outside the selector must be refused"
+            StatusCode::NOT_FOUND,
+            "a write to private B outside the selector must be refused with the \
+             existence-hiding 404 (#5458)"
         );
 
         cleanup(&rig).await;

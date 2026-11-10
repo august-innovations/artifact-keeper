@@ -90,7 +90,7 @@
     {
       "if": {
         "required": ["action"],
-        "properties": { "action": { "enum": ["LOGIN_FAILED", "PERMISSION_DENIED"] } }
+        "properties": { "action": { "enum": ["LOGIN_FAILED", "PERMISSION_DENIED", "LOGIN_RATE_LIMITED"] } }
       },
       "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/AuthDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
     },
@@ -180,7 +180,58 @@
         "format": { "type": "string" },
         "visibility": { "type": "string" },
         "age_gate_enabled": { "type": "boolean" },
-        "age_gate_min_age_days": { "type": "integer", "minimum": 0 }
+        "age_gate_min_age_days": { "type": "integer", "minimum": 0 },
+        "scan_config": { "$ref": "#/$defs/ScanConfigAuditState" },
+        "previous_scan_config": { "$ref": "#/$defs/ScanConfigAuditState" },
+        "scan_config_changed": { "type": "array", "items": { "type": "string" } },
+        "project_change": { "$ref": "#/$defs/ProjectChangeAudit" },
+        "age_gate_change": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["previous_enabled", "previous_min_age_days", "previous_mode", "actor_tier", "relaxed"],
+          "description": "Present on an age-gate policy change: the policy it replaced, the tier of administrator who made it, and whether it weakened the gate (disabled it, lowered the minimum age, or switched the age source).",
+          "properties": {
+            "previous_enabled": { "type": "boolean" },
+            "previous_min_age_days": { "type": "integer", "minimum": 0 },
+            "previous_mode": { "type": "string", "enum": ["upstream_publish_time", "first_seen"] },
+            "actor_tier": { "type": "string", "enum": ["instance_admin", "repository_admin"] },
+            "relaxed": { "type": "boolean" }
+          }
+        },
+        "upstream_mode_change": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["previous_upstream_mode", "upstream_mode"],
+          "description": "Present when PUT /api/v1/repositories/{key}/upstream-mode changed a Remote's upstream mode (#5282).",
+          "properties": {
+            "previous_upstream_mode": { "type": "string", "enum": ["online", "cache_only"] },
+            "upstream_mode": { "type": "string", "enum": ["online", "cache_only"] }
+          }
+        }
+      }
+    },
+    "ProjectChangeAudit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["previous_project_id", "project_id"],
+      "description": "A repository's project assignment before and after a REPOSITORY_UPDATED that changed it; project_id is null when the assignment was cleared (#4026).",
+      "properties": {
+        "previous_project_id": { "type": ["string", "null"], "format": "uuid" },
+        "project_id": { "type": ["string", "null"], "format": "uuid" }
+      }
+    },
+    "ScanConfigAuditState": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["scan_enabled", "scan_on_upload", "scan_on_proxy", "block_on_policy_violation", "severity_threshold", "proxy_scan_action"],
+      "description": "A repository scan configuration carried by a REPOSITORY_UPDATED scan-config change (#3645).",
+      "properties": {
+        "scan_enabled": { "type": "boolean" },
+        "scan_on_upload": { "type": "boolean" },
+        "scan_on_proxy": { "type": "boolean" },
+        "block_on_policy_violation": { "type": "boolean" },
+        "severity_threshold": { "type": "string", "enum": ["critical", "high", "medium", "low", "info"] },
+        "proxy_scan_action": { "type": "string", "enum": ["fail_open", "fail_closed", "record_only"] }
       }
     },
     "PermissionDetails": {
@@ -218,7 +269,7 @@
       "type": "object",
       "additionalProperties": true,
       "required": [],
-      "description": "details for LOGIN_FAILED / PERMISSION_DENIED and related authorization events.",
+      "description": "details for LOGIN_FAILED / PERMISSION_DENIED / LOGIN_RATE_LIMITED and related authorization events.",
       "properties": {
         "username": { "type": "string" },
         "path": { "type": "string" },

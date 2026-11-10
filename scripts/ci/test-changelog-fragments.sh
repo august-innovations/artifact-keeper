@@ -283,9 +283,16 @@ git -C "$d" init -q . && git -C "$d" -c user.email=t@t -c user.name=t commit -q 
 rc=0; bash "$d/scripts/release/assemble-changelog.sh" --append 1.9.0 > /dev/null 2>&1 || rc=$?
 [ "$rc" = 1 ] && pass "wrapper refuses --append for a tagged version" || fail "wrapper --append tagged: rc=$rc"
 
-# 14. The live tree: every fragment on this branch renders.
+# 14. The live tree: every fragment on this branch renders. A release-prep tip
+#     has already rendered and deleted them (RELEASING.md step 3) and holds no
+#     entries under '## [Unreleased]', so "nothing to assemble" is the expected
+#     answer there, not a failure; the assembler's own exit code 1 for that
+#     case is told apart from an invalid fragment by the absence of fragments.
 if python3 "$TOOL" assemble 99.0.0 --date 2026-01-01 --check > /dev/null; then
   pass "the fragments on this tree assemble"
+elif [ -z "$(find changes/unreleased -maxdepth 1 -name '*.md' ! -name 'README.md' -print -quit 2> /dev/null)" ] \
+  && ! awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f && /^- /{found=1} END{exit !found}' CHANGELOG.md; then
+  pass "the tree has no fragments and no Unreleased entries (a release-prep tip); nothing to assemble"
 else
   fail "the fragments on this tree do not assemble"
 fi

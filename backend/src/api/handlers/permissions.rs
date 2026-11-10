@@ -15,6 +15,9 @@ use crate::api::dto::Pagination;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -68,6 +71,9 @@ pub struct PermissionResponse {
     pub principal_name: Option<String>,
     pub target_type: String,
     pub target_id: Uuid,
+    /// Display name of the target (#4639): the repository, group or project
+    /// name, or `name@version` (the path when unversioned) for an artifact.
+    /// `null` for target types without a name and for deleted targets.
     pub target_name: Option<String>,
     pub actions: Vec<String>,
     /// Optional rule conditions (#1849); `{}` when the rule is unconditional.
@@ -118,6 +124,13 @@ impl From<PermissionRow> for PermissionResponse {
 /// exactly the rows a still-effective grant empowers. Because the join keys
 /// on the `users` primary key, dropping the guard can never attach the
 /// WRONG name to a row -- only a previously-missing one.
+///
+/// #4639: `target_name` is resolved for every target type that has a human
+/// name, not just repositories: a group's name, a project's name, and an
+/// artifact's `name@version` (its path when it has no version). Each is one
+/// primary-key LEFT JOIN guarded by `target_type`, so a listing stays a
+/// single query however many rows it returns. A target that no longer exists
+/// (or a soft-deleted artifact) keeps `null`, and the web UI shows the id.
 fn hydrate_select(from_clause: &str) -> String {
     format!(
         r#"
@@ -129,12 +142,23 @@ fn hydrate_select(from_clause: &str) -> String {
                END as principal_name,
                CASE
                    WHEN p.target_type = 'repository' THEN r.name
+                   WHEN p.target_type = 'group' THEN tg.name
+                   WHEN p.target_type = 'project' THEN pr.name
+                   WHEN p.target_type = 'artifact' THEN
+                       CASE
+                           WHEN NULLIF(a.version, '') IS NOT NULL THEN a.name || '@' || a.version
+                           ELSE a.path
+                       END
                END as target_name
         FROM {from_clause}
         LEFT JOIN users u ON p.principal_type IN ('user', 'service_account')
                          AND p.principal_id = u.id
         LEFT JOIN groups g ON p.principal_type = 'group' AND p.principal_id = g.id
         LEFT JOIN repositories r ON p.target_type = 'repository' AND p.target_id = r.id
+        LEFT JOIN groups tg ON p.target_type = 'group' AND p.target_id = tg.id
+        LEFT JOIN projects pr ON p.target_type = 'project' AND p.target_id = pr.id
+        LEFT JOIN artifacts a ON p.target_type = 'artifact' AND p.target_id = a.id
+                             AND NOT a.is_deleted
         "#
     )
 }
@@ -158,6 +182,38 @@ fn map_permission_write_error(e: sqlx::Error) -> AppError {
     } else {
         AppError::Database(msg)
     }
+}
+
+/// The audited shape of a permission rule (#4710): who it grants, on what,
+/// which actions and under which conditions.
+fn permission_rule_audit_snapshot(row: &PermissionRow) -> serde_json::Value {
+    serde_json::json!({
+        "principal_type": row.principal_type,
+        "principal_id": row.principal_id,
+        "principal_name": row.principal_name,
+        "target_type": row.target_type,
+        "target_id": row.target_id,
+        "target_name": row.target_name,
+        "actions": row.actions,
+        "conditions": row.conditions,
+    })
+}
+
+/// Record a permission-rule change (#4710), best-effort.
+async fn audit_permission_rule(
+    state: &SharedState,
+    auth: &AuthExtension,
+    action: AuditAction,
+    rule_id: Uuid,
+    details: serde_json::Value,
+) {
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(action, ResourceType::PermissionRule, auth)
+            .resource(rule_id)
+            .details(details),
+    )
+    .await;
 }
 
 async fn fetch_permission_row<'e, E>(executor: E, id: Uuid) -> Result<Option<PermissionRow>>
@@ -330,6 +386,41 @@ fn validate_anonymous_rule(payload: &CreatePermissionRequest) -> Result<()> {
     Ok(())
 }
 
+/// Write-time guard for `conditions.mcp_namespaces` (#5253): a
+/// namespace-conditioned rule is an MCP publish grant that only the MCP
+/// namespace write gate evaluates (every other check treats it as not
+/// applicable), so it is accepted only on a `repository` target that is an
+/// MCP repository. On any other target it would be inert, so refuse it (400)
+/// rather than persist a rule that looks like it grants something.
+async fn validate_mcp_namespace_target(
+    db: &sqlx::PgPool,
+    payload: &CreatePermissionRequest,
+) -> Result<()> {
+    let carries = payload
+        .conditions
+        .as_ref()
+        .is_some_and(|c| c.mcp_namespaces.is_some());
+    if !carries {
+        return Ok(());
+    }
+    let is_mcp_repo = payload.target_type == "repository"
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM repositories WHERE id = $1 AND format::text = 'mcp')",
+        )
+        .bind(payload.target_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    if !is_mcp_repo {
+        return Err(AppError::Validation(
+            "conditions.mcp_namespaces applies only to a 'repository' target that is an MCP \
+             repository"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Create a permission
 #[utoipa::path(
     post,
@@ -369,7 +460,6 @@ pub async fn create_permission(
     // surfaced as 500 DATABASE_ERROR. The contract is admin-only, so reject
     // here with 403 before any DB write.
     auth.require_admin()?;
-    let _ = auth;
 
     // Only now, after the caller is authorized, parse the payload. Malformed
     // or missing fields surface as 400 VALIDATION_ERROR (the canonical
@@ -395,6 +485,7 @@ pub async fn create_permission(
         conditions.validate()?;
     }
     validate_anonymous_rule(&payload)?;
+    validate_mcp_namespace_target(&state.db, &payload).await?;
 
     // #2826: hydrate the response inside the write statement. The INSERT's
     // `RETURNING *` feeds the shared `hydrate_select` joins through a
@@ -453,6 +544,23 @@ pub async fn create_permission(
     state
         .event_bus
         .emit("permission.created", permission.id, None);
+    let snapshot = permission_rule_audit_snapshot(&permission);
+    crate::services::mcp_namespaces::audit_grant_change(
+        &state.db,
+        &auth,
+        permission.id,
+        None,
+        Some(&snapshot),
+    )
+    .await;
+    audit_permission_rule(
+        &state,
+        &auth,
+        AuditAction::PermissionRuleCreated,
+        permission.id,
+        snapshot,
+    )
+    .await;
 
     Ok(Json(PermissionResponse::from(permission)))
 }
@@ -535,7 +643,6 @@ pub async fn update_permission(
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
     auth.require_admin()?;
-    let _ = auth;
 
     let payload: CreatePermissionRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::Validation(format!("Invalid permission payload: {}", e)))?;
@@ -554,6 +661,7 @@ pub async fn update_permission(
         conditions.validate()?;
     }
     validate_anonymous_rule(&payload)?;
+    validate_mcp_namespace_target(&state.db, &payload).await?;
 
     // Same hydrate-inside-the-write-statement shape as create_permission
     // above (#2826); before this, update ran a bare `UPDATE ... RETURNING
@@ -577,6 +685,11 @@ pub async fn update_permission(
         "#,
         hydrate_select("p")
     );
+    // The rule as it stood, for the audit row's before/after (#4710).
+    let before = fetch_permission_row(&state.db, id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
+
     // As on create, an absent `conditions` field persists `{}` (unconditional).
     let conditions_json = payload
         .conditions
@@ -600,6 +713,28 @@ pub async fn update_permission(
     state
         .event_bus
         .emit("permission.updated", permission.id, None);
+    let before = permission_rule_audit_snapshot(&before);
+    let after = permission_rule_audit_snapshot(&permission);
+    crate::services::mcp_namespaces::audit_grant_change(
+        &state.db,
+        &auth,
+        permission.id,
+        Some(&before),
+        Some(&after),
+    )
+    .await;
+    audit_permission_rule(
+        &state,
+        &auth,
+        AuditAction::PermissionRuleUpdated,
+        permission.id,
+        serde_json::json!({
+            "changed_fields": crate::services::audit_service::changed_fields(&before, &after),
+            "before": before,
+            "after": after,
+        }),
+    )
+    .await;
 
     Ok(Json(PermissionResponse::from(permission)))
 }
@@ -639,7 +774,9 @@ pub async fn delete_permission(
     // treatment, so any logged-in non-admin could remove arbitrary permission
     // rows. Match create/update: admin only.
     auth.require_admin()?;
-    let _ = auth;
+
+    // The rule being removed, for the audit row (#4710).
+    let removed = fetch_permission_row(&state.db, id).await?;
 
     let result = sqlx::query("DELETE FROM permissions WHERE id = $1")
         .bind(id)
@@ -653,6 +790,19 @@ pub async fn delete_permission(
 
     state.permission_service.invalidate_cache();
     state.event_bus.emit("permission.deleted", id, None);
+    let removed = removed
+        .as_ref()
+        .map_or(serde_json::Value::Null, permission_rule_audit_snapshot);
+    crate::services::mcp_namespaces::audit_grant_change(&state.db, &auth, id, Some(&removed), None)
+        .await;
+    audit_permission_rule(
+        &state,
+        &auth,
+        AuditAction::PermissionRuleDeleted,
+        id,
+        removed,
+    )
+    .await;
 
     Ok(())
 }
@@ -865,6 +1015,111 @@ mod tests {
             .await;
     }
 
+    /// #4639: grants on a group, a project or an artifact list (and fetch)
+    /// with the target's human name, not `target_name: null`; an artifact
+    /// reads `name@version`, or its path when it has no version. A grant
+    /// whose target no longer exists (or a soft-deleted artifact) keeps
+    /// `null`, which the web UI renders as the raw id.
+    #[tokio::test]
+    async fn list_and_get_hydrate_non_repository_target_names_4639() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (group_id, group_name) = tdh::create_group(&pool).await;
+        let (repo_id, _repo_name, _storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+        let tag = Uuid::new_v4().simple().to_string();
+
+        let project_name = format!("Project {}", &tag[..8]);
+        let project_id: Uuid =
+            sqlx::query_scalar("INSERT INTO projects (key, name) VALUES ($1, $2) RETURNING id")
+                .bind(format!("t4639{}", &tag[..10]))
+                .bind(&project_name)
+                .fetch_one(&pool)
+                .await
+                .expect("seed project");
+        let seed_artifact = |path: String, version: Option<&'static str>, deleted: bool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, is_deleted) \
+                     VALUES ($1, $2, 'left-pad', $3, 1, $4, 'application/octet-stream', $2, $5) \
+                     RETURNING id",
+                )
+                .bind(repo_id)
+                .bind(path)
+                .bind(version)
+                .bind("0".repeat(64))
+                .bind(deleted)
+                .fetch_one(&pool)
+                .await
+                .expect("seed artifact")
+            }
+        };
+        let versioned = seed_artifact(
+            format!("left-pad/-/left-pad-1.3.0-{tag}.tgz"),
+            Some("1.3.0"),
+            false,
+        )
+        .await;
+        let unversioned_path = format!("misc/{tag}/notes.txt");
+        let unversioned = seed_artifact(unversioned_path.clone(), None, false).await;
+        let soft_deleted = seed_artifact(format!("gone/{tag}.tgz"), Some("0.0.1"), true).await;
+
+        let group_grant = seed_permission(&pool, "group", group_id, "group", group_id).await;
+        let project_grant = seed_permission(&pool, "group", group_id, "project", project_id).await;
+        let artifact_grant = seed_permission(&pool, "group", group_id, "artifact", versioned).await;
+        let path_grant = seed_permission(&pool, "group", group_id, "artifact", unversioned).await;
+        let deleted_grant =
+            seed_permission(&pool, "group", group_id, "artifact", soft_deleted).await;
+        let dangling_grant =
+            seed_permission(&pool, "group", group_id, "project", Uuid::new_v4()).await;
+
+        let listed = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/?principal_id={group_id}&per_page=100")),
+        )
+        .await;
+        let items = listed["items"].as_array().expect("permission items");
+        let name_of = |id: Uuid| {
+            items
+                .iter()
+                .find(|item| item["id"] == id.to_string())
+                .expect("listed permission")["target_name"]
+                .clone()
+        };
+        assert_eq!(name_of(group_grant), group_name);
+        assert_eq!(name_of(project_grant), project_name);
+        assert_eq!(name_of(artifact_grant), "left-pad@1.3.0");
+        assert_eq!(name_of(path_grant), unversioned_path);
+        assert!(name_of(deleted_grant).is_null(), "soft-deleted target");
+        assert!(name_of(dangling_grant).is_null(), "deleted target");
+
+        for (id, expected) in [
+            (group_grant, serde_json::json!(group_name)),
+            (project_grant, serde_json::json!(project_name)),
+            (artifact_grant, serde_json::json!("left-pad@1.3.0")),
+        ] {
+            let fetched =
+                response_json(state.clone(), auth.clone(), tdh::get(format!("/{id}"))).await;
+            assert_eq!(fetched["target_name"], expected);
+        }
+
+        let _ = sqlx::query("DELETE FROM artifacts WHERE id = ANY($1)")
+            .bind(vec![versioned, unversioned, soft_deleted])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(project_id)
+            .execute(&pool)
+            .await;
+        cleanup_permission_fixtures(&pool, repo_id, admin_id, &[], &[group_id]).await;
+    }
+
     /// #2826 hardening: between migration 057 (Feb 2026, `is_service_account`
     /// introduced) and #2499 (Jul 2026, `principal_type = 'service_account'`
     /// first honored by resolvers), the only working way to grant a service
@@ -922,6 +1177,80 @@ mod tests {
         assert_eq!(fetched_legacy["target_name"], repo_name);
 
         cleanup_permission_fixtures(&pool, repo_id, admin_id, &[service_account_id], &[]).await;
+    }
+
+    /// #4710: create, update and delete of a permission rule each write one
+    /// audit row naming the admin, the rule's principal and target, and (for
+    /// an update) what changed.
+    #[tokio::test]
+    async fn permission_rule_crud_is_audited() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (grantee_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_name, _storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+        let rule = |actions: serde_json::Value| {
+            Bytes::from(
+                json!({
+                    "principal_type": "user",
+                    "principal_id": grantee_id,
+                    "target_type": "repository",
+                    "target_id": repo_id,
+                    "actions": actions
+                })
+                .to_string(),
+            )
+        };
+
+        let created = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::post("/".to_string(), "application/json", rule(json!(["read"]))),
+        )
+        .await;
+        let rule_id: Uuid = serde_json::from_value(created["id"].clone()).expect("rule id");
+        response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::put_json(format!("/{rule_id}"), rule(json!(["read", "write"]))),
+        )
+        .await;
+        let (delete_status, _) = tdh::send(
+            permission_app(state.clone(), auth.clone()),
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/{rule_id}"))
+                .body(Body::empty())
+                .expect("DELETE request"),
+        )
+        .await;
+
+        let created_row =
+            tdh::audit_row_eventually(&pool, rule_id, "PERMISSION_RULE_CREATED").await;
+        let updated_row =
+            tdh::audit_row_eventually(&pool, rule_id, "PERMISSION_RULE_UPDATED").await;
+        let deleted_row =
+            tdh::audit_row_eventually(&pool, rule_id, "PERMISSION_RULE_DELETED").await;
+        cleanup_permission_fixtures(&pool, repo_id, admin_id, &[grantee_id], &[]).await;
+
+        assert_eq!(delete_status, StatusCode::OK);
+        assert_eq!(created_row.user_id, Some(admin_id));
+        assert_eq!(created_row.resource_type, "permission_rule");
+        assert_eq!(created_row.details["principal_id"], grantee_id.to_string());
+        assert_eq!(created_row.details["target_id"], repo_id.to_string());
+        assert_eq!(created_row.details["actions"], json!(["read"]));
+        assert_eq!(updated_row.user_id, Some(admin_id));
+        assert_eq!(updated_row.details["changed_fields"], json!(["actions"]));
+        assert_eq!(updated_row.details["before"]["actions"], json!(["read"]));
+        assert_eq!(
+            updated_row.details["after"]["actions"],
+            json!(["read", "write"])
+        );
+        assert_eq!(deleted_row.user_id, Some(admin_id));
+        assert_eq!(deleted_row.details["actions"], json!(["read", "write"]));
     }
 
     #[tokio::test]
@@ -2002,6 +2331,92 @@ mod tests {
 
         tdh::cleanup_user(&pool, user_id).await;
         tdh::cleanup(&pool, repo_id, admin_id).await;
+    }
+
+    /// Review finding 1 (#5253): `conditions.mcp_namespaces` is accepted only
+    /// on an MCP repository target; a non-MCP repository or a project target
+    /// is refused 400 and nothing persists.
+    #[tokio::test]
+    async fn mcp_namespaces_condition_only_on_mcp_repositories() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (generic_id, _, _d1) = tdh::create_repo(&pool, "local", "generic").await;
+        let (mcp_id, _, _d2) = tdh::create_repo(&pool, "local", "mcp").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+        let body = |target_type: &str, target_id: Uuid| {
+            Bytes::from(
+                json!({
+                    "principal_type": "user",
+                    "principal_id": user_id,
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "actions": ["write"],
+                    "conditions": {"mcp_namespaces": ["com.acme/*"]}
+                })
+                .to_string(),
+            )
+        };
+        for (target_type, target_id) in [
+            ("repository", generic_id),
+            ("project", Uuid::new_v4()),
+            ("repository", Uuid::new_v4()),
+        ] {
+            let (status, resp) = tdh::send(
+                permission_app(state.clone(), auth.clone()),
+                tdh::post(
+                    "/".to_string(),
+                    "application/json",
+                    body(target_type, target_id),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{target_type} {target_id}: {}",
+                String::from_utf8_lossy(&resp)
+            );
+        }
+        let created = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::post(
+                "/".to_string(),
+                "application/json",
+                body("repository", mcp_id),
+            ),
+        )
+        .await;
+        let id = created["id"].as_str().expect("id").to_string();
+        // An update cannot move the condition onto a non-MCP target either.
+        let (status, _) = tdh::send(
+            permission_app(state.clone(), auth.clone()),
+            tdh::put_json(format!("/{id}"), body("repository", generic_id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM permissions WHERE principal_id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count permissions");
+        assert_eq!(persisted, 1, "only the MCP repository rule persists");
+
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup(&pool, mcp_id, admin_id).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(generic_id)
+            .execute(&pool)
+            .await;
     }
 
     /// The anonymous principal accepts exactly `read` on a repository (or

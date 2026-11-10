@@ -2,13 +2,14 @@
 
 use std::time::Duration;
 
+use chrono::Utc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::security::{
-    DashboardSummary, Grade, RawFinding, RawPackage, RepoSecurityScore, ScanFinding, ScanResult,
-    Severity,
+    DashboardSummary, Grade, GradeStatus, RawFinding, RawPackage, RepoSecurityScore, ScanFinding,
+    ScanResult, ScoreCoverage, Severity, VulnDbProvenance,
 };
 use crate::services::audit_service::{AuditAction, AuditEntry, ResourceType};
 
@@ -71,6 +72,39 @@ pub(crate) fn stable_lock_key(scan_type: &str) -> i32 {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     hash as i32
+}
+
+/// Attempts [`ScanResultService::recalculate_score`] makes before it returns
+/// a serialization failure (#5006). An attempt that found the repository's
+/// lock busy also counts, so this also bounds how long one call waits behind
+/// other recalculations of the same repository.
+const SCORE_RECALC_MAX_ATTEMPTS: u32 = 8;
+
+/// Advisory-lock key text serializing score recalculations per repository
+/// (#5006). Hashed server-side with `hashtextextended(..., 0)`; the
+/// `repo-security-score:` namespace keeps it apart from the other text-keyed
+/// advisory locks.
+fn score_recalc_lock_key(repository_id: Uuid) -> String {
+    format!("repo-security-score:{repository_id}")
+}
+
+/// Whether a failed score recalculation lost a race with a concurrent writer
+/// and is safe to run again: a serialization failure (`40001`) or a deadlock
+/// (`40P01`). The recalculation commits atomically, so a retry never leaves a
+/// partial row. The stringified form is matched too, for statements whose
+/// error is flattened to `AppError::Database`.
+fn is_score_recalc_conflict(err: &AppError) -> bool {
+    match err {
+        AppError::Sqlx(e) => matches!(
+            e.as_database_error().and_then(|d| d.code()).as_deref(),
+            Some("40001" | "40P01")
+        ),
+        AppError::Database(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("could not serialize access") || lower.contains("deadlock detected")
+        }
+        _ => false,
+    }
 }
 
 /// Fold a 128-bit artifact UUID down to a single 32-bit key, used as the
@@ -243,6 +277,169 @@ pub(crate) fn merge_packages_for_batch(packages: &[RawPackage]) -> Vec<RawPackag
     out
 }
 
+/// One proxied `vulnerable` verdict paired with the scan settings of a
+/// repository that serves it (#4380).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct ProxyBlockCandidate {
+    pub checksum_sha256: String,
+    /// The serving repository's `repository_format` label; only a format
+    /// whose proxy path runs the gate can block (#4582).
+    pub format: String,
+    pub max_severity: Option<String>,
+    pub proxy_scan_action: String,
+    pub block_on_policy_violation: bool,
+    pub severity_threshold: String,
+}
+
+/// Count the distinct digests that at least one repository's proxy scan gate
+/// refuses (#4380). Uses the gate's own severity rule
+/// ([`proxy_severity_gate_for_row`](crate::services::scan_config_service::proxy_severity_gate_for_row)),
+/// so record-only repositories and verdicts below an opted-in threshold are
+/// not counted as blocked, and the handlers' own format predicate
+/// ([`format_key_enforces_scan_on_proxy`](crate::formats::format_key_enforces_scan_on_proxy)),
+/// so a verdict on a format that stores `scan_on_proxy` but serves its
+/// proxied bytes unscanned is not counted either (#4582).
+pub(crate) fn count_blocked_proxy_digests(rows: &[ProxyBlockCandidate]) -> i64 {
+    let blocked: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|r| {
+            proxy_gate_refuses(
+                &r.format,
+                r.block_on_policy_violation,
+                &r.severity_threshold,
+                &r.proxy_scan_action,
+                r.max_severity.as_deref(),
+            )
+        })
+        .map(|r| r.checksum_sha256.as_str())
+        .collect();
+    blocked.len() as i64
+}
+
+/// Whether a repository's proxy scan gate refuses a stored `vulnerable`
+/// verdict: the format's proxy path runs the gate (#4582), and the
+/// repository's severity gate blocks the verdict's highest severity
+/// (record-only never does, a verdict below an opted-in threshold serves).
+/// The one predicate the dashboard count and the blocked listings share
+/// (#4380, #4510, #4777), so they cannot disagree with each other or with the
+/// gate.
+pub(crate) fn proxy_gate_refuses(
+    format: &str,
+    block_on_policy_violation: bool,
+    severity_threshold: &str,
+    proxy_scan_action: &str,
+    max_severity: Option<&str>,
+) -> bool {
+    crate::formats::format_key_enforces_scan_on_proxy(format)
+        && crate::services::scan_config_service::proxy_severity_gate_for_row(
+            block_on_policy_violation,
+            severity_threshold,
+            proxy_scan_action,
+        )
+        .blocks(max_severity.and_then(Severity::from_str_loose))
+}
+
+/// Whether a repository's proxy scan gate would refuse a stored `vulnerable`
+/// verdict if it enforced (#5232), whatever its current action:
+/// [`proxy_gate_refuses`] itself, asked with an enforcing action, so a preview
+/// and the gate cannot grade a verdict differently. `fail_open` and
+/// `fail_closed` grade a stored `vulnerable` verdict alike; they differ only
+/// where there is no verdict to grade ([`ProxyNoVerdictCounts`]).
+pub(crate) fn proxy_gate_would_refuse(
+    format: &str,
+    block_on_policy_violation: bool,
+    severity_threshold: &str,
+    max_severity: Option<&str>,
+) -> bool {
+    proxy_gate_refuses(
+        format,
+        block_on_policy_violation,
+        severity_threshold,
+        crate::services::proxy_scan_service::ProxyScanAction::FailClosed.as_db_str(),
+        max_severity,
+    )
+}
+
+/// Count the distinct digests at least one repository's proxy scan gate would
+/// refuse if it enforced (#5232): [`count_blocked_proxy_digests`] plus what
+/// `record_only` repositories record and serve.
+pub(crate) fn count_would_block_proxy_digests(rows: &[ProxyBlockCandidate]) -> i64 {
+    let would_block: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|r| {
+            proxy_gate_would_refuse(
+                &r.format,
+                r.block_on_policy_violation,
+                &r.severity_threshold,
+                r.max_severity.as_deref(),
+            )
+        })
+        .map(|r| r.checksum_sha256.as_str())
+        .collect();
+    would_block.len() as i64
+}
+
+/// Cached digests of gate-running repositories that a `would_block` preview
+/// does not list, because the gate has no verdict it would act on (#5232):
+/// `fail_closed` scans them inline on the next pull, then serves, refuses, or
+/// answers `423` if the scan is inconclusive; `fail_open` and `record_only`
+/// serve them. Same catalog as the `proxy-scans` summary, so cached metadata
+/// is left out, and a cached file the format serves without gating it (a
+/// Maven POM, a Debian `Release`) is counted there and here.
+#[derive(Debug, Default, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ProxyNoVerdictCounts {
+    /// No verdict row, or an `error` row, which no current code writes: the
+    /// same reading as the `proxy-scans` summary's `not_scanned`.
+    pub no_verdict: i64,
+    /// A `clean` or `vulnerable` verdict older than the scan TTL.
+    pub stale_verdict: i64,
+    /// A current `clean` verdict for which
+    /// [`clean_verdict_graded_nothing`](crate::services::proxy_scan_service::clean_verdict_graded_nothing)
+    /// holds: `fail_closed` does not reuse it.
+    pub clean_graded_nothing: i64,
+}
+
+/// The `repository_format` labels of the formats that run the proxy gate.
+fn proxy_gated_format_labels() -> Vec<&'static str> {
+    crate::models::repository::RepositoryFormat::ALL
+        .iter()
+        .filter(|f| crate::formats::format_enforces_scan_on_proxy(f))
+        .map(|f| f.as_key())
+        .collect()
+}
+
+/// One proxied path whose stored verdict its repository's proxy scan gate
+/// currently refuses (#4510, #4777): a `proxy_cache_artifacts` row (or, for
+/// OCI, an image manifest the repository references) whose digest has a
+/// `vulnerable` verdict newer than the scan TTL that the repository's gate
+/// blocks. Verdicts are shared by digest across repositories; a row is only
+/// listed where THAT repository's settings refuse it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ProxyBlockedEntry {
+    pub repository_id: Uuid,
+    pub repository_key: String,
+    pub repository_format: String,
+    /// The cached logical path; for an OCI manifest, `sha256:<digest>`.
+    pub path: String,
+    pub checksum_sha256: String,
+    pub max_severity: Option<String>,
+    pub findings_count: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    pub scanned_at: chrono::DateTime<chrono::Utc>,
+    /// The serving repository's gate settings the row was judged under.
+    pub block_on_policy_violation: bool,
+    pub severity_threshold: String,
+    pub proxy_scan_action: String,
+}
+
+/// Upper bound on the candidate rows one blocked-proxy listing reads. The
+/// candidates are vulnerable verdicts on cached paths, a small set in
+/// practice; the cap only bounds a pathological instance, and is logged.
+pub(crate) const PROXY_BLOCKED_CANDIDATE_CAP: i64 = 50_000;
+
 /// Build a DashboardSummary from raw count values.
 pub(crate) fn build_dashboard_summary(
     repos_with_scanning: i64,
@@ -260,8 +457,177 @@ pub(crate) fn build_dashboard_summary(
         critical_findings,
         high_findings,
         policy_violations_blocked: 0,
+        proxy_blocked: 0,
+        proxy_would_block: 0,
         repos_grade_a,
         repos_grade_f,
+        repos_rated: 0,
+        repos_incomplete: 0,
+        repos_unrated: 0,
+    }
+}
+
+/// Columns of `repo_security_scores` every [`RepoSecurityScore`] read selects,
+/// as a literal for `concat!`. Runtime `query_as` (not the macro) so the
+/// #4336 columns need no `.sqlx` regeneration.
+macro_rules! score_columns {
+    () => {
+        "id, repository_id, score, grade, total_findings, \
+         critical_count, high_count, medium_count, low_count, acknowledged_count, \
+         last_scan_at, has_failed_scan, has_uncataloged_scan, calculated_at, \
+         grade_status, rated_grade, artifact_count, scanned_count, cataloged_count, \
+         partial_count, failed_count, uncataloged_count, status_calculated_at"
+    };
+}
+
+/// The grade letter 1.11 replicas read from `repo_security_scores.grade`
+/// (#4336 keeps writing it unchanged): the score's letter, floored to F while
+/// a failed scan (#2167) or a floor-qualifying uncataloged artifact (#4036,
+/// #4154) is unsuperseded. 1.12 reads `grade_status` and `rated_grade`
+/// instead and never shows the floor.
+pub(crate) fn legacy_grade_letter(
+    grade: Grade,
+    has_failed_scan: bool,
+    uncataloged_floors: bool,
+) -> char {
+    if has_failed_scan || uncataloged_floors {
+        'F'
+    } else {
+        grade.as_char()
+    }
+}
+
+/// The repository status stored in `grade_status` (#4336): the coverage's
+/// status, except that a repository is never `unrated` (no letter) while
+/// something in it was assessed. An artifact one scanner cataloged and another
+/// failed on counts as failed in the coverage, and the findings of an earlier
+/// completed scan stay counted after a failed rescan; either way the findings
+/// are real, so the repository is `incomplete` and shows their letter.
+pub(crate) fn repository_grade_status(
+    coverage: &ScoreCoverage,
+    any_artifact_assessed: bool,
+    has_findings: bool,
+) -> GradeStatus {
+    match coverage.grade_status() {
+        GradeStatus::Unrated if any_artifact_assessed || has_findings => GradeStatus::Incomplete,
+        status => status,
+    }
+}
+
+/// The letter stored in `rated_grade` (#4336): the score's letter over the
+/// assessed artifacts, `None` when nothing was assessed.
+pub(crate) fn rated_grade_letter(grade: Grade, status: GradeStatus) -> Option<char> {
+    match status {
+        GradeStatus::Unrated => None,
+        GradeStatus::Rated | GradeStatus::Incomplete => Some(grade.as_char()),
+    }
+}
+
+/// Dashboard counts over the score rows (#4336).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GradeTally {
+    pub grade_a: i64,
+    pub grade_f: i64,
+    pub rated: i64,
+    pub incomplete: i64,
+    pub unrated: i64,
+}
+
+/// Count score rows by status and by displayed letter: the letter tiles count
+/// only rows that have a letter ([`RepoSecurityScore::display_grade`]), so an
+/// `unrated` repository is neither A nor F and an `incomplete` one counts
+/// under its real letter.
+pub(crate) fn tally_grade_rows(rows: impl IntoIterator<Item = RepoSecurityScore>) -> GradeTally {
+    let mut t = GradeTally::default();
+    for row in rows {
+        match row.status() {
+            GradeStatus::Rated => t.rated += 1,
+            GradeStatus::Incomplete => t.incomplete += 1,
+            GradeStatus::Unrated => t.unrated += 1,
+        }
+        match row.display_grade().as_deref() {
+            Some("A") => t.grade_a += 1,
+            Some("F") => t.grade_f += 1,
+            _ => {}
+        }
+    }
+    t
+}
+
+/// How long the score refresher collects `artifact.deleted` events before it
+/// recalculates: a bulk delete of N artifacts in one repository costs one
+/// recalculation, not N.
+const SCORE_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Keep a repository's grade status and coverage current when an artifact
+/// leaves it (#4336).
+///
+/// A score was only recalculated after a scan, so deleting the one artifact
+/// that could not be cataloged left the repository `incomplete` until the
+/// next scan. This subscribes to `artifact.deleted` on the in-process bus,
+/// collects the repositories for [`SCORE_REFRESH_DEBOUNCE`], and recalculates
+/// each one that already has a score row (a repository that was never scored
+/// gets none from a delete). Best effort: the bus is at-most-once and
+/// per-replica, so a missed event leaves the score as stale as it was before
+/// this existed, and the next scan corrects it.
+pub fn spawn_score_refresher(
+    event_bus: std::sync::Arc<crate::services::event_bus::EventBus>,
+    db: PgPool,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut rx = event_bus.subscribe();
+    tokio::spawn(async move {
+        let mut pending: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        let mut tick = tokio::time::interval(SCORE_REFRESH_DEBOUNCE);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => break,
+                _ = tick.tick() => {
+                    for repository_id in std::mem::take(&mut pending) {
+                        refresh_existing_score(&db, repository_id).await;
+                    }
+                }
+                recv = rx.recv() => match recv {
+                    Ok(event) => {
+                        if event.event_type == "artifact.deleted" {
+                            if let Some(repository_id) = event.repository_id {
+                                pending.insert(repository_id);
+                            }
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "score refresher lagged; some deletes were not seen");
+                    }
+                    Err(RecvError::Closed) => break,
+                },
+            }
+        }
+    });
+}
+
+/// Recalculate `repository_id`'s score if it has one; log and move on if not
+/// or on error.
+async fn refresh_existing_score(db: &PgPool, repository_id: Uuid) {
+    let exists: std::result::Result<bool, sqlx::Error> = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM repo_security_scores WHERE repository_id = $1)",
+    )
+    .bind(repository_id)
+    .fetch_one(db)
+    .await;
+    match exists {
+        Ok(true) => {
+            if let Err(e) = ScanResultService::new(db.clone())
+                .recalculate_score(repository_id)
+                .await
+            {
+                tracing::warn!(%repository_id, error = %e, "score refresh after delete failed");
+            }
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!(%repository_id, error = %e, "score refresh lookup failed"),
     }
 }
 
@@ -299,9 +665,90 @@ pub(crate) fn build_scan_reaped_audit_details(
     })
 }
 
+/// Optional exact-match filters for [`ScanResultService::list_findings`]
+/// (#3410, #3013). `None` leaves a column unfiltered; callers validate the
+/// closed vocabularies (`severity`, `finding_class`) before building this.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FindingListFilter<'a> {
+    pub severity: Option<&'a str>,
+    pub source: Option<&'a str>,
+    pub cve_id: Option<&'a str>,
+    /// `vulnerability`, `malicious` or `policy` (#3013).
+    pub finding_class: Option<&'a str>,
+}
+
 pub struct ScanResultService {
     db: PgPool,
 }
+
+/// Columns of a [`ScanResult`] row, shared by the reusable-scan queries.
+macro_rules! scan_result_columns {
+    () => {
+        "id, artifact_id, repository_id, scan_type, status, \
+         findings_count, critical_count, high_count, medium_count, low_count, info_count, \
+         scanner_version, error_message, started_at, completed_at, created_at, \
+         is_reused, source_scan_id, scan_completeness, scan_completeness_reason, \
+         vuln_db_version, vuln_db_published_at"
+    };
+}
+
+/// Filters every reusable completed scan must pass: same bytes, scanner and
+/// pin, a gradeable local verdict, inside the TTL. `$1::bpchar` because
+/// `checksum_sha256` is `CHAR(64)` and sqlx binds `&str` as `text`: without
+/// the cast Postgres compares `checksum_sha256::text = $1` and cannot use
+/// the column as an index condition (#4426).
+macro_rules! reusable_scan_filters {
+    () => {
+        "checksum_sha256 = $1::bpchar \
+         AND scan_type = $2 \
+         AND status = 'completed' \
+         AND scan_completeness <> 'not_cataloged' \
+         AND origin = 'local_scan' \
+         AND pin_identity IS NOT DISTINCT FROM $5 \
+         AND completed_at > NOW() - (CASE WHEN findings_count = 0 THEN $4 ELSE $3 END || ' days')::interval"
+    };
+}
+
+/// [`ScanResultService::find_reusable_scan`]: the newest ORIGINAL scan
+/// (`source_scan_id IS NULL`, #4425). Served by `idx_scan_results_dedup_local`.
+/// `NOT is_reused` as well, because `source_scan_id` is cleared when the source is
+/// deleted (#5153) and a copy must not then pass as an original: its `completed_at`
+/// can be the time it was copied, which would restart the age limit.
+pub(crate) const FIND_REUSABLE_SCAN_SQL: &str = concat!(
+    "SELECT ",
+    scan_result_columns!(),
+    " FROM scan_results WHERE ",
+    reusable_scan_filters!(),
+    " AND source_scan_id IS NULL AND NOT is_reused ORDER BY completed_at DESC LIMIT 1"
+);
+
+/// Whether one row of an artifact's own scans is a complete verdict a dedup could
+/// reuse: the same filters, so a promotion cannot accept what a byte-identical
+/// upload would refuse. `partial` is excluded on top of them, because a promoted
+/// copy has no rescan coming and a partial verdict would read as a scanned artifact.
+pub(crate) const FIND_CARRYABLE_SCAN_SQL: &str = concat!(
+    "SELECT EXISTS (SELECT 1 FROM scan_results WHERE ",
+    reusable_scan_filters!(),
+    " AND scan_completeness = 'complete' AND artifact_id = $6 AND id = $7)"
+);
+
+/// [`ScanResultService::find_own_reusable_scan`]: the same filters on one
+/// artifact's own rows, reused copies included.
+pub(crate) const FIND_OWN_REUSABLE_SCAN_SQL: &str = concat!(
+    "SELECT ",
+    scan_result_columns!(),
+    " FROM scan_results WHERE ",
+    reusable_scan_filters!(),
+    " AND artifact_id = $6 ORDER BY completed_at DESC LIMIT 1"
+);
+
+/// The columns of [`ScanFinding`] as `scan_findings_effective` (migration 312)
+/// projects them.
+const SCAN_FINDING_COLUMNS: &str =
+    "id, scan_result_id, artifact_id, severity, title, description, \
+     cve_id, affected_component, affected_version, fixed_version, source, source_url, \
+     is_acknowledged, acknowledged_by, acknowledged_reason, acknowledged_at, \
+     acknowledgement_id, acknowledgement_expires_at, created_at, finding_class";
 
 impl ScanResultService {
     pub fn new(db: PgPool) -> Self {
@@ -335,8 +782,8 @@ impl ScanResultService {
     /// Durability caveats: neither half of the pair is a long-term
     /// compliance store:
     ///   * `audit_log.action='SCAN_REAPED'` entries are deleted by the
-    ///     `audit_retention_days` retention sweep (default 90 days, see
-    ///     `AuditService::cleanup`).
+    ///     `audit_retention_days` retention sweep once a period is saved
+    ///     (off by default, see `services::audit_retention`).
     ///   * The `scan_results` row itself is `ON DELETE CASCADE` from
     ///     `artifacts` and `repositories`, so deleting a repo destroys
     ///     its reaped-row evidence independently of audit retention.
@@ -642,7 +1089,8 @@ impl ScanResultService {
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             "#,
             artifact_id,
             repository_id,
@@ -673,15 +1121,26 @@ impl ScanResultService {
     /// the verdict was received, which is the only instant this side of the
     /// seam can attest to. A scanner's own timing is its business and is not
     /// trusted into columns the janitor and the dedup window read.
-    pub async fn create_completed_scan_result(
+    ///
+    /// #4667: the row and its findings are written in ONE transaction. They
+    /// used to be two autocommit statements, so a findings insert that failed
+    /// (a NUL byte in a text field was the observed case) left a `completed`
+    /// row behind with no findings under it: a clean verdict nobody issued,
+    /// which every gate that reads the latest scan would honour.
+    pub async fn create_completed_scan_with_findings(
         &self,
         artifact_id: Uuid,
         repository_id: Uuid,
         scan_type: &str,
-        findings_count: i32,
         counts: [i32; 5],
         scanner_version: Option<&str>,
+        findings: &[RawFinding],
     ) -> Result<ScanResult> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         let result = sqlx::query_as!(
             ScanResult,
             r#"
@@ -693,12 +1152,13 @@ impl ScanResultService {
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             "#,
             artifact_id,
             repository_id,
             scan_type,
-            findings_count,
+            findings.len() as i32,
             counts[0],
             counts[1],
             counts[2],
@@ -706,9 +1166,14 @@ impl ScanResultService {
             counts[4],
             scanner_version,
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        insert_findings(&mut *tx, result.id, artifact_id, findings).await?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(result)
     }
@@ -744,6 +1209,34 @@ impl ScanResultService {
     /// served for an unpinned generic request and vice versa. Callers that do
     /// not pin (every non-npm format today) pass `None`, which restores the
     /// pre-#3442 behavior exactly against other unpinned rows.
+    ///
+    /// #4154: a `not_cataloged` row is never reused. It graded nothing, and
+    /// the orchestrator writes it provisionally while a scan set is still
+    /// running, so it is not a verdict another artifact can inherit; the
+    /// requester runs its own scan instead.
+    ///
+    /// #2464: only `origin = 'local_scan'` rows are reused. `scan_results` is
+    /// keyed by content hash, not by artifact lifecycle, so a row whose
+    /// verdict did not come from this instance's own scanner (scan evidence
+    /// carried in an imported bundle) would otherwise become a permanent,
+    /// instance-wide scan exemption for every future upload of those bytes.
+    /// Imported evidence lives in `bundle_scan_evidence`; this filter holds
+    /// even if a later change routes it here. The per-artifact short-circuits
+    /// ([`Self::find_existing_scan_for_artifact`] and step 1 of
+    /// [`Self::prepare_scan_placeholder`]) apply the same filter, so an
+    /// imported row can never stand in for an artifact's own local scan.
+    ///
+    /// #4425: only an ORIGINAL scan is a dedup source (`source_scan_id IS
+    /// NULL`). A reused row (`is_reused = true`) is a copy of some other
+    /// row's verdict; handing it out as a source would chain copies of
+    /// copies, and because `convert_to_reused` stamps `completed_at = NOW()`
+    /// on the copy, each hop would also restart the TTL window so a verdict
+    /// could outlive its real scan indefinitely. Requiring the original keeps
+    /// every reused row exactly one hop from a scan that actually ran, and
+    /// bounds reuse by that scan's age. This query does not know which
+    /// artifact is asking, so an artifact whose own row is a reused copy now
+    /// gets the original (another artifact's) row back; the scanner checks
+    /// the artifact's own row before copying (see `scan_artifact_inner`).
     pub async fn find_reusable_scan(
         &self,
         checksum_sha256: &str,
@@ -752,35 +1245,74 @@ impl ScanResultService {
         zero_findings_ttl_days: i32,
         pin_identity: Option<&str>,
     ) -> Result<Option<ScanResult>> {
-        let result = sqlx::query_as!(
-            ScanResult,
-            r#"
-            SELECT id, artifact_id, repository_id, scan_type, status,
-                   findings_count, critical_count, high_count, medium_count, low_count, info_count,
-                   scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id
-            FROM scan_results
-            WHERE checksum_sha256 = $1
-              AND scan_type = $2
-              AND status = 'completed'
-              AND pin_identity IS NOT DISTINCT FROM $5
-              AND completed_at > NOW() - (
-                  CASE WHEN findings_count = 0 THEN $4 ELSE $3 END || ' days'
-              )::interval
-            ORDER BY completed_at DESC
-            LIMIT 1
-            "#,
+        self.fetch_reusable_scan(
+            FIND_REUSABLE_SCAN_SQL,
             checksum_sha256,
             scan_type,
-            ttl_days.to_string(),
-            zero_findings_ttl_days.to_string(),
+            ttl_days,
+            zero_findings_ttl_days,
             pin_identity,
+            None,
         )
-        .fetch_optional(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+    }
 
-        Ok(result)
+    /// [`Self::find_reusable_scan`]'s filters (TTLs, pin, `not_cataloged`,
+    /// `origin`) applied to THIS artifact's own completed rows, reused copies
+    /// included: "is this artifact already scanned for these bytes, under
+    /// this pin, with a gradeable verdict?" The scanner asks it before
+    /// copying another artifact's original into a new row (#4425), so a
+    /// rescan of an artifact whose own row is a reused copy does not add a
+    /// second completed row, while a stale-pin or `not_cataloged` own row
+    /// still lets a gradeable verdict be copied in exactly as before.
+    pub async fn find_own_reusable_scan(
+        &self,
+        artifact_id: Uuid,
+        checksum_sha256: &str,
+        scan_type: &str,
+        ttl_days: i32,
+        zero_findings_ttl_days: i32,
+        pin_identity: Option<&str>,
+    ) -> Result<Option<ScanResult>> {
+        self.fetch_reusable_scan(
+            FIND_OWN_REUSABLE_SCAN_SQL,
+            checksum_sha256,
+            scan_type,
+            ttl_days,
+            zero_findings_ttl_days,
+            pin_identity,
+            Some(artifact_id),
+        )
+        .await
+    }
+
+    /// Run one of the reusable-scan queries. Unchecked `query_as` because the
+    /// SQL is a shared const (the EXPLAIN test runs the same text); the DB
+    /// tests exercise both queries.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_reusable_scan(
+        &self,
+        sql: &'static str,
+        checksum_sha256: &str,
+        scan_type: &str,
+        ttl_days: i32,
+        zero_findings_ttl_days: i32,
+        pin_identity: Option<&str>,
+        artifact_id: Option<Uuid>,
+    ) -> Result<Option<ScanResult>> {
+        let mut query = sqlx::query_as::<_, ScanResult>(sql)
+            .bind(checksum_sha256)
+            .bind(scan_type)
+            .bind(ttl_days.to_string())
+            .bind(zero_findings_ttl_days.to_string())
+            .bind(pin_identity);
+        if let Some(artifact_id) = artifact_id {
+            query = query.bind(artifact_id);
+        }
+        query
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Find an existing completed scan for THIS artifact_id with the given
@@ -814,12 +1346,14 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             FROM scan_results
             WHERE artifact_id = $1
-              AND checksum_sha256 = $2
+              AND checksum_sha256 = $2::bpchar
               AND scan_type = $3
               AND status = 'completed'
+              AND origin = 'local_scan'
               AND completed_at > NOW() - (
                   CASE WHEN findings_count = 0 THEN $5 ELSE $4 END || ' days'
               )::interval
@@ -910,9 +1444,10 @@ impl ScanResultService {
             SELECT id
             FROM scan_results
             WHERE artifact_id = $1
-              AND checksum_sha256 = $2
+              AND checksum_sha256 = $2::bpchar
               AND scan_type = $3
               AND status = 'completed'
+              AND origin = 'local_scan'
               AND completed_at > NOW() - (
                   CASE WHEN findings_count = 0 THEN $5 ELSE $4 END || ' days'
               )::interval
@@ -944,7 +1479,7 @@ impl ScanResultService {
             SELECT id
             FROM scan_results
             WHERE artifact_id = $1
-              AND checksum_sha256 = $2
+              AND checksum_sha256 = $2::bpchar
               AND scan_type = $3
               AND status = 'running'
             ORDER BY started_at DESC NULLS LAST, created_at DESC
@@ -1022,21 +1557,49 @@ impl ScanResultService {
             .begin()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+        let new_scan = Self::copy_scan_results_in_tx(
+            &mut tx,
+            source_scan_id,
+            artifact_id,
+            repository_id,
+            scan_type,
+            checksum_sha256,
+            pin_identity,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
+        Ok(new_scan)
+    }
+
+    /// [`Self::copy_scan_results`] inside a caller's transaction, for a caller
+    /// copying several scans that must land together.
+    pub(crate) async fn copy_scan_results_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        source_scan_id: Uuid,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        scan_type: &str,
+        checksum_sha256: &str,
+        pin_identity: Option<&str>,
+    ) -> Result<ScanResult> {
         let source = sqlx::query_as!(
             ScanResult,
             r#"
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             FROM scan_results
             WHERE id = $1
             FOR SHARE
             "#,
             source_scan_id,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Source scan result not found".to_string()))?;
@@ -1059,13 +1622,18 @@ impl ScanResultService {
             INSERT INTO scan_results (
                 artifact_id, repository_id, scan_type, status, started_at, completed_at,
                 findings_count, critical_count, high_count, medium_count, low_count, info_count,
-                scanner_version, checksum_sha256, source_scan_id, is_reused, pin_identity
+                scanner_version, checksum_sha256, source_scan_id, is_reused, pin_identity,
+                scan_completeness, scan_completeness_reason, inventory_status,
+                vuln_db_version, vuln_db_published_at
             )
-            VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true, $15)
+            VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true, $15,
+                    $16, $17, (SELECT inventory_status FROM scan_results WHERE id = $14),
+                    $18, $19)
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             "#,
             artifact_id,
             repository_id,
@@ -1084,8 +1652,15 @@ impl ScanResultService {
             // #3604: record the CURRENT request's pin on the reused row so it
             // cannot be handed to a byte-identical upload under a different pin.
             pin_identity,
+            // #4154: the copy inherits the source's completeness verdict.
+            source.scan_completeness,
+            source.scan_completeness_reason,
+            // #3014: a reused verdict is only as fresh as the database the
+            // ORIGINAL scan ran against; record that vintage, not NULL.
+            source.vuln_db_version,
+            source.vuln_db_published_at,
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -1095,11 +1670,11 @@ impl ScanResultService {
             INSERT INTO scan_findings (
                 scan_result_id, artifact_id, severity, title, description,
                 cve_id, affected_component, affected_version, fixed_version,
-                source, source_url
+                source, source_url, finding_class
             )
             SELECT $1, $2, severity, title, description,
                    cve_id, affected_component, affected_version, fixed_version,
-                   source, source_url
+                   source, source_url, finding_class
             FROM scan_findings
             WHERE scan_result_id = $3
             "#,
@@ -1107,15 +1682,47 @@ impl ScanResultService {
             artifact_id,
             source_scan_id,
         )
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
         Ok(new_scan)
+    }
+
+    /// The reused rows pointing at `scan_id`, for a caller who can see a copy of
+    /// a scan and not its source: the scan listing reports a copy under its
+    /// source's id. Bounded: a caller who sees none of these gets a 404.
+    pub async fn copies_of_scan(&self, scan_id: Uuid) -> Result<Vec<ScanResult>> {
+        let sql = concat!(
+            "SELECT ",
+            scan_result_columns!(),
+            " FROM scan_results WHERE source_scan_id = $1 ORDER BY created_at LIMIT 200"
+        );
+        sqlx::query_as::<_, ScanResult>(sql)
+            .bind(scan_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// The one artifact's copy of `scan_id`, or `scan_id` itself if it is theirs.
+    pub async fn scan_for_artifact(
+        &self,
+        scan_id: Uuid,
+        artifact_id: Uuid,
+    ) -> Result<Option<ScanResult>> {
+        let sql = concat!(
+            "SELECT ",
+            scan_result_columns!(),
+            " FROM scan_results WHERE artifact_id = $2 AND (id = $1 OR source_scan_id = $1) \
+             ORDER BY created_at DESC LIMIT 1"
+        );
+        sqlx::query_as::<_, ScanResult>(sql)
+            .bind(scan_id)
+            .bind(artifact_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Convert a pre-allocated `running` scan_result row into a reused row
@@ -1159,7 +1766,8 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             FROM scan_results
             WHERE id = $1
             FOR SHARE
@@ -1195,12 +1803,18 @@ impl ScanResultService {
                 is_reused = true,
                 source_scan_id = $8,
                 scanner_version = $9,
-                pin_identity = $10
+                pin_identity = $10,
+                scan_completeness = $11,
+                scan_completeness_reason = $12,
+                inventory_status = (SELECT inventory_status FROM scan_results WHERE id = $8),
+                vuln_db_version = $13,
+                vuln_db_published_at = $14
             WHERE id = $1 AND status = 'running'
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             "#,
             target_scan_id,
             findings,
@@ -1215,6 +1829,13 @@ impl ScanResultService {
             // row so a later byte-identical upload under a different pin cannot
             // reuse this verdict.
             pin_identity,
+            // #4154: a reused row inherits the source's completeness verdict,
+            // or a `partial` source would read as an authoritative `complete`.
+            source.scan_completeness,
+            source.scan_completeness_reason,
+            // #3014: and the source's vulnerability-database vintage.
+            source.vuln_db_version,
+            source.vuln_db_published_at,
         )
         .fetch_optional(&mut *tx)
         .await
@@ -1240,11 +1861,11 @@ impl ScanResultService {
             INSERT INTO scan_findings (
                 scan_result_id, artifact_id, severity, title, description,
                 cve_id, affected_component, affected_version, fixed_version,
-                source, source_url
+                source, source_url, finding_class
             )
             SELECT $1, $2, severity, title, description,
                    cve_id, affected_component, affected_version, fixed_version,
-                   source, source_url
+                   source, source_url, finding_class
             FROM scan_findings
             WHERE scan_result_id = $3
             "#,
@@ -1276,6 +1897,10 @@ impl ScanResultService {
     /// `scan_completeness_reason` (#4036) is the human-readable why behind a
     /// non-`complete` `scan_completeness` (e.g. which scanner cataloged no
     /// components); `None` for ordinary completions.
+    ///
+    /// `vuln_db` (#3014) is the vulnerability database the scanner graded
+    /// against; `None` (no database, or not reported) is stored as NULL in
+    /// both `vuln_db_version` and `vuln_db_published_at`.
     #[allow(clippy::too_many_arguments)]
     pub async fn complete_scan(
         &self,
@@ -1291,6 +1916,7 @@ impl ScanResultService {
         scan_completeness: &str,
         pin_identity: Option<&str>,
         scan_completeness_reason: Option<&str>,
+        vuln_db: Option<&VulnDbProvenance>,
     ) -> Result<()> {
         sqlx::query!(
             r#"
@@ -1302,7 +1928,9 @@ impl ScanResultService {
                 started_at = $9,
                 scan_completeness = $10,
                 pin_identity = $11,
-                scan_completeness_reason = $12
+                scan_completeness_reason = $12,
+                vuln_db_version = $13,
+                vuln_db_published_at = $14
             WHERE id = $1
             "#,
             scan_id,
@@ -1317,6 +1945,8 @@ impl ScanResultService {
             scan_completeness,
             pin_identity,
             scan_completeness_reason,
+            vuln_db.map(|p| p.version.as_str()),
+            vuln_db.and_then(|p| p.published_at),
         )
         .execute(&self.db)
         .await
@@ -1413,7 +2043,8 @@ impl ScanResultService {
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             "#,
             artifact_id,
             repository_id,
@@ -1436,7 +2067,8 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             FROM scan_results
             WHERE id = $1
             "#,
@@ -1472,7 +2104,8 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             FROM scan_results
             WHERE ($1::uuid IS NULL OR repository_id = $1)
               AND ($2::uuid IS NULL OR artifact_id = $2)
@@ -1510,6 +2143,62 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        Ok((results, total))
+    }
+
+    /// [`Self::list_scans`] showing a scan of one of `served_only.repos` (MCP
+    /// registries the caller does not hold, #5253) only when its artifact is
+    /// in `served_only.served`, so the scans of a version the caller is not
+    /// served, and of a row the served set does not name, are left out in
+    /// SQL (fail closed) and `total` and the page count only the rest.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_scans_served_only(
+        &self,
+        repository_id: Option<Uuid>,
+        artifact_id: Option<Uuid>,
+        status: Option<&str>,
+        scan_type: Option<&str>,
+        served_only: &crate::services::search_service::McpServedOnly,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<ScanResult>, i64)> {
+        const FILTER: &str = "($1::uuid IS NULL OR repository_id = $1) \
+              AND ($2::uuid IS NULL OR artifact_id = $2) \
+              AND ($3::text IS NULL OR status = $3) \
+              AND ($4::text IS NULL OR scan_type = $4) \
+              AND (repository_id <> ALL($5) OR artifact_id = ANY($6))";
+        let page_sql = format!(
+            "SELECT id, artifact_id, repository_id, scan_type, status, \
+                    findings_count, critical_count, high_count, medium_count, low_count, \
+                    info_count, scanner_version, error_message, started_at, completed_at, \
+                    created_at, is_reused, source_scan_id, scan_completeness, \
+                    scan_completeness_reason, vuln_db_version, vuln_db_published_at \
+             FROM scan_results WHERE {FILTER} \
+             ORDER BY created_at DESC LIMIT $7 OFFSET $8"
+        );
+        let results = sqlx::query_as::<_, ScanResult>(sqlx::AssertSqlSafe(page_sql))
+            .bind(repository_id)
+            .bind(artifact_id)
+            .bind(status)
+            .bind(scan_type)
+            .bind(&served_only.repos)
+            .bind(&served_only.served)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let count_sql = format!("SELECT COUNT(*) FROM scan_results WHERE {FILTER}");
+        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql))
+            .bind(repository_id)
+            .bind(artifact_id)
+            .bind(status)
+            .bind(scan_type)
+            .bind(&served_only.repos)
+            .bind(&served_only.served)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         Ok((results, total))
     }
 
@@ -1616,72 +2305,7 @@ impl ScanResultService {
         artifact_id: Uuid,
         findings: &[RawFinding],
     ) -> Result<()> {
-        if findings.is_empty() {
-            return Ok(());
-        }
-
-        let severities: Vec<String> = findings
-            .iter()
-            .map(|f| severity_to_db_string(f.severity))
-            .collect();
-        let titles: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
-        let descriptions: Vec<Option<&str>> =
-            findings.iter().map(|f| f.description.as_deref()).collect();
-        let cve_ids: Vec<Option<&str>> = findings.iter().map(|f| f.cve_id.as_deref()).collect();
-        let affected_components: Vec<Option<&str>> = findings
-            .iter()
-            .map(|f| f.affected_component.as_deref())
-            .collect();
-        let affected_versions: Vec<Option<&str>> = findings
-            .iter()
-            .map(|f| f.affected_version.as_deref())
-            .collect();
-        let fixed_versions: Vec<Option<&str>> = findings
-            .iter()
-            .map(|f| f.fixed_version.as_deref())
-            .collect();
-        let sources: Vec<Option<&str>> = findings.iter().map(|f| f.source.as_deref()).collect();
-        let source_urls: Vec<Option<&str>> =
-            findings.iter().map(|f| f.source_url.as_deref()).collect();
-
-        sqlx::query!(
-            r#"
-            INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title,
-                description, cve_id, affected_component, affected_version, fixed_version,
-                source, source_url)
-            SELECT $1, $2, severity, title, description,
-                   cve_id, affected_component, affected_version, fixed_version,
-                   source, source_url
-            FROM UNNEST(
-                $3::text[],
-                $4::text[],
-                $5::text[],
-                $6::text[],
-                $7::text[],
-                $8::text[],
-                $9::text[],
-                $10::text[],
-                $11::text[]
-            ) AS t(severity, title, description, cve_id, affected_component,
-                   affected_version, fixed_version, source, source_url)
-            "#,
-            scan_result_id,
-            artifact_id,
-            &severities as &[String],
-            &titles as &[&str],
-            &descriptions as &[Option<&str>],
-            &cve_ids as &[Option<&str>],
-            &affected_components as &[Option<&str>],
-            &affected_versions as &[Option<&str>],
-            &fixed_versions as &[Option<&str>],
-            &sources as &[Option<&str>],
-            &source_urls as &[Option<&str>],
-        )
-        .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(())
+        insert_findings(&self.db, scan_result_id, artifact_id, findings).await
     }
 
     /// Finding identities from the LATEST completed `dependency` scan of one
@@ -1735,6 +2359,34 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))
     }
+
+    /// Put back the completeness a scan row would have had, after the
+    /// orchestrator wrote it `not_cataloged` provisionally and the finished
+    /// scan set turned out to have assessed the artifact (#4154). Resets the
+    /// inventory status the provisional write marked partial. Runtime query
+    /// (not the macro) so it needs no offline query metadata.
+    pub async fn restore_completeness(
+        &self,
+        scan_id: Uuid,
+        scan_completeness: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE scan_results \
+             SET scan_completeness = $2, \
+                 scan_completeness_reason = $3, \
+                 inventory_status = 'complete' \
+             WHERE id = $1 AND status = 'completed'",
+        )
+        .bind(scan_id)
+        .bind(scan_completeness)
+        .bind(reason)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     ///
     /// Called by the scanner orchestrator when `create_packages` returns
     /// an error: the scan itself succeeded, the SBOM is degraded, and the
@@ -1837,24 +2489,26 @@ impl ScanResultService {
     pub async fn list_findings(
         &self,
         scan_result_id: Uuid,
-        severity: Option<&str>,
-        source: Option<&str>,
-        cve_id: Option<&str>,
+        filter: &FindingListFilter<'_>,
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<ScanFinding>, i64)> {
-        let findings = sqlx::query_as!(
-            ScanFinding,
+        let FindingListFilter {
+            severity,
+            source,
+            cve_id,
+            finding_class,
+        } = *filter;
+        // #5153: acknowledged state comes from the decisions, through the view.
+        let sql = format!(
             r#"
-            SELECT id, scan_result_id, artifact_id, severity, title, description,
-                   cve_id, affected_component, affected_version, fixed_version,
-                   source, source_url, is_acknowledged, acknowledged_by,
-                   acknowledged_reason, acknowledged_at, created_at
-            FROM scan_findings
+            SELECT {SCAN_FINDING_COLUMNS}
+            FROM scan_findings_effective
             WHERE scan_result_id = $1
               AND ($2::text IS NULL OR severity = $2)
               AND ($3::text IS NULL OR source = $3)
               AND ($4::text IS NULL OR cve_id = $4)
+              AND ($7::text IS NULL OR finding_class = $7)
             ORDER BY
                 CASE severity
                     WHEN 'critical' THEN 0
@@ -1865,17 +2519,19 @@ impl ScanResultService {
                 END,
                 created_at DESC
             LIMIT $5 OFFSET $6
-            "#,
-            scan_result_id,
-            severity,
-            source,
-            cve_id,
-            limit,
-            offset,
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+            "#
+        );
+        let findings = sqlx::query_as::<_, ScanFinding>(sqlx::AssertSqlSafe(sql))
+            .bind(scan_result_id)
+            .bind(severity)
+            .bind(source)
+            .bind(cve_id)
+            .bind(limit)
+            .bind(offset)
+            .bind(finding_class)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         let total = sqlx::query_scalar!(
             r#"
@@ -1885,11 +2541,13 @@ impl ScanResultService {
               AND ($2::text IS NULL OR severity = $2)
               AND ($3::text IS NULL OR source = $3)
               AND ($4::text IS NULL OR cve_id = $4)
+              AND ($5::text IS NULL OR finding_class = $5)
             "#,
             scan_result_id,
             severity,
             source,
             cve_id,
+            finding_class,
         )
         .fetch_one(&self.db)
         .await
@@ -1898,58 +2556,109 @@ impl ScanResultService {
         Ok((findings, total))
     }
 
-    /// Acknowledge a finding (accept risk).
+    /// Acknowledge a finding (accept risk): record a decision about its identity
+    /// (#5153, [`crate::services::finding_acknowledgements`]) and return the row
+    /// with the state of the repository decided, which need not be the row's own.
     pub async fn acknowledge_finding(
         &self,
         finding_id: Uuid,
-        user_id: Uuid,
+        actor: &crate::services::finding_acknowledgements::AckActor,
         reason: &str,
+        options: crate::services::finding_acknowledgements::AcknowledgeOptions,
     ) -> Result<ScanFinding> {
-        let finding = sqlx::query_as!(
-            ScanFinding,
-            r#"
-            UPDATE scan_findings
-            SET is_acknowledged = true, acknowledged_by = $2,
-                acknowledged_reason = $3, acknowledged_at = NOW()
-            WHERE id = $1
-            RETURNING id, scan_result_id, artifact_id, severity, title, description,
-                      cve_id, affected_component, affected_version, fixed_version,
-                      source, source_url, is_acknowledged, acknowledged_by,
-                      acknowledged_reason, acknowledged_at, created_at
-            "#,
-            finding_id,
-            user_id,
-            reason,
-        )
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Finding not found".to_string()))?;
+        let decision =
+            crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+                self.db.clone(),
+            )
+            .acknowledge_finding(finding_id, actor, Some(reason), options)
+            .await?;
+        self.get_finding_as_decided(finding_id, decision.repository_id)
+            .await
+    }
 
+    /// The row, with its acknowledged fields as they stand in `repository_id`.
+    /// `None`, an every-repository decision, is the row's own state.
+    async fn get_finding_as_decided(
+        &self,
+        finding_id: Uuid,
+        repository_id: Option<Uuid>,
+    ) -> Result<ScanFinding> {
+        let mut finding = self.get_finding(finding_id).await?;
+        if let Some(repository_id) = repository_id {
+            let decision =
+                crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+                    self.db.clone(),
+                )
+                .decision_in_repository(finding_id, repository_id)
+                .await?;
+            finding.is_acknowledged = decision.is_some();
+            finding.acknowledgement_id = decision.as_ref().map(|d| d.id);
+            finding.acknowledged_by = decision.as_ref().and_then(|d| d.acknowledged_by);
+            finding.acknowledged_reason = decision.as_ref().and_then(|d| d.reason.clone());
+            finding.acknowledged_at = decision.as_ref().map(|d| d.acknowledged_at);
+            finding.acknowledgement_expires_at = decision.as_ref().and_then(|d| d.expires_at);
+        }
         Ok(finding)
     }
 
-    /// Revoke acknowledgment of a finding.
-    pub async fn revoke_acknowledgment(&self, finding_id: Uuid) -> Result<ScanFinding> {
-        let finding = sqlx::query_as!(
-            ScanFinding,
-            r#"
-            UPDATE scan_findings
-            SET is_acknowledged = false, acknowledged_by = NULL,
-                acknowledged_reason = NULL, acknowledged_at = NULL
-            WHERE id = $1
-            RETURNING id, scan_result_id, artifact_id, severity, title, description,
-                      cve_id, affected_component, affected_version, fixed_version,
-                      source, source_url, is_acknowledged, acknowledged_by,
-                      acknowledged_reason, acknowledged_at, created_at
-            "#,
-            finding_id,
+    /// One finding with its effective acknowledged state.
+    async fn get_finding(&self, finding_id: Uuid) -> Result<ScanFinding> {
+        let sql =
+            format!("SELECT {SCAN_FINDING_COLUMNS} FROM scan_findings_effective WHERE id = $1");
+        sqlx::query_as::<_, ScanFinding>(sqlx::AssertSqlSafe(sql))
+            .bind(finding_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("Finding not found".to_string()))
+    }
+
+    /// Recompute the security score of the repository holding `artifact_id`
+    /// after its findings changed outside a scan (an acknowledgement or its
+    /// revocation). Without it the per-repository row kept counting a finding
+    /// the dashboard tiles had already dropped (#4338). Best-effort: the
+    /// triage change is committed either way, so a failed recompute is
+    /// logged, not returned, and the next scan of the repository repairs it.
+    pub async fn refresh_score_for_artifact(&self, artifact_id: Uuid) {
+        let repository_id: Option<Uuid> = match sqlx::query_scalar(
+            "SELECT repository_id FROM artifacts WHERE id = $1",
         )
+        .bind(artifact_id)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Finding not found".to_string()))?;
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(%artifact_id, error = %e, "security score refresh: repository lookup failed");
+                return;
+            }
+        };
+        if let Some(repository_id) = repository_id {
+            if let Err(e) = self.recalculate_score(repository_id).await {
+                tracing::warn!(%repository_id, error = %e, "security score refresh failed");
+            }
+        }
+    }
 
+    /// Revoke the decision covering a finding, as far as the actor has authority
+    /// (#5153), and return the row with the state of the repository asked about.
+    /// `acknowledgements_left_effective` counts what stayed.
+    pub async fn revoke_acknowledgment(
+        &self,
+        finding_id: Uuid,
+        repository_id: Option<Uuid>,
+        actor: &crate::services::finding_acknowledgements::AckActor,
+    ) -> Result<ScanFinding> {
+        let outcome =
+            crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+                self.db.clone(),
+            )
+            .revoke_finding(finding_id, repository_id, actor)
+            .await?;
+        let mut finding = self
+            .get_finding_as_decided(finding_id, repository_id)
+            .await?;
+        finding.acknowledgements_left_effective = Some(outcome.left_effective);
         Ok(finding)
     }
 
@@ -1958,7 +2667,53 @@ impl ScanResultService {
     // -----------------------------------------------------------------------
 
     /// Recalculate and materialize the security score for a repository.
+    ///
+    /// Recalculations of one repository are serialized (#5006). Every caller
+    /// (scan completion, the delete refresher, triage changes, the ingest
+    /// handler) goes through here, and two scans of one repository often
+    /// finish together. Each attempt runs under a per-repository
+    /// transaction-scoped advisory lock, and an attempt that hits a
+    /// serialization failure is retried, so the stored score always comes
+    /// from a snapshot that includes every recalculation committed before it.
+    /// Before #5006 the loser of such a race returned 40001, and the winner's
+    /// score, computed before the loser's scan had committed, stayed until
+    /// the next scan or delete in the repository.
     pub async fn recalculate_score(&self, repository_id: Uuid) -> Result<RepoSecurityScore> {
+        let mut attempt = 1;
+        loop {
+            let last = attempt >= SCORE_RECALC_MAX_ATTEMPTS;
+            match self.recalculate_score_once(repository_id, last).await {
+                Ok(Some(score)) => return Ok(score),
+                // Another recalculation held the lock; it has finished now.
+                Ok(None) => {}
+                Err(err) if !last && is_score_recalc_conflict(&err) => {
+                    let jitter: f64 = rand::random();
+                    let base_ms = 20 * u64::from(attempt);
+                    let jitter_ms = (base_ms as f64 * jitter).round() as u64;
+                    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
+                    tracing::debug!(
+                        %repository_id,
+                        attempt,
+                        "security score recalculation hit a serialization conflict; retrying"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+            attempt += 1;
+        }
+    }
+
+    /// One attempt of [`Self::recalculate_score`]. Returns `Ok(None)` when
+    /// another recalculation of the repository held the lock: this attempt
+    /// waited for it to finish and gave up its snapshot, which predates that
+    /// recalculation's commit, so the caller starts over with a fresh one.
+    /// With `wait_for_lock` the attempt waits for the lock and computes in
+    /// any case (the last attempt).
+    async fn recalculate_score_once(
+        &self,
+        repository_id: Uuid,
+        wait_for_lock: bool,
+    ) -> Result<Option<RepoSecurityScore>> {
         // Wrap the three sequential queries (counts, last_scan_at, upsert)
         // in a single REPEATABLE READ transaction so all three statements
         // observe the same snapshot. The default sqlx transaction is
@@ -1981,52 +2736,54 @@ impl ScanResultService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Count non-acknowledged findings by severity, but only from the
-        // LATEST completed scan per (artifact_id, scan_type) within the
-        // repository (#962). Without this restriction, rescanning the
-        // same artifact N times multiplied the repo's finding counts by
-        // N because every scan_results row owns its own set of
-        // scan_findings rows. See #1126 for the matching fix applied
-        // to get_dashboard_summary; #1127 forward-ports it here.
-        //
-        // Note: the `legacy_unverified = false` filter present on
-        // release/1.1.x is omitted because main lacks that column
-        // (migration 075 on main is the unrelated `075_quarantine_period.sql`).
-        // Re-add when migration 080 lands.
-        let counts = sqlx::query!(
-            r#"
-            WITH latest_scans AS (
-                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
-                FROM scan_results sr
-                JOIN artifacts a ON a.id = sr.artifact_id
-                WHERE a.repository_id = $1
-                  AND NOT a.is_deleted
-                  AND sr.status = 'completed'
-                ORDER BY sr.artifact_id, sr.scan_type,
-                         sr.completed_at DESC NULLS LAST, sr.created_at DESC
-            )
-            SELECT
-                COUNT(*) FILTER (WHERE severity = 'critical' AND NOT is_acknowledged) as "critical!",
-                COUNT(*) FILTER (WHERE severity = 'high' AND NOT is_acknowledged) as "high!",
-                COUNT(*) FILTER (WHERE severity = 'medium' AND NOT is_acknowledged) as "medium!",
-                COUNT(*) FILTER (WHERE severity = 'low' AND NOT is_acknowledged) as "low!",
-                COUNT(*) FILTER (WHERE is_acknowledged) as "acknowledged!",
-                COUNT(*) as "total!"
-            FROM scan_findings
-            WHERE scan_result_id IN (SELECT id FROM latest_scans)
-            "#,
-            repository_id,
+        // #5006: serialize recalculations of this repository. Under
+        // REPEATABLE READ the snapshot is taken when the first statement
+        // starts, which is the lock statement itself, so an attempt that had
+        // to wait for the lock would read from before the holder's commit.
+        // Take the lock without waiting; when it is busy, wait for the holder
+        // to finish and start over with a fresh snapshot.
+        let lock_key = score_recalc_lock_key(repository_id);
+        if wait_for_lock {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(&lock_key)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            let acquired: bool =
+                sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(&lock_key)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if !acquired {
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(&lock_key)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.rollback().await?;
+                return Ok(None);
+            }
+        }
+
+        // #4338: the shared definition of open vulnerabilities by severity
+        // (latest completed scan per (artifact, scan type), one per
+        // (artifact, advisory) at its highest reported severity), the same
+        // one the dashboard tiles and the Overview summary count, read inside
+        // this transaction's snapshot. #962 / #1127 windowed this query to the
+        // latest scans; the shared definition keeps that.
+        let counts = crate::services::open_findings::severity_counts(
+            &mut *tx,
+            crate::services::open_findings::FindingScope::Repository(repository_id),
         )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .await?;
 
         let critical = counts.critical as i32;
         let high = counts.high as i32;
         let medium = counts.medium as i32;
         let low = counts.low as i32;
         let acknowledged = counts.acknowledged as i32;
-        let total = counts.total as i32;
+        // Open vulnerabilities of every severity: what the dashboard's
+        // "Open Findings" tile counts across all repositories.
+        let total = counts.open as i32;
 
         let (score, grade) = compute_security_score(critical, high, medium, low);
 
@@ -2080,17 +2837,114 @@ impl ScanResultService {
         let has_failed_scan = fail_closed.has_failed;
         let has_uncataloged_scan = fail_closed.has_uncataloged;
 
-        // Grade floor: while a failed scan is unsuperseded, the repo must never
-        // present as clean. Force grade F so both the dashboard and the
-        // release-gate treat "scan errored" as NOT clean, regardless of the
-        // (necessarily incomplete) finding counts from the completed rows.
-        // #4036: an unsuperseded not-cataloged scan is floored the same way —
-        // an artifact whose contents were never cataloged is never grade A.
-        let grade_char = if has_failed_scan || has_uncataloged_scan {
-            'F'
+        // #4154: only some uncataloged artifacts floor the grade (see
+        // `uncataloged_floors_grade`): every one in a typed repository, and
+        // package-shaped archives in a generic one. A plain generic archive
+        // keeps `has_uncataloged_scan` (and its row's reason) without the
+        // floor. Runtime query: it only runs when the flag is already set.
+        let uncataloged_floors = if has_uncataloged_scan {
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                r#"
+                WITH latest_status AS (
+                    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
+                           sr.artifact_id, sr.status, sr.scan_completeness
+                    FROM scan_results sr
+                    JOIN artifacts a ON a.id = sr.artifact_id
+                    WHERE a.repository_id = $1
+                      AND NOT a.is_deleted
+                    ORDER BY sr.artifact_id, sr.scan_type,
+                             sr.completed_at DESC NULLS LAST, sr.created_at DESC
+                )
+                SELECT DISTINCT r.format::text, a.path
+                FROM latest_status ls
+                JOIN artifacts a ON a.id = ls.artifact_id
+                JOIN repositories r ON r.id = a.repository_id
+                WHERE ls.status = 'completed'
+                  AND ls.scan_completeness = 'not_cataloged'
+                "#,
+            )
+            .bind(repository_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            rows.iter().any(|(format, path)| {
+                let filename = path.rsplit('/').next().unwrap_or(path);
+                crate::services::scanner_service::uncataloged_floors_grade(format, filename)
+            })
         } else {
-            grade.as_char()
+            false
         };
+
+        // The legacy letter: 1.11 replicas read `grade` and expect the floor
+        // (#2167, #4036/#4154), so it is written exactly as before. 1.12 reads
+        // the status and the unfloored letter below (#4336).
+        let grade_char = legacy_grade_letter(grade, has_failed_scan, uncataloged_floors);
+
+        // #4336: coverage, per live artifact, from the same latest-row window.
+        // An artifact is failed if any latest scan failed, else uncataloged if
+        // any latest completed scan cataloged nothing, else cataloged when a
+        // latest completed scan assessed it (`partial` counted separately).
+        let (
+            artifact_count,
+            failed_count,
+            uncataloged_count,
+            cataloged_count,
+            partial_count,
+            assessed_any_count,
+        ): (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            WITH latest AS (
+                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
+                       sr.artifact_id, sr.status, sr.scan_completeness
+                FROM scan_results sr
+                JOIN artifacts a ON a.id = sr.artifact_id
+                WHERE a.repository_id = $1
+                  AND NOT a.is_deleted
+                ORDER BY sr.artifact_id, sr.scan_type,
+                         sr.completed_at DESC NULLS LAST, sr.created_at DESC
+            ),
+            per_artifact AS (
+                SELECT artifact_id,
+                       bool_or(status = 'failed') AS failed,
+                       bool_or(status = 'completed'
+                               AND scan_completeness = 'not_cataloged') AS uncataloged,
+                       bool_or(status = 'completed'
+                               AND scan_completeness IN ('complete', 'partial')) AS cataloged,
+                       bool_or(status = 'completed'
+                               AND scan_completeness = 'partial') AS partial
+                FROM latest
+                GROUP BY artifact_id
+            )
+            SELECT
+                (SELECT COUNT(*) FROM artifacts
+                  WHERE repository_id = $1 AND NOT is_deleted),
+                COUNT(*) FILTER (WHERE failed),
+                COUNT(*) FILTER (WHERE NOT failed AND uncataloged),
+                COUNT(*) FILTER (WHERE NOT failed AND NOT uncataloged AND cataloged),
+                COUNT(*) FILTER (WHERE NOT failed AND NOT uncataloged AND cataloged AND partial),
+                COUNT(*) FILTER (WHERE cataloged)
+            FROM per_artifact
+            "#,
+        )
+        .bind(repository_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let coverage = ScoreCoverage {
+            artifacts: artifact_count,
+            scanned: failed_count + uncataloged_count + cataloged_count,
+            cataloged: cataloged_count,
+            partial: partial_count,
+            failed: failed_count,
+            uncataloged: uncataloged_count,
+        };
+        let status = repository_grade_status(
+            &coverage,
+            assessed_any_count > 0,
+            critical + high + medium + low + acknowledged + total > 0,
+        );
+        let rated = rated_grade_letter(grade, status);
+        let as_i32 = |n: i64| i32::try_from(n).unwrap_or(i32::MAX);
 
         let last_scan_at = sqlx::query_scalar!(
             r#"
@@ -2104,14 +2958,16 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let result = sqlx::query_as!(
-            RepoSecurityScore,
+        const INSERT: &str = concat!(
             r#"
             INSERT INTO repo_security_scores (repository_id, score, grade, total_findings,
                 critical_count, high_count, medium_count, low_count,
                 acknowledged_count, last_scan_at, has_failed_scan,
-                has_uncataloged_scan, calculated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+                has_uncataloged_scan, calculated_at, grade_status, rated_grade,
+                artifact_count, scanned_count, cataloged_count, partial_count,
+                failed_count, uncataloged_count, status_calculated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(),
+                    $13, $14, $15, $16, $17, $18, $19, $20, NOW())
             ON CONFLICT (repository_id)
             DO UPDATE SET
                 score = EXCLUDED.score,
@@ -2125,137 +2981,615 @@ impl ScanResultService {
                 last_scan_at = EXCLUDED.last_scan_at,
                 has_failed_scan = EXCLUDED.has_failed_scan,
                 has_uncataloged_scan = EXCLUDED.has_uncataloged_scan,
-                calculated_at = NOW()
-            RETURNING id, repository_id, score, grade, total_findings,
-                      critical_count, high_count, medium_count, low_count,
-                      acknowledged_count, last_scan_at, has_failed_scan,
-                      has_uncataloged_scan, calculated_at
-            "#,
-            repository_id,
-            score,
-            grade_char.to_string(),
-            total,
-            critical,
-            high,
-            medium,
-            low,
-            acknowledged,
-            last_scan_at,
-            has_failed_scan,
-            has_uncataloged_scan,
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+                calculated_at = NOW(),
+                grade_status = EXCLUDED.grade_status,
+                rated_grade = EXCLUDED.rated_grade,
+                artifact_count = EXCLUDED.artifact_count,
+                scanned_count = EXCLUDED.scanned_count,
+                cataloged_count = EXCLUDED.cataloged_count,
+                partial_count = EXCLUDED.partial_count,
+                failed_count = EXCLUDED.failed_count,
+                uncataloged_count = EXCLUDED.uncataloged_count,
+                status_calculated_at = NOW()
+            RETURNING "#,
+            score_columns!()
+        );
+        let result = sqlx::query_as::<_, RepoSecurityScore>(INSERT)
+            .bind(repository_id)
+            .bind(score)
+            .bind(grade_char.to_string())
+            .bind(total)
+            .bind(critical)
+            .bind(high)
+            .bind(medium)
+            .bind(low)
+            .bind(acknowledged)
+            .bind(last_scan_at)
+            .bind(has_failed_scan)
+            .bind(has_uncataloged_scan)
+            .bind(status.as_str())
+            .bind(rated.map(|c| c.to_string()))
+            .bind(as_i32(coverage.artifacts))
+            .bind(as_i32(coverage.scanned))
+            .bind(as_i32(coverage.cataloged))
+            .bind(as_i32(coverage.partial))
+            .bind(as_i32(coverage.failed))
+            .bind(as_i32(coverage.uncataloged))
+            .fetch_one(&mut *tx)
+            .await?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        // The upsert and the commit keep the typed error so a serialization
+        // failure is recognized and retried (#5006).
+        tx.commit().await?;
 
-        Ok(result)
+        Ok(Some(result))
     }
 
     /// Get the current security score for a repository.
     pub async fn get_score(&self, repository_id: Uuid) -> Result<Option<RepoSecurityScore>> {
-        let score = sqlx::query_as!(
-            RepoSecurityScore,
-            r#"
-            SELECT id, repository_id, score, grade, total_findings,
-                   critical_count, high_count, medium_count, low_count,
-                   acknowledged_count, last_scan_at, has_failed_scan,
-                   has_uncataloged_scan, calculated_at
-            FROM repo_security_scores
-            WHERE repository_id = $1
-            "#,
-            repository_id,
-        )
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(score)
+        const SQL: &str = concat!(
+            "SELECT ",
+            score_columns!(),
+            " FROM repo_security_scores WHERE repository_id = $1"
+        );
+        sqlx::query_as::<_, RepoSecurityScore>(SQL)
+            .bind(repository_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Get all repository scores for the leaderboard.
     pub async fn get_all_scores(&self) -> Result<Vec<RepoSecurityScore>> {
-        let scores = sqlx::query_as!(
-            RepoSecurityScore,
-            r#"
-            SELECT id, repository_id, score, grade, total_findings,
-                   critical_count, high_count, medium_count, low_count,
-                   acknowledged_count, last_scan_at, has_failed_scan,
-                   has_uncataloged_scan, calculated_at
-            FROM repo_security_scores
-            ORDER BY score ASC, critical_count DESC
-            "#,
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(scores)
+        const SQL: &str = concat!(
+            "SELECT ",
+            score_columns!(),
+            " FROM repo_security_scores ORDER BY score ASC, critical_count DESC"
+        );
+        sqlx::query_as::<_, RepoSecurityScore>(SQL)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Get aggregate dashboard summary across all repositories.
     ///
-    /// #962: the finding totals are restricted to the LATEST completed scan
-    /// per (artifact_id, scan_type) tuple. Without this windowing, scanning
-    /// the same Docker image ten times multiplied the dashboard's
-    /// vulnerability count tenfold ("150 vulns" instead of the actual 15)
-    /// because every scan_results row owns its own `scan_findings`.
-    ///
-    /// Soft-deleted artifacts are excluded so users do not see deleted-
-    /// artifact CVE counts mixed into the live dashboard; this matches the
-    /// per-repo score recompute query.
-    ///
-    /// FILTER aggregates collapse the three finding subqueries into one
-    /// scan of the `latest_findings` CTE.
+    /// The finding totals (`total_findings` = open vulnerabilities of every
+    /// severity, `critical_findings`, `high_findings`) use the shared
+    /// definition in [`crate::services::open_findings`] (#4338), which keeps
+    /// #962's restriction to the latest completed scan per (artifact, scan
+    /// type) and the exclusion of soft-deleted artifacts.
     pub async fn get_dashboard_summary(&self) -> Result<DashboardSummary> {
-        let summary = sqlx::query!(
+        // #4338: finding totals come from the shared definition, so the tiles
+        // equal the sum of the per-repository rows and the Overview summary.
+        let counts = crate::services::open_findings::severity_counts(
+            &self.db,
+            crate::services::open_findings::FindingScope::All,
+        )
+        .await?;
+        // #4336: the letter tiles count the unfloored letter of repositories
+        // that have one (`rated_grade`; never an F floor), and the status
+        // tiles count by `grade_status`. A row a 1.11 replica wrote has
+        // neither: its status is derived the way `RepoSecurityScore::status`
+        // does (a floored letter or a fail-closed flag reads `incomplete`),
+        // and its letter is the stored one unless it was floored.
+        let (repos_with_scanning, total_scans): (i64, i64) = sqlx::query_as(
             r#"
-            WITH latest_scans AS (
-                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
-                FROM scan_results sr
-                JOIN artifacts a ON a.id = sr.artifact_id
-                WHERE sr.status = 'completed'
-                  AND NOT a.is_deleted
-                ORDER BY sr.artifact_id, sr.scan_type,
-                         sr.completed_at DESC NULLS LAST, sr.created_at DESC
-            ),
-            latest_findings AS (
-                SELECT sf.severity, sf.is_acknowledged
-                FROM scan_findings sf
-                JOIN latest_scans ls ON ls.id = sf.scan_result_id
-            )
             SELECT
-                (SELECT COUNT(*) FROM scan_configs WHERE scan_enabled = true) as "repos_with_scanning!",
-                (SELECT COUNT(*) FROM scan_results) as "total_scans!",
-                COUNT(*) FILTER (WHERE NOT is_acknowledged) as "total_findings!",
-                COUNT(*) FILTER (
-                    WHERE severity = 'critical' AND NOT is_acknowledged
-                ) as "critical_findings!",
-                COUNT(*) FILTER (
-                    WHERE severity = 'high' AND NOT is_acknowledged
-                ) as "high_findings!",
-                (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'A') as "repos_grade_a!",
-                (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'F') as "repos_grade_f!"
-            FROM latest_findings
+                (SELECT COUNT(*) FROM scan_configs WHERE scan_enabled = true),
+                (SELECT COUNT(*) FROM scan_results)
             "#,
         )
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        type Row = (
+            String,
+            i32,
+            bool,
+            bool,
+            Option<String>,
+            Option<String>,
+            chrono::DateTime<Utc>,
+            Option<chrono::DateTime<Utc>>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT grade, score, has_failed_scan, has_uncataloged_scan, grade_status, \
+             rated_grade, calculated_at, status_calculated_at FROM repo_security_scores",
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let tally = tally_grade_rows(rows.into_iter().map(
+            |(
+                grade,
+                score,
+                has_failed_scan,
+                has_uncataloged_scan,
+                grade_status,
+                rated_grade,
+                calculated_at,
+                status_calculated_at,
+            )| {
+                RepoSecurityScore {
+                    id: Uuid::nil(),
+                    repository_id: Uuid::nil(),
+                    score,
+                    grade,
+                    total_findings: 0,
+                    critical_count: 0,
+                    high_count: 0,
+                    medium_count: 0,
+                    low_count: 0,
+                    acknowledged_count: 0,
+                    last_scan_at: None,
+                    calculated_at,
+                    has_failed_scan,
+                    has_uncataloged_scan,
+                    grade_status,
+                    rated_grade,
+                    artifact_count: None,
+                    scanned_count: None,
+                    cataloged_count: None,
+                    partial_count: None,
+                    failed_count: None,
+                    uncataloged_count: None,
+                    status_calculated_at,
+                }
+            },
+        ));
+        let (repos_grade_a, repos_grade_f) = (tally.grade_a, tally.grade_f);
 
-        Ok(build_dashboard_summary(
-            summary.repos_with_scanning,
-            summary.total_scans,
-            summary.total_findings,
-            summary.critical_findings,
-            summary.high_findings,
-            summary.repos_grade_a,
-            summary.repos_grade_f,
+        let mut out = build_dashboard_summary(
+            repos_with_scanning,
+            total_scans,
+            counts.open,
+            counts.critical,
+            counts.high,
+            repos_grade_a,
+            repos_grade_f,
+        );
+        let hosted = self.count_hosted_rejected().await?;
+        // One read: `proxy_would_block` grades the same candidates.
+        let candidates = self.proxy_block_candidates().await?;
+        let proxy = count_blocked_proxy_digests(&candidates);
+        out.policy_violations_blocked = hosted + proxy;
+        out.proxy_blocked = proxy;
+        out.proxy_would_block = count_would_block_proxy_digests(&candidates);
+        out.repos_rated = tally.rated;
+        out.repos_incomplete = tally.incomplete;
+        out.repos_unrated = tally.unrated;
+        Ok(out)
+    }
+
+    /// What the dashboard's `policy_violations_blocked` counts (#4380).
+    ///
+    /// The field was hard-wired to 0, so a scan policy that blocked content
+    /// left no trace on the dashboard. It now counts the items a scan policy
+    /// is currently refusing:
+    ///
+    /// * **hosted** artifacts whose quarantine workflow ended `rejected`, and
+    /// * **proxied** content (any format; for OCI, the image manifest) with a
+    ///   `vulnerable` verdict that the owning repository's proxy scan gate
+    ///   enforces: a format whose proxy path runs the gate (#4582),
+    ///   scan-on-proxy enabled, not `record_only`, and the verdict at or
+    ///   above the repository's severity threshold when one is opted into. Proxied bytes have no `artifacts` row (#1278), so they are found
+    ///   through the repository's proxy cache catalog and its OCI manifest
+    ///   edges, each distinct digest counted once.
+    ///
+    /// A verdict older than the scan TTL is not counted: the gate re-scans it
+    /// on the next pull rather than trusting it.
+    pub async fn count_policy_violations_blocked(&self) -> Result<i64> {
+        Ok(self.count_hosted_rejected().await? + self.count_proxy_blocked().await?)
+    }
+
+    /// Hosted artifacts whose quarantine workflow ended `rejected`: the
+    /// hosted half of `policy_violations_blocked` (#4380).
+    async fn count_hosted_rejected(&self) -> Result<i64> {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts \
+             WHERE quarantine_status = 'rejected' AND NOT is_deleted",
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// The dashboard's `proxy_blocked` (#4777): distinct proxied digests at
+    /// least one repository's proxy scan gate refuses right now, the same
+    /// set the cross-repository blocked listing pages through.
+    pub async fn count_proxy_blocked(&self) -> Result<i64> {
+        Ok(count_blocked_proxy_digests(
+            &self.proxy_block_candidates().await?,
         ))
     }
+
+    /// Every fresh `vulnerable` verdict on a digest a scanning repository
+    /// caches, paired with that repository's settings and whatever its action:
+    /// the gate's predicates decide from here.
+    async fn proxy_block_candidates(&self) -> Result<Vec<ProxyBlockCandidate>> {
+        sqlx::query_as(
+            r#"
+            SELECT DISTINCT psr.checksum_sha256, r.format::text AS format,
+                   psr.max_severity,
+                   sc.proxy_scan_action, sc.block_on_policy_violation,
+                   sc.severity_threshold
+            FROM scan_configs sc
+            JOIN repositories r ON r.id = sc.repository_id
+            JOIN LATERAL (
+                SELECT pca.checksum_sha256 AS digest
+                  FROM proxy_cache_artifacts pca
+                 WHERE pca.repository_id = sc.repository_id
+                   AND pca.checksum_sha256 IS NOT NULL
+                UNION
+                SELECT REPLACE(mbr.manifest_digest, 'sha256:', '')
+                  FROM manifest_blob_refs mbr
+                 WHERE mbr.repository_id = sc.repository_id
+            ) cached ON true
+            JOIN proxy_scan_results psr
+              ON psr.checksum_sha256 = cached.digest
+             AND psr.scan_type = $1
+             AND psr.verdict = 'vulnerable'
+             AND psr.scanned_at > NOW() - make_interval(days => $2)
+            WHERE sc.scan_on_proxy
+              AND r.repo_type IN ('remote', 'virtual')
+            "#,
+        )
+        .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+        .bind(crate::services::scanner_service::DEDUP_TTL_DAYS)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// The CVE ids recorded for each of `digests` (#4777), most severe
+    /// first, at most `per_digest` each: one statement for a whole page.
+    pub async fn proxy_cve_ids(
+        &self,
+        digests: &[String],
+        per_digest: i64,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        if digests.is_empty() {
+            return Ok(Default::default());
+        }
+        let rows: Vec<(String, Vec<String>)> = sqlx::query_as(
+            r#"
+            SELECT checksum_sha256,
+                   (ARRAY_AGG(cve_id ORDER BY
+                        CASE lower(severity)
+                            WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                            WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+                        cve_id))[1:$3::int] AS cve_ids
+              FROM (SELECT DISTINCT checksum_sha256, cve_id, severity
+                      FROM proxy_scan_findings
+                     WHERE checksum_sha256 = ANY($1) AND scan_type = $2) f
+             GROUP BY checksum_sha256
+            "#,
+        )
+        .bind(digests)
+        .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+        .bind(per_digest)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Every proxied path a repository's proxy scan gate currently refuses
+    /// (#4510, #4777), optionally for one repository, ordered by repository
+    /// key then path. Same candidate set and TTL as
+    /// [`Self::count_policy_violations_blocked`], filtered with
+    /// [`proxy_gate_refuses`], so a listed row is one the gate would refuse.
+    pub async fn list_blocked_proxy_entries(
+        &self,
+        repository_key: Option<&str>,
+    ) -> Result<Vec<ProxyBlockedEntry>> {
+        let mut rows = self.cached_vulnerable_proxy_entries(repository_key).await?;
+        rows.retain(|r| {
+            proxy_gate_refuses(
+                &r.repository_format,
+                r.block_on_policy_violation,
+                &r.severity_threshold,
+                &r.proxy_scan_action,
+                r.max_severity.as_deref(),
+            )
+        });
+        Ok(rows)
+    }
+
+    /// Every proxied path a repository's proxy scan gate would refuse if it
+    /// enforced (#5232): [`Self::list_blocked_proxy_entries`] over the same
+    /// candidates, filtered with [`proxy_gate_would_refuse`].
+    pub async fn list_would_block_proxy_entries(
+        &self,
+        repository_key: Option<&str>,
+    ) -> Result<Vec<ProxyBlockedEntry>> {
+        let mut rows = self.cached_vulnerable_proxy_entries(repository_key).await?;
+        rows.retain(|r| {
+            proxy_gate_would_refuse(
+                &r.repository_format,
+                r.block_on_policy_violation,
+                &r.severity_threshold,
+                r.max_severity.as_deref(),
+            )
+        });
+        Ok(rows)
+    }
+
+    /// See [`ProxyNoVerdictCounts`]. One statement; the catalog is read once
+    /// per repository, and each distinct digest is looked up once.
+    pub async fn count_proxy_no_verdict(
+        &self,
+        repository_key: Option<&str>,
+    ) -> Result<ProxyNoVerdictCounts> {
+        let packument_formats: Vec<&str> =
+            crate::services::proxy_catalog::packument_format_labels();
+        let not_metadata = crate::services::proxy_catalog::not_cached_metadata_sql_by_format(
+            "pca.path",
+            "r.format::text",
+            "$5",
+        );
+        sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
+            r#"
+            WITH scanning AS (
+                SELECT r.id, r.format
+                  FROM scan_configs sc
+                  JOIN repositories r ON r.id = sc.repository_id
+                 WHERE sc.scan_on_proxy
+                   AND r.repo_type IN ('remote', 'virtual')
+                   AND r.format::text = ANY($3)
+                   AND ($4::text IS NULL OR r.key = $4)
+            ), cached AS (
+                SELECT pca.checksum_sha256 AS digest
+                  FROM scanning r
+                  JOIN proxy_cache_artifacts pca ON pca.repository_id = r.id
+                 WHERE pca.checksum_sha256 IS NOT NULL
+                   AND {not_metadata}
+                UNION
+                SELECT REPLACE(mbr.manifest_digest, 'sha256:', '')
+                  FROM scanning r
+                  JOIN manifest_blob_refs mbr ON mbr.repository_id = r.id
+            )
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE psr.verdict IS NULL
+                       OR psr.verdict NOT IN ('clean', 'vulnerable')
+                ) AS no_verdict,
+                COUNT(*) FILTER (
+                    WHERE psr.verdict IN ('clean', 'vulnerable')
+                      AND psr.scanned_at <= NOW() - make_interval(days => $2)
+                ) AS stale_verdict,
+                COUNT(*) FILTER (
+                    WHERE psr.verdict = 'clean'
+                      AND psr.scanned_at > NOW() - make_interval(days => $2)
+                      AND psr.findings_count = 0
+                      AND COALESCE(psr.components_cataloged, 0) <= 0
+                      AND psr.pin_identity IS NULL
+                ) AS clean_graded_nothing
+              FROM cached
+              LEFT JOIN proxy_scan_results psr
+                     ON psr.checksum_sha256 = cached.digest
+                    AND psr.scan_type = $1
+            "#
+        )))
+        .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+        .bind(crate::services::scanner_service::DEDUP_TTL_DAYS)
+        .bind(proxy_gated_format_labels())
+        .bind(repository_key)
+        .bind(packument_formats)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Fresh `vulnerable` verdicts on cached paths of scanning repositories,
+    /// ordered by repository key then path, before any gate decides.
+    async fn cached_vulnerable_proxy_entries(
+        &self,
+        repository_key: Option<&str>,
+    ) -> Result<Vec<ProxyBlockedEntry>> {
+        let rows: Vec<ProxyBlockedEntry> = sqlx::query_as(
+            r#"
+            SELECT r.id AS repository_id, r.key AS repository_key,
+                   r.format::text AS repository_format,
+                   cached.path, psr.checksum_sha256, psr.max_severity,
+                   psr.findings_count, psr.critical_count, psr.high_count,
+                   psr.medium_count, psr.low_count, psr.scanned_at,
+                   sc.block_on_policy_violation, sc.severity_threshold,
+                   sc.proxy_scan_action
+            FROM scan_configs sc
+            JOIN repositories r ON r.id = sc.repository_id
+            JOIN LATERAL (
+                SELECT pca.path, pca.checksum_sha256 AS digest
+                  FROM proxy_cache_artifacts pca
+                 WHERE pca.repository_id = sc.repository_id
+                   AND pca.checksum_sha256 IS NOT NULL
+                UNION
+                SELECT DISTINCT mbr.manifest_digest,
+                       REPLACE(mbr.manifest_digest, 'sha256:', '')
+                  FROM manifest_blob_refs mbr
+                 WHERE mbr.repository_id = sc.repository_id
+            ) cached ON true
+            JOIN proxy_scan_results psr
+              ON psr.checksum_sha256 = cached.digest
+             AND psr.scan_type = $1
+             AND psr.verdict = 'vulnerable'
+             AND psr.scanned_at > NOW() - make_interval(days => $2)
+            WHERE sc.scan_on_proxy
+              AND r.repo_type IN ('remote', 'virtual')
+              AND ($3::text IS NULL OR r.key = $3)
+            ORDER BY r.key, cached.path
+            LIMIT $4
+            "#,
+        )
+        .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+        .bind(crate::services::scanner_service::DEDUP_TTL_DAYS)
+        .bind(repository_key)
+        .bind(PROXY_BLOCKED_CANDIDATE_CAP)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        if rows.len() as i64 >= PROXY_BLOCKED_CANDIDATE_CAP {
+            tracing::warn!(
+                cap = PROXY_BLOCKED_CANDIDATE_CAP,
+                "blocked proxy listing reached its candidate cap; later repositories are not listed"
+            );
+        }
+        Ok(rows)
+    }
+}
+
+/// Longest `scan_findings.cve_id` the column holds, in characters
+/// (`VARCHAR(30)`, migration 022). It is the one scanner-supplied text column
+/// migration 339 did not widen to `TEXT` (#5534): a partial index sits on it,
+/// and widening would rebuild that index under an exclusive lock.
+pub(crate) const SCAN_FINDING_CVE_ID_MAX_CHARS: usize = 30;
+
+/// Why `findings` cannot be stored, naming the finding and the column, or
+/// `None` when every row fits the `scan_findings` schema (#5534).
+///
+/// The findings go in as ONE statement, so a single value the column rejects
+/// fails the whole batch, and PostgreSQL's error names neither the row nor
+/// (for an over-long value) the column. This check runs first and says which.
+/// It refuses rather than truncates or drops: storing a finding other than
+/// the one the scanner reported, or completing a scan without it, would hand
+/// every gate that reads the scan a verdict nobody issued.
+///
+/// Covers what the schema still refuses: a NUL byte in any text column
+/// (PostgreSQL cannot store one in `TEXT`) and an over-long `cve_id`.
+fn unstorable_finding(findings: &[RawFinding]) -> Option<String> {
+    let total = findings.len();
+    findings.iter().enumerate().find_map(|(index, f)| {
+        let text_columns = [
+            ("title", Some(f.title.as_str())),
+            ("description", f.description.as_deref()),
+            ("cve_id", f.cve_id.as_deref()),
+            ("affected_component", f.affected_component.as_deref()),
+            ("affected_version", f.affected_version.as_deref()),
+            ("fixed_version", f.fixed_version.as_deref()),
+            ("source", f.source.as_deref()),
+            ("source_url", f.source_url.as_deref()),
+        ];
+        let problem = text_columns.iter().find_map(|(column, value)| {
+            let value = (*value)?;
+            if value.contains('\0') {
+                return Some(format!("`{column}` contains a NUL byte"));
+            }
+            let chars = value.chars().count();
+            (*column == "cve_id" && chars > SCAN_FINDING_CVE_ID_MAX_CHARS).then(|| {
+                format!(
+                    "`cve_id` is {chars} characters, longer than the \
+                     {SCAN_FINDING_CVE_ID_MAX_CHARS} the column holds"
+                )
+            })
+        })?;
+        let label: String = f
+            .cve_id
+            .as_deref()
+            .unwrap_or(&f.title)
+            .chars()
+            .take(80)
+            .collect();
+        Some(format!(
+            "finding {} of {total} ({label:?}) cannot be stored: {problem}",
+            index + 1
+        ))
+    })
+}
+
+/// The single-statement UNNEST insert behind
+/// [`ScanResultService::create_findings`], generic over the executor so
+/// [`ScanResultService::create_completed_scan_with_findings`] can run it
+/// inside the transaction that wrote the scan row (#4667).
+///
+/// #5534: a batch the schema would refuse is answered with a `Validation`
+/// error naming the finding and the column (see [`unstorable_finding`]), and
+/// any other database error says how many findings for which scan it lost.
+pub(crate) async fn insert_findings<'e, E>(
+    executor: E,
+    scan_result_id: Uuid,
+    artifact_id: Uuid,
+    findings: &[RawFinding],
+) -> Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if findings.is_empty() {
+        return Ok(());
+    }
+    if let Some(problem) = unstorable_finding(findings) {
+        return Err(AppError::Validation(problem));
+    }
+
+    let severities: Vec<String> = findings
+        .iter()
+        .map(|f| severity_to_db_string(f.severity))
+        .collect();
+    let titles: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
+    let descriptions: Vec<Option<&str>> =
+        findings.iter().map(|f| f.description.as_deref()).collect();
+    let cve_ids: Vec<Option<&str>> = findings.iter().map(|f| f.cve_id.as_deref()).collect();
+    let affected_components: Vec<Option<&str>> = findings
+        .iter()
+        .map(|f| f.affected_component.as_deref())
+        .collect();
+    let affected_versions: Vec<Option<&str>> = findings
+        .iter()
+        .map(|f| f.affected_version.as_deref())
+        .collect();
+    let fixed_versions: Vec<Option<&str>> = findings
+        .iter()
+        .map(|f| f.fixed_version.as_deref())
+        .collect();
+    let sources: Vec<Option<&str>> = findings.iter().map(|f| f.source.as_deref()).collect();
+    let source_urls: Vec<Option<&str>> = findings.iter().map(|f| f.source_url.as_deref()).collect();
+    let finding_classes: Vec<&str> = findings.iter().map(|f| f.finding_class.as_str()).collect();
+
+    sqlx::query!(
+        r#"
+            INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title,
+                description, cve_id, affected_component, affected_version, fixed_version,
+                source, source_url, finding_class)
+            SELECT $1, $2, severity, title, description,
+                   cve_id, affected_component, affected_version, fixed_version,
+                   source, source_url, finding_class
+            FROM UNNEST(
+                $3::text[],
+                $4::text[],
+                $5::text[],
+                $6::text[],
+                $7::text[],
+                $8::text[],
+                $9::text[],
+                $10::text[],
+                $11::text[],
+                $12::text[]
+            ) AS t(severity, title, description, cve_id, affected_component,
+                   affected_version, fixed_version, source, source_url, finding_class)
+            "#,
+        scan_result_id,
+        artifact_id,
+        &severities as &[String],
+        &titles as &[&str],
+        &descriptions as &[Option<&str>],
+        &cve_ids as &[Option<&str>],
+        &affected_components as &[Option<&str>],
+        &affected_versions as &[Option<&str>],
+        &fixed_versions as &[Option<&str>],
+        &sources as &[Option<&str>],
+        &source_urls as &[Option<&str>],
+        &finding_classes as &[&str],
+    )
+    .execute(executor)
+    .await
+    .map_err(|e| {
+        AppError::Database(format!(
+            "storing {} findings for scan {scan_result_id}: {e}",
+            findings.len()
+        ))
+    })?;
+
+    Ok(())
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -2427,6 +3761,207 @@ mod tests {
         assert_eq!(summary.policy_violations_blocked, 0);
     }
 
+    fn block_candidate(
+        digest: &str,
+        max_severity: Option<&str>,
+        action: &str,
+        block_on_policy_violation: bool,
+        threshold: &str,
+    ) -> ProxyBlockCandidate {
+        format_block_candidate(
+            "pypi",
+            digest,
+            max_severity,
+            action,
+            block_on_policy_violation,
+            threshold,
+        )
+    }
+
+    fn format_block_candidate(
+        format: &str,
+        digest: &str,
+        max_severity: Option<&str>,
+        action: &str,
+        block_on_policy_violation: bool,
+        threshold: &str,
+    ) -> ProxyBlockCandidate {
+        ProxyBlockCandidate {
+            format: format.to_string(),
+            checksum_sha256: digest.to_string(),
+            max_severity: max_severity.map(str::to_string),
+            proxy_scan_action: action.to_string(),
+            block_on_policy_violation,
+            severity_threshold: threshold.to_string(),
+        }
+    }
+
+    /// #4380: the dashboard counts a proxied verdict as blocked exactly when
+    /// the proxy scan gate would refuse it, once per digest.
+    #[test]
+    fn test_count_blocked_proxy_digests_follows_the_gate() {
+        let rows = vec![
+            // Critical at a critical threshold: blocked.
+            block_candidate("a", Some("critical"), "fail_open", true, "critical"),
+            // The same digest cached by a second enforcing repo: still one.
+            block_candidate("a", Some("critical"), "fail_closed", false, "high"),
+            // High below a critical threshold: served, not blocked.
+            block_candidate("b", Some("high"), "fail_open", true, "critical"),
+            // No threshold opted in: any finding blocks.
+            block_candidate("c", Some("low"), "fail_open", false, "critical"),
+            // Record-only never blocks.
+            block_candidate("d", Some("critical"), "record_only", true, "critical"),
+            // Unknown severity fails closed: blocked.
+            block_candidate("e", None, "fail_open", true, "critical"),
+        ];
+        assert_eq!(count_blocked_proxy_digests(&rows), 3);
+        assert_eq!(count_blocked_proxy_digests(&[]), 0);
+    }
+
+    /// #5232: the preview is the gate's own predicate asked with an enforcing
+    /// action, and agrees with every decision the serve paths take on a stored
+    /// `vulnerable` verdict, for every format, opt-in, threshold and severity.
+    #[test]
+    fn test_would_refuse_is_the_gate_under_enforcement_5232() {
+        use crate::api::handlers::proxy_helpers::stored_verdict_blocks_under_gate;
+        use crate::services::proxy_scan_service::{
+            decide_cache_scan_gate, decide_serve, CacheScanGate, ProxyScanAction, ProxyScanRow,
+            ServeDecision, StoredProxyVerdict,
+        };
+        use crate::services::scan_config_service::proxy_severity_gate_for_row;
+        let now = chrono::Utc::now();
+        for format in [
+            "npm", "pypi", "conda", "helm_oci", "helm", "generic", "no-such",
+        ] {
+            for block in [false, true] {
+                for threshold in ["critical", "high", "medium", "low", "info", "garbage"] {
+                    for severity in [
+                        Some("critical"),
+                        Some("high"),
+                        Some("medium"),
+                        Some("low"),
+                        Some("info"),
+                        Some("junk"),
+                        None,
+                    ] {
+                        let ctx = format!("{format} {block} {threshold} {severity:?}");
+                        let would = proxy_gate_would_refuse(format, block, threshold, severity);
+                        for action in ["fail_open", "fail_closed"] {
+                            assert_eq!(
+                                would,
+                                proxy_gate_refuses(format, block, threshold, action, severity),
+                                "{ctx}: an enforcing repository lists exactly the preview"
+                            );
+                        }
+                        assert!(
+                            !proxy_gate_refuses(format, block, threshold, "record_only", severity),
+                            "{ctx}: record-only itself keeps refusing nothing"
+                        );
+
+                        // The decisions the real serve paths take.
+                        let row = ProxyScanRow {
+                            checksum_sha256: "d".repeat(64),
+                            scan_type: "grype".to_string(),
+                            verdict: "vulnerable".to_string(),
+                            findings_count: 1,
+                            critical_count: 0,
+                            high_count: 0,
+                            medium_count: 0,
+                            low_count: 0,
+                            max_severity: severity.map(str::to_string),
+                            scanner_version: Some("v".to_string()),
+                            scanned_at: now,
+                        };
+                        let gate = proxy_severity_gate_for_row(block, threshold, "fail_closed");
+                        let enforced = crate::formats::format_key_enforces_scan_on_proxy(format);
+                        for action in [ProxyScanAction::FailOpen, ProxyScanAction::FailClosed] {
+                            assert_eq!(
+                                decide_serve(Some(&row), Some("v"), action, 30, now),
+                                ServeDecision::BlockCached,
+                                "{ctx}"
+                            );
+                            assert_eq!(
+                                would,
+                                enforced && stored_verdict_blocks_under_gate(Some(&row), gate),
+                                "{ctx}: the buffered gate"
+                            );
+                            let stored = StoredProxyVerdict {
+                                row: row.clone(),
+                                pin_identity: None,
+                                components_cataloged: Some(1),
+                            };
+                            let fast = decide_cache_scan_gate(
+                                Some(&stored),
+                                Some("v"),
+                                action,
+                                gate,
+                                30,
+                                now,
+                            );
+                            assert_eq!(
+                                would,
+                                enforced && fast == CacheScanGate::Block,
+                                "{ctx}: the redirect gate"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// #5232: the counter is `proxy_blocked` plus what `record_only` serves,
+    /// once per digest, and a digest refused anywhere is not counted twice.
+    #[test]
+    fn test_count_would_block_proxy_digests_5232() {
+        let rows = vec![
+            // Enforcing: both counters.
+            block_candidate("a", Some("critical"), "fail_open", true, "high"),
+            // The same digest record-only elsewhere: still one.
+            block_candidate("a", Some("critical"), "record_only", true, "high"),
+            // Record-only at or above its threshold: the preview only.
+            block_candidate("b", Some("high"), "record_only", true, "high"),
+            // Record-only below its threshold: neither.
+            block_candidate("c", Some("medium"), "record_only", true, "high"),
+            // Record-only with no threshold opted in: any finding would block.
+            block_candidate("d", Some("low"), "record_only", false, "critical"),
+            // Record-only and ungraded: fails closed.
+            block_candidate("e", None, "record_only", true, "critical"),
+        ];
+        assert_eq!(count_blocked_proxy_digests(&rows), 1);
+        assert_eq!(count_would_block_proxy_digests(&rows), 4);
+        assert_eq!(count_would_block_proxy_digests(&[]), 0);
+    }
+
+    /// #4582: a blocking verdict counts only where the format's proxy path
+    /// runs the gate. The same high verdict under the same policy is counted
+    /// on a conda remote (gated since #4585) and an OCI alias, and not on a
+    /// helm or generic remote, which store `scan_on_proxy` but serve unscanned.
+    #[test]
+    fn test_count_blocked_proxy_digests_skips_ungated_formats_4582() {
+        let blocking = |format: &str, digest: &str| {
+            format_block_candidate(format, digest, Some("high"), "fail_open", true, "high")
+        };
+        assert_eq!(count_blocked_proxy_digests(&[blocking("helm", "a")]), 0);
+        assert_eq!(count_blocked_proxy_digests(&[blocking("generic", "a")]), 0);
+        assert_eq!(
+            count_blocked_proxy_digests(&[blocking("no-such-format", "a")]),
+            0
+        );
+        assert_eq!(count_blocked_proxy_digests(&[blocking("conda", "a")]), 1);
+        assert_eq!(
+            count_blocked_proxy_digests(&[blocking("conda_native", "a")]),
+            1
+        );
+        assert_eq!(count_blocked_proxy_digests(&[blocking("helm_oci", "a")]), 1);
+        // A digest an ungated repository also caches is still one blocked
+        // digest when a gated repository refuses it.
+        assert_eq!(
+            count_blocked_proxy_digests(&[blocking("helm", "a"), blocking("conda", "a")]),
+            1
+        );
+    }
+
     #[test]
     fn test_build_dashboard_summary_zeroes() {
         let summary = build_dashboard_summary(0, 0, 0, 0, 0, 0, 0);
@@ -2478,6 +4013,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: false,
             source_scan_id: None,
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         assert_eq!(result.scan_type, "dependency");
         assert_eq!(result.status, "completed");
@@ -2509,6 +4048,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: false,
             source_scan_id: None,
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["scan_type"], "image");
@@ -2539,6 +4082,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: false,
             source_scan_id: None,
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         assert_eq!(result.status, "failed");
         assert_eq!(result.error_message.as_deref(), Some("Scanner timed out"));
@@ -2566,6 +4113,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: true,
             source_scan_id: Some(source_id),
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         assert!(result.is_reused);
         assert_eq!(result.source_scan_id, Some(source_id));
@@ -2629,7 +4180,11 @@ mod tests {
             acknowledged_by: None,
             acknowledged_reason: None,
             acknowledged_at: None,
+            acknowledgement_id: None,
+            acknowledgement_expires_at: None,
+            acknowledgements_left_effective: None,
             created_at: chrono::Utc::now(),
+            finding_class: "vulnerability".to_string(),
         };
         assert!(!finding.is_acknowledged);
         assert_eq!(finding.severity, "critical");
@@ -2655,7 +4210,11 @@ mod tests {
             acknowledged_by: Some(user_id),
             acknowledged_reason: Some("Accepted risk for legacy code".to_string()),
             acknowledged_at: Some(chrono::Utc::now()),
+            acknowledgement_id: None,
+            acknowledgement_expires_at: None,
+            acknowledgements_left_effective: None,
             created_at: chrono::Utc::now(),
+            finding_class: "vulnerability".to_string(),
         };
         assert!(finding.is_acknowledged);
         assert_eq!(finding.acknowledged_by, Some(user_id));
@@ -2677,6 +4236,7 @@ mod tests {
             fixed_version: Some("1.0.3".to_string()),
             source: Some("trivy".to_string()),
             source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2024-1234".to_string()),
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         assert_eq!(finding.severity, Severity::Critical);
         assert_eq!(finding.title, "CVE-2024-1234");
@@ -2694,9 +4254,73 @@ mod tests {
             fixed_version: None,
             source: None,
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         assert_eq!(finding.severity, Severity::Info);
         assert!(finding.description.is_none());
+    }
+
+    // =======================================================================
+    // unstorable_finding (#5534)
+    // =======================================================================
+
+    fn storable_finding(cve: &str) -> RawFinding {
+        RawFinding {
+            severity: Severity::High,
+            title: format!("{cve} in libexpat"),
+            description: None,
+            cve_id: Some(cve.to_string()),
+            affected_component: Some("libexpat".to_string()),
+            affected_version: Some("2.5.0".to_string()),
+            fixed_version: Some("2.6.0".to_string()),
+            source: Some("trivy".to_string()),
+            source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
+        }
+    }
+
+    /// Lengths the 022 schema refused are storable now that the columns are
+    /// `TEXT` (339): nothing is refused, so nothing would be truncated.
+    #[test]
+    fn test_unstorable_finding_accepts_long_text_columns() {
+        let mut long = storable_finding("CVE-2024-5534");
+        long.title = "t".repeat(2000);
+        long.affected_component = Some("c".repeat(600));
+        long.affected_version = Some("a".repeat(300));
+        long.fixed_version = Some("f".repeat(300));
+        long.source = Some("s".repeat(300));
+        long.source_url = Some("u".repeat(1000));
+        long.cve_id = Some("C".repeat(SCAN_FINDING_CVE_ID_MAX_CHARS));
+        assert_eq!(unstorable_finding(&[storable_finding("CVE-1"), long]), None);
+        assert_eq!(unstorable_finding(&[]), None);
+    }
+
+    #[test]
+    fn test_unstorable_finding_names_the_finding_and_column() {
+        let mut overlong = storable_finding(&"X".repeat(SCAN_FINDING_CVE_ID_MAX_CHARS + 1));
+        overlong.title = "ignored".to_string();
+        let message = unstorable_finding(&[storable_finding("CVE-1"), overlong])
+            .expect("a cve_id past VARCHAR(30) is refused");
+        assert!(message.starts_with("finding 2 of 2 (\"XXXX"), "{message}");
+        assert!(
+            message.contains("`cve_id` is 31 characters, longer than the 30"),
+            "{message}"
+        );
+
+        // Characters, not bytes: the column is VARCHAR(30) characters.
+        let wide = storable_finding(&"é".repeat(SCAN_FINDING_CVE_ID_MAX_CHARS));
+        assert_eq!(unstorable_finding(&[wide]), None);
+
+        // A NUL in any text column, labelled by title when there is no id.
+        let mut nul = storable_finding("CVE-2");
+        nul.cve_id = None;
+        nul.fixed_version = Some("1.0\u{0}".to_string());
+        let message = unstorable_finding(&[nul]).expect("a NUL is refused");
+        assert_eq!(
+            message,
+            "finding 1 of 1 (\"CVE-2 in libexpat\") cannot be stored: \
+             `fixed_version` contains a NUL byte"
+        );
     }
 
     // =======================================================================
@@ -2736,6 +4360,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: false,
             source_scan_id: None,
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         }
     }
 
@@ -3194,6 +4822,127 @@ mod tests {
     // lines (`tx.begin`, `&mut *tx`, `tx.commit`) are exercised.
     // =======================================================================
 
+    #[test]
+    fn legacy_letter_keeps_the_floor_and_rated_letter_never_floors_4336() {
+        assert_eq!(legacy_grade_letter(Grade::B, false, false), 'B');
+        assert_eq!(legacy_grade_letter(Grade::B, true, false), 'F');
+        assert_eq!(legacy_grade_letter(Grade::A, false, true), 'F');
+        assert_eq!(rated_grade_letter(Grade::B, GradeStatus::Rated), Some('B'));
+        assert_eq!(
+            rated_grade_letter(Grade::B, GradeStatus::Incomplete),
+            Some('B')
+        );
+        assert_eq!(rated_grade_letter(Grade::A, GradeStatus::Unrated), None);
+    }
+
+    #[test]
+    fn score_recalc_retries_only_concurrency_conflicts_5006() {
+        let msg = |m: &str| AppError::Database(m.to_string());
+        assert!(is_score_recalc_conflict(&msg(
+            "error returned from database: could not serialize access due to concurrent update"
+        )));
+        assert!(is_score_recalc_conflict(&msg(
+            "error returned from database: deadlock detected"
+        )));
+        assert!(!is_score_recalc_conflict(&msg(
+            "error returned from database: relation \"x\" does not exist"
+        )));
+        assert!(!is_score_recalc_conflict(&AppError::Sqlx(
+            sqlx::Error::RowNotFound
+        )));
+        assert!(!is_score_recalc_conflict(&AppError::NotFound("x".into())));
+        assert_eq!(
+            score_recalc_lock_key(Uuid::nil()),
+            "repo-security-score:00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn assessed_or_found_is_never_unrated_4336() {
+        let failed_only = ScoreCoverage {
+            artifacts: 1,
+            scanned: 1,
+            failed: 1,
+            ..ScoreCoverage::default()
+        };
+        assert_eq!(
+            repository_grade_status(&failed_only, false, false),
+            GradeStatus::Unrated
+        );
+        // One scanner cataloged the artifact, another failed on it.
+        assert_eq!(
+            repository_grade_status(&failed_only, true, false),
+            GradeStatus::Incomplete
+        );
+        // Findings of an earlier completed scan, latest rescan failed.
+        assert_eq!(
+            repository_grade_status(&failed_only, false, true),
+            GradeStatus::Incomplete
+        );
+        let rated = ScoreCoverage {
+            artifacts: 1,
+            scanned: 1,
+            cataloged: 1,
+            ..ScoreCoverage::default()
+        };
+        assert_eq!(
+            repository_grade_status(&rated, true, true),
+            GradeStatus::Rated
+        );
+    }
+
+    #[test]
+    fn dashboard_tally_counts_status_and_shown_letter_4336() {
+        let now = chrono::Utc::now();
+        let row = |grade: &str, score: i32, status: Option<&str>, rated: Option<&str>| {
+            RepoSecurityScore {
+                id: Uuid::nil(),
+                repository_id: Uuid::nil(),
+                score,
+                grade: grade.to_string(),
+                total_findings: 0,
+                critical_count: 0,
+                high_count: 0,
+                medium_count: 0,
+                low_count: 0,
+                acknowledged_count: 0,
+                last_scan_at: None,
+                calculated_at: now,
+                has_failed_scan: false,
+                has_uncataloged_scan: false,
+                grade_status: status.map(str::to_string),
+                rated_grade: rated.map(str::to_string),
+                artifact_count: None,
+                scanned_count: None,
+                cataloged_count: None,
+                partial_count: None,
+                failed_count: None,
+                uncataloged_count: None,
+                status_calculated_at: status.map(|_| now),
+            }
+        };
+        let t = tally_grade_rows([
+            row("A", 100, Some("rated"), Some("A")),
+            // Floored for 1.11, shown as its real letter A.
+            row("F", 95, Some("incomplete"), Some("A")),
+            // Nothing assessed: neither A nor F.
+            row("A", 100, Some("unrated"), None),
+            row("F", 10, Some("rated"), Some("F")),
+            // Written by 1.11: legacy floor read back as incomplete, letter B.
+            row("F", 80, None, None),
+        ]);
+        assert_eq!(
+            t,
+            GradeTally {
+                grade_a: 2,
+                grade_f: 1,
+                rated: 2,
+                incomplete: 2,
+                unrated: 1,
+            }
+        );
+    }
+
     mod db {
         use super::*;
         use crate::api::handlers::test_db_helpers as db_helpers;
@@ -3284,6 +5033,245 @@ mod tests {
                 .await;
         }
 
+        /// One completed scan of `scan_type` carrying `findings`
+        /// (`(severity, cve_id, title, component)`), for the #4338 pin.
+        async fn seed_scan_4338(
+            svc: &ScanResultService,
+            artifact_id: Uuid,
+            repo_id: Uuid,
+            scan_type: &str,
+            findings: &[(Severity, Option<&str>, &str, &str)],
+        ) -> Uuid {
+            let scan = svc
+                .create_scan_result(artifact_id, repo_id, scan_type)
+                .await
+                .expect("create scan");
+            let raw: Vec<RawFinding> = findings
+                .iter()
+                .map(|(severity, cve, title, component)| RawFinding {
+                    severity: *severity,
+                    title: title.to_string(),
+                    description: None,
+                    cve_id: cve.map(str::to_string),
+                    affected_component: Some(component.to_string()),
+                    affected_version: Some("1.0".to_string()),
+                    fixed_version: None,
+                    source: Some(scan_type.to_string()),
+                    source_url: None,
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
+                })
+                .collect();
+            svc.create_findings(scan.id, artifact_id, &raw)
+                .await
+                .expect("create findings");
+            svc.complete_scan(
+                scan.id,
+                raw.len() as i32,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("test"),
+                chrono::Utc::now(),
+                "complete",
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("complete scan");
+            scan.id
+        }
+
+        /// #4338: the security dashboard tiles, the per-repository score row
+        /// and the Overview CVE summary report the same open counts for the
+        /// same data, under the definition in `services::open_findings`.
+        ///
+        /// The data is the reported shape: one CVE found in two packages of
+        /// an image (and, in a different case, by a second scanner at a lower
+        /// severity), a second CVE, a GHSA-only advisory with no CVE id, an
+        /// informational finding; then an acknowledgement, then a rescan that
+        /// no longer reports some of them. Before #4338 the three views read
+        /// 3 / 3 / 2 criticals on the first scan, 2 / 3 / 2 after the
+        /// acknowledgement, and 1 / 1 / 2 after the rescan.
+        ///
+        /// Own database: the dashboard and the all-repository summary count
+        /// every repository, so other tests' rows would move the totals.
+        #[tokio::test]
+        async fn severity_counts_agree_across_dashboard_repo_and_overview_4338() {
+            let Some(iso) = crate::testing::try_isolated_pool().await else {
+                return;
+            };
+            let pool = iso.pool.clone();
+            let svc = ScanResultService::new(pool.clone());
+            let sbom = crate::services::sbom_service::SbomService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (artifact_id, _) = insert_test_artifact(&pool, repo_id, "image").await;
+
+            // (dashboard tiles, repository row as stored, Overview for all
+            // repositories, Overview for the repository)
+            let views = || async {
+                let dash = svc.get_dashboard_summary().await.expect("dashboard");
+                let repo = svc
+                    .get_score(repo_id)
+                    .await
+                    .expect("score")
+                    .expect("score row");
+                let all = sbom.get_cve_trends(None).await.expect("trends");
+                let one = sbom
+                    .get_cve_trends(Some(repo_id))
+                    .await
+                    .expect("repo trends");
+                (dash, repo, all, one)
+            };
+            let assert_agree = |label: &str,
+                                v: &(
+                DashboardSummary,
+                RepoSecurityScore,
+                crate::models::sbom::CveTrends,
+                crate::models::sbom::CveTrends,
+            ),
+                                critical: i64,
+                                high: i64,
+                                open: i64,
+                                acknowledged: i64| {
+                let (dash, repo, all, one) = v;
+                for (view, got) in [
+                    ("dashboard tiles", dash.critical_findings),
+                    ("repository row", repo.critical_count as i64),
+                    ("overview (all)", all.critical_count),
+                    ("overview (repo)", one.critical_count),
+                ] {
+                    assert_eq!(got, critical, "{label}: {view} critical");
+                }
+                for (view, got) in [
+                    ("dashboard tiles", dash.high_findings),
+                    ("repository row", repo.high_count as i64),
+                    ("overview (all)", all.high_count),
+                    ("overview (repo)", one.high_count),
+                ] {
+                    assert_eq!(got, high, "{label}: {view} high");
+                }
+                for (view, got) in [
+                    ("dashboard tiles", dash.total_findings),
+                    ("repository row", repo.total_findings as i64),
+                    ("overview (all)", all.open_cves),
+                    ("overview (repo)", one.open_cves),
+                ] {
+                    assert_eq!(got, open, "{label}: {view} open");
+                }
+                assert_eq!(
+                    repo.acknowledged_count as i64, acknowledged,
+                    "{label}: repo ack"
+                );
+                assert_eq!(all.acknowledged_cves, acknowledged, "{label}: overview ack");
+            };
+
+            seed_scan_4338(
+                &svc,
+                artifact_id,
+                repo_id,
+                "grype",
+                &[
+                    (
+                        Severity::Critical,
+                        Some("CVE-2026-0001"),
+                        "CVE-2026-0001 in openssl",
+                        "openssl",
+                    ),
+                    (
+                        Severity::Critical,
+                        Some("cve-2026-0001"),
+                        "CVE-2026-0001 in libssl3",
+                        "libssl3",
+                    ),
+                    (
+                        Severity::Critical,
+                        Some("CVE-2026-0002"),
+                        "CVE-2026-0002 in zlib",
+                        "zlib",
+                    ),
+                    (Severity::High, None, "GHSA-aaaa-bbbb-cccc", "left-pad"),
+                    (Severity::Info, None, "informational note", "base"),
+                ],
+            )
+            .await;
+            seed_scan_4338(
+                &svc,
+                artifact_id,
+                repo_id,
+                "image",
+                &[(
+                    Severity::High,
+                    Some("CVE-2026-0001"),
+                    "CVE-2026-0001",
+                    "openssl",
+                )],
+            )
+            .await;
+            svc.recalculate_score(repo_id)
+                .await
+                .expect("score after scans");
+            // CVE-2026-0001 (two packages, two scanners: one, at critical),
+            // CVE-2026-0002, the GHSA advisory, the info finding.
+            assert_agree("after the scans", &views().await, 2, 1, 4, 0);
+
+            // Acknowledge CVE-2026-0002. No rescan, no explicit recompute:
+            // the repository row must follow the triage change on its own.
+            let finding_id: Uuid = sqlx::query_scalar(
+                "SELECT id FROM scan_findings WHERE artifact_id = $1 AND cve_id = 'CVE-2026-0002'",
+            )
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("finding");
+            let admin = crate::api::handlers::test_db_helpers::create_user(&pool)
+                .await
+                .0;
+            crate::api::handlers::test_db_helpers::grant_repo_access(&pool, repo_id, admin).await;
+            svc.acknowledge_finding(
+                finding_id,
+                &crate::services::finding_acknowledgements::AckActor::new(
+                    admin,
+                    crate::models::access_scope::AccessScope::Admin,
+                ),
+                "not reachable",
+                Default::default(),
+            )
+            .await
+            .expect("acknowledge");
+            assert_agree(
+                "after acknowledging CVE-2026-0002",
+                &views().await,
+                1,
+                1,
+                3,
+                1,
+            );
+
+            // grype rescans and now reports only CVE-2026-0002. The new row is
+            // covered by the decision (#5153), so it stays acknowledged.
+            // CVE-2026-0001 is still reported by the image scanner, at high.
+            seed_scan_4338(
+                &svc,
+                artifact_id,
+                repo_id,
+                "grype",
+                &[(
+                    Severity::Critical,
+                    Some("CVE-2026-0002"),
+                    "CVE-2026-0002 in zlib",
+                    "zlib",
+                )],
+            )
+            .await;
+            svc.recalculate_score(repo_id)
+                .await
+                .expect("score after rescan");
+            assert_agree("after the rescan", &views().await, 0, 1, 1, 1);
+        }
+
         /// Build a completed source scan with one High finding.
         async fn seed_completed_source_scan(
             svc: &ScanResultService,
@@ -3307,6 +5295,7 @@ mod tests {
                     fixed_version: Some("1.0.1".to_string()),
                     source: Some("test".to_string()),
                     source_url: None,
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
                 }],
             )
             .await
@@ -3322,6 +5311,7 @@ mod tests {
                 Some("test-scanner-1.0"),
                 chrono::Utc::now(),
                 "complete",
+                None,
                 None,
                 None,
             )
@@ -3417,6 +5407,133 @@ mod tests {
             cleanup_repo(&pool, repo_id).await;
         }
 
+        fn raw_finding(cve: &str, class: crate::models::security::FindingClass) -> RawFinding {
+            RawFinding {
+                severity: Severity::Medium,
+                title: cve.to_string(),
+                description: None,
+                cve_id: Some(cve.to_string()),
+                affected_component: Some("pkg".to_string()),
+                affected_version: Some("1.0.0".to_string()),
+                fixed_version: None,
+                source: Some("osv".to_string()),
+                source_url: None,
+                finding_class: class,
+            }
+        }
+
+        /// #3014 + #3013: the vulnerability-DB provenance written by
+        /// `complete_scan` and each finding's class survive the round trip,
+        /// the `finding_class` filter narrows the listing, and BOTH reuse
+        /// paths carry the source scan's DB vintage and finding classes onto
+        /// the reused row (a reused verdict is only as fresh as its source).
+        #[tokio::test]
+        async fn vuln_db_and_finding_class_round_trip_and_survive_reuse() {
+            use crate::models::security::{FindingClass, VulnDbProvenance};
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (src_aid, _) = insert_test_artifact(&pool, repo_id, "src").await;
+            let (copy_aid, copy_checksum) = insert_test_artifact(&pool, repo_id, "copy").await;
+            let (conv_aid, _) = insert_test_artifact(&pool, repo_id, "conv").await;
+
+            let built = chrono::DateTime::parse_from_rfc3339("2026-10-04T08:11:47Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            let provenance = VulnDbProvenance::new("grype-db-v6.1.10", Some(built)).unwrap();
+
+            let scan = svc
+                .create_scan_result(src_aid, repo_id, "dependency")
+                .await
+                .expect("create scan");
+            svc.create_findings(
+                scan.id,
+                src_aid,
+                &[
+                    raw_finding("CVE-2024-1111", FindingClass::Vulnerability),
+                    raw_finding("MAL-2024-2222", FindingClass::Malicious),
+                ],
+            )
+            .await
+            .expect("create findings");
+            svc.complete_scan(
+                scan.id,
+                2,
+                0,
+                0,
+                2,
+                0,
+                0,
+                Some("grype-0.118.0"),
+                chrono::Utc::now(),
+                "complete",
+                None,
+                None,
+                Some(&provenance),
+            )
+            .await
+            .expect("complete scan");
+
+            let stored = svc.get_scan(scan.id).await.expect("get scan");
+            assert_eq!(stored.vuln_db_version.as_deref(), Some("grype-db-v6.1.10"));
+            assert_eq!(stored.vuln_db_published_at, Some(built));
+
+            let malicious = FindingListFilter {
+                finding_class: Some("malicious"),
+                ..Default::default()
+            };
+            let (rows, total) = svc
+                .list_findings(scan.id, &malicious, 0, 50)
+                .await
+                .expect("list malicious");
+            assert_eq!(total, 1);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].cve_id.as_deref(), Some("MAL-2024-2222"));
+            assert_eq!(rows[0].finding_class, "malicious");
+            let (all, all_total) = svc
+                .list_findings(scan.id, &FindingListFilter::default(), 0, 50)
+                .await
+                .expect("list all");
+            assert_eq!(all_total, 2);
+            assert!(all.iter().any(|f| f.finding_class == "vulnerability"
+                && f.cve_id.as_deref() == Some("CVE-2024-1111")));
+
+            let copied = svc
+                .copy_scan_results(
+                    scan.id,
+                    copy_aid,
+                    repo_id,
+                    "dependency",
+                    &copy_checksum,
+                    None,
+                )
+                .await
+                .expect("copy_scan_results");
+            let target = svc
+                .create_scan_result(conv_aid, repo_id, "dependency")
+                .await
+                .expect("create target");
+            let converted = svc
+                .convert_to_reused(target.id, scan.id, conv_aid, None)
+                .await
+                .expect("convert_to_reused");
+
+            for reused in [&copied, &converted] {
+                assert_eq!(reused.vuln_db_version.as_deref(), Some("grype-db-v6.1.10"));
+                assert_eq!(reused.vuln_db_published_at, Some(built));
+                let (rows, total) = svc
+                    .list_findings(reused.id, &malicious, 0, 50)
+                    .await
+                    .expect("list reused malicious");
+                assert_eq!(total, 1, "the reused copy must keep the malicious class");
+                assert_eq!(rows[0].finding_class, "malicious");
+            }
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
         /// Complete a fresh `grype` scan for `artifact_id` carrying `checksum`
         /// and `pin_identity`, returning the row id.
         async fn seed_completed_scan_with_pin(
@@ -3442,6 +5559,7 @@ mod tests {
                 chrono::Utc::now(),
                 "complete",
                 pin_identity,
+                None,
                 None,
             )
             .await
@@ -3537,6 +5655,273 @@ mod tests {
                 pinned_req.is_none(),
                 "a pinned request must not be served an unpinned (byte-only) verdict"
             );
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #2464 (adversarial constraint 1): a completed row whose verdict did
+        /// not come from this instance's scanner (`origin = 'imported'`) must
+        /// never be a dedup source, or a bundle-scoped trust decision becomes
+        /// an instance-wide scan exemption for every future upload of the
+        /// same bytes. The same row as `local_scan` is reused.
+        #[tokio::test]
+        async fn find_reusable_scan_never_reuses_an_imported_verdict() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, ck) = insert_test_artifact(&pool, repo_id, "imported").await;
+            let scan_id = seed_completed_scan_with_pin(&svc, aid, repo_id, &ck, None).await;
+
+            let origin: String =
+                sqlx::query_scalar("SELECT origin FROM scan_results WHERE id = $1")
+                    .bind(scan_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("origin");
+            assert_eq!(origin, "local_scan", "scanner rows default to local_scan");
+            let local = svc
+                .find_reusable_scan(&ck, "grype", 3650, 3650, None)
+                .await
+                .expect("query ok");
+            assert_eq!(local.map(|r| r.id), Some(scan_id));
+
+            sqlx::query("UPDATE scan_results SET origin = 'imported' WHERE id = $1")
+                .bind(scan_id)
+                .execute(&pool)
+                .await
+                .expect("mark imported");
+            let imported = svc
+                .find_reusable_scan(&ck, "grype", 3650, 3650, None)
+                .await
+                .expect("query ok");
+            assert!(
+                imported.is_none(),
+                "an imported verdict must never satisfy hash-based scan dedup"
+            );
+            let own = svc
+                .find_existing_scan_for_artifact(aid, &ck, "grype", 3650, 3650)
+                .await
+                .expect("query ok");
+            assert!(
+                own.is_none(),
+                "an imported row must not short-circuit the artifact's own scan"
+            );
+            let (placeholder, _) = svc
+                .prepare_scan_placeholder(aid, repo_id, &ck, "grype", 3650, 3650)
+                .await
+                .expect("prepare");
+            assert_ne!(
+                placeholder, scan_id,
+                "prepare must queue a local scan rather than reuse the imported row"
+            );
+
+            let bogus = sqlx::query("UPDATE scan_results SET origin = 'bundle' WHERE id = $1")
+                .bind(scan_id)
+                .execute(&pool)
+                .await;
+            assert!(bogus.is_err(), "origin is constrained to known values");
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #4425: a reused row (`source_scan_id` set) is never a dedup
+        /// source. `convert_to_reused` stamps `completed_at = NOW()` on the
+        /// copy, so before the fix the copy was the NEWEST matching row and
+        /// `ORDER BY completed_at DESC` handed it out: copies chained onto
+        /// copies, and the chain kept a verdict alive past its original
+        /// scan's TTL. The artifact's own short-circuit still sees its copy.
+        #[tokio::test]
+        async fn find_reusable_scan_never_returns_a_reused_row() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (orig_aid, ck) = insert_test_artifact(&pool, repo_id, "orig").await;
+            let original = seed_completed_scan_with_pin(&svc, orig_aid, repo_id, &ck, None).await;
+            // The original ran ten days ago.
+            sqlx::query(
+                "UPDATE scan_results SET completed_at = NOW() - INTERVAL '10 days' WHERE id = $1",
+            )
+            .bind(original)
+            .execute(&pool)
+            .await
+            .expect("age original");
+
+            // A second artifact with the same bytes inherits it via the
+            // prepare-then-convert path, which stamps completed_at = NOW().
+            let (copy_aid, _) = insert_test_artifact(&pool, repo_id, "copy").await;
+            let placeholder = svc
+                .create_scan_result_with_checksum(copy_aid, repo_id, "grype", Some(&ck))
+                .await
+                .expect("placeholder");
+            let reused = svc
+                .convert_to_reused(placeholder.id, original, copy_aid, None)
+                .await
+                .expect("convert_to_reused");
+            assert!(reused.is_reused);
+            assert_eq!(reused.source_scan_id, Some(original));
+
+            let hit = svc
+                .find_reusable_scan(&ck, "grype", 3650, 3650, None)
+                .await
+                .expect("query ok")
+                .expect("the original is reusable");
+            assert_eq!(
+                hit.id, original,
+                "the newer reused copy must never be handed out as a dedup source"
+            );
+            assert_eq!(hit.source_scan_id, None);
+
+            // Inside the copy's window but outside the original's: the copy
+            // must not extend the verdict's life.
+            let stale = svc
+                .find_reusable_scan(&ck, "grype", 5, 5, None)
+                .await
+                .expect("query ok");
+            assert!(
+                stale.is_none(),
+                "a reused copy must not keep an expired original's verdict reusable"
+            );
+
+            // The per-artifact short-circuit (#1373) is unchanged: the copy is
+            // that artifact's own completed scan.
+            let own = svc
+                .find_existing_scan_for_artifact(copy_aid, &ck, "grype", 3650, 3650)
+                .await
+                .expect("query ok");
+            assert_eq!(own.map(|r| r.id), Some(reused.id));
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #4426: the dedup partial index carries `origin = 'local_scan'`
+        /// (migrations 273-275) and the old index without it is gone.
+        #[tokio::test]
+        async fn dedup_index_predicate_requires_local_scan_origin() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let defs: Vec<(String, String, bool)> = sqlx::query_as(
+                "SELECT c.relname::text, pg_get_indexdef(i.indexrelid), i.indisvalid \
+                   FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                  WHERE i.indrelid = 'scan_results'::regclass \
+                    AND c.relname IN ('idx_scan_results_dedup', 'idx_scan_results_dedup_local')",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("index catalog");
+            assert_eq!(defs.len(), 1, "exactly one dedup index: {defs:?}");
+            let (name, def, valid) = &defs[0];
+            assert_eq!(name, "idx_scan_results_dedup_local");
+            assert!(valid, "the concurrent build must leave a valid index");
+            assert!(
+                def.contains("origin = 'local_scan'"),
+                "dedup index predicate must require local_scan: {def}"
+            );
+            assert!(def.contains("= 'completed'"), "{def}");
+        }
+
+        /// #4426: the planner serves the REAL `find_reusable_scan` SQL from
+        /// the rebuilt index, with both leading columns as index conditions.
+        /// The statement is PREPAREd with `text` parameters, as sqlx binds
+        /// `&str`, and EXPLAINed as a generic plan, so a missing `::bpchar`
+        /// cast (which demotes the CHAR(64) checksum to a filter) or a
+        /// query/index predicate drift fails here. Sequential scan is off so
+        /// the assertion is about the index being usable, not about row
+        /// estimates on a test-sized table.
+        #[tokio::test]
+        async fn find_reusable_scan_can_use_the_dedup_index() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut conn = pool.acquire().await.expect("conn");
+            let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("tx");
+            for stmt in [
+                "SET LOCAL enable_seqscan = off",
+                "SET LOCAL plan_cache_mode = force_generic_plan",
+            ] {
+                sqlx::query(stmt).execute(&mut *tx).await.expect("set");
+            }
+            sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "PREPARE ak4426_reuse (text, text, text, text, text) AS {FIND_REUSABLE_SCAN_SQL}"
+            )))
+            .execute(&mut *tx)
+            .await
+            .expect("prepare");
+            let plans: Vec<String> = sqlx::query_scalar(
+                "EXPLAIN EXECUTE ak4426_reuse ('abc', 'grype', '30', '1', NULL)",
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .expect("explain");
+            tx.rollback().await.expect("rollback");
+            sqlx::query("DEALLOCATE ak4426_reuse")
+                .execute(&mut *conn)
+                .await
+                .expect("deallocate");
+            let plan = plans.join("\n");
+            assert!(
+                plan.contains("idx_scan_results_dedup_local"),
+                "find_reusable_scan must use the dedup index, got:\n{plan}"
+            );
+            let index_cond = plans
+                .iter()
+                .find(|l| l.contains("Index Cond"))
+                .unwrap_or_else(|| panic!("no Index Cond in:\n{plan}"));
+            assert!(
+                index_cond.contains("checksum_sha256") && index_cond.contains("scan_type"),
+                "checksum and scan_type must both be index conditions, got:\n{plan}"
+            );
+        }
+
+        /// #4425: the own-row lookup applies `find_reusable_scan`'s filters
+        /// to the artifact's own rows, reused copies included: a matching
+        /// copy is found, a differently-pinned or `not_cataloged` own row is
+        /// not, and another artifact's row never is.
+        #[tokio::test]
+        async fn find_own_reusable_scan_applies_the_reuse_filters() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (orig_aid, ck) = insert_test_artifact(&pool, repo_id, "own-orig").await;
+            let original = seed_completed_scan_with_pin(&svc, orig_aid, repo_id, &ck, None).await;
+            let (copy_aid, _) = insert_test_artifact(&pool, repo_id, "own-copy").await;
+            let copy = svc
+                .copy_scan_results(original, copy_aid, repo_id, "grype", &ck, None)
+                .await
+                .expect("copy");
+
+            let own = |pin: Option<&'static str>| {
+                let svc = &svc;
+                let ck = ck.clone();
+                async move {
+                    svc.find_own_reusable_scan(copy_aid, &ck, "grype", 3650, 3650, pin)
+                        .await
+                        .expect("query ok")
+                        .map(|r| r.id)
+                }
+            };
+            assert_eq!(own(None).await, Some(copy.id), "the own reused copy counts");
+            assert_eq!(own(Some("npm|x|1")).await, None, "a different pin does not");
+            let other = svc
+                .find_own_reusable_scan(Uuid::new_v4(), &ck, "grype", 3650, 3650, None)
+                .await
+                .expect("query ok");
+            assert!(other.is_none(), "never another artifact's row");
+
+            sqlx::query(
+                "UPDATE scan_results SET scan_completeness = 'not_cataloged' WHERE id = $1",
+            )
+            .bind(copy.id)
+            .execute(&pool)
+            .await
+            .expect("mark not_cataloged");
+            assert_eq!(own(None).await, None, "a not_cataloged own row does not");
 
             cleanup_repo(&pool, repo_id).await;
         }
@@ -3672,6 +6057,7 @@ mod tests {
                 "complete",
                 None,
                 None,
+                None,
             )
             .await
             .expect("complete rescan");
@@ -3708,6 +6094,549 @@ mod tests {
             cleanup_repo(&pool, empty_repo).await;
         }
 
+        /// Finish `scan_id` as `completed` with `completeness`.
+        async fn complete_as_4336(svc: &ScanResultService, scan_id: Uuid, completeness: &str) {
+            svc.complete_scan(
+                scan_id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("test"),
+                chrono::Utc::now(),
+                completeness,
+                (completeness != "complete").then_some("test reason"),
+                None,
+                None,
+            )
+            .await
+            .expect("complete scan");
+        }
+
+        async fn soft_delete_4336(pool: &PgPool, artifact_id: Uuid) {
+            sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+                .bind(artifact_id)
+                .execute(pool)
+                .await
+                .expect("soft delete");
+        }
+
+        /// #4336: a failed scan or an uncataloged archive makes the repository
+        /// `incomplete` (something assessed) or `unrated` (nothing assessed)
+        /// with coverage counts, and the shown letter is the one over what was
+        /// assessed, never an F floor. The legacy `grade` column keeps the
+        /// floor for 1.11 replicas. Deleting what was not assessed makes the
+        /// repository `rated` with its real letter; no scans is `unrated`.
+        #[tokio::test]
+        async fn grade_status_and_coverage_replace_the_f_floor_4336() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+
+            // A scannable artifact with one medium finding: score 95, A.
+            let (jar, _) = insert_test_artifact(&pool, repo_id, "jar").await;
+            seed_scan_4338(
+                &svc,
+                jar,
+                repo_id,
+                "grype",
+                &[(Severity::Medium, Some("CVE-2026-4336"), "t", "lib")],
+            )
+            .await;
+            // An archive no scanner could catalog.
+            let (archive, _) = insert_test_artifact(&pool, repo_id, "archive").await;
+            let s = svc
+                .create_scan_result(archive, repo_id, "grype")
+                .await
+                .expect("create");
+            complete_as_4336(&svc, s.id, "not_cataloged").await;
+
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            let cov = score.coverage().expect("coverage written");
+            assert_eq!(
+                (
+                    cov.artifacts,
+                    cov.scanned,
+                    cov.cataloged,
+                    cov.uncataloged,
+                    cov.failed
+                ),
+                (2, 2, 1, 1, 0),
+                "coverage 1 of 2"
+            );
+            let real = Grade::from_score(score.score).as_char().to_string();
+            assert_eq!(score.display_grade().as_deref(), Some(real.as_str()));
+            assert_ne!(score.display_grade().as_deref(), Some("F"));
+
+            // A failed scan on a third artifact: still incomplete, counted.
+            let (img, _) = insert_test_artifact(&pool, repo_id, "img").await;
+            let f = svc
+                .create_scan_result(img, repo_id, "image")
+                .await
+                .expect("create");
+            svc.fail_scan(f.id, "scanner error", Some("t"), chrono::Utc::now())
+                .await
+                .expect("fail");
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            assert_eq!(score.coverage().unwrap().failed, 1);
+            assert_eq!(score.grade, "F", "1.11 replicas still read the floor");
+            assert_eq!(score.display_grade().as_deref(), Some(real.as_str()));
+
+            // Remove what was not assessed: rated, with the real letter.
+            soft_delete_4336(&pool, archive).await;
+            soft_delete_4336(&pool, img).await;
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Rated);
+            assert_eq!(
+                score.grade, real,
+                "rated: the legacy letter is the real one"
+            );
+            assert_eq!(score.display_grade().as_deref(), Some(real.as_str()));
+            let cov = score.coverage().unwrap();
+            assert_eq!((cov.artifacts, cov.scanned, cov.cataloged), (1, 1, 1));
+            assert_eq!(cov.coverage_pct(), Some(100));
+
+            // The same row read back through get_score and the leaderboard.
+            let read = svc.get_score(repo_id).await.expect("get").expect("row");
+            assert_eq!(read.status(), GradeStatus::Rated);
+            assert_eq!(read.coverage(), Some(cov));
+            assert!(svc
+                .get_all_scores()
+                .await
+                .expect("all")
+                .iter()
+                .any(|r| r.repository_id == repo_id && r.status() == GradeStatus::Rated));
+            cleanup_repo(&pool, repo_id).await;
+
+            // Nothing assessed: no scans at all, and only a failed scan.
+            let empty = insert_test_repo(&pool).await;
+            let score = svc.recalculate_score(empty).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Unrated);
+            assert_eq!(score.display_grade(), None);
+            assert_eq!(score.grade, "A", "the legacy column is unchanged for 1.11");
+            cleanup_repo(&pool, empty).await;
+
+            let only_failed = insert_test_repo(&pool).await;
+            let (a, _) = insert_test_artifact(&pool, only_failed, "a").await;
+            let f = svc
+                .create_scan_result(a, only_failed, "image")
+                .await
+                .expect("create");
+            svc.fail_scan(f.id, "scanner error", Some("t"), chrono::Utc::now())
+                .await
+                .expect("fail");
+            let score = svc
+                .recalculate_score(only_failed)
+                .await
+                .expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Unrated);
+            assert_eq!(score.display_grade(), None);
+            assert_eq!(score.coverage().unwrap().failed, 1);
+            cleanup_repo(&pool, only_failed).await;
+        }
+
+        /// Poll until a backend other than `exclude` is waiting on a lock held
+        /// by one of `holders`, and return its pid (#5006).
+        async fn wait_for_blocked_backend_5006(
+            pool: &PgPool,
+            holders: &[i32],
+            exclude: &[i32],
+        ) -> i32 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                let pid: Option<i32> = sqlx::query_scalar(
+                    "SELECT pid FROM pg_stat_activity \
+                     WHERE pg_blocking_pids(pid) && $1::int4[] AND NOT (pid = ANY($2::int4[])) \
+                     LIMIT 1",
+                )
+                .bind(holders)
+                .bind(exclude)
+                .fetch_optional(pool)
+                .await
+                .expect("poll pg_stat_activity");
+                if let Some(pid) = pid {
+                    return pid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no recalculation blocked behind {holders:?} within 15 s"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// #5006: two scans of one repository complete together, and the
+        /// final score reflects both. The interleaving is the one the DTF
+        /// tier hit: recalculation R1 takes its snapshot before the jar's scan
+        /// has committed and is held at its upsert (a row lock on the score
+        /// row stands in for the slow part of R1); the jar's scan then
+        /// completes and its recalculation R2 starts. Before the fix R1
+        /// committed the stale score and R2 failed with 40001, so the score
+        /// kept counting the jar as unscanned. Now R2 waits for R1 and
+        /// recomputes from a fresh snapshot.
+        #[tokio::test]
+        async fn concurrent_recalculations_keep_every_completed_scan_5006() {
+            let Some(pool) = crate::testing::try_pool_with(8).await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+
+            // First scan completion: an archive no scanner could catalog.
+            let (archive, _) = insert_test_artifact(&pool, repo_id, "archive").await;
+            let s = svc
+                .create_scan_result(archive, repo_id, "grype")
+                .await
+                .expect("create");
+            complete_as_4336(&svc, s.id, "not_cataloged").await;
+            let (jar, _) = insert_test_artifact(&pool, repo_id, "jar").await;
+            let before = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(before.status(), GradeStatus::Unrated, "jar not scanned yet");
+
+            // Hold the score row so R1 stops at its upsert after its reads.
+            let mut blocker = pool.begin().await.expect("begin blocker");
+            let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *blocker)
+                .await
+                .expect("blocker pid");
+            sqlx::query("SELECT 1 FROM repo_security_scores WHERE repository_id = $1 FOR UPDATE")
+                .bind(repo_id)
+                .execute(&mut *blocker)
+                .await
+                .expect("lock score row");
+
+            let r1 = tokio::spawn({
+                let svc = ScanResultService::new(pool.clone());
+                async move { svc.recalculate_score(repo_id).await }
+            });
+            let r1_pid = wait_for_blocked_backend_5006(&pool, &[blocker_pid], &[]).await;
+
+            // Second scan completion: the jar, cataloged with one finding.
+            seed_scan_4338(
+                &svc,
+                jar,
+                repo_id,
+                "grype",
+                &[(Severity::Medium, Some("CVE-2026-5006"), "t", "lib")],
+            )
+            .await;
+            let r2 = tokio::spawn({
+                let svc = ScanResultService::new(pool.clone());
+                async move { svc.recalculate_score(repo_id).await }
+            });
+            wait_for_blocked_backend_5006(&pool, &[blocker_pid, r1_pid], &[r1_pid]).await;
+
+            blocker.commit().await.expect("release score row");
+            let r1 = r1.await.expect("join r1");
+            let r2 = r2.await.expect("join r2");
+
+            let score = svc.get_score(repo_id).await.expect("get").expect("row");
+            let cov = score.coverage().expect("coverage written");
+            assert_eq!(
+                (
+                    cov.artifacts,
+                    cov.scanned,
+                    cov.cataloged,
+                    cov.uncataloged,
+                    cov.failed
+                ),
+                (2, 2, 1, 1, 0),
+                "the stored coverage must count the jar's completed scan"
+            );
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            assert_eq!(score.medium_count, 1, "the jar's finding is counted");
+            let real = Grade::from_score(score.score).as_char().to_string();
+            assert_eq!(score.display_grade().as_deref(), Some(real.as_str()));
+            assert!(r1.is_ok(), "first recalculation failed: {:?}", r1.err());
+            assert!(r2.is_ok(), "second recalculation failed: {:?}", r2.err());
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #5006: a recalculation whose upsert loses to a concurrent write of
+        /// the score row (40001 under REPEATABLE READ) is retried with a fresh
+        /// snapshot instead of returning the error.
+        #[tokio::test]
+        async fn recalculation_retries_a_serialization_failure_5006() {
+            let Some(pool) = crate::testing::try_pool_with(6).await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (jar, _) = insert_test_artifact(&pool, repo_id, "jar").await;
+            svc.recalculate_score(repo_id).await.expect("recalculate");
+
+            // A concurrent writer updates the score row and holds it.
+            let mut writer = pool.begin().await.expect("begin writer");
+            let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *writer)
+                .await
+                .expect("writer pid");
+            sqlx::query("UPDATE repo_security_scores SET score = 0 WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(&mut *writer)
+                .await
+                .expect("update score row");
+
+            seed_scan_4338(
+                &svc,
+                jar,
+                repo_id,
+                "grype",
+                &[(Severity::Medium, Some("CVE-2026-50061"), "t", "lib")],
+            )
+            .await;
+            let recalc = tokio::spawn({
+                let svc = ScanResultService::new(pool.clone());
+                async move { svc.recalculate_score(repo_id).await }
+            });
+            wait_for_blocked_backend_5006(&pool, &[writer_pid], &[]).await;
+            writer.commit().await.expect("commit writer");
+
+            let score = recalc
+                .await
+                .expect("join")
+                .expect("the serialization failure is retried");
+            assert_eq!(score.medium_count, 1);
+            assert_eq!(score.status(), GradeStatus::Rated);
+            let stored = svc.get_score(repo_id).await.expect("get").expect("row");
+            assert_eq!(stored.score, score.score, "the retried score is stored");
+            assert_ne!(stored.score, 0);
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #4336: `incomplete` and `unrated` never hide a finding. A critical
+        /// finding next to an uncataloged archive, a critical finding on an
+        /// artifact another scanner failed on, and a critical finding whose
+        /// rescan failed all show `incomplete` with the finding's letter.
+        #[tokio::test]
+        async fn a_vulnerable_artifact_is_never_hidden_by_the_status_4336() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let (_, want) = compute_security_score(1, 0, 0, 0);
+            let want = want.as_char().to_string();
+            let critical = [(Severity::Critical, Some("CVE-2026-43361"), "t", "lib")];
+
+            // One critical finding and one archive no scanner could catalog.
+            let repo_a = insert_test_repo(&pool).await;
+            let (jar, _) = insert_test_artifact(&pool, repo_a, "jar").await;
+            seed_scan_4338(&svc, jar, repo_a, "grype", &critical).await;
+            let (archive, _) = insert_test_artifact(&pool, repo_a, "archive").await;
+            let s = svc
+                .create_scan_result(archive, repo_a, "grype")
+                .await
+                .expect("create");
+            complete_as_4336(&svc, s.id, "not_cataloged").await;
+            let score = svc.recalculate_score(repo_a).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            assert_eq!(score.critical_count, 1);
+            assert_eq!(score.display_grade().as_deref(), Some(want.as_str()));
+            cleanup_repo(&pool, repo_a).await;
+
+            // One artifact: grype found the critical, another scanner failed.
+            let repo_b = insert_test_repo(&pool).await;
+            let (img, _) = insert_test_artifact(&pool, repo_b, "img").await;
+            seed_scan_4338(&svc, img, repo_b, "grype", &critical).await;
+            let f = svc
+                .create_scan_result(img, repo_b, "image")
+                .await
+                .expect("create");
+            svc.fail_scan(f.id, "scanner error", Some("t"), chrono::Utc::now())
+                .await
+                .expect("fail");
+            let score = svc.recalculate_score(repo_b).await.expect("recalculate");
+            assert_eq!(score.critical_count, 1);
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            assert_eq!(score.display_grade().as_deref(), Some(want.as_str()));
+            cleanup_repo(&pool, repo_b).await;
+
+            // One artifact: grype found the critical, the grype rescan failed.
+            let repo_c = insert_test_repo(&pool).await;
+            let (lib, _) = insert_test_artifact(&pool, repo_c, "lib").await;
+            seed_scan_4338(&svc, lib, repo_c, "grype", &critical).await;
+            let f = svc
+                .create_scan_result(lib, repo_c, "grype")
+                .await
+                .expect("create");
+            svc.fail_scan(f.id, "scanner error", Some("t"), chrono::Utc::now())
+                .await
+                .expect("fail");
+            let score = svc.recalculate_score(repo_c).await.expect("recalculate");
+            assert_eq!(
+                score.critical_count, 1,
+                "the earlier completed scan still counts"
+            );
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            assert_eq!(score.display_grade().as_deref(), Some(want.as_str()));
+            cleanup_repo(&pool, repo_c).await;
+        }
+
+        /// #4336: for every repository that is `rated`, the letter shown is
+        /// exactly the one the pre-#4336 code computed (the legacy `grade`,
+        /// which carried no floor for these), over a fixture set of severity
+        /// mixes covering every letter boundary.
+        #[tokio::test]
+        async fn rated_letters_match_the_pre_4336_grade_over_a_fixture_set() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            // (critical, high, medium, low)
+            let fixtures: &[(usize, usize, usize, usize)] = &[
+                (0, 0, 0, 0),
+                (0, 0, 0, 1),
+                (0, 1, 0, 0),
+                (0, 1, 0, 1),
+                (1, 0, 0, 0),
+                (0, 0, 2, 3),
+                (0, 2, 1, 0),
+                (1, 2, 5, 10),
+                (2, 0, 0, 0),
+                (0, 0, 10, 0),
+                (0, 0, 0, 50),
+                (5, 0, 0, 0),
+                (3, 4, 2, 1),
+                // Letter boundaries the mixes above do not hit: 74 (C top),
+                // 49 (D top), 25 (D bottom), 24 (F top), 91 (A).
+                (1, 0, 0, 1),
+                (2, 0, 0, 1),
+                (3, 0, 0, 0),
+                (3, 0, 0, 1),
+                (0, 0, 3, 0),
+            ];
+            for (i, &(c, h, m, l)) in fixtures.iter().enumerate() {
+                let repo_id = insert_test_repo(&pool).await;
+                let (aid, _) = insert_test_artifact(&pool, repo_id, &format!("fx{i}")).await;
+                let mut findings: Vec<(Severity, Option<&str>, &str, &str)> = Vec::new();
+                let cves: Vec<String> = (0..c + h + m + l)
+                    .map(|n| format!("CVE-2026-{i:02}{n:03}"))
+                    .collect();
+                let mut n = 0;
+                for (sev, count) in [
+                    (Severity::Critical, c),
+                    (Severity::High, h),
+                    (Severity::Medium, m),
+                    (Severity::Low, l),
+                ] {
+                    for _ in 0..count {
+                        findings.push((sev, Some(cves[n].as_str()), "t", "lib"));
+                        n += 1;
+                    }
+                }
+                seed_scan_4338(&svc, aid, repo_id, "grype", &findings).await;
+                let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+                let (want_score, want_grade) =
+                    compute_security_score(c as i32, h as i32, m as i32, l as i32);
+                assert_eq!(score.score, want_score, "fixture {i}");
+                assert_eq!(score.status(), GradeStatus::Rated, "fixture {i}");
+                assert_eq!(score.grade, want_grade.as_char().to_string(), "fixture {i}");
+                assert_eq!(
+                    score.display_grade(),
+                    Some(want_grade.as_char().to_string()),
+                    "fixture {i}: the shown letter must equal the pre-#4336 letter"
+                );
+                cleanup_repo(&pool, repo_id).await;
+            }
+        }
+
+        /// #4336: a row a 1.11 replica recalculated after 1.12 wrote its
+        /// status (it moves `calculated_at` and floors `grade`, leaving the
+        /// new columns stale) is read from the legacy flags, not the stale
+        /// status.
+        #[tokio::test]
+        async fn a_score_a_1_11_replica_rewrote_is_not_read_as_stale_status_4336() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "a").await;
+            seed_scan_4338(&svc, aid, repo_id, "grype", &[]).await;
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Rated);
+
+            // What 1.11's upsert writes after a failed rescan.
+            sqlx::query(
+                "UPDATE repo_security_scores SET grade = 'F', has_failed_scan = true, \
+                 calculated_at = NOW() + INTERVAL '1 second' WHERE repository_id = $1",
+            )
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("legacy rewrite");
+            let read = svc.get_score(repo_id).await.expect("get").expect("row");
+            assert_eq!(read.status(), GradeStatus::Incomplete);
+            assert!(read.coverage().is_none());
+            assert_eq!(read.display_grade().as_deref(), Some("A"));
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #4336: deleting an artifact recalculates its repository's score
+        /// (the refresher listens for `artifact.deleted`), so removing the
+        /// one uncataloged archive makes the repository `rated` without
+        /// waiting for the next scan. A repository with no score row gets
+        /// none from a delete.
+        #[tokio::test]
+        async fn deleting_an_artifact_refreshes_the_score_4336() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (jar, _) = insert_test_artifact(&pool, repo_id, "jar").await;
+            seed_scan_4338(&svc, jar, repo_id, "grype", &[]).await;
+            let (archive, _) = insert_test_artifact(&pool, repo_id, "archive").await;
+            let s = svc
+                .create_scan_result(archive, repo_id, "grype")
+                .await
+                .expect("create");
+            complete_as_4336(&svc, s.id, "not_cataloged").await;
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+
+            let unscored = insert_test_repo(&pool).await;
+
+            let bus = std::sync::Arc::new(crate::services::event_bus::EventBus::new(16));
+            let token = tokio_util::sync::CancellationToken::new();
+            spawn_score_refresher(bus.clone(), pool.clone(), token.clone());
+            soft_delete_4336(&pool, archive).await;
+            bus.emit_for_repo("artifact.deleted", archive, repo_id, None);
+            bus.emit_for_repo("artifact.deleted", Uuid::new_v4(), unscored, None);
+
+            let mut status = GradeStatus::Incomplete;
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                status = svc
+                    .get_score(repo_id)
+                    .await
+                    .expect("get")
+                    .expect("row")
+                    .status();
+                if status == GradeStatus::Rated {
+                    break;
+                }
+            }
+            token.cancel();
+            assert_eq!(
+                status,
+                GradeStatus::Rated,
+                "the delete must refresh the score"
+            );
+            assert!(
+                svc.get_score(unscored).await.expect("get").is_none(),
+                "a delete must not create a score row"
+            );
+            cleanup_repo(&pool, repo_id).await;
+            cleanup_repo(&pool, unscored).await;
+        }
+
         /// #4036 fail-closed: a repo whose LATEST completed scan is
         /// `scan_completeness='not_cataloged'` (a cataloging scanner enumerated
         /// NO components from a package-archive artifact whose format expects
@@ -3725,8 +6654,17 @@ mod tests {
             let svc = ScanResultService::new(pool.clone());
 
             // --- A not-cataloged completed scan -> flag + grade F (NOT A) ---
+            // The test repo is generic, so the artifact must be package-shaped
+            // (#4154: a plain generic archive is flagged but not floored; see
+            // `scanner_service::uncataloged_floors_grade`).
             let repo_id = insert_test_repo(&pool).await;
             let (aid, _) = insert_test_artifact(&pool, repo_id, "pkg.tar.bz2").await;
+            sqlx::query("UPDATE artifacts SET path = $2 WHERE id = $1")
+                .bind(aid)
+                .bind(format!("{}/pkg-1.0-0.conda", aid.as_simple()))
+                .execute(&pool)
+                .await
+                .expect("make the artifact package-shaped");
             let scan = svc
                 .create_scan_result(aid, repo_id, "grype")
                 .await
@@ -3744,6 +6682,7 @@ mod tests {
                 "not_cataloged",
                 None,
                 Some("grype cataloged no components; artifact contents were not recognized"),
+                None,
             )
             .await
             .expect("complete scan as not_cataloged");
@@ -3798,6 +6737,7 @@ mod tests {
                 "complete",
                 None,
                 None,
+                None,
             )
             .await
             .expect("complete rescan");
@@ -3835,6 +6775,7 @@ mod tests {
                 Some("grype-0.80"),
                 chrono::Utc::now(),
                 "partial",
+                None,
                 None,
                 None,
             )
@@ -4158,6 +7099,7 @@ mod tests {
                     fixed_version: Some(format!("2.{i}")),
                     source: Some("trivy".into()),
                     source_url: None,
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
                 })
                 .collect();
 
@@ -4335,6 +7277,7 @@ mod tests {
                 "complete",
                 None,
                 None,
+                None,
             )
             .await
             .expect("complete legacy");
@@ -4368,6 +7311,7 @@ mod tests {
                 Some("v1"),
                 chrono::Utc::now(),
                 "complete",
+                None,
                 None,
                 None,
             )
@@ -4437,6 +7381,7 @@ mod tests {
                 "complete",
                 None,
                 None,
+                None,
             )
             .await
             .expect("complete old scan");
@@ -4459,6 +7404,7 @@ mod tests {
                 Some("v1"),
                 chrono::Utc::now(),
                 "complete",
+                None,
                 None,
                 None,
             )

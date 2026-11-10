@@ -30,6 +30,15 @@
 //! # SAS redirect downloads (Shared Key only)
 //! AZURE_REDIRECT_DOWNLOADS=true
 //! AZURE_SAS_EXPIRY=3600  # seconds, default 1 hour
+//! # Client-facing base URL for SAS redirects when AZURE_STORAGE_ENDPOINT is
+//! # not reachable by clients (#4417). Backend calls keep the internal endpoint.
+//! AZURE_STORAGE_PUBLIC_ENDPOINT=https://blobs.example.com
+//!
+//! # Minimum deadline, in seconds, for one server-side copy (Put Blob From
+//! # URL). The default deadline is 60 s plus the source size at 8 MiB/s; raise
+//! # this when the account copies slower than that (#4858). Unset or 0 keeps
+//! # the size-derived deadline.
+//! AZURE_COPY_TIMEOUT_SECS=1800
 //!
 //! # For Artifactory migration:
 //! STORAGE_PATH_FORMAT=migration  # native, artifactory, or migration
@@ -49,6 +58,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::storage::public_endpoint::{public_endpoint_from_env, EndpointPath};
 use crate::storage::{
     PresignedUrl, PresignedUrlSource, PutStreamResult, StorageBackend, StoragePathFormat,
 };
@@ -80,12 +90,22 @@ pub struct AzureConfig {
     pub access_key: Option<String>,
     /// Optional custom endpoint (for Azure Government, China, etc.)
     pub endpoint: Option<String>,
+    /// Client-facing base URL for SAS redirect URLs
+    /// (`AZURE_STORAGE_PUBLIC_ENDPOINT`, #4417). Replaces the account base URL
+    /// in the URLs handed to clients only; the SAS signature covers the
+    /// account, container and blob names, not the host, so the same token
+    /// validates through it. May carry a path (path-style endpoints such as
+    /// Azurite put the account name there).
+    pub public_endpoint: Option<String>,
     /// Enable redirect downloads via SAS URLs (requires access key)
     pub redirect_downloads: bool,
     /// SAS URL expiry duration
     pub sas_expiry: Duration,
     /// Storage path format (native, artifactory, or migration)
     pub path_format: StoragePathFormat,
+    /// Minimum Put Blob From URL deadline (`AZURE_COPY_TIMEOUT_SECS`, #4858).
+    /// Zero keeps the size-derived deadline of [`put_blob_from_url_timeout`].
+    pub copy_timeout_floor: Duration,
 }
 
 impl AzureConfig {
@@ -100,9 +120,13 @@ impl AzureConfig {
         let container_name = std::env::var("AZURE_STORAGE_CONTAINER")
             .map_err(|_| AppError::Config("AZURE_STORAGE_CONTAINER not set".to_string()))?;
 
-        let access_key = std::env::var("AZURE_STORAGE_ACCESS_KEY").ok();
+        let access_key = crate::config::secret_or_env("AZURE_STORAGE_ACCESS_KEY")
+            .ok()
+            .flatten();
 
         let endpoint = std::env::var("AZURE_STORAGE_ENDPOINT").ok();
+        let public_endpoint =
+            public_endpoint_from_env("AZURE_STORAGE_PUBLIC_ENDPOINT", EndpointPath::Allowed)?;
 
         let redirect_downloads = std::env::var("AZURE_REDIRECT_DOWNLOADS")
             .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -116,14 +140,19 @@ impl AzureConfig {
 
         let path_format = StoragePathFormat::from_env();
 
+        let copy_timeout_floor =
+            parse_copy_timeout_floor(std::env::var("AZURE_COPY_TIMEOUT_SECS").ok().as_deref());
+
         Ok(Self {
             account_name,
             container_name,
             access_key,
             endpoint,
+            public_endpoint,
             redirect_downloads,
             sas_expiry,
             path_format,
+            copy_timeout_floor,
         })
     }
 
@@ -187,6 +216,12 @@ const AZURE_BLOCK_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const AZURE_MAX_BLOCKS: usize = 50_000;
 const AZURE_BLOCK_WARNING_THRESHOLD: usize = 40_000;
 const AZURE_PUT_BLOB_FROM_URL_MAX_SIZE: u64 = 5_000 * 1024 * 1024;
+/// Fixed part of a Put Blob From URL request's deadline.
+const AZURE_PUT_BLOB_FROM_URL_BASE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Slowest server-side copy rate a Put Blob From URL deadline allows for.
+/// Azure sends no response byte until the copy is finished, so the deadline
+/// has to cover the whole copy: 5000 MiB at this rate is about 11 minutes.
+const AZURE_PUT_BLOB_FROM_URL_MIN_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
 const AZURE_COPY_SOURCE_URL_MAX_LEN: usize = 2 * 1024;
 
 /// How far to backdate a SAS token's signed start (st) to tolerate clock
@@ -198,7 +233,9 @@ impl TokenCredentialProvider {
     fn from_env(client: &reqwest::Client) -> Result<Self> {
         let tenant_id = std::env::var("AZURE_TENANT_ID").ok();
         let client_id = std::env::var("AZURE_CLIENT_ID").ok();
-        let client_secret = std::env::var("AZURE_CLIENT_SECRET").ok();
+        let client_secret = crate::config::secret_or_env("AZURE_CLIENT_SECRET")
+            .ok()
+            .flatten();
 
         let credential = match (tenant_id, client_id.clone(), client_secret) {
             (Some(t), Some(c), Some(s)) => {
@@ -295,7 +332,7 @@ impl TokenCredentialProvider {
             ])
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to request Azure AD token: {}", e)))?;
+            .map_err(|e| request_error("Failed to request Azure AD token", e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -330,7 +367,7 @@ impl TokenCredentialProvider {
                 AppError::Storage(format!(
                     "Failed to reach Azure IMDS for managed identity token. \
                      Are you running on Azure? Error: {}",
-                    e
+                    e.without_url()
                 ))
             })?;
 
@@ -347,9 +384,10 @@ impl TokenCredentialProvider {
     }
 
     async fn parse_token_response(&self, response: reqwest::Response) -> Result<CachedToken> {
-        let body: serde_json::Value = response.json().await.map_err(|e| {
-            AppError::Storage(format!("Failed to parse Azure token response: {}", e))
-        })?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| request_error("Failed to parse Azure token response", e))?;
 
         let access_token = body["access_token"]
             .as_str()
@@ -405,16 +443,232 @@ pub(crate) fn is_redirect_compatible(
     true
 }
 
+/// Storage error for a failed Azure HTTP request.
+///
+/// The request URL is left out: in Shared Key mode its query string is a SAS
+/// token, and this message reaches API clients and the logs.
+fn request_error(operation: &str, e: reqwest::Error) -> AppError {
+    // #5649: a refused connection or a timeout is tagged unavailable (503).
+    crate::storage::failure::transport_storage_error(operation, e)
+}
+
+/// Longest Azure error code or request id kept in an error message.
+const AZURE_ERROR_TOKEN_MAX_LEN: usize = 64;
+
+/// True for the shape of an Azure error code or request id: letters, digits
+/// and hyphens. A value outside it is dropped rather than quoted, because the
+/// message it would land in reaches API clients and the logs.
+fn is_azure_error_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= AZURE_ERROR_TOKEN_MAX_LEN
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// One diagnostic field of a failed Azure response: the response header, or
+/// failing that the body's XML element, when it has the shape of a token.
+fn azure_error_field(
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+    header: &str,
+    element: &str,
+) -> Option<String> {
+    let from_header = headers.get(header).and_then(|value| value.to_str().ok());
+    let from_body = || {
+        let open = format!("<{element}>");
+        let close = format!("</{element}>");
+        let rest = &body[body.find(&open)? + open.len()..];
+        Some(rest[..rest.find(&close)?].trim())
+    };
+    from_header
+        .or_else(from_body)
+        .filter(|value| is_azure_error_token(value))
+        .map(str::to_string)
+}
+
+/// What an error message may say about a failed Azure response (#5181): the
+/// error code, the copy source's code and status, and the request id.
+///
+/// Everything else is withheld, not filtered. When Azure refuses a signature,
+/// `AuthenticationErrorDetail` quotes the string it signed, which on Put Blob
+/// From URL holds the source URL and its SAS, and a query parameter error
+/// quotes the value it rejected. A SAS grants read access until it expires, and
+/// these messages reach API clients and the logs. The HTTP status comes from
+/// the caller, and the code and request id are enough to look up the rest in
+/// the Azure documentation and diagnostics logs.
+fn azure_error_detail_from(headers: &reqwest::header::HeaderMap, body: &str) -> String {
+    let field = |header, element| azure_error_field(headers, body, header, element);
+    let mut parts =
+        vec![field("x-ms-error-code", "Code").unwrap_or_else(|| "no Azure error code".to_string())];
+    if let Some(code) = field("x-ms-copy-source-error-code", "CopySourceErrorCode") {
+        parts.push(format!("copy source code {code}"));
+    }
+    if let Some(status) = field("x-ms-copy-source-status-code", "CopySourceStatusCode") {
+        parts.push(format!("copy source status {status}"));
+    }
+    if let Some(id) = field("x-ms-request-id", "RequestId") {
+        parts.push(format!("request id {id}"));
+    }
+    parts.join(", ")
+}
+
+/// The Azure error code at the front of an [`azure_error_detail_from`]
+/// string, when the response carried one. It is token-shaped by
+/// construction, so it cannot be a client-chosen blob name (#5650).
+fn azure_error_code(detail: &str) -> Option<&str> {
+    detail
+        .split(", ")
+        .next()
+        .filter(|code| is_azure_error_token(code))
+}
+
+/// [`azure_error_detail_from`] for a response, consuming its body.
+async fn azure_error_detail(response: reqwest::Response) -> String {
+    let headers = response.headers().clone();
+    let body = response.text().await.unwrap_or_default();
+    azure_error_detail_from(&headers, &body)
+}
+
 // ---------------------------------------------------------------------------
 // Azure Blob Storage backend
 // ---------------------------------------------------------------------------
+
+/// How [`AzureBackend::copy_reporting_path`] moved the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AzureCopyPath {
+    /// Azure copied the blob server-side with Put Blob From URL.
+    PutBlobFromUrl,
+    /// This process streamed the blob through a block upload.
+    BlockUpload,
+}
 
 /// Azure Blob Storage backend
 pub struct AzureBackend {
     config: AzureConfig,
     client: reqwest::Client,
+    /// Client for Put Blob From URL. It has no read timeout, because Azure
+    /// answers only once the copy is done; each request sets its own deadline
+    /// from [`put_blob_from_url_timeout`].
+    copy_client: reqwest::Client,
     auth: AzureAuthMode,
     path_format: StoragePathFormat,
+}
+
+/// Parse `AZURE_COPY_TIMEOUT_SECS`; unset or unparsable means no floor.
+fn parse_copy_timeout_floor(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.trim().parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::ZERO)
+}
+
+/// Deadline for a Put Blob From URL request copying `size` bytes.
+///
+/// Azure performs the copy before it sends the response, so this bounds the
+/// whole copy, not a gap between reads. `floor` (`AZURE_COPY_TIMEOUT_SECS`)
+/// raises it for accounts that copy slower than the assumed rate.
+fn put_blob_from_url_timeout(size: u64, floor: Duration) -> Duration {
+    (AZURE_PUT_BLOB_FROM_URL_BASE_TIMEOUT
+        + Duration::from_secs(size.div_ceil(AZURE_PUT_BLOB_FROM_URL_MIN_BYTES_PER_SEC)))
+    .max(floor)
+}
+
+/// One page of a List Blobs response (#4320).
+#[derive(Debug, Default, PartialEq)]
+struct ListBlobsPage {
+    keys: Vec<crate::storage::ListedKey>,
+    /// The marker of the next page; `None` when this is the last one.
+    next_marker: Option<String>,
+}
+
+/// Parse a List Blobs `EnumerationResults` document: each
+/// `Blobs/Blob/Name` with its `Properties/Last-Modified` (RFC 1123), and the
+/// `NextMarker`. Entity references and CDATA in names are decoded. A document
+/// whose root is not `EnumerationResults` (an `<Error>` body) is an error, so
+/// a failure is never read as an empty listing.
+fn parse_list_blobs_result(xml: &str) -> Result<ListBlobsPage> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    let mut page = ListBlobsPage::default();
+    let mut stack: Vec<String> = Vec::new();
+    let mut root: Option<String> = None;
+    let mut text = String::new();
+    let mut name: Option<String> = None;
+    let mut modified: Option<chrono::DateTime<Utc>> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let tag = e.local_name().as_ref().to_owned();
+                if stack.is_empty() && root.is_none() {
+                    root = Some(tag.clone());
+                }
+                stack.push(tag);
+                text.clear();
+            }
+            Ok(Event::Text(e)) => text.push_str(&e),
+            Ok(Event::GeneralRef(e)) => {
+                if let Ok(Some(resolved)) = e.resolve_char_ref() {
+                    text.push(resolved);
+                } else {
+                    let entity: &str = &e;
+                    match entity {
+                        "amp" => text.push('&'),
+                        "lt" => text.push('<'),
+                        "gt" => text.push('>'),
+                        "quot" => text.push('"'),
+                        "apos" => text.push('\''),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::CData(e)) => text.push_str(&e),
+            Ok(Event::End(e)) => {
+                let closed = stack
+                    .pop()
+                    .unwrap_or_else(|| e.local_name().as_ref().to_owned());
+                let parent = stack.last().map(String::as_str).unwrap_or("");
+                match (parent, closed.as_str()) {
+                    ("Blob", "Name") => name = Some(std::mem::take(&mut text)),
+                    ("Properties", "Last-Modified") => {
+                        modified = chrono::DateTime::parse_from_rfc2822(text.trim())
+                            .ok()
+                            .map(|d| d.with_timezone(&Utc));
+                    }
+                    ("Blobs", "Blob") => {
+                        if let Some(key) = name.take() {
+                            page.keys.push(crate::storage::ListedKey {
+                                key,
+                                last_modified: modified.take(),
+                            });
+                        }
+                        modified = None;
+                    }
+                    ("EnumerationResults", "NextMarker") => {
+                        let marker = text.trim();
+                        page.next_marker = (!marker.is_empty()).then(|| marker.to_string());
+                    }
+                    _ => {}
+                }
+                text.clear();
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => {
+                return Err(AppError::Storage(format!(
+                    "Failed to parse the Azure List Blobs response: {}",
+                    e
+                )))
+            }
+        }
+    }
+    match root.as_deref() {
+        Some("EnumerationResults") => Ok(page),
+        _ => Err(AppError::Storage(format!(
+            "Azure List Blobs response is not an EnumerationResults document: {}",
+            azure_error_detail_from(&reqwest::header::HeaderMap::new(), xml)
+        ))),
+    }
 }
 
 impl AzureBackend {
@@ -437,7 +691,15 @@ impl AzureBackend {
         // so the HTTP client must allow non-TLS when RBAC mode might use managed identity.
         let needs_http = allow_http || config.access_key.is_none();
 
+        // #5649: STORAGE_CONNECT_TIMEOUT_SECS bounds one connection attempt,
+        // so a stopped endpoint is reported unavailable promptly.
+        let connect_timeout = crate::storage::StorageTimeouts::from_env().connect;
         let client = crate::services::http_client::large_object_client_builder(needs_http)
+            .connect_timeout(connect_timeout)
+            .build()
+            .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
+        let copy_client = crate::services::http_client::server_side_copy_client_builder(needs_http)
+            .connect_timeout(connect_timeout)
             .build()
             .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
         let token_client = crate::services::http_client::base_client_builder()
@@ -488,6 +750,7 @@ impl AzureBackend {
         Ok(Self {
             config,
             client,
+            copy_client,
             auth,
             path_format,
         })
@@ -514,7 +777,20 @@ impl AzureBackend {
 
     /// Get the full URL for a blob
     fn blob_url(&self, key: &str) -> String {
-        format!("{}/{}/{}", self.base_url(), self.config.container_name, key)
+        Self::blob_url_on(&self.base_url(), &self.config.container_name, key)
+    }
+
+    fn blob_url_on(base: &str, container: &str, key: &str) -> String {
+        format!("{}/{}/{}", base, container, key)
+    }
+
+    /// Base URL for the SAS URLs handed to clients: the public endpoint when
+    /// one is configured (#4417), otherwise the same base the backend uses.
+    fn presented_base_url(&self) -> String {
+        self.config
+            .public_endpoint
+            .clone()
+            .unwrap_or_else(|| self.base_url())
     }
 
     fn append_query(mut url: String, query: &str) -> String {
@@ -562,7 +838,7 @@ impl AzureBackend {
             let bytes = response
                 .bytes()
                 .await
-                .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
+                .map_err(|e| request_error("Failed to read response", e))?;
             return Ok(Some(bytes));
         }
 
@@ -571,11 +847,15 @@ impl AzureBackend {
         }
 
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        Err(AppError::Storage(format!(
-            "Azure fallback ranged download failed with status {} for {} ({}): {}",
-            status, key, range_header, body
-        )))
+        let detail = azure_error_detail(response).await;
+        Err(crate::storage::failure::status_storage_error(
+            status.as_u16(),
+            azure_error_code(&detail),
+            format!(
+                "Azure fallback ranged download failed with status {} for {} ({}): {}",
+                status, key, range_header, detail
+            ),
+        ))
     }
 
     fn write_url(&self, key: &str) -> Result<String> {
@@ -670,6 +950,23 @@ impl AzureBackend {
         )
     }
 
+    /// String-to-sign for a Put Blob From URL request in Shared Key mode
+    /// (#4320): no body (empty Content-Length field) and no Content-Type, the
+    /// four `x-ms-*` headers the request sends in canonical (sorted) order.
+    fn put_blob_from_url_string_to_sign(
+        &self,
+        date_str: &str,
+        key: &str,
+        source_url: &str,
+    ) -> String {
+        format!(
+            "PUT\n\n\n\n\n\n\n\n\n\n\n\nx-ms-blob-type:BlockBlob\nx-ms-copy-source:{}\nx-ms-date:{}\nx-ms-version:2021-06-08\n{}",
+            source_url,
+            date_str,
+            self.shared_key_canonicalized_resource(key)
+        )
+    }
+
     /// String-to-sign for a Delete Blob request in Shared Key mode.
     fn delete_blob_string_to_sign(&self, date_str: &str, key: &str) -> String {
         format!(
@@ -719,7 +1016,7 @@ impl AzureBackend {
                     .body(content.clone())
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))
+                    .map_err(|e| request_error("Azure upload failed", e))
             }
             AzureAuthMode::TokenCredential { provider } => {
                 let token = provider.get_token().await?;
@@ -735,7 +1032,7 @@ impl AzureBackend {
                     .body(content.clone())
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))
+                    .map_err(|e| request_error("Azure upload failed", e))
             }
         }
     }
@@ -760,7 +1057,7 @@ impl AzureBackend {
         request
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("Azure Put Block failed: {}", e)))
+            .map_err(|e| request_error("Azure Put Block failed", e))
     }
 
     async fn authorized_put_block_list(
@@ -787,36 +1084,49 @@ impl AzureBackend {
         request
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("Azure Put Block List failed: {}", e)))
+            .map_err(|e| request_error("Azure Put Block List failed", e))
     }
 
     async fn authorized_put_blob_from_url(
         &self,
         dest_url: &str,
+        dest_key: &str,
         source_url: &str,
+        timeout: Duration,
     ) -> Result<reqwest::Response> {
         let date_str = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
         let mut request = self
-            .client
+            .copy_client
             .put(dest_url)
+            .timeout(timeout)
             .header("x-ms-date", &date_str)
             .header("x-ms-version", "2021-06-08")
             .header("x-ms-blob-type", "BlockBlob")
             .header("x-ms-copy-source", source_url)
             .header("Content-Length", "0");
 
-        if let AzureAuthMode::TokenCredential { provider } = &self.auth {
-            let token = provider.get_token().await?;
-            let bearer = format!("Bearer {}", token);
-            request = request
-                .header("Authorization", bearer.clone())
-                .header("x-ms-copy-source-authorization", bearer);
+        match &self.auth {
+            AzureAuthMode::TokenCredential { provider } => {
+                let token = provider.get_token().await?;
+                let bearer = format!("Bearer {}", token);
+                request = request
+                    .header("Authorization", bearer.clone())
+                    .header("x-ms-copy-source-authorization", bearer);
+            }
+            AzureAuthMode::SharedKey { decoded_key } => {
+                let string_to_sign =
+                    self.put_blob_from_url_string_to_sign(&date_str, dest_key, source_url);
+                request = request.header(
+                    "Authorization",
+                    Self::shared_key_auth(decoded_key, &self.config.account_name, &string_to_sign)?,
+                );
+            }
         }
 
         request
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("Azure Put Blob From URL failed: {}", e)))
+            .map_err(|e| request_error("Azure Put Blob From URL failed", e))
     }
 
     /// Build an authorized GET request.
@@ -828,7 +1138,7 @@ impl AzureBackend {
                     .get(url)
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure download failed: {}", e)))
+                    .map_err(|e| request_error("Azure download failed", e))
             }
             AzureAuthMode::TokenCredential { provider } => {
                 let token = provider.get_token().await?;
@@ -841,7 +1151,7 @@ impl AzureBackend {
                     .header("x-ms-version", "2021-06-08")
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure download failed: {}", e)))
+                    .map_err(|e| request_error("Azure download failed", e))
             }
         }
     }
@@ -860,7 +1170,7 @@ impl AzureBackend {
                 .header("x-ms-range", range_header)
                 .send()
                 .await
-                .map_err(|e| AppError::Storage(format!("Azure ranged download failed: {}", e))),
+                .map_err(|e| request_error("Azure ranged download failed", e)),
             AzureAuthMode::TokenCredential { provider } => {
                 let token = provider.get_token().await?;
                 let date_str = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
@@ -874,7 +1184,7 @@ impl AzureBackend {
                     .header("x-ms-range", range_header)
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure ranged download failed: {}", e)))
+                    .map_err(|e| request_error("Azure ranged download failed", e))
             }
         }
     }
@@ -887,7 +1197,7 @@ impl AzureBackend {
                 .head(url)
                 .send()
                 .await
-                .map_err(|e| AppError::Storage(format!("Azure HEAD request failed: {}", e))),
+                .map_err(|e| request_error("Azure HEAD request failed", e)),
             AzureAuthMode::TokenCredential { provider } => {
                 let token = provider.get_token().await?;
                 let date_str = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
@@ -899,7 +1209,7 @@ impl AzureBackend {
                     .header("x-ms-version", "2021-06-08")
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure HEAD request failed: {}", e)))
+                    .map_err(|e| request_error("Azure HEAD request failed", e))
             }
         }
     }
@@ -921,7 +1231,7 @@ impl AzureBackend {
                     .header("x-ms-version", "2021-06-08")
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure delete failed: {}", e)))
+                    .map_err(|e| request_error("Azure delete failed", e))
             }
             AzureAuthMode::TokenCredential { provider } => {
                 let token = provider.get_token().await?;
@@ -933,7 +1243,7 @@ impl AzureBackend {
                     .header("x-ms-version", "2021-06-08")
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure delete failed: {}", e)))
+                    .map_err(|e| request_error("Azure delete failed", e))
             }
         }
     }
@@ -973,6 +1283,18 @@ impl AzureBackend {
         expires_in: Duration,
         signed_permissions: &str,
     ) -> Result<String> {
+        self.generate_sas_token_at(key, expires_in, signed_permissions, Utc::now())
+    }
+
+    /// [`Self::generate_sas_token_with_permissions`] for an explicit issue
+    /// time, so tests can pin the otherwise clock-derived `st`/`se`.
+    fn generate_sas_token_at(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        signed_permissions: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<String> {
         let decoded_key = match &self.auth {
             AzureAuthMode::SharedKey { decoded_key } => decoded_key,
             AzureAuthMode::TokenCredential { .. } => {
@@ -983,7 +1305,6 @@ impl AzureBackend {
             }
         };
 
-        let now = Utc::now();
         let expiry = now + ChronoDuration::seconds(expires_in.as_secs() as i64);
         // Backdate the start time to tolerate clock skew between this host
         // and the Azure storage service (Azure's documented guidance is a
@@ -1047,6 +1368,24 @@ impl AzureBackend {
         Ok(format!("{}?{}", self.blob_url(key), sas_token))
     }
 
+    /// SAS URL for a client redirect: same token as [`Self::generate_sas_url`],
+    /// on [`Self::presented_base_url`]. Backend-internal reads keep
+    /// `generate_sas_url` so they never leave the internal endpoint.
+    fn generate_client_sas_url(&self, key: &str, expires_in: Duration) -> Result<String> {
+        self.client_sas_url_at(key, expires_in, Utc::now())
+    }
+
+    fn client_sas_url_at(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<String> {
+        let sas_token = self.generate_sas_token_at(key, expires_in, "r", now)?;
+        let url = Self::blob_url_on(&self.presented_base_url(), &self.config.container_name, key);
+        Ok(format!("{}?{}", url, sas_token))
+    }
+
     fn generate_sas_url_with_permissions(
         &self,
         key: &str,
@@ -1095,11 +1434,15 @@ impl AzureBackend {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "Azure Put Block for '{}' failed with status {}: {}",
-                key, status, body
-            )));
+            let detail = azure_error_detail(response).await;
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!(
+                    "Azure Put Block for '{}' failed with status {}: {}",
+                    key, status, detail
+                ),
+            ));
         }
 
         block_ids.push(block_id);
@@ -1122,11 +1465,15 @@ impl AzureBackend {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "Azure Put Block List for '{}' failed with status {}: {}",
-                key, status, body
-            )));
+            let detail = azure_error_detail(response).await;
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!(
+                    "Azure Put Block List for '{}' failed with status {}: {}",
+                    key, status, detail
+                ),
+            ));
         }
 
         Ok(())
@@ -1215,7 +1562,8 @@ impl AzureBackend {
         })
     }
 
-    async fn size(&self, key: &str) -> Result<u64> {
+    /// The size of blob `key` in bytes (a HEAD). `NotFound` when absent.
+    pub async fn size(&self, key: &str) -> Result<u64> {
         let url = self.read_url(key, Duration::from_secs(60))?;
         let response = self.authorized_head(&url).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -1223,19 +1571,238 @@ impl AzureBackend {
         }
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "Azure HEAD for '{}' failed with status {}: {}",
-                key, status, body
-            )));
+            let detail = azure_error_detail(response).await;
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!(
+                    "Azure HEAD for '{}' failed with status {}: {}",
+                    key, status, detail
+                ),
+            ));
         }
         Self::content_length_from_head(&response, key)
     }
 
-    async fn copy_via_stream(&self, source: &str, dest: &str) -> Result<()> {
+    async fn copy_via_stream(&self, source: &str, dest: &str) -> Result<AzureCopyPath> {
         let stream = self.get_stream(source).await?;
         self.put_stream(dest, stream).await?;
-        Ok(())
+        Ok(AzureCopyPath::BlockUpload)
+    }
+
+    /// Server-side copy of blob `source` onto `dest` (the [`StorageBackend`]
+    /// copy), reachable as an inherent method for the storage facade wrapper.
+    pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        <Self as StorageBackend>::copy(self, source, dest).await
+    }
+
+    /// The [`StorageBackend`] copy, answering which path moved the bytes. A
+    /// successful copy looks the same either way, so the live test (#4963) needs
+    /// this to tell a working Put Blob From URL from its block-upload fallback.
+    pub async fn copy_reporting_path(&self, source: &str, dest: &str) -> Result<AzureCopyPath> {
+        let size = match self.size(source).await {
+            Ok(size) => size,
+            Err(AppError::NotFound(_)) if self.path_format.has_fallback() => {
+                return self.copy_via_stream(source, dest).await;
+            }
+            Err(e) => return Err(e),
+        };
+        if size > AZURE_PUT_BLOB_FROM_URL_MAX_SIZE {
+            tracing::debug!(
+                source = %source,
+                dest = %dest,
+                size,
+                "Azure source is too large for Put Blob From URL; streaming through block upload"
+            );
+            return self.copy_via_stream(source, dest).await;
+        }
+
+        // Azure reads the source while the request is open, so the source SAS
+        // must outlive the request rather than expire part-way through it.
+        let timeout = put_blob_from_url_timeout(size, self.config.copy_timeout_floor);
+        let source_url = self.read_url(
+            source,
+            Duration::from_secs(300).max(timeout + Duration::from_secs(60)),
+        )?;
+        if source_url.len() > AZURE_COPY_SOURCE_URL_MAX_LEN {
+            tracing::debug!(
+                source = %source,
+                dest = %dest,
+                source_url_len = source_url.len(),
+                "Azure source URL is too long for Put Blob From URL; streaming through block upload"
+            );
+            return self.copy_via_stream(source, dest).await;
+        }
+
+        // #4320: in Shared Key mode the destination is authorized with a
+        // signed Authorization header rather than a SAS in its URL. Azure
+        // accepts either. An endpoint that rejects the SAS form with an error
+        // of its own (the Azurite emulator answers 500) reports a missing API
+        // as 501 under Shared Key, which the fallback below handles; and the
+        // header keeps a signed URL out of the request line besides.
+        let dest_url = match &self.auth {
+            AzureAuthMode::SharedKey { .. } => self.blob_url(dest),
+            AzureAuthMode::TokenCredential { .. } => self.write_url(dest)?,
+        };
+        let response = self
+            .authorized_put_blob_from_url(&dest_url, dest, &source_url, timeout)
+            .await?;
+        // #4320: an Azure-compatible endpoint that does not implement Put
+        // Blob From URL at all (the Azurite emulator answers 501) gets the
+        // streamed copy instead. 501 is "this API does not exist here", never
+        // a transient failure of one that does, so a real Azure copy error
+        // still surfaces below.
+        if response.status() == reqwest::StatusCode::NOT_IMPLEMENTED {
+            tracing::debug!(
+                source = %source,
+                dest = %dest,
+                "Azure endpoint does not implement Put Blob From URL; streaming the copy"
+            );
+            return self.copy_via_stream(source, dest).await;
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = azure_error_detail(response).await;
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!(
+                    "Azure Put Blob From URL copy from '{}' to '{}' failed with status {}: {}",
+                    source, dest, status, detail
+                ),
+            ));
+        }
+
+        Ok(AzureCopyPath::PutBlobFromUrl)
+    }
+
+    /// List the blob names under `prefix` (#4320), following `NextMarker`
+    /// until the listing ends.
+    pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        Ok(self
+            .list_with_modified(prefix)
+            .await?
+            .into_iter()
+            .map(|l| l.key)
+            .collect())
+    }
+
+    /// [`Self::list`] that also carries each blob's `Last-Modified`.
+    ///
+    /// List Blobs is a container operation: with Shared Key auth it is
+    /// authorized by a container SAS with list permission, with a token
+    /// credential by the bearer token, as every other request here.
+    pub async fn list_with_modified(
+        &self,
+        prefix: Option<&str>,
+    ) -> Result<Vec<crate::storage::ListedKey>> {
+        let mut keys = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut query = String::from("restype=container&comp=list&maxresults=5000");
+            if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
+                query.push_str("&prefix=");
+                query.push_str(&urlencoding::encode(prefix));
+            }
+            if let Some(marker) = marker.as_deref() {
+                query.push_str("&marker=");
+                query.push_str(&urlencoding::encode(marker));
+            }
+            let url = self.list_url(&query)?;
+            let response = self.authorized_get(&url).await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let detail = azure_error_detail(response).await;
+                return Err(crate::storage::failure::status_storage_error(
+                    status.as_u16(),
+                    azure_error_code(&detail),
+                    format!("Azure List Blobs failed with status {}: {}", status, detail),
+                ));
+            }
+            let body = response
+                .text()
+                .await
+                .map_err(|e| request_error("Azure List Blobs body", e))?;
+            let page = parse_list_blobs_result(&body)?;
+            keys.extend(page.keys);
+            match page.next_marker {
+                Some(next) => marker = Some(next),
+                None => break,
+            }
+        }
+        Ok(keys)
+    }
+
+    /// URL of a List Blobs request carrying `query` (`restype=container&...`).
+    fn list_url(&self, query: &str) -> Result<String> {
+        let url = format!(
+            "{}/{}?{}",
+            self.base_url(),
+            self.config.container_name,
+            query
+        );
+        match &self.auth {
+            AzureAuthMode::SharedKey { .. } => Ok(Self::append_query(
+                url,
+                &self.generate_container_sas_token("l", Duration::from_secs(300), Utc::now())?,
+            )),
+            AzureAuthMode::TokenCredential { .. } => Ok(url),
+        }
+    }
+
+    /// A service SAS for the whole container (`sr=c`), for container
+    /// operations such as List Blobs. Same signing as the blob SAS in
+    /// [`Self::generate_sas_token_at`], with the container as the resource.
+    fn generate_container_sas_token(
+        &self,
+        signed_permissions: &str,
+        expires_in: Duration,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<String> {
+        let decoded_key = match &self.auth {
+            AzureAuthMode::SharedKey { decoded_key } => decoded_key,
+            AzureAuthMode::TokenCredential { .. } => {
+                return Err(AppError::Storage(
+                    "SAS token generation requires Shared Key auth (AZURE_STORAGE_ACCESS_KEY)"
+                        .to_string(),
+                ));
+            }
+        };
+        let expiry = now + ChronoDuration::seconds(expires_in.as_secs() as i64);
+        let start = now - ChronoDuration::minutes(SAS_CLOCK_SKEW_ALLOWANCE_MINUTES);
+        let signed_version = "2021-06-08";
+        let signed_resource = "c";
+        let signed_start = start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let signed_expiry = expiry.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let signed_protocol = "https";
+        let canonicalized_resource = format!(
+            "/blob/{}/{}",
+            self.config.account_name, self.config.container_name
+        );
+        let string_to_sign = format!(
+            "{}\n{}\n{}\n{}\n\n\n{}\n{}\n{}\n\n\n\n\n\n\n",
+            signed_permissions,
+            signed_start,
+            signed_expiry,
+            canonicalized_resource,
+            signed_protocol,
+            signed_version,
+            signed_resource,
+        );
+        let mut mac = HmacSha256::new_from_slice(decoded_key)
+            .map_err(|e| AppError::Storage(format!("Failed to create HMAC: {}", e)))?;
+        mac.update(string_to_sign.as_bytes());
+        let signature = BASE64.encode(mac.finalize().into_bytes());
+        Ok(format!(
+            "sv={}&st={}&se={}&sr={}&sp={}&spr={}&sig={}",
+            urlencoding::encode(signed_version),
+            urlencoding::encode(&signed_start),
+            urlencoding::encode(&signed_expiry),
+            signed_resource,
+            signed_permissions,
+            signed_protocol,
+            urlencoding::encode(&signature),
+        ))
     }
 
     /// Whether this backend is using RBAC (token credential) auth.
@@ -1254,29 +1821,34 @@ fn commit_lost_to_concurrent_writer(error: &AppError) -> bool {
 
 #[async_trait]
 impl StorageBackend for AzureBackend {
+    async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+        AzureBackend::size(self, key).await.map(Some)
+    }
+
     /// `exists` also probes the Artifactory fallback key in migration mode.
     fn exists_may_match_fallback_key(&self) -> bool {
         self.path_format.has_fallback()
     }
 
-    #[tracing::instrument(skip(self, content), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, content), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let url = self.blob_url(key);
         let response = self.authorized_put(&url, key, &content).await?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "Azure upload failed with status {}: {}",
-                status, body
-            )));
+            let detail = azure_error_detail(response).await;
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!("Azure upload failed with status {}: {}", status, detail),
+            ));
         }
 
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get"))]
     async fn get(&self, key: &str) -> Result<Bytes> {
         let url = self.read_url(key, Duration::from_secs(300))?;
         let response = self.authorized_get(&url).await?;
@@ -1304,20 +1876,22 @@ impl StorageBackend for AzureBackend {
                             );
                             #[allow(clippy::disallowed_methods)]
                             // STREAMING-EXEMPT: storage-internal Artifactory-fallback get()/range body; backs the streaming get impl; genuinely exempt (#1608)
-                            let bytes = fallback_response.bytes().await.map_err(|e| {
-                                AppError::Storage(format!("Failed to read response: {}", e))
-                            })?;
+                            let bytes = fallback_response
+                                .bytes()
+                                .await
+                                .map_err(|e| request_error("Failed to read response", e))?;
                             return Ok(bytes);
                         }
                     }
                 }
                 return Err(AppError::NotFound(format!("Blob not found: {}", key)));
             }
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "Azure download failed with status {}: {}",
-                status, body
-            )));
+            let detail = azure_error_detail(response).await;
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!("Azure download failed with status {}: {}", status, detail),
+            ));
         }
 
         #[allow(clippy::disallowed_methods)]
@@ -1325,12 +1899,12 @@ impl StorageBackend for AzureBackend {
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| request_error("Failed to read response", e))?;
 
         Ok(bytes)
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_range"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_range"))]
     async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -1346,7 +1920,7 @@ impl StorageBackend for AzureBackend {
             return response
                 .bytes()
                 .await
-                .map_err(|e| AppError::Storage(format!("Failed to read range response: {}", e)));
+                .map_err(|e| request_error("Failed to read range response", e));
         }
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -1357,16 +1931,20 @@ impl StorageBackend for AzureBackend {
         }
 
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        Err(AppError::Storage(format!(
-            "Azure ranged download failed with status {} for {} ({}): {}",
-            status, key, range_header, body
-        )))
+        let detail = azure_error_detail(response).await;
+        Err(crate::storage::failure::status_storage_error(
+            status.as_u16(),
+            azure_error_code(&detail),
+            format!(
+                "Azure ranged download failed with status {} for {} ({}): {}",
+                status, key, range_header, detail
+            ),
+        ))
     }
 
     // The span covers GET initiation (time-to-first-byte); the body transfer
     // happens later as the caller polls the returned stream.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_stream"))]
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let url = self.read_url(key, Duration::from_secs(300))?;
         let mut response = self.authorized_get(&url).await?;
@@ -1395,22 +1973,23 @@ impl StorageBackend for AzureBackend {
                     return Err(AppError::NotFound(format!("Blob not found: {}", key)));
                 }
             } else {
-                let body = response.text().await.unwrap_or_default();
-                return Err(AppError::Storage(format!(
-                    "Azure download failed with status {}: {}",
-                    status, body
-                )));
+                let detail = azure_error_detail(response).await;
+                return Err(crate::storage::failure::status_storage_error(
+                    status.as_u16(),
+                    azure_error_code(&detail),
+                    format!("Azure download failed with status {}: {}", status, detail),
+                ));
             }
         }
 
         let stream = response
             .bytes_stream()
-            .map(|chunk| chunk.map_err(|e| AppError::Storage(format!("Stream read error: {}", e))));
+            .map(|chunk| chunk.map_err(|e| request_error("Stream read error", e)));
 
         Ok(Box::pin(stream))
     }
 
-    #[tracing::instrument(skip(self, stream), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, stream), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put_stream"))]
     async fn put_stream(
         &self,
         key: &str,
@@ -1504,53 +2083,34 @@ impl StorageBackend for AzureBackend {
         })
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "copy"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "copy"))]
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
-        let size = match self.size(source).await {
-            Ok(size) => size,
-            Err(AppError::NotFound(_)) if self.path_format.has_fallback() => {
-                return self.copy_via_stream(source, dest).await;
-            }
-            Err(e) => return Err(e),
-        };
-        if size > AZURE_PUT_BLOB_FROM_URL_MAX_SIZE {
-            tracing::debug!(
-                source = %source,
-                dest = %dest,
-                size,
-                "Azure source is too large for Put Blob From URL; streaming through block upload"
-            );
-            return self.copy_via_stream(source, dest).await;
-        }
-
-        let source_url = self.read_url(source, Duration::from_secs(300))?;
-        if source_url.len() > AZURE_COPY_SOURCE_URL_MAX_LEN {
-            tracing::debug!(
-                source = %source,
-                dest = %dest,
-                source_url_len = source_url.len(),
-                "Azure source URL is too long for Put Blob From URL; streaming through block upload"
-            );
-            return self.copy_via_stream(source, dest).await;
-        }
-
-        let dest_url = self.write_url(dest)?;
-        let response = self
-            .authorized_put_blob_from_url(&dest_url, &source_url)
-            .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "Azure Put Blob From URL copy from '{}' to '{}' failed with status {}: {}",
-                source, dest, status, body
-            )));
-        }
-
-        Ok(())
+        self.copy_reporting_path(source, dest).await.map(|_| ())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "exists"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "exists_at_exact_key"))]
+    async fn exists_at_exact_key(&self, key: &str) -> Result<bool> {
+        let url = self.read_url(key, Duration::from_secs(60))?;
+        let response = self.authorized_head(&url).await?;
+        if response.status().is_success() {
+            return Ok(true);
+        }
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let status = response.status();
+        let detail = azure_error_detail(response).await;
+        Err(crate::storage::failure::status_storage_error(
+            status.as_u16(),
+            azure_error_code(&detail),
+            format!(
+                "Azure HEAD for '{}' failed with status {}: {}",
+                key, status, detail
+            ),
+        ))
+    }
+
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let url = self.read_url(key, Duration::from_secs(60))?;
         let response = self.authorized_head(&url).await?;
@@ -1565,11 +2125,15 @@ impl StorageBackend for AzureBackend {
         // object instead of taking their retryable storage-error path.
         if response.status() != reqwest::StatusCode::NOT_FOUND {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "Azure HEAD for '{}' failed with status {}: {}",
-                key, status, body
-            )));
+            let detail = azure_error_detail(response).await;
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!(
+                    "Azure HEAD for '{}' failed with status {}: {}",
+                    key, status, detail
+                ),
+            ));
         }
 
         // In migration mode, check the Artifactory fallback path only after a
@@ -1588,10 +2152,10 @@ impl StorageBackend for AzureBackend {
                 }
                 if fallback_response.status() != reqwest::StatusCode::NOT_FOUND {
                     let status = fallback_response.status();
-                    let body = fallback_response.text().await.unwrap_or_default();
+                    let detail = azure_error_detail(fallback_response).await;
                     return Err(AppError::Storage(format!(
                         "Azure fallback HEAD for '{}' failed with status {}: {}",
-                        fallback_key, status, body
+                        fallback_key, status, detail
                     )));
                 }
             }
@@ -1600,18 +2164,19 @@ impl StorageBackend for AzureBackend {
         Ok(false)
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "delete"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "delete"))]
     async fn delete(&self, key: &str) -> Result<()> {
         let url = self.blob_url(key);
         let response = self.authorized_delete(&url, key).await?;
 
         if !response.status().is_success() && response.status() != reqwest::StatusCode::NOT_FOUND {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "Azure delete failed with status {}: {}",
-                status, body
-            )));
+            let detail = azure_error_detail(response).await;
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!("Azure delete failed with status {}: {}", status, detail),
+            ));
         }
 
         Ok(())
@@ -1623,7 +2188,7 @@ impl StorageBackend for AzureBackend {
     /// revalidation. Returns `Ok(None)` for a missing blob or for a
     /// response without an `ETag` header so the freshness probe can fall
     /// through to the slow path without surfacing a backend error.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "head_etag"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "head_etag"))]
     async fn head_etag(&self, key: &str) -> Result<Option<String>> {
         let url = self.read_url(key, Duration::from_secs(60))?;
         let response = self.authorized_head(&url).await?;
@@ -1650,7 +2215,18 @@ impl StorageBackend for AzureBackend {
         self.config.redirect_downloads && !self.is_rbac()
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_presigned_url"))]
+    /// Azure block-blob uploads stream from the request body to the container
+    /// without a local file, so a chunked completion can assemble straight
+    /// into a staging object (#3916).
+    fn supports_streamed_assembly(&self) -> bool {
+        true
+    }
+
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_presigned_url"))]
+    async fn list_keys(&self, prefix: &str) -> Result<Option<Vec<crate::storage::ListedKey>>> {
+        self.list_with_modified(Some(prefix)).await.map(Some)
+    }
+
     async fn get_presigned_url(
         &self,
         key: &str,
@@ -1660,7 +2236,7 @@ impl StorageBackend for AzureBackend {
             return Ok(None);
         }
 
-        let url = self.generate_sas_url(key, expires_in)?;
+        let url = self.generate_client_sas_url(key, expires_in)?;
 
         tracing::debug!(
             key = %key,
@@ -1686,7 +2262,7 @@ impl StorageBackend for AzureBackend {
     /// PUT BlockBlob request and let `reqwest::Body::wrap_stream` pump the
     /// file chunk-by-chunk over the wire. Peak heap usage is O(chunk_size),
     /// not O(file_size).
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put_file"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put_file"))]
     async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
         use futures::StreamExt;
         use tokio::io::BufReader;
@@ -1724,7 +2300,7 @@ impl StorageBackend for AzureBackend {
                     .body(reqwest::Body::wrap_stream(stream))
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))?
+                    .map_err(|e| request_error("Azure upload failed", e))?
             }
             AzureAuthMode::TokenCredential { provider } => {
                 let token = provider.get_token().await?;
@@ -1739,23 +2315,24 @@ impl StorageBackend for AzureBackend {
                     .body(reqwest::Body::wrap_stream(stream))
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))?
+                    .map_err(|e| request_error("Azure upload failed", e))?
             }
         };
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "Azure upload failed with status {}: {}",
-                status, body
-            )));
+            let detail = azure_error_detail(response).await;
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!("Azure upload failed with status {}: {}", status, detail),
+            ));
         }
 
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "health_check"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "health_check"))]
     async fn health_check(&self) -> Result<()> {
         // HEAD a sentinel blob path. A 404 is fine (proves the container is
         // reachable and credentials are accepted). Only transport-level or
@@ -1777,11 +2354,12 @@ impl StorageBackend for AzureBackend {
                 status
             )))
         } else {
-            let body = response.text().await.unwrap_or_default();
-            Err(AppError::Storage(format!(
-                "Azure health check failed (status {}): {}",
-                status, body
-            )))
+            let detail = azure_error_detail(response).await;
+            Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!("Azure health check failed (status {}): {}", status, detail),
+            ))
         }
     }
 }
@@ -1801,9 +2379,11 @@ mod tests {
                     .to_string(),
             ),
             endpoint: None,
+            public_endpoint: None,
             redirect_downloads: true,
             sas_expiry: Duration::from_secs(3600),
             path_format: StoragePathFormat::Native,
+            copy_timeout_floor: Duration::ZERO,
         }
     }
 
@@ -1813,9 +2393,11 @@ mod tests {
             container_name: "testcontainer".to_string(),
             access_key: None,
             endpoint: None,
+            public_endpoint: None,
             redirect_downloads: false,
             sas_expiry: Duration::from_secs(3600),
             path_format: StoragePathFormat::Native,
+            copy_timeout_floor: Duration::ZERO,
         }
     }
 
@@ -1852,6 +2434,7 @@ mod tests {
         };
         AzureBackend {
             config: create_rbac_config(),
+            copy_client: client.clone(),
             client,
             auth: AzureAuthMode::TokenCredential {
                 provider: Arc::new(provider),
@@ -1878,6 +2461,7 @@ mod tests {
         config.path_format = path_format;
         AzureBackend {
             config,
+            copy_client: client.clone(),
             client,
             auth: AzureAuthMode::TokenCredential {
                 provider: Arc::new(provider),
@@ -2136,6 +2720,113 @@ mod tests {
             header,
             "SharedKey devstoreaccount1:b0RVKgjLFrvt4fqAuLLg3E+hGrJPhIU4Qr31NgdGlC8="
         );
+    }
+
+    // ── AZURE_STORAGE_PUBLIC_ENDPOINT (#4417) ───────────────────────────
+
+    #[tokio::test]
+    async fn test_presigned_url_without_public_endpoint_is_unchanged_4417() {
+        let mut config = create_test_config();
+        config.endpoint = Some("http://azurite.internal:10000/testaccount".to_string());
+        let backend = AzureBackend::new(config).await.unwrap();
+        let presigned = backend
+            .get_presigned_url("a/b.bin", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            presigned
+                .url
+                .starts_with("http://azurite.internal:10000/testaccount/testcontainer/a/b.bin?"),
+            "{}",
+            presigned.url
+        );
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_uses_public_endpoint_4417() {
+        for (public, want_prefix) in [
+            (
+                "https://blobs.example.com",
+                "https://blobs.example.com/testcontainer/a/b.bin?",
+            ),
+            (
+                "http://dl.example.com:10000/testaccount",
+                "http://dl.example.com:10000/testaccount/testcontainer/a/b.bin?",
+            ),
+        ] {
+            let mut config = create_test_config();
+            config.endpoint = Some("http://azurite.internal:10000/testaccount".to_string());
+            config.public_endpoint = Some(public.to_string());
+            let backend = AzureBackend::new(config).await.unwrap();
+            let presigned = backend
+                .get_presigned_url("a/b.bin", Duration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                presigned.url.starts_with(want_prefix),
+                "{public}: {}",
+                presigned.url
+            );
+            // The SAS token signs account/container/blob, not the host: for a
+            // pinned issue time the client URL carries exactly the token the
+            // internal URL would, on the public base.
+            let now = Utc::now();
+            let token = backend
+                .generate_sas_token_at("a/b.bin", Duration::from_secs(60), "r", now)
+                .unwrap();
+            let client = backend
+                .client_sas_url_at("a/b.bin", Duration::from_secs(60), now)
+                .unwrap();
+            assert_eq!(client, format!("{want_prefix}{token}"));
+            assert_eq!(
+                backend.blob_url("a/b.bin"),
+                "http://azurite.internal:10000/testaccount/testcontainer/a/b.bin",
+                "backend-internal URLs keep the internal endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn test_azure_config_from_env_reads_public_endpoint_4417() {
+        let saved: Vec<(&str, Option<String>)> = [
+            "AZURE_STORAGE_ACCOUNT",
+            "AZURE_STORAGE_CONTAINER",
+            "AZURE_STORAGE_PUBLIC_ENDPOINT",
+        ]
+        .into_iter()
+        .map(|k| (k, std::env::var(k).ok()))
+        .collect();
+        std::env::set_var("AZURE_STORAGE_ACCOUNT", "acct");
+        std::env::set_var("AZURE_STORAGE_CONTAINER", "c");
+
+        std::env::set_var(
+            "AZURE_STORAGE_PUBLIC_ENDPOINT",
+            "https://blobs.example.com/",
+        );
+        let config = AzureConfig::from_env().unwrap();
+        assert_eq!(
+            config.public_endpoint.as_deref(),
+            Some("https://blobs.example.com")
+        );
+
+        std::env::set_var("AZURE_STORAGE_PUBLIC_ENDPOINT", "blobs.example.com");
+        let err = AzureConfig::from_env().expect_err("malformed");
+        assert!(
+            err.to_string().contains("AZURE_STORAGE_PUBLIC_ENDPOINT"),
+            "{err}"
+        );
+
+        std::env::remove_var("AZURE_STORAGE_PUBLIC_ENDPOINT");
+        assert!(AzureConfig::from_env().unwrap().public_endpoint.is_none());
+
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 
     // ── SAS URL generation (Shared Key only) ─────────────────────────────
@@ -2411,6 +3102,138 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // #4320: List Blobs and the proxy-cache arm.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_list_blobs_result_reads_names_times_and_marker_4320() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ServiceEndpoint="https://a.blob.core.windows.net/" ContainerName="c">
+  <Prefix>proxy-cache/r/</Prefix>
+  <Blobs>
+    <Blob><Name>proxy-cache/r/a&amp;b/__content__</Name>
+      <Properties><Last-Modified>Fri, 23 Oct 2026 10:00:00 GMT</Last-Modified></Properties></Blob>
+    <Blob><Name><![CDATA[proxy-cache/r/<x>/__cache_meta__.json]]></Name><Properties/></Blob>
+  </Blobs>
+  <NextMarker>2!88!MDAwMDQ3</NextMarker>
+</EnumerationResults>"#;
+        let page = parse_list_blobs_result(xml).expect("parse");
+        let keys: Vec<&str> = page.keys.iter().map(|k| k.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "proxy-cache/r/a&b/__content__",
+                "proxy-cache/r/<x>/__cache_meta__.json"
+            ]
+        );
+        assert_eq!(
+            page.keys[0].last_modified.map(|t| t.to_rfc3339()),
+            Some("2026-10-23T10:00:00+00:00".to_string())
+        );
+        assert_eq!(page.keys[1].last_modified, None);
+        assert_eq!(page.next_marker.as_deref(), Some("2!88!MDAwMDQ3"));
+
+        let last = parse_list_blobs_result(
+            "<EnumerationResults><Blobs/><NextMarker/></EnumerationResults>",
+        )
+        .expect("empty last page");
+        assert!(last.keys.is_empty());
+        assert_eq!(last.next_marker, None);
+
+        // An error body is a failure, never an empty listing.
+        assert!(
+            parse_list_blobs_result("<Error><Code>AuthenticationFailed</Code></Error>").is_err()
+        );
+    }
+
+    /// #4320: `list` pages through `NextMarker`, sends the List Blobs query
+    /// and returns every name; the trait's `list_keys` is the same listing
+    /// (before, Azure answered `Ok(None)`: cannot enumerate).
+    #[tokio::test]
+    async fn test_list_follows_next_marker_4320() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/testcontainer"))
+            .and(query_param("restype", "container"))
+            .and(query_param("comp", "list"))
+            .and(query_param("prefix", "proxy-cache/"))
+            .and(query_param("marker", "page2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<EnumerationResults><Blobs><Blob><Name>proxy-cache/b</Name></Blob></Blobs>\
+                 <NextMarker/></EnumerationResults>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/testcontainer"))
+            .and(query_param("restype", "container"))
+            .and(query_param("comp", "list"))
+            .and(query_param("prefix", "proxy-cache/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<EnumerationResults><Blobs><Blob><Name>proxy-cache/a</Name></Blob></Blobs>\
+                 <NextMarker>page2</NextMarker></EnumerationResults>",
+            ))
+            .mount(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+        let keys = backend.list(Some("proxy-cache/")).await.expect("list");
+        assert_eq!(keys, vec!["proxy-cache/a", "proxy-cache/b"]);
+        let listed = StorageBackendTrait::list_keys(&backend, "proxy-cache/")
+            .await
+            .expect("list_keys")
+            .expect("Azure can enumerate its blobs");
+        assert_eq!(listed.len(), 2);
+    }
+
+    /// #4320: a Shared Key List Blobs request carries a container SAS
+    /// (`sr=c`, list permission).
+    #[tokio::test]
+    async fn test_list_url_carries_a_container_list_sas_4320() {
+        let backend = create_test_backend().await;
+        let url = backend
+            .list_url("restype=container&comp=list")
+            .expect("url");
+        assert!(url.starts_with(
+            "https://testaccount.blob.core.windows.net/testcontainer?restype=container&comp=list&"
+        ));
+        assert!(url.contains("&sr=c&"), "{url}");
+        assert!(url.contains("&sp=l&"), "{url}");
+        assert!(url.contains("&sig="), "{url}");
+    }
+
+    /// #4320: a Shared Key Put Blob From URL signs its destination with the
+    /// copy source among the canonical headers, in sorted order, with an
+    /// empty Content-Length field.
+    #[tokio::test]
+    async fn test_put_blob_from_url_string_to_sign_4320() {
+        let backend = create_azurite_backend().await;
+        let sts = backend.put_blob_from_url_string_to_sign(
+            "Mon, 06 Jul 2026 22:37:12 GMT",
+            "proxy-cache/r/p/__content__",
+            "https://azurite:10000/devstoreaccount1/c/staging?sv=x&sig=y",
+        );
+        let fields: Vec<&str> = sts.split('\n').collect();
+        assert_eq!(fields[0], "PUT");
+        assert_eq!(fields[3], "", "zero Content-Length signs as empty");
+        assert_eq!(fields[12], "x-ms-blob-type:BlockBlob");
+        assert_eq!(
+            fields[13],
+            "x-ms-copy-source:https://azurite:10000/devstoreaccount1/c/staging?sv=x&sig=y"
+        );
+        assert_eq!(fields[14], "x-ms-date:Mon, 06 Jul 2026 22:37:12 GMT");
+        assert_eq!(fields[15], "x-ms-version:2021-06-08");
+        assert_eq!(
+            fields[16],
+            "/devstoreaccount1/devstoreaccount1/testcontainer/proxy-cache/r/p/__content__"
+        );
+    }
+
     #[tokio::test]
     async fn test_exists_checks_migration_fallback_after_primary_404() {
         use crate::storage::StorageBackend as StorageBackendTrait;
@@ -2439,6 +3262,41 @@ mod tests {
                 .await
                 .unwrap(),
             "a primary 404 must still find a legacy migration-path object"
+        );
+    }
+
+    /// #4980: the upload commit guard's presence check never answers from the
+    /// migration fallback key.
+    #[tokio::test]
+    async fn test_exists_at_exact_key_ignores_the_migration_fallback_4980() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("HEAD"))
+            .and(path(format!("/testcontainer/repos/generic/{checksum}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path(format!("/testcontainer/ab/{checksum}")))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint_and_path_format(
+            server.uri(),
+            StoragePathFormat::Migration,
+        );
+        let key = format!("repos/generic/{checksum}");
+        assert!(StorageBackendTrait::exists(&backend, &key).await.unwrap());
+        assert!(
+            !StorageBackendTrait::exists_at_exact_key(&backend, &key)
+                .await
+                .unwrap(),
+            "only the canonical key may answer the exact presence check"
         );
     }
 
@@ -2806,6 +3664,797 @@ mod tests {
                 .any(|request| request.method.as_str() == "GET"),
             "server-side copy must not download the source through the backend"
         );
+    }
+
+    #[test]
+    fn test_put_blob_from_url_timeout_covers_the_whole_copy() {
+        let none = Duration::ZERO;
+        assert_eq!(put_blob_from_url_timeout(0, none), Duration::from_secs(60));
+        assert_eq!(put_blob_from_url_timeout(1, none), Duration::from_secs(61));
+        // The 1.9 GiB layer from the bug report: about four minutes.
+        assert_eq!(
+            put_blob_from_url_timeout(2_046_467_024, none),
+            Duration::from_secs(60 + 244)
+        );
+        assert_eq!(
+            put_blob_from_url_timeout(AZURE_PUT_BLOB_FROM_URL_MAX_SIZE, none),
+            Duration::from_secs(60 + 625)
+        );
+    }
+
+    #[test]
+    fn test_put_blob_from_url_timeout_honours_the_configured_floor() {
+        let floor = Duration::from_secs(1800);
+        assert_eq!(put_blob_from_url_timeout(1, floor), floor);
+        // A floor below the size-derived deadline does not shorten it.
+        assert_eq!(
+            put_blob_from_url_timeout(AZURE_PUT_BLOB_FROM_URL_MAX_SIZE, Duration::from_secs(5)),
+            Duration::from_secs(60 + 625)
+        );
+    }
+
+    #[test]
+    fn test_parse_copy_timeout_floor() {
+        assert_eq!(
+            parse_copy_timeout_floor(Some(" 1800 ")),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(parse_copy_timeout_floor(None), Duration::ZERO);
+        assert_eq!(parse_copy_timeout_floor(Some("soon")), Duration::ZERO);
+    }
+
+    /// Accept one connection, read one request's headers, and return them
+    /// with the socket. Put Blob From URL and HEAD carry no body.
+    async fn read_one_request(
+        listener: &tokio::net::TcpListener,
+    ) -> (tokio::net::TcpStream, String) {
+        use tokio::io::AsyncReadExt;
+        let (mut socket, _) = listener.accept().await.expect("accept request");
+        let mut received = Vec::new();
+        let mut buf = [0_u8; 1024];
+        while !received.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = socket.read(&mut buf).await.expect("read request");
+            assert_ne!(n, 0, "client closed before request headers");
+            received.extend_from_slice(&buf[..n]);
+        }
+        (socket, String::from_utf8_lossy(&received).into_owned())
+    }
+
+    /// Azure performs Put Blob From URL before it sends any response byte, so
+    /// copying a large blob leaves the connection silent for as long as the
+    /// copy takes. Through the 30-second read-inactivity timeout of the
+    /// data-plane client, every copy longer than that failed with "Azure Put
+    /// Blob From URL failed: error sending request", although Azure was still
+    /// copying. The copy must wait for the answer.
+    ///
+    /// The clock is paused only once the copy request has reached the server,
+    /// as in `test_large_object_client_builder_does_not_apply_total_timeout`.
+    /// It then moves in two steps: past the 30-second read timeout, where the
+    /// old client failed, and then to the server's answer at 45 seconds.
+    #[tokio::test]
+    async fn test_copy_waits_for_put_blob_from_url_longer_than_read_timeout() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (copy_received_tx, copy_received_rx) = tokio::sync::oneshot::channel::<()>();
+        let (answered_tx, answered_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (mut head_conn, request) = read_one_request(&listener).await;
+            assert!(request.starts_with("HEAD "), "size probe first: {request}");
+            // `Connection: close`, so the copy arrives on a new connection
+            // even when it is sent on the same client as the HEAD.
+            head_conn
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("answer HEAD");
+
+            let (mut copy_conn, request) = read_one_request(&listener).await;
+            assert!(request.starts_with("PUT "), "then the copy: {request}");
+            assert!(
+                request.to_ascii_lowercase().contains("x-ms-copy-source:"),
+                "the copy is Put Blob From URL: {request}"
+            );
+            copy_received_tx.send(()).expect("signal copy received");
+            tokio::time::sleep(Duration::from_secs(45)).await;
+            copy_conn
+                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .expect("answer copy");
+            answered_tx.send(()).expect("signal copy answered");
+        });
+
+        let mut backend = create_cached_rbac_backend_with_endpoint(endpoint);
+        // The clients `AzureBackend::new` builds, minus any proxy from the
+        // environment so the requests reach this test's listener.
+        backend.client = crate::services::http_client::large_object_client_builder(true)
+            .no_proxy()
+            .build()
+            .expect("build data-plane client");
+        backend.copy_client = crate::services::http_client::server_side_copy_client_builder(true)
+            .no_proxy()
+            .build()
+            .expect("build copy client");
+        let copy = tokio::spawn(async move {
+            StorageBackendTrait::copy(&backend, "source/blob.bin", "dest/blob.bin").await
+        });
+
+        // Real time still runs here, so a copy that never reaches the server
+        // fails the test instead of hanging it.
+        tokio::time::timeout(Duration::from_secs(20), copy_received_rx)
+            .await
+            .expect("copy request reached the server in time")
+            .expect("copy request reached the server");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        if copy.is_finished() {
+            panic!(
+                "the copy gave up while Azure was still copying: {:?}",
+                copy.await
+            );
+        }
+        tokio::time::advance(Duration::from_secs(14)).await;
+        answered_rx.await.expect("server answered the copy");
+        // Socket readiness arrives in wall-clock time; see the test named above.
+        tokio::time::resume();
+
+        copy.await
+            .expect("copy task")
+            .expect("copy succeeds once Azure answers");
+        server.await.expect("server task");
+    }
+
+    /// Shared Key backend whose endpoint is `listener`, with the clients
+    /// `AzureBackend::new` builds minus any proxy from the environment.
+    async fn create_shared_key_backend_on(listener: &tokio::net::TcpListener) -> AzureBackend {
+        let endpoint = format!(
+            "http://{}/testaccount",
+            listener.local_addr().expect("local addr")
+        );
+        create_shared_key_backend_at(&endpoint).await
+    }
+
+    /// Shared Key backend on `endpoint`, with the clients `AzureBackend::new`
+    /// builds minus any proxy from the environment.
+    async fn create_shared_key_backend_at(endpoint: &str) -> AzureBackend {
+        let mut backend = create_test_backend_with_endpoint(endpoint).await;
+        backend.client = crate::services::http_client::large_object_client_builder(true)
+            .no_proxy()
+            .build()
+            .expect("build data-plane client");
+        backend.copy_client = crate::services::http_client::server_side_copy_client_builder(true)
+            .no_proxy()
+            .build()
+            .expect("build copy client");
+        backend
+    }
+
+    // -----------------------------------------------------------------------
+    // #5181: Azure's error bodies quote signed strings, so they stay out of
+    // every error message and log line.
+    // -----------------------------------------------------------------------
+
+    /// A signature no request carries, so it can only reach an error by way
+    /// of the response body.
+    const REFUSED_BODY_SIGNATURE: &str = "c2VjcmV0LXNpZ25hdHVyZS01MTgx";
+
+    /// Azure's refusal of a signature: `AuthenticationErrorDetail` quotes the
+    /// string it signed, here `quoted` plus a marker SAS and the rejected
+    /// query parameter elements a malformed SAS gets back.
+    fn refused_signature_body(quoted: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><Error><Code>AuthenticationFailed</Code>\
+             <Message>Server failed to authenticate the request.\nRequestId:r-1</Message>\
+             <QueryParameterName>sig</QueryParameterName>\
+             <QueryParameterValue>{REFUSED_BODY_SIGNATURE}</QueryParameterValue>\
+             <AuthenticationErrorDetail>The MAC signature found in the HTTP request \
+             'bWFj' is not the same as any computed signature. Server used following \
+             string to sign: 'PUT\n\nx-ms-copy-source:https://acct.blob.core.windows.net/\
+             c/src?sv=2021-06-08&amp;se=2099-01-01&amp;sr=b&amp;sp=r&amp;\
+             sig={REFUSED_BODY_SIGNATURE}\n{quoted}'.</AuthenticationErrorDetail></Error>"
+        )
+    }
+
+    /// Answers every request with `status` and a refusal that echoes back the
+    /// signed parts of that very request, as Azure's string to sign does.
+    struct RefusingAzure(u16);
+
+    impl wiremock::Respond for RefusingAzure {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let source = request
+                .headers
+                .get("x-ms-copy-source")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let quoted = format!("{source}\n{}", request.url);
+            wiremock::ResponseTemplate::new(self.0)
+                .insert_header("x-ms-error-code", "AuthenticationFailed")
+                .insert_header("x-ms-request-id", "11111111-2222-3333-4444-555555555555")
+                .set_body_string(refused_signature_body(&quoted))
+        }
+    }
+
+    /// The `sig` value of a signed URL or query string.
+    fn sas_signature(signed: &str) -> Option<String> {
+        signed
+            .split(['?', '&'])
+            .find_map(|pair| pair.strip_prefix("sig="))
+            .map(str::to_string)
+    }
+
+    /// Every SAS signature the mock was actually sent, in the request's URL or
+    /// in its copy source, in both the encoded and the decoded spelling.
+    async fn signatures_sent_to(server: &wiremock::MockServer) -> Vec<String> {
+        let mut signatures = Vec::new();
+        for request in server.received_requests().await.unwrap_or_default() {
+            let source = request
+                .headers
+                .get("x-ms-copy-source")
+                .and_then(|value| value.to_str().ok())
+                .and_then(sas_signature);
+            let url = request.url.query().and_then(sas_signature);
+            for signature in [source, url].into_iter().flatten() {
+                let decoded = urlencoding::decode(&signature)
+                    .expect("signature decodes")
+                    .into_owned();
+                signatures.push(decoded);
+                signatures.push(signature);
+            }
+        }
+        signatures
+    }
+
+    /// Fails if `text` holds a signature, or the signed text Azure quotes.
+    fn assert_no_refused_signature(text: &str, sent: &[String]) {
+        for secret in [
+            REFUSED_BODY_SIGNATURE,
+            "sig=",
+            "QueryParameterValue",
+            "AuthenticationErrorDetail",
+            "string to sign",
+            "x-ms-copy-source",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked into: {text}");
+        }
+        for signature in sent {
+            assert!(!text.contains(signature), "SAS {signature} in: {text}");
+        }
+    }
+
+    /// Collects what a subscriber writes at every level, as the log output.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        /// Installs this buffer as the thread's subscriber until the guard
+        /// drops. `#[tokio::test]` polls on one thread, so the backend's spans
+        /// and events all land here.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone())
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+        }
+    }
+
+    #[test]
+    fn azure_error_detail_keeps_the_code_and_withholds_the_body_5181() {
+        let detail = azure_error_detail_from(
+            &reqwest::header::HeaderMap::new(),
+            &refused_signature_body(""),
+        );
+        assert_eq!(detail, "AuthenticationFailed");
+        assert_no_refused_signature(&detail, &[]);
+    }
+
+    #[test]
+    fn azure_error_detail_reports_the_copy_source_fields_5181() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            ("x-ms-error-code", "CannotVerifyCopySource"),
+            ("x-ms-copy-source-error-code", "AuthorizationFailure"),
+            ("x-ms-copy-source-status-code", "403"),
+            ("x-ms-request-id", "11111111-2222-3333"),
+        ] {
+            headers.insert(name, value.parse().expect("header value"));
+        }
+        assert_eq!(
+            azure_error_detail_from(&headers, "<Error/>"),
+            "CannotVerifyCopySource, copy source code AuthorizationFailure, \
+             copy source status 403, request id 11111111-2222-3333"
+        );
+        assert_eq!(
+            azure_error_detail_from(
+                &reqwest::header::HeaderMap::new(),
+                "<Error><Code>CannotVerifyCopySource</Code>\
+                 <CopySourceErrorCode>AuthorizationFailure</CopySourceErrorCode>\
+                 <CopySourceStatusCode>403</CopySourceStatusCode></Error>"
+            ),
+            "CannotVerifyCopySource, copy source code AuthorizationFailure, copy source status 403"
+        );
+    }
+
+    /// A body that is not Azure's XML, or a "code" that is not a code, says so
+    /// instead of being quoted.
+    #[test]
+    fn azure_error_detail_drops_what_is_not_a_token_5181() {
+        let none = reqwest::header::HeaderMap::new();
+        for body in [
+            "",
+            "upstream connect error sig=abc",
+            "<Error><Code>sig=abc</Code></Error>",
+            "<Error><Code>https://a/c/k?sv=1&amp;sig=abc</Code></Error>",
+            "<Error><Code></Code></Error>",
+            "<Error><Code>AuthenticationFailed",
+        ] {
+            assert_eq!(azure_error_detail_from(&none, body), "no Azure error code");
+        }
+        let long = "A".repeat(AZURE_ERROR_TOKEN_MAX_LEN + 1);
+        assert_eq!(
+            azure_error_detail_from(&none, &format!("<Code>{long}</Code>")),
+            "no Azure error code"
+        );
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ms-error-code", "sig=abc".parse().expect("header value"));
+        assert_eq!(azure_error_detail_from(&headers, ""), "no Azure error code");
+    }
+
+    /// #5181 as it was seen: Azure refuses Put Blob From URL, its body quotes
+    /// the source SAS, and the copy error and the logs must carry the status
+    /// and code and no signature, in both auth modes.
+    #[tokio::test]
+    async fn refused_copy_keeps_the_source_sas_out_of_errors_and_logs_5181() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for shared_key in [true, false] {
+            let logs = CapturedLogs::default();
+            let _subscriber = logs.install();
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(200).insert_header("content-length", "1024"))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(header_exists("x-ms-copy-source"))
+                .respond_with(RefusingAzure(403))
+                .mount(&server)
+                .await;
+            let backend = if shared_key {
+                create_shared_key_backend_at(&server.uri()).await
+            } else {
+                create_cached_rbac_backend_with_endpoint(server.uri())
+            };
+
+            let error = StorageBackendTrait::copy(&backend, "staging/blob", "final/blob")
+                .await
+                .expect_err("a refused signature fails the copy");
+
+            let sent = signatures_sent_to(&server).await;
+            if shared_key {
+                assert!(!sent.is_empty(), "the copy source must be a signed URL");
+            }
+            let message = error.to_string();
+            assert!(message.contains("403"), "status is kept: {message}");
+            assert!(
+                message.contains("AuthenticationFailed"),
+                "the Azure code is kept: {message}"
+            );
+            assert!(
+                message.contains("'staging/blob' to 'final/blob'"),
+                "the blob keys are kept: {message}"
+            );
+            assert_no_refused_signature(&message, &sent);
+            assert_no_refused_signature(&format!("{error:?}"), &sent);
+
+            let logged = logs.text();
+            assert!(
+                logged.contains("AuthenticationFailed"),
+                "the span's `err` record must reach the capture, or this proves nothing: {logged}"
+            );
+            assert_no_refused_signature(&logged, &sent);
+        }
+    }
+
+    /// Every operation that used to quote a response body, against an endpoint
+    /// that refuses each request and echoes its signed URL back. 403 and 500
+    /// because the health check only reads the body on the latter.
+    #[tokio::test]
+    async fn every_azure_operation_withholds_the_refused_body_5181() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use futures::stream;
+        use wiremock::{Mock, MockServer};
+
+        for status in [403, 500] {
+            let logs = CapturedLogs::default();
+            let _subscriber = logs.install();
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(RefusingAzure(status))
+                .mount(&server)
+                .await;
+            let backend = create_shared_key_backend_at(&server.uri()).await;
+            let backend = &backend;
+
+            let errors: Vec<(&str, String)> = vec![
+                (
+                    "put",
+                    StorageBackendTrait::put(backend, "k", Bytes::from_static(b"x"))
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+                (
+                    "get",
+                    StorageBackendTrait::get(backend, "k")
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+                (
+                    "get_range",
+                    StorageBackendTrait::get_range(backend, "k", 0, 1)
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+                (
+                    "get_stream",
+                    StorageBackendTrait::get_stream(backend, "k")
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+                (
+                    "put_stream",
+                    StorageBackendTrait::put_stream(
+                        backend,
+                        "k",
+                        Box::pin(stream::iter([Ok(Bytes::from_static(b"x"))])),
+                    )
+                    .await
+                    .map(drop)
+                    .unwrap_err()
+                    .to_string(),
+                ),
+                (
+                    "exists",
+                    StorageBackendTrait::exists(backend, "k")
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+                (
+                    "exists_at_exact_key",
+                    StorageBackendTrait::exists_at_exact_key(backend, "k")
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+                (
+                    "delete",
+                    StorageBackendTrait::delete(backend, "k")
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+                (
+                    "size",
+                    backend.size("k").await.map(drop).unwrap_err().to_string(),
+                ),
+                (
+                    "list",
+                    backend.list(None).await.map(drop).unwrap_err().to_string(),
+                ),
+                (
+                    "health_check",
+                    StorageBackendTrait::health_check(backend)
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+            ];
+
+            let sent = signatures_sent_to(&server).await;
+            assert!(!sent.is_empty(), "the reads must use a signed URL");
+            for (operation, message) in &errors {
+                assert!(
+                    message.contains(&status.to_string()),
+                    "{operation} keeps the status: {message}"
+                );
+                if !(*operation == "health_check" && status == 403) {
+                    assert!(
+                        message.contains("AuthenticationFailed"),
+                        "{operation} keeps the Azure code: {message}"
+                    );
+                }
+                assert_no_refused_signature(message, &sent);
+            }
+            assert_no_refused_signature(&logs.text(), &sent);
+        }
+    }
+
+    /// The commit step of a streamed upload, past a Put Block that succeeded.
+    #[tokio::test]
+    async fn refused_block_list_commit_withholds_the_body_5181() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use futures::stream;
+        use wiremock::matchers::{method, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let logs = CapturedLogs::default();
+        let _subscriber = logs.install();
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(query_param("comp", "block"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("comp", "blocklist"))
+            .respond_with(RefusingAzure(403))
+            .mount(&server)
+            .await;
+        let backend = create_shared_key_backend_at(&server.uri()).await;
+
+        let message = StorageBackendTrait::put_stream(
+            &backend,
+            "k",
+            Box::pin(stream::iter([Ok(Bytes::from_static(b"x"))])),
+        )
+        .await
+        .map(drop)
+        .unwrap_err()
+        .to_string();
+
+        let sent = signatures_sent_to(&server).await;
+        assert!(message.contains("Put Block List"), "{message}");
+        assert!(message.contains("AuthenticationFailed"), "{message}");
+        assert_no_refused_signature(&message, &sent);
+        assert_no_refused_signature(&logs.text(), &sent);
+    }
+
+    /// The migration-mode fallback probes, which report on a second URL: the
+    /// primary path misses and the fallback path is refused.
+    #[tokio::test]
+    async fn refused_fallback_probes_withhold_the_body_5181() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let key = format!("repos/generic/{checksum}");
+        let server = MockServer::start().await;
+        Mock::given(path(format!("/testcontainer/{key}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/testcontainer/ab/{checksum}")))
+            .respond_with(RefusingAzure(403))
+            .mount(&server)
+            .await;
+        let backend = create_cached_rbac_backend_with_endpoint_and_path_format(
+            server.uri(),
+            StoragePathFormat::Migration,
+        );
+
+        for message in [
+            StorageBackendTrait::exists(&backend, &key)
+                .await
+                .map(drop)
+                .unwrap_err()
+                .to_string(),
+            StorageBackendTrait::get_range(&backend, &key, 0, 1)
+                .await
+                .map(drop)
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(message.contains("fallback"), "{message}");
+            assert!(message.contains("AuthenticationFailed"), "{message}");
+            assert_no_refused_signature(&message, &[]);
+        }
+    }
+
+    /// A 200 that is not a listing is echoed nowhere either.
+    #[test]
+    fn list_blobs_non_listing_withholds_the_body_5181() {
+        let message = parse_list_blobs_result(&refused_signature_body("sig=quoted"))
+            .expect_err("an error document is not a listing")
+            .to_string();
+        assert!(message.contains("AuthenticationFailed"), "{message}");
+        assert_no_refused_signature(&message, &[]);
+    }
+
+    fn assert_no_sas_query(message: &str) {
+        for field in ["sig=", "sp=", "sv=", "se="] {
+            assert!(
+                !message.contains(field),
+                "error message must not carry the request's query string ({field}): {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_error_leaves_out_the_request_url() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        // Port 0 cannot be connected to, so the request fails in transport.
+        let err = client
+            .get("http://127.0.0.1:0/c/k?sv=2021-06-08&sr=b&sp=cw&sig=c2lnbmF0dXJl")
+            .send()
+            .await
+            .expect_err("connecting to port 0 fails");
+        assert!(
+            err.to_string().contains("sig="),
+            "reqwest names the URL: {err}"
+        );
+
+        let message = request_error("Azure upload failed", err).to_string();
+        assert!(message.contains("Azure upload failed: "), "{message}");
+        assert!(!message.contains("127.0.0.1"), "{message}");
+        assert_no_sas_query(&message);
+    }
+
+    /// The text of a transport error names the request URL, and in Shared Key
+    /// mode that URL is signed. The message returned to the caller keeps the
+    /// operation and the transport error only.
+    #[tokio::test]
+    async fn test_copy_transport_error_omits_request_query_string() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let backend = create_shared_key_backend_on(&listener).await;
+
+        let server = tokio::spawn(async move {
+            let (mut head_conn, request) = read_one_request(&listener).await;
+            assert!(request.starts_with("HEAD "), "size probe first: {request}");
+            head_conn
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("answer HEAD");
+            let (copy_conn, request) = read_one_request(&listener).await;
+            assert!(request.starts_with("PUT "), "then the copy: {request}");
+            assert!(
+                request.contains("sig="),
+                "Shared Key copy URL is signed: {request}"
+            );
+            // Close the connection without answering.
+            drop(copy_conn);
+        });
+
+        let err = StorageBackendTrait::copy(&backend, "source/blob.bin", "dest/blob.bin")
+            .await
+            .expect_err("a dropped copy connection fails the copy");
+        server.await.expect("server task");
+        let message = err.to_string();
+        assert!(
+            message.contains("Azure Put Blob From URL failed"),
+            "the operation is still named: {message}"
+        );
+        assert_no_sas_query(&message);
+    }
+
+    #[tokio::test]
+    async fn test_download_transport_error_omits_request_query_string() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let backend = create_shared_key_backend_on(&listener).await;
+        // Nothing listens any more, so the request fails to connect.
+        drop(listener);
+
+        let err = StorageBackendTrait::get(&backend, "some/blob.bin")
+            .await
+            .expect_err("a refused connection fails the download");
+        let message = err.to_string();
+        assert!(
+            message.contains("Azure download failed"),
+            "the operation is still named: {message}"
+        );
+        assert_no_sas_query(&message);
+    }
+
+    /// #4320: an endpoint that answers Put Blob From URL with 501 Not
+    /// Implemented (Azurite) gets the streamed copy, so the proxy cache's
+    /// staging-to-live publish still lands there. Any other failure status
+    /// still fails the copy.
+    #[tokio::test]
+    async fn test_copy_streams_when_put_blob_from_url_is_not_implemented_4320() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{header_exists, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (status, expect_ok) in [(501u16, true), (500u16, false)] {
+            let server = MockServer::start().await;
+            let source_path = "/testcontainer/proxy-cache-staging/x";
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "10"))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(source_path))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_bytes(Vec::from(&b"small-copy"[..])),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(header_exists("x-ms-copy-source"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("<Error/>"))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(query_param("comp", "block"))
+                .respond_with(ResponseTemplate::new(201))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(query_param("comp", "blocklist"))
+                .respond_with(ResponseTemplate::new(201))
+                .mount(&server)
+                .await;
+
+            let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+            let result =
+                StorageBackendTrait::copy(&backend, "proxy-cache-staging/x", "proxy-cache/r/p")
+                    .await;
+            let requests = server.received_requests().await.unwrap_or_default();
+            let committed = requests.iter().any(|request| {
+                request
+                    .url
+                    .query_pairs()
+                    .any(|(key, value)| key == "comp" && value == "blocklist")
+            });
+            if expect_ok {
+                result.expect("a 501 falls back to the streamed copy");
+                assert!(committed, "the streamed copy commits the destination");
+            } else {
+                assert!(result.is_err(), "a 500 is a copy failure, not a fallback");
+                assert!(!committed);
+            }
+        }
     }
 
     #[tokio::test]
@@ -3265,6 +4914,7 @@ mod tests {
         config.redirect_downloads = true;
         let backend = AzureBackend {
             config,
+            copy_client: client.clone(),
             client,
             auth: AzureAuthMode::TokenCredential {
                 provider: Arc::new(provider),
@@ -3402,6 +5052,7 @@ mod tests {
         config.endpoint = Some("https://gov.blob.core.usgovcloudapi.net".to_string());
         let backend = AzureBackend {
             config,
+            copy_client: client.clone(),
             client,
             auth: AzureAuthMode::TokenCredential {
                 provider: Arc::new(provider),
@@ -3425,6 +5076,7 @@ mod tests {
         };
         let backend = AzureBackend {
             config: create_rbac_config(),
+            copy_client: client.clone(),
             client,
             auth: AzureAuthMode::TokenCredential {
                 provider: Arc::new(provider),

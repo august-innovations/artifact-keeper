@@ -2,10 +2,14 @@
 //!
 //! Provides Kubernetes-style probes:
 //! - `/livez`   - lightweight liveness (process alive, no external deps)
-//! - `/readyz`  - readiness gate (DB + migrations reachable). Initial-setup
-//!   state (admin password change required) is reported as an informational
-//!   field but does NOT cause a 503. A 503 here would make Kubernetes restart
-//!   the pod and prevent operators from completing setup via `kubectl exec`.
+//! - `/readyz`  - readiness gate: "this replica can serve artifacts", i.e. the
+//!   database is reachable and migrations have applied. Initial-setup state
+//!   (admin password change required) is reported as an informational field
+//!   but does NOT cause a 503. A 503 here would make Kubernetes restart the
+//!   pod and prevent operators from completing setup via `kubectl exec`. The
+//!   other dependencies (OpenSearch, storage, scanner, LDAP) are reported in a
+//!   `dependencies` object without gating, except that
+//!   `READYZ_REQUIRE_SEARCH=true` makes an unhealthy OpenSearch a 503 (#4610).
 //! - `/health`  - rich status page for dashboards (all services + pool stats)
 //! - `/healthz` - alias for `/health`
 //!
@@ -22,6 +26,7 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use once_cell::sync::Lazy;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -61,6 +66,26 @@ pub struct HealthResponse {
     pub commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dirty: Option<bool>,
+    /// Storage backends that were configured but skipped at startup because of
+    /// a configuration error (#4530). Empty on a healthy deployment and omitted
+    /// then; a non-empty list makes the overall status `unhealthy` and names
+    /// each backend with the error that skipped it. These are also reported to
+    /// the admin `GET /api/v1/admin/storage-backends` availability list as
+    /// unavailable, so a repository on one of them does not look routable.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_storage_backends: Vec<SkippedStorageBackend>,
+}
+
+/// One storage backend that was configured but skipped at startup (#4530).
+#[derive(Serialize, ToSchema)]
+pub struct SkippedStorageBackend {
+    /// Backend name (`s3`, `azure`, `gcs`), the value a repository's
+    /// `storage_backend` names.
+    pub backend: String,
+    /// The configuration error that skipped it, safe to publish: it names the
+    /// environment variable and why its value was refused, never credentials
+    /// (the public-endpoint parser redacts userinfo, #4503).
+    pub error: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -93,6 +118,228 @@ pub struct LivezResponse {
 pub struct ReadyzResponse {
     pub status: String,
     pub checks: ReadyzChecks,
+    /// Every other dependency `/health` probes, always present, so a probe
+    /// reader sees degradation without `EXPOSE_DETAILED_HEALTH` (#4610).
+    /// Each says whether it gates readiness (`required`).
+    pub dependencies: ReadyzDependencies,
+    /// The checks or dependencies that made this replica not ready. Omitted
+    /// when ready.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failing: Vec<String>,
+    /// Dependencies that are unhealthy but do not gate readiness (#5649,
+    /// #5650): storage while the object store is unreachable or full, and
+    /// equally OpenSearch, the scanner or LDAP when unhealthy and not
+    /// required. The replica stays ready, since every replica shares the same
+    /// store and pulling them all would only turn a storage outage into a
+    /// total one, but a probe reader sees the degradation without reading
+    /// each dependency. Omitted when nothing is degraded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
+}
+
+/// Status of one dependency on `/readyz`.
+///
+/// `status` is `healthy`, `unhealthy` or `not_configured`; `required` says
+/// whether it gates readiness on this deployment. `message` (the probe's
+/// error text) is only included when `EXPOSE_DETAILED_HEALTH` is on, because
+/// it can name internal hosts.
+#[derive(Serialize, ToSchema, Clone, Debug)]
+pub struct DependencyStatus {
+    pub status: String,
+    pub required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// The dependencies `/readyz` reports (#4610).
+#[derive(Serialize, ToSchema, Clone, Debug)]
+pub struct ReadyzDependencies {
+    pub opensearch: DependencyStatus,
+    pub storage: DependencyStatus,
+    pub scanner: DependencyStatus,
+    pub ldap: DependencyStatus,
+}
+
+/// Status string for an optional dependency this deployment does not use.
+const STATUS_NOT_CONFIGURED: &str = "not_configured";
+
+/// How long `/readyz` waits for any one dependency probe. Probes run
+/// concurrently and share the `/health` TTL caches, so a dead dependency
+/// costs the probe at most this long, once per cache window.
+const READYZ_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(2);
+
+impl DependencyStatus {
+    fn not_configured(required: bool) -> Self {
+        Self {
+            status: STATUS_NOT_CONFIGURED.to_string(),
+            required,
+            message: None,
+        }
+    }
+
+    /// Fold a probe result into the `/readyz` vocabulary: anything that is
+    /// not `healthy` (the probes also say `unavailable` or `unknown`) is
+    /// `unhealthy`.
+    fn from_check(check: CheckStatus, required: bool, detailed: bool) -> Self {
+        let healthy = check.status == STATUS_HEALTHY;
+        Self {
+            status: if healthy {
+                STATUS_HEALTHY
+            } else {
+                STATUS_UNHEALTHY
+            }
+            .to_string(),
+            required,
+            message: if detailed { check.message } else { None },
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.status == STATUS_HEALTHY
+    }
+}
+
+/// How much later than the probe deadline the outer `/readyz` deadline (the
+/// one that bounds the cache-lock wait) fires. It must never fire first: that
+/// would drop the cached probe before it stores its timed-out result (#4781).
+const READYZ_LOCK_WAIT_MARGIN: Duration = Duration::from_millis(100);
+
+/// Run `probe` until `deadline`; a timeout is an unhealthy result.
+async fn with_readyz_deadline<F>(
+    name: &str,
+    deadline: tokio::time::Instant,
+    probe: F,
+) -> CheckStatus
+where
+    F: std::future::Future<Output = CheckStatus>,
+{
+    match tokio::time::timeout_at(deadline, probe).await {
+        Ok(check) => check,
+        Err(_) => CheckStatus {
+            status: STATUS_UNHEALTHY.to_string(),
+            message: Some(format!(
+                "{name} probe timed out ({}s)",
+                READYZ_DEPENDENCY_TIMEOUT.as_secs()
+            )),
+        },
+    }
+}
+
+/// Serve a `/readyz` dependency probe through its `/health` cache, with the
+/// deadline applied INSIDE the cached probe, so a hung dependency's timeout
+/// is cached for the TTL like any other result instead of costing every
+/// `/readyz` the full deadline. The outer deadline bounds the wait for the
+/// cache lock when a slower `/health` probe of the same dependency holds it.
+///
+/// Both deadlines derive from one `Instant` taken before the lock wait, and
+/// the outer one is [`READYZ_LOCK_WAIT_MARGIN`] later, so the inner timeout
+/// always fires first and its result is stored. Two independent
+/// `timeout(READYZ_DEPENDENCY_TIMEOUT)` calls raced: the inner timer starts
+/// only once the lock is held, so the outer could fire first and drop the
+/// probe before the store (#4781).
+async fn readyz_cached<F, Fut>(
+    name: &str,
+    cache: &HealthCache,
+    ttl: Duration,
+    probe: F,
+) -> CheckStatus
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = CheckStatus>,
+{
+    let deadline = tokio::time::Instant::now() + READYZ_DEPENDENCY_TIMEOUT;
+    with_readyz_deadline(
+        name,
+        deadline + READYZ_LOCK_WAIT_MARGIN,
+        cached_check(cache, ttl, || with_readyz_deadline(name, deadline, probe())),
+    )
+    .await
+}
+
+/// Probe every dependency the detailed health knows about, concurrently, each
+/// through its `/health` cache and under [`READYZ_DEPENDENCY_TIMEOUT`].
+async fn probe_readyz_dependencies(state: &crate::api::AppState) -> ReadyzDependencies {
+    let detailed = state.config.expose_detailed_health;
+    let require_search = state.config.readyz_require_search;
+
+    let opensearch = async {
+        match &state.search_service {
+            Some(svc) => DependencyStatus::from_check(
+                readyz_cached(
+                    "OpenSearch",
+                    &OPENSEARCH_HEALTH_CACHE,
+                    DEPENDENCY_HEALTH_TTL,
+                    || probe_opensearch_health(svc),
+                )
+                .await,
+                require_search,
+                detailed,
+            ),
+            // OPENSEARCH_URL is set but startup could not reach the cluster,
+            // so the server runs without search until it restarts. That is
+            // an unhealthy dependency, not an unconfigured one.
+            None if state.config.opensearch_url.is_some() => DependencyStatus::from_check(
+                CheckStatus {
+                    status: STATUS_UNHEALTHY.to_string(),
+                    message: Some(
+                        "OpenSearch is configured but was unreachable at startup; \
+                         search stays disabled until the server restarts"
+                            .to_string(),
+                    ),
+                },
+                require_search,
+                detailed,
+            ),
+            None => DependencyStatus::not_configured(require_search),
+        }
+    };
+    let storage = async {
+        DependencyStatus::from_check(
+            readyz_cached("Storage", &STORAGE_HEALTH_CACHE, STORAGE_HEALTH_TTL, || {
+                probe_storage_health(&state.config, &state.storage)
+            })
+            .await,
+            false,
+            detailed,
+        )
+    };
+    let scanner = async {
+        match &state.config.trivy_url {
+            Some(url) => DependencyStatus::from_check(
+                readyz_cached(
+                    "Scanner",
+                    &SCANNER_HEALTH_CACHE,
+                    DEPENDENCY_HEALTH_TTL,
+                    || check_service_health(url, "/healthz", "Trivy"),
+                )
+                .await,
+                false,
+                detailed,
+            ),
+            None => DependencyStatus::not_configured(false),
+        }
+    };
+    let ldap = async {
+        if state.config.ldap_url.is_some() {
+            DependencyStatus::from_check(
+                readyz_cached("LDAP", &LDAP_HEALTH_CACHE, DEPENDENCY_HEALTH_TTL, || {
+                    probe_ldap_health(&state.db, &state.config)
+                })
+                .await,
+                false,
+                detailed,
+            )
+        } else {
+            DependencyStatus::not_configured(false)
+        }
+    };
+    let (opensearch, storage, scanner, ldap) = tokio::join!(opensearch, storage, scanner, ldap);
+    ReadyzDependencies {
+        opensearch,
+        storage,
+        scanner,
+        ldap,
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -266,12 +513,23 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         .as_ref()
         .is_none_or(|c| c.status == STATUS_HEALTHY);
 
-    let overall_status =
-        if db_check.status == STATUS_HEALTHY && storage_healthy && opensearch_healthy {
-            STATUS_HEALTHY
-        } else {
-            STATUS_UNHEALTHY
-        };
+    // #4530: a backend that was configured but skipped at startup is a
+    // deployment-level degradation even though the primary probe passes. A
+    // repository on the skipped backend fails every request, so the operator
+    // must see it here rather than only in a startup log line.
+    let skipped_storage_backends =
+        skipped_storage_backends(state.storage_registry.skipped_backends());
+    let storage_backends_healthy = skipped_storage_backends.is_empty();
+
+    let overall_status = if db_check.status == STATUS_HEALTHY
+        && storage_healthy
+        && storage_backends_healthy
+        && opensearch_healthy
+    {
+        STATUS_HEALTHY
+    } else {
+        STATUS_UNHEALTHY
+    };
 
     let pool_stats = DbPoolStats {
         max_connections: state.db.options().get_max_connections(),
@@ -311,6 +569,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         db_pool,
         commit,
         dirty,
+        skipped_storage_backends,
     };
 
     let status_code = if overall_status == STATUS_HEALTHY {
@@ -324,8 +583,13 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
 
 /// Readiness probe - is the service ready to accept traffic?
 ///
-/// Returns 200 once the database is reachable and migrations have applied
-/// successfully. Initial-setup state (whether the default admin password has
+/// Ready means "can serve artifacts": 200 once the database is reachable and
+/// migrations have applied successfully. OpenSearch, storage, the scanner and
+/// LDAP are probed too (concurrently, cached, at most
+/// [`READYZ_DEPENDENCY_TIMEOUT`] each) and reported under `dependencies`, but
+/// do not gate readiness: artifact serving works without them. With
+/// `READYZ_REQUIRE_SEARCH=true` an unhealthy or unconfigured OpenSearch makes
+/// this a 503 that names it under `failing` (#4610). Initial-setup state (whether the default admin password has
 /// been changed) is reported as an informational field on the response but
 /// does NOT influence the status code: a 503 here would make Kubernetes
 /// restart the pod, terminating any `kubectl exec` session an operator is
@@ -379,7 +643,12 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
     let setup_required = state
         .setup_required
         .load(std::sync::atomic::Ordering::Relaxed);
-    let (status_code, response) = build_readyz_response(db_check, migrations_check, setup_required);
+    let dependencies = probe_readyz_dependencies(&state).await;
+    let (status_code, response) =
+        build_readyz_response(db_check, migrations_check, setup_required, dependencies);
+    if !response.failing.is_empty() {
+        tracing::warn!(failing = ?response.failing, "/readyz: not ready");
+    }
 
     if setup_required {
         tracing::debug!("/readyz: setup incomplete (informational, not blocking readiness)");
@@ -401,10 +670,14 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
 /// changed" so dashboards and operators can see the condition, but it is
 /// intentionally excluded from the readiness gate (see #889 - restarting
 /// the pod here makes setup impossible via `kubectl exec`).
+///
+/// `dependencies` carries each dependency's `required` flag, so the
+/// `READYZ_REQUIRE_SEARCH` decision is made by the caller that built them.
 fn build_readyz_response(
     db_check: CheckStatus,
     migrations_check: CheckStatus,
     setup_required: bool,
+    dependencies: ReadyzDependencies,
 ) -> (StatusCode, ReadyzResponse) {
     let setup_check = if setup_required {
         CheckStatus {
@@ -418,7 +691,28 @@ fn build_readyz_response(
         }
     };
 
-    let ready = is_ready(&db_check, &migrations_check);
+    let mut failing = Vec::new();
+    let mut degraded = Vec::new();
+    if db_check.status != STATUS_HEALTHY {
+        failing.push("database".to_string());
+    }
+    if migrations_check.status != STATUS_HEALTHY {
+        failing.push("migrations".to_string());
+    }
+    for (name, dep) in [
+        ("opensearch", &dependencies.opensearch),
+        ("storage", &dependencies.storage),
+        ("scanner", &dependencies.scanner),
+        ("ldap", &dependencies.ldap),
+    ] {
+        if dep.required && !dep.is_healthy() {
+            failing.push(name.to_string());
+        } else if !dep.required && dep.status == STATUS_UNHEALTHY {
+            degraded.push(name.to_string());
+        }
+    }
+
+    let ready = is_ready(&db_check, &migrations_check) && failing.is_empty();
 
     let response = ReadyzResponse {
         status: if ready {
@@ -431,6 +725,9 @@ fn build_readyz_response(
             migrations: migrations_check,
             setup_complete: setup_check,
         },
+        dependencies,
+        failing,
+        degraded,
     };
 
     let status_code = if ready {
@@ -597,6 +894,23 @@ impl Clone for CheckStatus {
     }
 }
 
+/// Build the `/health` list of backends that were configured but skipped at
+/// startup (#4530), sorted by name so the body is stable across scrapes.
+///
+/// Pure (no state or I/O) so the ordering and shape are unit-testable without
+/// a `SharedState`.
+fn skipped_storage_backends(skipped: &HashMap<String, String>) -> Vec<SkippedStorageBackend> {
+    let mut entries: Vec<SkippedStorageBackend> = skipped
+        .iter()
+        .map(|(backend, error)| SkippedStorageBackend {
+            backend: backend.clone(),
+            error: error.clone(),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.backend.cmp(&b.backend));
+    entries
+}
+
 /// Verify storage backend connectivity, behind a short-TTL cache.
 ///
 /// The actual probe lives in [`probe_storage_health`]; this wrapper collapses
@@ -721,8 +1035,85 @@ async fn probe_ldap_health(db: &sqlx::PgPool, config: &crate::config::Config) ->
 /// 503 under concurrency.
 ///
 /// S3, GCS, Azure: perform a real API call via the storage backend's
-/// `health_check()` method, with a 5-second timeout.
+/// `health_check()` method, bounded by [`STORAGE_PROBE_TIMEOUT`].
+/// Unhealthy filesystem-storage status that names the failed step but not the
+/// error (#3907).
+///
+/// The `std::io::Error` behind a failed `canonicalize` or probe write carries
+/// the OS error text, and the step itself runs against the configured storage
+/// path, so echoing it into the detailed health payload is the same leak class
+/// #3718 closed for format handlers. The fixed `message` is enough for a probe
+/// consumer to tell the two failure modes apart; the raw error goes to the
+/// server log, at warn because a failing probe repeats on every health poll.
+fn unhealthy_filesystem_storage(message: &'static str, error: &std::io::Error) -> CheckStatus {
+    tracing::warn!(error = %error, check = "storage", "{message}");
+    CheckStatus {
+        status: STATUS_UNHEALTHY.to_string(),
+        message: Some(message.to_string()),
+    }
+}
+
+/// Replace every URL in a storage error with `<url>`, keeping only the
+/// product documentation link and the `example.com` placeholders the S3
+/// diagnostics quote as guidance. The health endpoints are unauthenticated,
+/// so a storage endpoint, bucket or key must never reach them.
+fn redact_storage_urls(text: &str) -> String {
+    static URL: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r#"(?i)\bhttps?://[^\s"'<>]+"#).expect("static regex"));
+    URL.replace_all(text, |caps: &regex::Captures<'_>| {
+        let url = &caps[0];
+        let host = url
+            .split_once("://")
+            .map(|(_, rest)| rest.split(['/', ':', '?', '#']).next().unwrap_or(""))
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if host == "artifactkeeper.com" || host == "example.com" || host.ends_with(".example.com") {
+            url.to_string()
+        } else {
+            "<url>".to_string()
+        }
+    })
+    .into_owned()
+}
+
+/// How long the storage probe may take before the check reports the backend
+/// unhealthy (#5649). The probe is one small write (filesystem) or one HEAD
+/// (object stores). Two seconds matches `/readyz`'s per-dependency deadline
+/// ([`READYZ_DEPENDENCY_TIMEOUT`]) and leaves room for a cross-region HEAD or
+/// a credential refresh (IRSA, instance profile) without flapping, while
+/// still reporting a stalled store promptly.
+const STORAGE_PROBE_TIMEOUT: Duration = READYZ_DEPENDENCY_TIMEOUT;
+
+/// Message for a storage check that a refused write marked degraded (#5650).
+const STORAGE_FULL_CHECK_MESSAGE: &str =
+    "storage backend refused writes for lack of space within the last 60s";
+
+/// Probe the storage backend, then fold in what requests saw (#5650).
+///
+/// A connectivity probe cannot see a full bucket: the HEAD still succeeds.
+/// Writes refused for lack of space are recorded where they are answered
+/// (`507 STORAGE_FULL`, see [`crate::storage::failure`]), and for
+/// [`crate::storage::failure::STORAGE_FULL_SIGNAL_WINDOW`] after the last one
+/// the check is unhealthy even when the probe passes.
 async fn probe_storage_health(
+    config: &crate::config::Config,
+    storage: &Arc<dyn StorageBackend>,
+) -> CheckStatus {
+    let probed = probe_storage_connectivity(config, storage).await;
+    if probed.status == STATUS_HEALTHY
+        && crate::storage::failure::refused_for_space_within(
+            crate::storage::failure::STORAGE_FULL_SIGNAL_WINDOW,
+        )
+    {
+        return CheckStatus {
+            status: STATUS_UNHEALTHY.to_string(),
+            message: Some(STORAGE_FULL_CHECK_MESSAGE.to_string()),
+        };
+    }
+    probed
+}
+
+async fn probe_storage_connectivity(
     config: &crate::config::Config,
     storage: &Arc<dyn StorageBackend>,
 ) -> CheckStatus {
@@ -732,12 +1123,7 @@ async fn probe_storage_health(
             // canonicalize and verify the probe stays under the base dir.
             let storage_base = match std::path::Path::new(&config.storage_path).canonicalize() {
                 Ok(p) => p,
-                Err(e) => {
-                    return CheckStatus {
-                        status: STATUS_UNHEALTHY.to_string(),
-                        message: Some(format!("Storage path not accessible: {}", e)),
-                    };
-                }
+                Err(e) => return unhealthy_filesystem_storage("Storage path not accessible", &e),
             };
             // Unique per-call probe filename so concurrent /health requests
             // never share a file (which previously caused spurious 503s).
@@ -752,41 +1138,56 @@ async fn probe_storage_health(
             // matter (RO/full/unmounted/perms). Read-back is intentionally
             // dropped: it added nothing a liveness probe needs and was the
             // source of the cross-request data dependency.
-            match tokio::fs::write(&probe_path, b"ok").await {
-                Ok(()) => {
+            match tokio::time::timeout(STORAGE_PROBE_TIMEOUT, tokio::fs::write(&probe_path, b"ok"))
+                .await
+            {
+                Ok(Ok(())) => {
                     let _ = tokio::fs::remove_file(&probe_path).await;
                     CheckStatus {
                         status: STATUS_HEALTHY.to_string(),
                         message: None,
                     }
                 }
-                Err(e) => CheckStatus {
+                Ok(Err(e)) => unhealthy_filesystem_storage("Storage write failed", &e),
+                // A hung volume (a stalled NFS mount) blocks every request
+                // that touches it; report it rather than waiting with it.
+                Err(_) => CheckStatus {
                     status: STATUS_UNHEALTHY.to_string(),
-                    message: Some(format!("Storage write failed: {}", e)),
+                    message: Some(format!(
+                        "Storage write timed out ({}s)",
+                        STORAGE_PROBE_TIMEOUT.as_secs()
+                    )),
                 },
             }
         }
         "s3" | "gcs" | "azure" => {
-            // Perform a real connectivity probe with a 5-second timeout so a
-            // slow or hung backend does not block the health endpoint.
+            // Perform a real connectivity probe, bounded by
+            // STORAGE_PROBE_TIMEOUT, so a slow or hung backend does not block
+            // the health endpoint (#5649).
             let probe = storage.health_check();
-            match tokio::time::timeout(Duration::from_secs(5), probe).await {
+            match tokio::time::timeout(STORAGE_PROBE_TIMEOUT, probe).await {
                 Ok(Ok(())) => CheckStatus {
                     status: STATUS_HEALTHY.to_string(),
                     message: None,
                 },
+                // /health and /healthz are unauthenticated, so the message
+                // must never name the storage endpoint, bucket or key. Each
+                // backend keeps request URLs out of its errors; this strips
+                // any URL that still slips through.
                 Ok(Err(e)) => CheckStatus {
                     status: STATUS_UNHEALTHY.to_string(),
                     message: Some(format!(
                         "{} storage probe failed: {}",
-                        config.storage_backend, e
+                        config.storage_backend,
+                        redact_storage_urls(&e.to_string())
                     )),
                 },
                 Err(_) => CheckStatus {
                     status: STATUS_UNHEALTHY.to_string(),
                     message: Some(format!(
-                        "{} storage probe timed out (5s)",
-                        config.storage_backend
+                        "{} storage probe timed out ({}s)",
+                        config.storage_backend,
+                        STORAGE_PROBE_TIMEOUT.as_secs()
                     )),
                 },
             }
@@ -957,7 +1358,10 @@ pub async fn memory_stats() -> impl IntoResponse {
         DbPoolStats,
         LivezResponse,
         ReadyzResponse,
-        ReadyzChecks
+        ReadyzChecks,
+        ReadyzDependencies,
+        DependencyStatus,
+        SkippedStorageBackend
     ))
 )]
 pub struct HealthApiDoc;
@@ -982,6 +1386,15 @@ mod tests {
     // rather than constructing a setup CheckStatus by hand, which avoids
     // the issue inside this module; the comment is here to warn anyone
     // adding new tests that bypass `build_readyz_response`.
+
+    fn no_dependencies() -> ReadyzDependencies {
+        ReadyzDependencies {
+            opensearch: DependencyStatus::not_configured(false),
+            storage: DependencyStatus::not_configured(false),
+            scanner: DependencyStatus::not_configured(false),
+            ldap: DependencyStatus::not_configured(false),
+        }
+    }
 
     fn healthy_check() -> CheckStatus {
         CheckStatus {
@@ -1182,6 +1595,7 @@ mod tests {
             db_pool,
             commit,
             dirty,
+            skipped_storage_backends: Vec::new(),
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"status\":\"healthy\""));
@@ -1211,6 +1625,7 @@ mod tests {
             db_pool: Some(sample_pool_stats()),
             commit: None,
             dirty: None,
+            skipped_storage_backends: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1243,6 +1658,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            skipped_storage_backends: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1265,6 +1681,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            skipped_storage_backends: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1307,6 +1724,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            skipped_storage_backends: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1346,6 +1764,9 @@ mod tests {
                 migrations: healthy_check(),
                 setup_complete: setup_complete_check(),
             },
+            dependencies: no_dependencies(),
+            failing: Vec::new(),
+            degraded: Vec::new(),
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"status\":\"ready\""));
@@ -1364,6 +1785,9 @@ mod tests {
                 migrations: unhealthy_check("No successful migrations found"),
                 setup_complete: setup_complete_check(),
             },
+            dependencies: no_dependencies(),
+            failing: vec!["migrations".to_string()],
+            degraded: Vec::new(),
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"not_ready\""));
@@ -1385,6 +1809,7 @@ mod tests {
             healthy_check(),
             healthy_check(),
             true, // setup_required
+            no_dependencies(),
         );
 
         // The actual handler decision: 200 OK, status="ready".
@@ -1411,6 +1836,7 @@ mod tests {
             healthy_check(),
             healthy_check(),
             false, // setup_required
+            no_dependencies(),
         );
 
         assert_eq!(status_code, StatusCode::OK);
@@ -1429,6 +1855,7 @@ mod tests {
                 unhealthy_check("Database unreachable: timeout"),
                 healthy_check(),
                 setup_required,
+                no_dependencies(),
             );
             assert_eq!(
                 status_code,
@@ -1449,6 +1876,7 @@ mod tests {
                 healthy_check(),
                 unhealthy_check("No successful migrations found"),
                 setup_required,
+                no_dependencies(),
             );
             assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(response.status, "not_ready");
@@ -1538,6 +1966,121 @@ mod tests {
         }
     }
 
+    /// Mock storage backend whose probe never answers: an object store that
+    /// accepts the connection and then stalls (#5649).
+    struct HangingMockBackend;
+
+    #[async_trait]
+    impl crate::storage::StorageBackend for HangingMockBackend {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Ok(Bytes::new())
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> crate::error::Result<()> {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
+    }
+
+    /// #5649: a stalled object store is reported unhealthy within the 2s
+    /// probe bound, not after the 5s it used to take.
+    #[tokio::test]
+    async fn test_storage_probe_is_bounded_to_two_seconds_5649() {
+        crate::storage::failure::reset_failure_signal();
+        let config = test_config("s3");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HangingMockBackend);
+        let started = Instant::now();
+        let status = probe_storage_health(&config, &storage).await;
+        let took = started.elapsed();
+        assert_eq!(status.status, STATUS_UNHEALTHY);
+        assert!(
+            took < Duration::from_millis(2500),
+            "a stalled store must fail the probe within ~2s, took {took:?}"
+        );
+        assert!(status.message.unwrap().contains("timed out (2s)"));
+    }
+
+    /// #5650: a bucket at its quota still answers the connectivity probe, so
+    /// the storage check is degraded by the writes that were refused, and
+    /// clears once none has been refused for the signal window.
+    #[tokio::test]
+    async fn test_storage_check_is_degraded_after_an_out_of_space_refusal_5650() {
+        let config = test_config("s3");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
+        crate::storage::failure::reset_failure_signal();
+        assert_eq!(
+            probe_storage_health(&config, &storage).await.status,
+            STATUS_HEALTHY
+        );
+
+        // A 507 answered to a client is what records the refusal.
+        let refused = crate::error::AppError::Storage(
+            crate::storage::StorageFailure::Full.tag("Failed to put object"),
+        );
+        let _ = axum::response::IntoResponse::into_response(refused);
+        let degraded = probe_storage_health(&config, &storage).await;
+        assert_eq!(degraded.status, STATUS_UNHEALTHY);
+        assert_eq!(
+            degraded.message.as_deref(),
+            Some(STORAGE_FULL_CHECK_MESSAGE)
+        );
+
+        crate::storage::failure::reset_failure_signal();
+        assert_eq!(
+            probe_storage_health(&config, &storage).await.status,
+            STATUS_HEALTHY,
+            "the check clears once writes stop being refused"
+        );
+    }
+
+    /// #5649 / #5650: an unhealthy storage dependency does not make the
+    /// replica unready (every replica shares the store), but `/readyz` names
+    /// it under `degraded` so a probe reader sees it at a glance.
+    #[test]
+    fn test_readyz_reports_unhealthy_storage_as_degraded_5649() {
+        let mut dependencies = no_dependencies();
+        dependencies.storage = DependencyStatus::from_check(
+            CheckStatus {
+                status: STATUS_UNHEALTHY.to_string(),
+                message: Some("s3 storage probe timed out (2s)".to_string()),
+            },
+            false,
+            false,
+        );
+        let (status_code, response) =
+            build_readyz_response(healthy_check(), healthy_check(), false, dependencies);
+        assert_eq!(status_code, StatusCode::OK);
+        assert_eq!(response.status, "ready");
+        assert_eq!(response.degraded, vec!["storage".to_string()]);
+        assert!(response.failing.is_empty());
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["degraded"], serde_json::json!(["storage"]));
+        assert_eq!(json["dependencies"]["storage"]["status"], STATUS_UNHEALTHY);
+
+        let (_, healthy) =
+            build_readyz_response(healthy_check(), healthy_check(), false, no_dependencies());
+        let json = serde_json::to_value(&healthy).unwrap();
+        assert!(
+            json.get("degraded").is_none(),
+            "omitted when nothing is degraded"
+        );
+    }
+
     #[tokio::test]
     async fn test_check_storage_health_gcs_healthy() {
         let config = test_config("gcs");
@@ -1553,6 +2096,107 @@ mod tests {
         let status = probe_storage_health(&config, &storage).await;
         assert_eq!(status.status, "unhealthy");
         assert!(status.message.unwrap().contains("connection refused"));
+    }
+
+    /// A GCS backend pointed at a dead custom endpoint fails its probe in
+    /// transport. The unauthenticated health JSON must not name the endpoint
+    /// host, the bucket or the probe object key.
+    #[tokio::test]
+    async fn test_check_storage_health_gcs_transport_failure_omits_the_request_url() {
+        let bucket = "health-redaction-probe-bucket";
+        let config = crate::config::Config {
+            storage_backend: "gcs".to_string(),
+            gcs_bucket: Some(bucket.to_string()),
+            ..crate::config::Config::test_config()
+        };
+        let backend = crate::storage::gcs::GcsBackend::new(crate::storage::gcs::GcsConfig {
+            bucket: bucket.to_string(),
+            project_id: None,
+            service_account_email: None,
+            private_key: None,
+            redirect_downloads: false,
+            signed_url_expiry: Duration::from_secs(3600),
+            path_format: crate::storage::path_format::StoragePathFormat::Native,
+            // Port 1 on loopback has no listener: a fast transport failure.
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+        })
+        .await
+        .expect("backend builds");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(backend);
+
+        let status = probe_storage_health(&config, &storage).await;
+        assert_eq!(status.status, "unhealthy");
+        let body = serde_json::to_string(&status).expect("serializes");
+        for secret in ["127.0.0.1", bucket, ".health-probe", "http://"] {
+            assert!(
+                !body.contains(secret),
+                "health JSON must not carry the request URL ({secret}): {body}"
+            );
+        }
+    }
+
+    /// Whatever a backend's error says, the health message drops any URL.
+    #[tokio::test]
+    async fn test_check_storage_health_strips_a_url_from_the_backend_error() {
+        struct UrlEchoingBackend;
+        #[async_trait]
+        impl crate::storage::StorageBackend for UrlEchoingBackend {
+            async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+                Ok(Bytes::new())
+            }
+            async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+                Ok(false)
+            }
+            async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn health_check(&self) -> crate::error::Result<()> {
+                Err(crate::error::AppError::Storage(
+                    "request failed for url (https://storage.internal.example:9000/private-bucket/.health-probe)"
+                        .to_string(),
+                ))
+            }
+            async fn put_stream(
+                &self,
+                key: &str,
+                stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+            ) -> crate::error::Result<crate::storage::PutStreamResult> {
+                crate::storage::buffered_put_stream_fallback(self, key, stream).await
+            }
+        }
+
+        for backend in ["s3", "gcs", "azure"] {
+            let config = test_config(backend);
+            let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(UrlEchoingBackend);
+            let message = probe_storage_health(&config, &storage)
+                .await
+                .message
+                .expect("unhealthy carries a message");
+            assert!(message.contains("request failed"), "{message}");
+            for secret in [
+                "storage.internal.example",
+                "private-bucket",
+                ".health-probe",
+            ] {
+                assert!(!message.contains(secret), "{backend}: {message}");
+            }
+        }
+    }
+
+    /// The S3 diagnostics' documentation and example links stay readable.
+    #[test]
+    fn test_redact_storage_urls_keeps_the_guidance_links() {
+        let text = "See docs at https://artifactkeeper.com/docs/deployment/s3 \
+                    (e.g. https://s3.example.com:9000) after GET \
+                    http://minio.internal:9000/bucket/key?x=1 failed";
+        let redacted = redact_storage_urls(text);
+        assert!(redacted.contains("https://artifactkeeper.com/docs/deployment/s3"));
+        assert!(redacted.contains("https://s3.example.com:9000"));
+        assert!(!redacted.contains("minio.internal"), "{redacted}");
+        assert!(redacted.contains("<url>"), "{redacted}");
     }
 
     #[tokio::test]
@@ -1589,6 +2233,81 @@ mod tests {
         assert!(status.message.unwrap().contains("Unknown backend: ftp"));
     }
 
+    // -----------------------------------------------------------------------
+    // #4530: backends skipped at startup surface on /health
+    // -----------------------------------------------------------------------
+
+    /// A healthy registry produces an EMPTY list, and the field is omitted from
+    /// JSON so nothing changes for a deployment that never skipped a backend.
+    #[test]
+    fn test_skipped_storage_backends_empty_4530() {
+        let entries = skipped_storage_backends(&HashMap::new());
+        assert!(entries.is_empty());
+
+        let response = HealthResponse {
+            status: STATUS_HEALTHY.to_string(),
+            version: "1.0.0".to_string(),
+            demo_mode: false,
+            checks: HealthChecks {
+                database: healthy_check(),
+                storage: healthy_check(),
+                security_scanner: None,
+                opensearch: None,
+                ldap: None,
+            },
+            db_pool: None,
+            commit: None,
+            dirty: None,
+            skipped_storage_backends: entries,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(
+            !json.contains("skipped_storage_backends"),
+            "an empty list must be omitted, got: {json}"
+        );
+    }
+
+    /// A skipped backend is named with its configuration error, and the list is
+    /// sorted by backend name so the body is stable across scrapes.
+    #[test]
+    fn test_skipped_storage_backends_names_and_sorts_4530() {
+        let mut skipped = HashMap::new();
+        skipped.insert(
+            "s3".to_string(),
+            "S3_PUBLIC_ENDPOINT is invalid".to_string(),
+        );
+        skipped.insert("gcs".to_string(), "GCS_PROJECT_ID not set".to_string());
+
+        let entries = skipped_storage_backends(&skipped);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].backend, "gcs");
+        assert_eq!(entries[0].error, "GCS_PROJECT_ID not set");
+        assert_eq!(entries[1].backend, "s3");
+        assert_eq!(entries[1].error, "S3_PUBLIC_ENDPOINT is invalid");
+
+        // And it round-trips through the response JSON that a probe reads.
+        let response = HealthResponse {
+            status: STATUS_UNHEALTHY.to_string(),
+            version: "1.0.0".to_string(),
+            demo_mode: false,
+            checks: HealthChecks {
+                database: healthy_check(),
+                storage: healthy_check(),
+                security_scanner: None,
+                opensearch: None,
+                ldap: None,
+            },
+            db_pool: None,
+            commit: None,
+            dirty: None,
+            skipped_storage_backends: entries,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"skipped_storage_backends\""));
+        assert!(json.contains("\"backend\":\"s3\""));
+        assert!(json.contains("S3_PUBLIC_ENDPOINT is invalid"));
+    }
+
     #[test]
     fn test_db_pool_stats_serialization() {
         let stats = sample_pool_stats();
@@ -1615,6 +2334,7 @@ mod tests {
             db_pool: None,
             commit: Some("abc1234def5678".to_string()),
             dirty: Some(true),
+            skipped_storage_backends: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1638,6 +2358,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            skipped_storage_backends: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1710,15 +2431,29 @@ mod tests {
         std::fs::set_permissions(dir.path(), restore).unwrap();
 
         assert_eq!(status.status, STATUS_UNHEALTHY);
-        assert!(
-            status
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Storage write failed"),
-            "unexpected message: {:?}",
-            status.message
-        );
+        // #3907: the fixed wording only, with neither the OS error text nor
+        // the storage path that the raw `std::io::Error` would have carried.
+        assert_eq!(status.message.as_deref(), Some("Storage write failed"));
+    }
+
+    /// #3907: a storage path that cannot be canonicalized reports unhealthy
+    /// with a fixed message. The raw error names the configured path and the
+    /// OS error (`No such file or directory`), neither of which may reach the
+    /// detailed health payload.
+    #[tokio::test]
+    async fn test_probe_storage_health_filesystem_missing_path_does_not_echo_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("secret-internal-mount");
+        let config = fs_config(&missing);
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
+
+        let status = probe_storage_health(&config, &storage).await;
+
+        assert_eq!(status.status, STATUS_UNHEALTHY);
+        let message = status.message.unwrap_or_default();
+        assert_eq!(message, "Storage path not accessible");
+        assert!(!message.contains("secret-internal-mount"));
+        assert!(!message.contains("No such file"));
     }
 
     /// Regression guard for #2019: 40 concurrent filesystem probes against the
@@ -2459,6 +3194,117 @@ mod tests {
         );
     }
 
+    /// A probe that never answers, counting how often `readyz_cached` runs it.
+    fn hung_probe(
+        probes: &Arc<AtomicUsize>,
+    ) -> impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = CheckStatus> + Send>>
+    {
+        let probes = probes.clone();
+        move || {
+            probes.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// #4781: the outer `/readyz` deadline used to start before the cache
+    /// lock was taken and the inner probe deadline only after, both 2 s, so
+    /// any lock wait let the outer timer fire first and drop the probe
+    /// before it stored its timeout. Holding the lock for 500 ms (an earlier
+    /// prober that went away without storing) makes that gap deterministic
+    /// under paused time: the timeout must still be cached, and the next
+    /// call within the TTL must not probe again.
+    #[tokio::test(start_paused = true)]
+    async fn readyz_cached_stores_timeout_even_after_a_lock_wait() {
+        let cache: Arc<HealthCache> = Arc::new(Mutex::new(None));
+        let ttl = Duration::from_secs(60);
+        let probes = Arc::new(AtomicUsize::new(0));
+
+        let held = cache.clone().lock_owned().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            drop(held);
+        });
+
+        let start = tokio::time::Instant::now();
+        let first = readyz_cached("OpenSearch", &cache, ttl, hung_probe(&probes)).await;
+        let elapsed = start.elapsed();
+        assert_eq!(first.status, STATUS_UNHEALTHY);
+        assert_eq!(
+            first.message.as_deref(),
+            Some("OpenSearch probe timed out (2s)")
+        );
+        assert_eq!(probes.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            elapsed, READYZ_DEPENDENCY_TIMEOUT,
+            "the probe deadline, not the later lock-wait one, ends the call"
+        );
+        assert!(
+            cache.lock().await.is_some(),
+            "the timed-out result must be cached"
+        );
+
+        let start = tokio::time::Instant::now();
+        let second = readyz_cached("OpenSearch", &cache, ttl, hung_probe(&probes)).await;
+        assert_eq!(second.message, first.message);
+        assert_eq!(
+            probes.load(AtomicOrdering::SeqCst),
+            1,
+            "a cached timeout is not paid again"
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    /// The lock wait stays bounded: a holder that never lets go costs the
+    /// deadline plus the margin, and the waiter does not probe.
+    #[tokio::test(start_paused = true)]
+    async fn readyz_cached_bounds_the_lock_wait() {
+        let cache: Arc<HealthCache> = Arc::new(Mutex::new(None));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let _held = cache.clone().lock_owned().await;
+
+        let start = tokio::time::Instant::now();
+        let result = readyz_cached(
+            "Scanner",
+            &cache,
+            Duration::from_secs(60),
+            hung_probe(&probes),
+        )
+        .await;
+        assert_eq!(result.status, STATUS_UNHEALTHY);
+        assert_eq!(
+            start.elapsed(),
+            READYZ_DEPENDENCY_TIMEOUT + READYZ_LOCK_WAIT_MARGIN
+        );
+        assert_eq!(probes.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// A healthy dependency is unchanged: answered at once, cached, probed once.
+    #[tokio::test(start_paused = true)]
+    async fn readyz_cached_healthy_probe_is_cached_and_immediate() {
+        let cache: HealthCache = Mutex::new(None);
+        let ttl = Duration::from_secs(60);
+        let probes = Arc::new(AtomicUsize::new(0));
+        let probe = || {
+            let probes = probes.clone();
+            async move {
+                probes.fetch_add(1, AtomicOrdering::SeqCst);
+                CheckStatus {
+                    status: STATUS_HEALTHY.to_string(),
+                    message: None,
+                }
+            }
+        };
+
+        let start = tokio::time::Instant::now();
+        for _ in 0..3 {
+            let check = readyz_cached("LDAP", &cache, ttl, probe).await;
+            assert_eq!(check.status, STATUS_HEALTHY);
+            assert!(check.message.is_none());
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(probes.load(AtomicOrdering::SeqCst), 1);
+    }
+
     /// `/livez` must stay genuinely dependency-free: it is the probe
     /// Kubernetes uses to decide whether to restart the pod, so it must never
     /// touch Trivy, OpenSearch, the directory, storage or the database. The
@@ -2488,5 +3334,257 @@ mod tests {
         assert_eq!(trivy.reqs(), 0, "/livez must not probe the scanner");
         assert_eq!(opensearch.reqs(), 0, "/livez must not probe OpenSearch");
         assert_eq!(ldap.conns(), 0, "/livez must not bind to the directory");
+    }
+
+    // -----------------------------------------------------------------------
+    // #4610: /readyz reports its dependencies and gates on search only when
+    // READYZ_REQUIRE_SEARCH is set. Driven through a router so the status
+    // code, body and handler are exercised together.
+    // -----------------------------------------------------------------------
+
+    /// A loopback port nothing listens on: bind, read the port, drop.
+    async fn dead_port() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    fn readyz_state(
+        pool: sqlx::PgPool,
+        dir: &std::path::Path,
+        opensearch_port: u16,
+        require_search: bool,
+    ) -> crate::api::SharedState {
+        let config = crate::config::Config {
+            storage_backend: "filesystem".to_string(),
+            storage_path: dir.to_string_lossy().into_owned(),
+            readyz_require_search: require_search,
+            ..crate::config::Config::test_config()
+        };
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(config.storage_path.clone()),
+        );
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let mut state = crate::api::AppState::new(config, pool, storage, registry);
+        state.search_service = Some(Arc::new(
+            crate::services::opensearch_service::OpenSearchService::new(
+                &format!("http://127.0.0.1:{opensearch_port}"),
+                None,
+                None,
+                false,
+            )
+            .expect("opensearch client"),
+        ));
+        Arc::new(state)
+    }
+
+    /// GET /readyz through a router; returns status, parsed body, elapsed.
+    #[allow(clippy::disallowed_methods)]
+    async fn get_readyz(
+        state: crate::api::SharedState,
+    ) -> (StatusCode, serde_json::Value, Duration) {
+        use tower::ServiceExt as _;
+        let app = axum::Router::new()
+            .route("/readyz", axum::routing::get(readiness_check))
+            .with_state(state);
+        let started = Instant::now();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap(), elapsed)
+    }
+
+    /// A pool whose every query fails fast: nothing listens on port 1.
+    fn unreachable_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(500))
+            .connect_lazy("postgres://u:p@127.0.0.1:1/none")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn readyz_stays_ready_with_opensearch_down_and_reports_it() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        reset_health_caches().await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = readyz_state(pool, dir.path(), dead_port().await, false);
+
+        let (status, body, elapsed) = get_readyz(state).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["dependencies"]["opensearch"]["status"], "unhealthy");
+        assert_eq!(body["dependencies"]["opensearch"]["required"], false);
+        assert_eq!(body["dependencies"]["storage"]["status"], "healthy");
+        assert_eq!(body["dependencies"]["scanner"]["status"], "not_configured");
+        assert_eq!(body["dependencies"]["ldap"]["status"], "not_configured");
+        assert!(body.get("failing").is_none(), "{body}");
+        assert!(
+            body["dependencies"]["opensearch"].get("message").is_none(),
+            "probe errors name internal hosts; hidden without EXPOSE_DETAILED_HEALTH: {body}"
+        );
+        assert!(
+            elapsed < READYZ_DEPENDENCY_TIMEOUT + Duration::from_secs(1),
+            "readyz must stay fast: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_require_search_makes_dead_opensearch_a_503_naming_it() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        reset_health_caches().await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = readyz_state(pool, dir.path(), dead_port().await, true);
+
+        let (status, body, _) = get_readyz(state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["failing"], serde_json::json!(["opensearch"]));
+        assert_eq!(body["dependencies"]["opensearch"]["status"], "unhealthy");
+        assert_eq!(body["dependencies"]["opensearch"]["required"], true);
+        assert_eq!(body["checks"]["database"]["status"], "healthy");
+    }
+
+    #[tokio::test]
+    async fn readyz_require_search_is_ready_when_opensearch_is_healthy() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        reset_health_caches().await;
+        let opensearch = spawn_counting_http_stub("{\"status\":\"yellow\"}").await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = readyz_state(pool, dir.path(), opensearch.port, true);
+
+        let (status, body, _) = get_readyz(state).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["dependencies"]["opensearch"]["status"], "healthy");
+    }
+
+    /// OPENSEARCH_URL set, but startup could not reach the cluster and the
+    /// server carries on without search: that is unhealthy, not
+    /// "not configured", and gates readiness under the flag.
+    #[tokio::test]
+    async fn readyz_reports_search_that_failed_at_startup_as_unhealthy() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        for require_search in [false, true] {
+            reset_health_caches().await;
+            let dir = tempfile::tempdir().unwrap();
+            let config = crate::config::Config {
+                storage_backend: "filesystem".to_string(),
+                storage_path: dir.path().to_string_lossy().into_owned(),
+                opensearch_url: Some("http://127.0.0.1:1".to_string()),
+                readyz_require_search: require_search,
+                ..crate::config::Config::test_config()
+            };
+            let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+                crate::storage::filesystem::FilesystemStorage::new(config.storage_path.clone()),
+            );
+            let registry = Arc::new(crate::storage::StorageRegistry::new(
+                std::collections::HashMap::new(),
+                "filesystem".to_string(),
+            ));
+            let state = Arc::new(crate::api::AppState::new(
+                config,
+                pool.clone(),
+                storage,
+                registry,
+            ));
+            assert!(state.search_service.is_none());
+
+            let (status, body, _) = get_readyz(state).await;
+            assert_eq!(body["dependencies"]["opensearch"]["status"], "unhealthy");
+            let expected = if require_search {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            };
+            assert_eq!(status, expected, "require_search={require_search}: {body}");
+        }
+    }
+
+    /// A dependency that accepts connections but never answers costs one
+    /// `/readyz` the deadline; the timed-out result is cached, so the next
+    /// probe within the TTL answers at once.
+    #[tokio::test]
+    async fn readyz_hung_opensearch_costs_the_deadline_once_per_ttl() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        reset_health_caches().await;
+        // Accepts TCP, never replies.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _hold = tokio::spawn(async move {
+            let mut socks = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                socks.push(sock);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let state = readyz_state(pool, dir.path(), port, false);
+
+        let (status, body, first) = get_readyz(state.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["dependencies"]["opensearch"]["status"], "unhealthy");
+        assert!(
+            first < READYZ_DEPENDENCY_TIMEOUT + Duration::from_secs(1),
+            "bounded by the deadline: {first:?}"
+        );
+        let (_, body, second) = get_readyz(state).await;
+        assert_eq!(body["dependencies"]["opensearch"]["status"], "unhealthy");
+        assert!(
+            second < Duration::from_millis(500),
+            "the timeout is cached, not paid again: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_database_down_is_503_regardless_of_search_flag() {
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        for require_search in [false, true] {
+            reset_health_caches().await;
+            let opensearch = spawn_counting_http_stub("{\"status\":\"green\"}").await;
+            let dir = tempfile::tempdir().unwrap();
+            let state = readyz_state(
+                unreachable_pool(),
+                dir.path(),
+                opensearch.port,
+                require_search,
+            );
+
+            let (status, body, _) = get_readyz(state).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "require_search={require_search}: {body}"
+            );
+            assert_eq!(body["status"], "not_ready");
+            let failing = body["failing"].as_array().cloned().unwrap_or_default();
+            assert!(failing.contains(&serde_json::json!("database")), "{body}");
+            assert!(body["dependencies"].is_object(), "always present: {body}");
+        }
     }
 }
