@@ -215,6 +215,11 @@ pub struct AppState {
     /// disabled via `NPM_PACKUMENT_CACHE_ENABLED=false`. Invalidated on npm
     /// publish / dist-tag changes.
     pub npm_packument_cache: Option<Arc<NpmPackumentCache>>,
+    /// Short-TTL cache for age-gated packuments, whose filtered view changes
+    /// as versions age past the gate threshold (see
+    /// [`NpmPackumentCache::age_gated_from_config`]). `None` when the cache is
+    /// disabled or `NPM_PACKUMENT_CACHE_AGE_GATED_TTL_SECS=0`.
+    pub npm_age_gated_packument_cache: Option<Arc<NpmPackumentCache>>,
     /// Negative cache for proxied npm attestation answers (#3764): the
     /// `404`s `npm audit signatures` provokes on
     /// `/-/npm/v1/attestations/{pkg}@{ver}`, which were previously a fresh
@@ -283,6 +288,7 @@ impl AppState {
             );
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
+        let npm_age_gated_packument_cache = NpmPackumentCache::age_gated_from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
         let pypi_simple_cache = Arc::new(PypiSimpleCache::with_capacity(
             std::time::Duration::from_secs(config.pypi_simple_cache_ttl_secs),
@@ -310,6 +316,7 @@ impl AppState {
             repo_miss_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
+            npm_age_gated_packument_cache,
             npm_attestation_cache,
             pypi_simple_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -337,6 +344,7 @@ impl AppState {
             );
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
+        let npm_age_gated_packument_cache = NpmPackumentCache::age_gated_from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
         let pypi_simple_cache = Arc::new(PypiSimpleCache::with_capacity(
             std::time::Duration::from_secs(config.pypi_simple_cache_ttl_secs),
@@ -364,6 +372,7 @@ impl AppState {
             repo_miss_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
+            npm_age_gated_packument_cache,
             npm_attestation_cache,
             pypi_simple_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),

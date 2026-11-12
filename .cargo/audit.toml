@@ -42,4 +42,33 @@ ignore = [
     # issue #2158.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+
+    # crypto-bigint timing variability (RUSTSEC-2026-0387). The 0.7 line is
+    # updated to 0.7.11, which is the patched release (>=0.7.6). The only
+    # remaining copy is 0.5.5, pulled by pgp 0.14.2 (k256 / elliptic-curve
+    # 0.13) and the pinned bergshamra 0.5.1. There is no patched 0.5 release;
+    # the advisory's fix is >=0.7.6, which those crates have not moved to.
+    # Re-evaluate when bergshamra and pgp leave the 0.13 elliptic-curve stack.
+    "RUSTSEC-2026-0387",
+
+    # zip extraction advisories (symlink escape, mode/SUID preservation, abort
+    # on a huge symlink). Patched only in zip >=9. Our direct dependency is
+    # zip 8, and utoipa-swagger-ui 8's build script pins zip 2 to unpack its
+    # own UI bundle; swagger-ui 10 is the first release on zip 9 and it
+    # requires utoipa 6. Neither copy calls the vulnerable API from registry
+    # request handling: a repo-wide search finds no `ZipArchive::extract` or
+    # `ZipStreamReader::extract`. Re-evaluate on the utoipa 6 / zip 9 upgrade.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
+
+    # libsqlite3-sys via the bundled SQLite CVE (RUSTSEC-2026-0459), fixed in
+    # >=0.39.0. sqlx 0.9.0 is built without the `any` driver, so MySQL and
+    # SQLite are not compiled (`cargo tree -i sqlx-sqlite` is empty). Cargo
+    # still records those optional dependencies in Cargo.lock, and cargo-audit
+    # scans the lockfile, which is why 0.37.0 (the version sqlx-sqlite 0.9
+    # allows) is still reported. Re-evaluate when sqlx depends on
+    # libsqlite3-sys >=0.39 or stops listing the unused driver.
+    "RUSTSEC-2026-0459",
 ]

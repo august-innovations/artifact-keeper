@@ -85,7 +85,10 @@ on = wf.get('on', wf.get(True, {}))
 facts = []
 facts.append('trigger_merge_group=' + str('merge_group' in (on or {})).lower())
 for j in ('check-rust', 'test-backend-integration', 'test-backend-unit', 'ci-complete'):
-    facts.append(f'runs_on_{j}=' + str(wf['jobs'][j].get('runs-on')))
+    runner = wf['jobs'][j].get('runs-on')
+    if isinstance(runner, list):
+        runner = '|'.join(str(part) for part in runner)
+    facts.append(f'runs_on_{j}=' + str(runner))
 cc_needs = wf['jobs']['ci-complete'].get('needs', [])
 for j in ('smoke-e2e', 'build-backend-image', 'build-openscap-image'):
     facts.append(f'cc_needs_{j}=' + str(j in cc_needs).lower())
@@ -374,9 +377,15 @@ want_fact() {
   if [ "$(fact "$1")" = "$2" ]; then pass "$3"; else fail "$3: $1=$(fact "$1"), want $2"; fi
 }
 want_fact trigger_merge_group true "ci.yml triggers on merge_group (required checks must report in the queue)"
-for j in check-rust test-backend-integration test-backend-unit ci-complete; do
+for j in check-rust test-backend-unit ci-complete; do
   want_fact "runs_on_$j" ubuntu-24.04 "$j runs on pinned GitHub-hosted ubuntu-24.04"
 done
+integ_runner="$(fact runs_on_test-backend-integration)"
+case "$integ_runner" in
+  *cpu=16*ram=32*spot=false*)
+    pass "test-backend-integration runs on on-demand RunsOn (16 vCPU, 32 GiB, no spot reclaim)" ;;
+  *) fail "test-backend-integration must be cpu=16, ram=32, spot=false: $integ_runner" ;;
+esac
 for j in smoke-e2e build-backend-image build-openscap-image; do
   want_fact "cc_needs_$j" false "CI Complete does not wait for advisory $j"
 done

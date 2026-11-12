@@ -1040,6 +1040,14 @@ pub struct Config {
     /// `NPM_PACKUMENT_CACHE_STALE_MAX_SECS`, default 86400 (24 h).
     pub npm_packument_cache_stale_max_secs: u64,
 
+    /// Cache window in seconds for age-gated packuments: remote repos with the
+    /// age gate, and virtual repos with an age-gated member. They are cached
+    /// in-process with no stale window, so a version that ages past the gate
+    /// threshold, or a review decision, appears at most this late. `0`
+    /// recomputes them on every request. Env
+    /// `NPM_PACKUMENT_CACHE_AGE_GATED_TTL_SECS`, default 300 (5 minutes).
+    pub npm_packument_cache_age_gated_ttl_secs: u64,
+
     /// Redis URL selecting the shared packument-cache backend for
     /// multi-replica deployments (e.g. `redis://cache:6379/0`). When unset
     /// (the default) the cache is in-process. When set, Redis is read first
@@ -1217,6 +1225,7 @@ redacted_debug!(Config {
     show npm_packument_cache_enabled,
     show npm_packument_cache_fresh_ttl_secs,
     show npm_packument_cache_stale_max_secs,
+    show npm_packument_cache_age_gated_ttl_secs,
     redact_option npm_packument_cache_redis_url,
     show npm_attestation_negative_cache_enabled,
     show npm_attestation_negative_cache_ttl_secs,
@@ -1356,6 +1365,8 @@ impl Default for Config {
             npm_packument_cache_stale_max_secs:
                 crate::services::npm_packument_cache::NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS,
             npm_packument_cache_redis_url: None,
+            npm_packument_cache_age_gated_ttl_secs:
+                crate::services::npm_packument_cache::NPM_PACKUMENT_AGE_GATED_TTL_DEFAULT_SECS,
             npm_attestation_negative_cache_enabled: true,
             npm_attestation_negative_cache_ttl_secs:
                 crate::services::npm_attestation_cache::NPM_ATTESTATION_NEGATIVE_TTL_DEFAULT_SECS,
@@ -1777,6 +1788,10 @@ impl Config {
             npm_packument_cache_stale_max_secs: env_parse(
                 "NPM_PACKUMENT_CACHE_STALE_MAX_SECS",
                 crate::services::npm_packument_cache::NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS,
+            ),
+            npm_packument_cache_age_gated_ttl_secs: env_parse(
+                "NPM_PACKUMENT_CACHE_AGE_GATED_TTL_SECS",
+                crate::services::npm_packument_cache::NPM_PACKUMENT_AGE_GATED_TTL_DEFAULT_SECS,
             ),
             // Treat an empty value as unset, mirroring TRIVY_ADAPTER_URL:
             // deployment templates commonly render the var present-but-empty
@@ -2829,6 +2844,7 @@ mod tests {
         assert!(config.npm_packument_cache_enabled);
         assert_eq!(config.npm_packument_cache_fresh_ttl_secs, 300);
         assert_eq!(config.npm_packument_cache_stale_max_secs, 86_400);
+        assert_eq!(config.npm_packument_cache_age_gated_ttl_secs, 300);
         assert_eq!(config.npm_packument_cache_redis_url, None);
 
         // Restore

@@ -14493,6 +14493,9 @@ mod repodata_byte_stability_tests {
   "repodata_version": 1
 }"#;
 
+    // md5, sha256, and size are the zstd-compressed fixture (`zstd::encode_all`
+    // at level 3). A zstd release can change those bytes without changing the
+    // repodata shape.
     const GOLDEN_LINUX64: &str = r#"{
   "info": {
     "base_url": "/conda/{key}/linux-64/",
@@ -14512,10 +14515,10 @@ mod repodata_byte_stability_tests {
       ],
       "fn": "rattlerpy-0.4.1-py312h02b7e37_1.conda",
       "license": "BSD-3-Clause",
-      "md5": "9f2993fb3eeeebbb9128a5c6b6b537d4",
+      "md5": "2bc1f64c9044aa375c3734c6993249a9",
       "name": "rattlerpy",
-      "sha256": "ca5792b5733e64ca5de5776440792fd6b531ed9b2ded6a928a82682646d71a55",
-      "size": 523,
+      "sha256": "6bfe8c8ccdec37fef905000b47ae3e9f7441fd6e36bb729d763fd885a83832ec",
+      "size": 524,
       "subdir": "linux-64",
       "version": "0.4.1"
     }

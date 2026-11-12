@@ -4329,11 +4329,23 @@ pub async fn virtual_aggregate_cacheable(db: &PgPool, repo_id: Uuid, is_virtual:
 /// and for the same reason: the aggregated document now includes the leaves
 /// of nested members, so a gated leaf anywhere below the root can filter it.
 ///
-/// Errs on the side of `true` (bypass the cache) if the lookup fails:
-/// recomputing is merely slower, while serving a possibly-unfiltered cached
-/// document is wrong.
+/// Errs on the side of `true` (bypass the long-lived cache) if the lookup
+/// fails: recomputing is merely slower, while serving a possibly-unfiltered
+/// cached document is wrong.
+///
+/// A `true` answer is remembered for [`VIRTUAL_AGE_GATE_POSITIVE_TTL`]. The
+/// prod npm virtual is gated, and this query otherwise runs before every
+/// packument cache hit. Remembering `true` cannot widen a response: the
+/// age-gated cache is the stricter tier, and a failed lookup already fails
+/// closed to `true`. A `false` answer is not remembered, so enabling the gate
+/// takes effect on the next request. Disabling it can lag by one TTL, the
+/// same bound as a filtered packument that was computed while the gate was on.
 pub async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: Uuid) -> bool {
-    sqlx::query_scalar::<_, bool>(
+    let now = std::time::Instant::now();
+    if virtual_age_gate_remembered(virtual_repo_id, now) {
+        return true;
+    }
+    let gated = sqlx::query_scalar::<_, bool>(
         "WITH RECURSIVE reach(repo_id) AS ( \
             SELECT vrm.member_repo_id FROM virtual_repo_members vrm \
              WHERE vrm.virtual_repo_id = $1 \
@@ -4351,7 +4363,67 @@ pub async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: Uuid) ->
     .bind(virtual_repo_id)
     .fetch_one(db)
     .await
-    .unwrap_or(true)
+    .unwrap_or(true);
+    if gated {
+        remember_virtual_age_gate(virtual_repo_id, now);
+    }
+    gated
+}
+
+/// How long a positive age-gate member lookup is reused. This is the default
+/// age-gated packument TTL, so over-filtering cannot outlive the filtered
+/// document the lookup is protecting when the operator has not overridden it.
+const VIRTUAL_AGE_GATE_POSITIVE_TTL: Duration = Duration::from_secs(
+    crate::services::npm_packument_cache::NPM_PACKUMENT_AGE_GATED_TTL_DEFAULT_SECS,
+);
+const VIRTUAL_AGE_GATE_POSITIVE_MAX: usize = 1024;
+
+fn virtual_age_gate_positive_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn virtual_age_gate_remembered(virtual_repo_id: Uuid, now: std::time::Instant) -> bool {
+    let cache = virtual_age_gate_positive_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match cache.get(&virtual_repo_id) {
+        Some(seen) => now.saturating_duration_since(*seen) < VIRTUAL_AGE_GATE_POSITIVE_TTL,
+        None => false,
+    }
+}
+
+fn remember_virtual_age_gate(virtual_repo_id: Uuid, now: std::time::Instant) {
+    let mut cache = virtual_age_gate_positive_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= VIRTUAL_AGE_GATE_POSITIVE_MAX && !cache.contains_key(&virtual_repo_id) {
+        cache.clear();
+    }
+    cache.insert(virtual_repo_id, now);
+}
+
+#[cfg(test)]
+mod virtual_age_gate_memo_tests {
+    use super::*;
+
+    #[test]
+    fn positive_age_gate_memo_expires_and_does_not_remember_absence() {
+        let gated = Uuid::new_v4();
+        let ungated = Uuid::new_v4();
+        let now = std::time::Instant::now();
+        assert!(!virtual_age_gate_remembered(gated, now));
+        remember_virtual_age_gate(gated, now);
+        assert!(virtual_age_gate_remembered(gated, now));
+        assert!(!virtual_age_gate_remembered(
+            gated,
+            now + VIRTUAL_AGE_GATE_POSITIVE_TTL
+        ));
+        assert!(!virtual_age_gate_remembered(ungated, now));
+    }
 }
 
 /// Single-member form of [`authorize_virtual_members`]; see it for the access
@@ -12320,6 +12392,8 @@ mod tests {
                 npm_packument_cache_fresh_ttl_secs: 300,
                 npm_packument_cache_stale_max_secs: 86_400,
                 npm_packument_cache_redis_url: None,
+                npm_packument_cache_age_gated_ttl_secs:
+                    crate::services::npm_packument_cache::NPM_PACKUMENT_AGE_GATED_TTL_DEFAULT_SECS,
                 npm_attestation_negative_cache_enabled: true,
                 npm_attestation_negative_cache_ttl_secs: 86_400,
                 pypi_simple_cache_ttl_secs: 60,

@@ -34,8 +34,11 @@ on:
   # contexts above are jobs of this workflow, so this is the one trigger the
   # queue needs. A merge-group run tests the tree `main` will have after the
   # merge; the `changes` job classifies it from the group's own diff
-  # (merge_group.base_sha..head_sha), and every job it runs is
-  # GitHub-hosted, so a stalled self-hosted pool cannot stall a merge.
+  # (merge_group.base_sha..head_sha). The required Rust jobs stay
+  # GitHub-hosted so a stalled self-hosted pool cannot stall a merge.
+  # Backend Integration Tests is the exception: it compiles the unsharded
+  # library, so it runs on an on-demand RunsOn instance instead of the
+  # rocky pool (see that job).
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
@@ -864,7 +867,7 @@ jobs:
           df -h / | tail -1
           du -sh target 2>/dev/null || true
 
-  # INTEGRATION SUITES (backend/tests/), GitHub-hosted.
+  # INTEGRATION SUITES (backend/tests/).
   #
   # These link the library WITHOUT `cfg(test)`, so the unit-test sharding
   # above does nothing for them, and they need a Postgres and ~6 min of
@@ -876,12 +879,21 @@ jobs:
   #   1. the pure integration targets (Tier 1 contract tests);
   #   2. the `#[ignore]`d DB integration suite (Tier 2).
   #
-  # WHERE: ubuntu-24.04, not ak-ci-runners. The required "🧪 Backend Unit
-  # Tests" context waits on this job, so while it ran on the pool a stalled
-  # or saturated rocky node blocked every merge (queue p90 181 min,
-  # 2026-09-17..24). Nothing here needs the pool: Postgres is a service
-  # container from the GHCR mirror, and the pool's persistent target
-  # directory was an accelerator with an explicit fallback to `target/`.
+  # WHERE: an on-demand RunsOn 16-vCPU instance, not ak-ci-runners and not
+  # ubuntu-24.04. The required "🧪 Backend Unit Tests" context waits on this
+  # job, so while it ran on the rocky pool a stalled or saturated node
+  # blocked every merge (queue p90 181 min, 2026-09-17..24). GitHub-hosted
+  # ubuntu-24.04 then kept the queue off that pool, but the unsharded
+  # library compile is bound by that runner's 4 vCPU (hosted estimate 25-35
+  # min cold). RunsOn is a fresh instance per job, so it does not share the
+  # rocky queue. Inline labels, not `.github/runs-on.yml`: this repository
+  # is public, and RunsOn ignores that file until it is on the default
+  # branch (same constraint as ecr-publish.yml). `spot=false` because a
+  # reclaim throws away the compile. CARGO_BUILD_JOBS stays 8, not 16: the
+  # leaf rustc's codegen threads take their budget from it, and the
+  # instrumented suite was SIGKILLed around 16 GiB at -j4. This build is
+  # uninstrumented; 8 threads on 32 GiB is the headroom, and Postgres plus
+  # the linker use the cores left over.
   #
   # WHEN: always on merge_group and push, so the tree `main` gets is always
   # proven; on a pull request only when it changes what this job reads that
@@ -893,24 +905,32 @@ jobs:
   # false (see that job), and `rust`/`bump_only` skip it as before.
   test-backend-integration:
     name: 🧪 Backend Integration Tests
-    runs-on: ubuntu-24.04
-    # Hosted estimate 25-35 min cold (the pool run was ~2 min of test-crate
-    # compile and ~6 min of serial tests on a warm persistent target dir).
-    # The acceptance bar for staying on PRs is 35 min and 12 GiB peak RSS;
-    # 60 is headroom for a cold rust-cache, since a cancellation at the
-    # ceiling wastes the whole run.
+    # Public repo: a `runner=` profile in runs-on.yml is ignored off the
+    # default branch. cpu=16/ram=32 is c*.4xlarge (c8i.4xlarge is 16 vCPU,
+    # 32 GiB). volume=80gb: a cold target/ does not fit the hosted runner's
+    # ~14 GB free disk.
+    runs-on:
+      - runs-on=${{ github.run_id }}-${{ github.run_attempt }}-backend-integration
+      - cpu=16
+      - ram=32
+      - family=c8i.*+c8a.*+m8i.*+m8a.*+c8i-flex.*+m8i-flex.*
+      - image=ubuntu22-full-x64
+      - volume=80gb
+      - env=infra-prod-blue
+      - spot=false
+    # The cold hosted run was 25-35 min. 60 remains the ceiling: a
+    # cancellation there wastes the whole compile.
     timeout-minutes: 60
     needs: [changes, release-bump]
     # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
     # `tests != 'false'` fails open: an empty output (the gate died) runs it.
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' && (github.event_name == 'merge_group' || needs.changes.outputs.tests != 'false' || needs.changes.outputs.ci_full == 'true') }}
     # Debuginfo off to keep the library's compile memory down (#1515,
-    # #1679, #3856). CARGO_BUILD_JOBS is the hosted runner's core count
-    # (it was 6 on the 12-CPU pool pods).
+    # #1679, #3856). CARGO_BUILD_JOBS is 8 of the 16 vCPUs; see the job comment.
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      CARGO_BUILD_JOBS: "4"
+      CARGO_BUILD_JOBS: "8"
       CARGO_INCREMENTAL: "0"
       # Let cargo retry transient registry errors itself before the fetch
       # step below fails.
@@ -948,8 +968,8 @@ jobs:
         with:
           tool: cargo-nextest,sqlx-cli
 
-      # The self-hosted image shipped protoc; ubuntu-24.04 does not, and
-      # build scripts in the dependency tree need it.
+      # The old self-hosted image shipped protoc; do not assume the RunsOn
+      # image does. Build scripts in the dependency tree need it.
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 

@@ -1014,6 +1014,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             repo_miss_cache: state.repo_miss_cache.clone(),
             permission_service: state.permission_service.clone(),
             npm_packument_cache: state.npm_packument_cache.clone(),
+            npm_age_gated_packument_cache: state.npm_age_gated_packument_cache.clone(),
         },
         runtime_shutdown_token.clone(),
     )
