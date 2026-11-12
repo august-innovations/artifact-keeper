@@ -244,15 +244,21 @@ async fn validate_token(
     db: &PgPool,
     config: &crate::config::Config,
     headers: &HeaderMap,
-) -> Result<crate::services::auth_service::Claims, ()> {
-    let token = extract_bearer_token(headers).ok_or(())?;
+) -> Result<crate::services::auth_service::Claims, OciAuthError> {
+    let token = extract_bearer_token(headers).ok_or(OciAuthError::Invalid)?;
     let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
     // Replica-safe variant (#1173): consults the DB credential-change watermark
     // so a credential change on replica A is honoured on replica B.
     auth_service
         .validate_access_token_async(&token)
         .await
-        .map_err(|_| ())
+        .map_err(|e| {
+            if oci_auth_overloaded(&e) {
+                OciAuthError::Overloaded
+            } else {
+                OciAuthError::Invalid
+            }
+        })
 }
 
 /// Credential extracted from an OCI request's Authorization header.
@@ -356,9 +362,13 @@ async fn authenticate_oci_with_scopes(
             // `scopes: None` (unrestricted); a JWT exchanged from a scoped API
             // token carries `Some(ceiling)` (#2430). Surface whatever the JWT
             // carries so a laundered exchange JWT keeps its ceiling here.
-            if let Ok(claims) = auth_service.validate_access_token_async(&token).await {
-                let scopes = claims.scopes.clone();
-                return Ok((claims, scopes));
+            match auth_service.validate_access_token_async(&token).await {
+                Ok(claims) => {
+                    let scopes = claims.scopes.clone();
+                    return Ok((claims, scopes));
+                }
+                Err(e) if oci_auth_overloaded(&e) => return Err(OciAuthError::Overloaded),
+                Err(_) => {}
             }
             // Otherwise, accept a raw API token in the Bearer slot (common
             // for `docker login --password-stdin` with API token). Surface
@@ -471,7 +481,11 @@ async fn authenticate_oci_with_scopes(
             // Final fallback: accept a valid AK access token (JWT) as the Docker
             // password. Enables the CI/CD keyless push flow where the token from
             // the OIDC exchange is used directly as the Docker credential.
-            if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
+            let jwt_as_password = auth_service.validate_access_token_async(&password).await;
+            if matches!(&jwt_as_password, Err(e) if oci_auth_overloaded(e)) {
+                return Err(OciAuthError::Overloaded);
+            }
+            if let Ok(claims) = jwt_as_password {
                 // Preserve the presented JWT's action-scope ceiling (#2430): a
                 // JWT-as-password that was itself exchanged from a scoped API
                 // token must keep its `Some(ceiling)` here, not reset to full.
@@ -5143,7 +5157,11 @@ async fn token(
             // consults the DB credential-change watermark (#1173), so a
             // deactivated user's token fails here too.
             let had_bearer_header = extract_bearer_token(&headers).is_some();
-            if let Ok(claims) = validate_token(&state.db, &state.config, &headers).await {
+            let validated = validate_token(&state.db, &state.config, &headers).await;
+            if let Err(OciAuthError::Overloaded) = validated {
+                return oci_auth_overloaded_response();
+            }
+            if let Ok(claims) = validated {
                 let auth_service =
                     AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
                 // `AND is_active = true` mirrors `auth_service::authenticate`,
@@ -5352,11 +5370,15 @@ async fn token(
             };
             (user, tokens, true)
         }
+        // A shed or pool timeout is not a bad credential: 503 before the
+        // password fallback can bump `failed_login_attempts`.
+        Err(e) if oci_auth_overloaded(&e) => return oci_auth_overloaded_response(),
         Err(_) => match auth_service
             .authenticate(&credentials.0, &credentials.1)
             .await
         {
             Ok((user, tokens)) => (user, tokens, false),
+            Err(e) if oci_auth_overloaded(&e) => return oci_auth_overloaded_response(),
             Err(_) => {
                 // Final fallback: accept a valid AK access token (JWT) as the
                 // Docker password. This enables the CI/CD keyless push flow:
@@ -5407,6 +5429,7 @@ async fn token(
                         // Treat like an API token: bypass the TOTP guard below.
                         (user, tokens, true)
                     }
+                    Err(e) if oci_auth_overloaded(&e) => return oci_auth_overloaded_response(),
                     Err(_) => {
                         return oci_error(
                             StatusCode::UNAUTHORIZED,
@@ -5525,11 +5548,10 @@ async fn version_check(
     base_url: RequestBaseUrl,
 ) -> Response {
     // Accept Bearer token (standard Docker client flow)
-    if validate_token(&state.db, &state.config, &headers)
-        .await
-        .is_ok()
-    {
-        return version_check_ok();
+    match validate_token(&state.db, &state.config, &headers).await {
+        Ok(_) => return version_check_ok(),
+        Err(OciAuthError::Overloaded) => return oci_auth_overloaded_response(),
+        Err(OciAuthError::Invalid) => {}
     }
 
     // Accept Basic Auth directly (curl -u user:pass, HTTP clients).
@@ -5550,12 +5572,10 @@ async fn version_check(
             Err(e) if oci_auth_overloaded(&e) => return oci_auth_overloaded_response(),
             Err(_) => {}
         }
-        if auth_service
-            .validate_access_token_async(&password)
-            .await
-            .is_ok()
-        {
-            return version_check_ok();
+        match auth_service.validate_access_token_async(&password).await {
+            Ok(_) => return version_check_ok(),
+            Err(e) if oci_auth_overloaded(&e) => return oci_auth_overloaded_response(),
+            Err(_) => {}
         }
     }
 
@@ -40418,5 +40438,194 @@ mod cleanup_journal_repository_scope_tests {
         }
         let _ = std::fs::remove_dir_all(dir_a);
         let _ = std::fs::remove_dir_all(dir_b);
+    }
+}
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod oci_auth_overload_sheds_503 {
+    //! A database that cannot hand out a connection must reach a registry
+    //! client as the retryable 503, never as `invalid username or password`
+    //! for a credential that is valid.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::models::user::{AuthProvider, User};
+    use crate::services::auth_service::AuthService;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// Every acquire times out: nothing listens on port 1.
+    fn unreachable_pool() -> sqlx::PgPool {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy_with(
+                PgConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(1)
+                    .username("invalid")
+                    .password("invalid")
+                    .database("invalid"),
+            )
+    }
+
+    fn user() -> User {
+        let now = chrono::Utc::now();
+        User {
+            id: Uuid::new_v4(),
+            username: "oci-overload".to_string(),
+            email: "oci-overload@example.com".to_string(),
+            password_hash: None,
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            display_name: None,
+            is_active: true,
+            is_admin: false,
+            is_service_account: true,
+            must_change_password: false,
+            totp_secret: None,
+            totp_enabled: false,
+            totp_backup_codes: None,
+            totp_verified_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            last_failed_login_at: None,
+            password_changed_at: now,
+            last_login_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn basic(username: &str, password: &str) -> String {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+        )
+    }
+
+    async fn probe(state: &SharedState, uri: &str, authorization: &str) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header(AUTHORIZATION, authorization)
+            .body(Body::empty())
+            .expect("build request");
+        let resp = router(None)
+            .with_state(state.clone())
+            .oneshot(req)
+            .await
+            .expect("oneshot");
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("response body");
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn auth_paths_shed_503_on_pool_timeout_and_reject_bad_credentials_401() {
+        let dir = std::env::temp_dir().join(format!("ak-oci-503-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp storage dir");
+        let state = tdh::build_state(unreachable_pool(), dir.to_str().expect("utf8 path"));
+        let jwt = AuthService::new(state.db.clone(), Arc::new(state.config.clone()))
+            .generate_tokens(&user())
+            .expect("sign access token")
+            .access_token;
+        let bearer = format!("Bearer {jwt}");
+        let api_token = basic("ci-bot", "akt_0123456789abcdef0123456789abcdef");
+
+        let cases: Vec<(&str, &str, String, StatusCode, &str)> = vec![
+            (
+                "GET /v2/ bearer",
+                "/",
+                bearer.clone(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNAVAILABLE",
+            ),
+            (
+                "token basic api-token",
+                "/token",
+                api_token,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNAVAILABLE",
+            ),
+            (
+                "token bearer swap",
+                "/token",
+                bearer.clone(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNAVAILABLE",
+            ),
+            (
+                "manifest bearer",
+                "/ph-test-oci-503/app/manifests/latest",
+                bearer,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNAVAILABLE",
+            ),
+            (
+                "GET /v2/ forged bearer",
+                "/",
+                "Bearer not-a-jwt".into(),
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+            ),
+            (
+                "token forged bearer",
+                "/token",
+                "Bearer not-a-jwt".into(),
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+            ),
+        ];
+
+        for (label, uri, authorization, want_status, want_code) in cases {
+            let (status, body) = probe(&state, uri, &authorization).await;
+            assert_eq!(status, want_status, "{label}: {body}");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+            assert_eq!(
+                parsed["errors"][0]["code"].as_str(),
+                Some(want_code),
+                "{label}: {body}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn token_wrong_password_stays_401_invalid_username_or_password() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let dir = std::env::temp_dir().join(format!("ak-oci-401-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp storage dir");
+        let state = tdh::build_state(pool.clone(), dir.to_str().expect("utf8 path"));
+
+        let (status, body) = probe(
+            &state,
+            "/token",
+            &basic(&username, "definitely-not-the-password"),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(
+            parsed["errors"][0]["message"].as_str(),
+            Some("invalid username or password"),
+            "{body}"
+        );
     }
 }
