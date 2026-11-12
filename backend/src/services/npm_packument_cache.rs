@@ -76,7 +76,7 @@ pub const NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS: u64 = 86_400;
 /// time-dependent view (a version appears once it ages past the threshold), so
 /// it is cached for this long with no stale window: an aged-in version or a
 /// review decision shows up at most this late.
-pub const NPM_PACKUMENT_AGE_GATED_TTL_DEFAULT_SECS: u64 = 60;
+pub const NPM_PACKUMENT_AGE_GATED_TTL_DEFAULT_SECS: u64 = 300;
 
 /// Soft cap on in-process cache entries, mirroring
 /// [`crate::api::SIGNED_RELEASE_CACHE_MAX_ENTRIES`]. A large install

@@ -1045,7 +1045,7 @@ pub struct Config {
     /// in-process with no stale window, so a version that ages past the gate
     /// threshold, or a review decision, appears at most this late. `0`
     /// recomputes them on every request. Env
-    /// `NPM_PACKUMENT_CACHE_AGE_GATED_TTL_SECS`, default 60.
+    /// `NPM_PACKUMENT_CACHE_AGE_GATED_TTL_SECS`, default 300 (5 minutes).
     pub npm_packument_cache_age_gated_ttl_secs: u64,
 
     /// Redis URL selecting the shared packument-cache backend for
@@ -2844,7 +2844,7 @@ mod tests {
         assert!(config.npm_packument_cache_enabled);
         assert_eq!(config.npm_packument_cache_fresh_ttl_secs, 300);
         assert_eq!(config.npm_packument_cache_stale_max_secs, 86_400);
-        assert_eq!(config.npm_packument_cache_age_gated_ttl_secs, 60);
+        assert_eq!(config.npm_packument_cache_age_gated_ttl_secs, 300);
         assert_eq!(config.npm_packument_cache_redis_url, None);
 
         // Restore

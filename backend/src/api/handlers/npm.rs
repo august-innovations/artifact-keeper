@@ -886,19 +886,26 @@ pub(crate) async fn invalidate_packument_caches(
     repo_key: &str,
     package: &str,
 ) {
-    let Some(cache) = state.npm_packument_cache.as_ref() else {
+    let standard = state.npm_packument_cache.as_ref();
+    let age_gated = state.npm_age_gated_packument_cache.as_ref();
+    if standard.is_none() && age_gated.is_none() {
         return;
-    };
+    }
     // Local only: the fanout below reaches the age-gated cache on the other
-    // replicas through the same notification.
-    if let Some(age_gated) = state.npm_age_gated_packument_cache.as_ref() {
+    // replicas through the same notification. This must not depend on the
+    // standard cache being configured; the two are separate instances.
+    if let Some(age_gated) = age_gated {
         age_gated.invalidate_package(repo_key, package).await;
         for virtual_key in packument_cache::virtual_repo_keys(&state.db, repo_id).await {
             age_gated.invalidate_package(&virtual_key, package).await;
         }
     }
-    packument_cache::invalidate_package_and_virtuals(&state.db, cache, repo_id, repo_key, package)
+    if let Some(cache) = standard {
+        packument_cache::invalidate_package_and_virtuals(
+            &state.db, cache, repo_id, repo_key, package,
+        )
         .await;
+    }
 }
 
 use crate::api::middleware::auth::require_auth_with_bearer_fallback;
@@ -14706,7 +14713,7 @@ mod db_cov_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Age-gate packument-cache bypass: virtual member lookup
+    // Age-gated packument tier: virtual member lookup
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -14729,7 +14736,7 @@ mod db_cov_tests {
         assert!(
             !crate::api::handlers::proxy_helpers::virtual_has_age_gated_member(&pool, virtual_id)
                 .await,
-            "ungated member must not force a cache bypass"
+            "ungated member must stay on the standard packument cache"
         );
 
         sqlx::query("UPDATE repositories SET age_gate_enabled = true WHERE id = $1")
@@ -14741,7 +14748,7 @@ mod db_cov_tests {
         assert!(
             crate::api::handlers::proxy_helpers::virtual_has_age_gated_member(&pool, virtual_id)
                 .await,
-            "age-gated member must force a cache bypass"
+            "age-gated member must select the short-TTL packument cache"
         );
     }
 
@@ -15685,6 +15692,140 @@ mod db_cov_tests {
         assert!(
             !standard_entries,
             "an age-gated packument must never land in the standard SWR cache"
+        );
+    }
+
+    /// The production shape: a virtual repository whose member is age-gated.
+    /// The filtered packument is served from the short-TTL cache, so an
+    /// upstream change stays invisible until that entry is invalidated, and
+    /// the unfiltered document never lands in the standard cache.
+    #[tokio::test]
+    async fn test_virtual_age_gated_member_packument_uses_short_ttl_cache() {
+        use axum::http::StatusCode;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "virtagedpkg";
+        let old = "2020-01-01T00:00:00.000Z";
+        let now = chrono::Utc::now().to_rfc3339();
+        let packument = |versions: &[(&str, &str)]| {
+            let mut time = serde_json::Map::new();
+            let mut entries = serde_json::Map::new();
+            for (version, published) in versions {
+                time.insert(version.to_string(), serde_json::json!(published));
+                entries.insert(
+                    version.to_string(),
+                    serde_json::json!({
+                        "name": package,
+                        "version": version,
+                        "dist": {"tarball": format!(
+                            "https://registry.example.test/{package}/-/{package}-{version}.tgz"
+                        )}
+                    }),
+                );
+            }
+            serde_json::json!({
+                "name": package,
+                "dist-tags": {"latest": versions[0].0},
+                "time": time,
+                "versions": entries,
+            })
+        };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(packument(&[("1.0.0", old), ("9.9.9", now.as_str())])),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, is_public = true, \
+             age_gate_enabled = true, age_gate_min_age_days = 7 WHERE id = $2",
+        )
+        .bind(mock_server.uri())
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure age-gated member");
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach member");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let (status, _, first) = fetch_packument_json(&state, &fx.repo_key, package).await;
+
+        mock_server.reset().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(packument(&[
+                ("2.0.0", old),
+                ("1.0.0", old),
+                ("9.9.9", now.as_str()),
+            ])))
+            .mount(&mock_server)
+            .await;
+        let _ = std::fs::remove_dir_all(&member_dir);
+        std::fs::create_dir_all(&member_dir).expect("recreate member storage");
+        std::fs::remove_dir_all(&fx.storage_dir).expect("wipe virtual proxy cache");
+        std::fs::create_dir_all(&fx.storage_dir).expect("recreate virtual storage");
+        let (_, _, cached) = fetch_packument_json(&state, &fx.repo_key, package).await;
+
+        let standard_entries = match state.npm_packument_cache.as_ref() {
+            Some(cache) => cache
+                .lookup(&crate::services::npm_packument_cache::cache_key(
+                    &fx.repo_key,
+                    package,
+                    false,
+                    false,
+                    "http://localhost",
+                ))
+                .await
+                .is_some(),
+            None => false,
+        };
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&member_dir);
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            first["versions"]["1.0.0"].is_object() && first["versions"]["9.9.9"].is_null(),
+            "the virtual age gate must filter the young version; got {first:?}"
+        );
+        assert!(
+            cached["versions"]["2.0.0"].is_null() && cached["versions"]["1.0.0"].is_object(),
+            "a repeat request must be served from the age-gated cache; got {cached:?}"
+        );
+        assert!(
+            !standard_entries,
+            "a virtual with an age-gated member must not populate the standard SWR cache"
         );
     }
 

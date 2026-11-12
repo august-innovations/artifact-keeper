@@ -4370,10 +4370,12 @@ pub async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: Uuid) ->
     gated
 }
 
-/// How long a positive age-gate member lookup is reused. Matches the default
-/// age-gated packument TTL: over-filtering cannot outlive the filtered
-/// document the lookup is protecting.
-const VIRTUAL_AGE_GATE_POSITIVE_TTL: Duration = Duration::from_secs(60);
+/// How long a positive age-gate member lookup is reused. This is the default
+/// age-gated packument TTL, so over-filtering cannot outlive the filtered
+/// document the lookup is protecting when the operator has not overridden it.
+const VIRTUAL_AGE_GATE_POSITIVE_TTL: Duration = Duration::from_secs(
+    crate::services::npm_packument_cache::NPM_PACKUMENT_AGE_GATED_TTL_DEFAULT_SECS,
+);
 const VIRTUAL_AGE_GATE_POSITIVE_MAX: usize = 1024;
 
 fn virtual_age_gate_positive_cache(

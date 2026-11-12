@@ -792,6 +792,36 @@ mod tests {
         }
     }
 
+    /// The age-gated cache is a separate instance. A cross-replica invalidation
+    /// must drop the filtered entry even when the standard cache is empty.
+    #[tokio::test]
+    async fn applying_npm_packument_invalidated_also_evicts_the_age_gated_cache() {
+        let standard = in_process_packument_cache();
+        let age_gated = in_process_packument_cache();
+        let mut handles = test_handles();
+        handles.npm_packument_cache = Some(standard.clone());
+        handles.npm_age_gated_packument_cache = Some(age_gated.clone());
+
+        let key = npm_packument_cache::cache_key("npm-virtual", "widget", false, false, "http://a");
+        standard.store(&key, cached_packument_entry()).await;
+        age_gated.store(&key, cached_packument_entry()).await;
+
+        apply_invalidation_event(
+            &handles,
+            &InvalidationEvent::NpmPackumentInvalidated {
+                repo_keys: vec!["npm-virtual".to_string()],
+                package: "widget".to_string(),
+            },
+        )
+        .await;
+
+        assert!(standard.lookup(&key).await.is_none());
+        assert!(
+            age_gated.lookup(&key).await.is_none(),
+            "the age-gated entry must be evicted by the same cross-replica event"
+        );
+    }
+
     /// A replica with the packument cache disabled must apply the event as a
     /// no-op, not panic or flush other caches.
     #[tokio::test]
