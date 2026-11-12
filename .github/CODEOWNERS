@@ -1,5 +1,7 @@
-* @artifact-keeper/backend
-backend/migrations/ @artifact-keeper/backend
-backend/src/api/ @artifact-keeper/backend @artifact-keeper/platform-sdk
-backend/src/formats/ @artifact-keeper/backend
-scripts/ @artifact-keeper/backend
+# The infrastructure team owns every file. A later pattern replaces earlier
+# owners entirely, so each path below keeps the team as an owner.
+*                                          @august-innovations/infrastructure
+backend/migrations/                        @august-innovations/infrastructure @artifact-keeper/backend
+backend/src/api/                           @august-innovations/infrastructure @artifact-keeper/backend @artifact-keeper/platform-sdk
+backend/src/formats/                       @august-innovations/infrastructure @artifact-keeper/backend
+scripts/                                   @august-innovations/infrastructure @artifact-keeper/backend
